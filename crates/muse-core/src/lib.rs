@@ -3,6 +3,7 @@
 pub mod app;
 pub mod domain;
 pub mod model;
+pub mod process_supervision;
 pub mod speech;
 
 pub use app::{config, storage};

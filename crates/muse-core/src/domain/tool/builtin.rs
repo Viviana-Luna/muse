@@ -358,7 +358,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "skill_name": { "type": "string", "description": "技能名称，如 antigravity_guide 或项目专有技能名称" }
+                "skill_name": { "type": "string", "description": "技能名称，如 antigravity-guide 或项目专有技能名称", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64 }
             },
             "required": ["skill_name"],
             "additionalProperties": false
@@ -374,7 +374,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "skill_name": { "type": "string", "description": "技能名称，如 time_calculator 或项目专有技能名称" }
+                "skill_name": { "type": "string", "description": "技能名称，如 time-calculator 或项目专有技能名称", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64 }
             },
             "required": ["skill_name"],
             "additionalProperties": false
@@ -390,7 +390,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "skill_name": { "type": "string", "description": "技能名称，如 time_calculator 或项目专有技能名称" }
+                "skill_name": { "type": "string", "description": "技能名称，如 time-calculator 或项目专有技能名称", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64 }
             },
             "required": ["skill_name"],
             "additionalProperties": false

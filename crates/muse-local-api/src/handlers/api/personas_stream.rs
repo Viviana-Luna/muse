@@ -971,7 +971,10 @@ fn is_partial_reasoning_tag(trimmed: &str) -> bool {
         .any(|tag| tag.starts_with(&lower) && lower.len() < tag.len())
 }
 
-async fn refresh_mcp_tool_catalog_if_needed(state: &Arc<AppState>) -> mcp::McpToolCatalog {
+async fn refresh_mcp_tool_catalog_if_needed(
+    state: &Arc<AppState>,
+    active_persona: Option<&Persona>,
+) -> mcp::McpToolCatalog {
     let snapshot = {
         let mut store = state.user_config.lock().await;
         if let Err(error) = store.refresh_from_disk() {
@@ -979,7 +982,10 @@ async fn refresh_mcp_tool_catalog_if_needed(state: &Arc<AppState>) -> mcp::McpTo
         }
         store.mcp_runtime_snapshot()
     };
-    let config_hash = snapshot.config_hash().to_string();
+    let scope = mcp::EffectiveMcpScope::from_policy(
+        active_persona.map(|persona| &persona.mcp_policy),
+    );
+    let config_hash = format!("{}:{}", snapshot.config_hash(), scope.cache_key());
     {
         if let Some(catalog) = state
             .runtime_service
@@ -990,7 +996,7 @@ async fn refresh_mcp_tool_catalog_if_needed(state: &Arc<AppState>) -> mcp::McpTo
         }
     }
 
-    let catalog = mcp::discover_external_mcp_tools(&snapshot).await;
+    let catalog = mcp::discover_external_mcp_tools_for_scope(&snapshot, &scope).await;
     state
         .runtime_service
         .replace_mcp_tool_catalog(catalog.clone())
@@ -1013,7 +1019,7 @@ async fn runtime_frozen_tool_defs_for_policy(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
 ) -> Vec<ToolDef> {
-    let catalog = refresh_mcp_tool_catalog_if_needed(state).await;
+    let catalog = refresh_mcp_tool_catalog_if_needed(state, active_persona).await;
     runtime_frozen_tool_defs_for_policy_with_catalog(state, active_persona, &catalog)
 }
 

@@ -6,20 +6,21 @@ mod store;
 
 pub use config::{McpProfileConfig, McpRuntimeSnapshot, McpServerProfile};
 
+use crate::domain::persona::{McpPolicy, ResourcePolicyMode};
 use crate::domain::tool::{ToolDef, ToolExecutionOwner, ToolRisk};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -29,6 +30,58 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_RESOURCE_TEXT_PREVIEW_CHARS: usize = 40_000;
 const MCP_TOOL_TEXT_PREVIEW_CHARS: usize = 40_000;
+
+/// 单个 Turn 冻结的 MCP 服务范围。该范围必须在任何 transport 建立前应用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveMcpScope {
+    allowed_servers: Option<BTreeSet<String>>,
+}
+
+impl EffectiveMcpScope {
+    /// 管理端显式测试使用的全局范围，不受 Persona 策略限制。
+    pub fn unrestricted() -> Self {
+        Self {
+            allowed_servers: None,
+        }
+    }
+
+    /// 从当前 Persona 策略生成不可变范围。
+    pub fn from_policy(policy: Option<&McpPolicy>) -> Self {
+        match policy.map(|policy| &policy.mode) {
+            None | Some(ResourcePolicyMode::Inherit) => Self::unrestricted(),
+            Some(ResourcePolicyMode::Disabled) => Self {
+                allowed_servers: Some(BTreeSet::new()),
+            },
+            Some(ResourcePolicyMode::AllowList) => Self {
+                allowed_servers: Some(
+                    policy
+                        .into_iter()
+                        .flat_map(|policy| policy.allowed_servers.iter())
+                        .cloned()
+                        .collect(),
+                ),
+            },
+        }
+    }
+
+    fn allows(&self, server: &str) -> bool {
+        self.allowed_servers
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(server))
+    }
+
+    /// 参与 MCP 目录缓存键，防止不同 Persona 复用越权目录。
+    pub fn cache_key(&self) -> String {
+        match &self.allowed_servers {
+            None => "all".to_string(),
+            Some(allowed) if allowed.is_empty() => "none".to_string(),
+            Some(allowed) => format!(
+                "allow:{}",
+                allowed.iter().cloned().collect::<Vec<_>>().join(",")
+            ),
+        }
+    }
+}
 
 /// 外部 MCP 资源列表结果。
 #[derive(Debug, Clone)]
@@ -457,6 +510,14 @@ async fn read_external_mcp_resource_with_server(
 
 /// 发现所有启用 MCP 服务暴露的工具，并隔离单个服务失败。
 pub async fn discover_external_mcp_tools(snapshot: &McpRuntimeSnapshot) -> McpToolCatalog {
+    discover_external_mcp_tools_for_scope(snapshot, &EffectiveMcpScope::unrestricted()).await
+}
+
+/// 仅发现当前 Turn 允许的 MCP 服务；过滤发生在任何网络请求或进程启动之前。
+pub async fn discover_external_mcp_tools_for_scope(
+    snapshot: &McpRuntimeSnapshot,
+    scope: &EffectiveMcpScope,
+) -> McpToolCatalog {
     let refreshed_at = chrono::Local::now().to_rfc3339();
     let refreshed_at_millis = current_millis();
     let loaded = match load_enabled_servers(snapshot) {
@@ -475,7 +536,12 @@ pub async fn discover_external_mcp_tools(snapshot: &McpRuntimeSnapshot) -> McpTo
             return catalog;
         }
     };
-    let config_hash = loaded.config_hash();
+    let config_hash = format!("{}:{}", loaded.config_hash(), scope.cache_key());
+    let scoped_servers = loaded
+        .servers
+        .into_iter()
+        .filter(|server| scope.allows(&server.name))
+        .collect::<Vec<_>>();
     let mut catalog = McpToolCatalog {
         tools: Vec::new(),
         errors: Vec::new(),
@@ -483,10 +549,10 @@ pub async fn discover_external_mcp_tools(snapshot: &McpRuntimeSnapshot) -> McpTo
         refreshed_at_millis,
         config_path: loaded.config_path.clone(),
         config_hash,
-        server_configs: loaded.servers.clone(),
+        server_configs: scoped_servers.clone(),
     };
 
-    for server_config in &loaded.servers {
+    for server_config in &scoped_servers {
         match call_external_mcp_method(server_config, "tools/list", Some(serde_json::json!({})))
             .await
         {
@@ -1075,12 +1141,11 @@ async fn call_stdio_json_rpc(request: StdioJsonRpcRequest<'_>) -> Result<Value, 
         timeout_ms,
     } = request;
     let mut cmd = Command::new(command);
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::process_supervision::configure_process_tree(&mut cmd);
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -1091,6 +1156,16 @@ async fn call_stdio_json_rpc(request: StdioJsonRpcRequest<'_>) -> Result<Value, 
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("启动外部 MCP server `{server_name}` 失败：{err}"))?;
+    let process_tree_guard = match crate::process_supervision::ProcessTreeGuard::attach(&child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(format!(
+                "外部 MCP server `{server_name}` 进程树隔离失败：{error}"
+            ));
+        }
+    };
     let mut stdin = child
         .stdin
         .take()
@@ -1099,7 +1174,7 @@ async fn call_stdio_json_rpc(request: StdioJsonRpcRequest<'_>) -> Result<Value, 
         .stdout
         .take()
         .ok_or_else(|| format!("外部 MCP server `{server_name}` 无法打开 stdout。"))?;
-    let mut stderr = child.stderr.take();
+    let stderr_reader = tokio::spawn(read_stderr_bounded(child.stderr.take()));
 
     let mut lines = BufReader::new(stdout).lines();
     let read_result = async {
@@ -1120,13 +1195,19 @@ async fn call_stdio_json_rpc(request: StdioJsonRpcRequest<'_>) -> Result<Value, 
     .await;
     drop(stdin);
 
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    let _ = process_tree_guard.terminate(false);
+    if tokio::time::timeout(Duration::from_millis(250), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = process_tree_guard.terminate(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    }
+    let stderr_text = join_stderr_reader(stderr_reader).await;
 
     match read_result {
         Ok(value) => Ok(value),
         Err(err) => {
-            let stderr_text = read_stderr_snapshot(stderr.take()).await;
             if stderr_text.trim().is_empty() {
                 Err(err)
             } else {
@@ -1185,15 +1266,27 @@ async fn write_json_rpc_line(
         .map_err(|err| format!("写入外部 MCP stdin 失败：{err}"))
 }
 
-// 读取一小段 stderr 作为失败诊断，避免等待子进程长时间阻塞。
-async fn read_stderr_snapshot(stderr: Option<tokio::process::ChildStderr>) -> String {
+// 持续排空 stderr，避免服务写满管道后阻塞；只保留有界诊断内容。
+async fn read_stderr_bounded(stderr: Option<tokio::process::ChildStderr>) -> String {
     let Some(stderr) = stderr else {
         return String::new();
     };
-    let mut reader = BufReader::new(stderr);
-    let mut output = String::new();
-    let _ = tokio::time::timeout(Duration::from_millis(250), reader.read_line(&mut output)).await;
-    output
+    let reader = BufReader::new(stderr);
+    let mut output = Vec::new();
+    let _ = reader.take(16 * 1024).read_to_end(&mut output).await;
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+async fn join_stderr_reader(mut reader: tokio::task::JoinHandle<String>) -> String {
+    match tokio::time::timeout(Duration::from_millis(500), &mut reader).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => String::new(),
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            String::new()
+        }
+    }
 }
 
 // 构造带 id 的 JSON-RPC 请求对象。
@@ -1799,6 +1892,24 @@ fn truncate_for_error(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_profile(command: &str, args: Vec<String>) -> McpServerProfile {
+        McpServerProfile {
+            transport: "stdio".to_string(),
+            enabled: true,
+            request_timeout_ms: Some(1_000),
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            command: Some(command.to_string()),
+            args: Some(args),
+            cwd: None,
+            url: None,
+            env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            secret_headers: BTreeMap::new(),
+        }
+    }
+
     fn parse_test_servers(entries: Value) -> Result<Vec<ExternalMcpServerConfig>, String> {
         let entries = serde_json::from_value(entries)
             .map_err(|error| format!("构造 MCP 测试配置失败：{error}"))?;
@@ -1815,6 +1926,117 @@ mod tests {
         .expect("应能解析普通 JSON-RPC 响应");
 
         assert_eq!(result["resources"][0]["uri"], "demo://a");
+    }
+
+    #[tokio::test]
+    async fn disabled_scope_does_not_spawn_configured_stdio_server() {
+        let marker = std::env::temp_dir().join(format!(
+            "muse-mcp-denied-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "denied".to_string(),
+            test_profile(
+                "/bin/sh",
+                vec!["-c".to_string(), format!("touch '{}'", marker.display())],
+            ),
+        );
+        let snapshot = McpProfileConfig {
+            mcp_servers: profiles,
+        }
+        .runtime_snapshot(std::env::temp_dir().join("muse-mcp-scope.toml"));
+        let policy = McpPolicy {
+            mode: ResourcePolicyMode::Disabled,
+            allowed_servers: Vec::new(),
+        };
+
+        let catalog = discover_external_mcp_tools_for_scope(
+            &snapshot,
+            &EffectiveMcpScope::from_policy(Some(&policy)),
+        )
+        .await;
+
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.server_configs.is_empty());
+        assert!(!marker.exists(), "禁用范围不能启动 stdio MCP 服务");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_stdio_request_kills_spawned_process_group() {
+        let marker = std::env::temp_dir().join(format!(
+            "muse-mcp-child-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let marker_for_task = marker.clone();
+        let request_task = tokio::spawn(async move {
+            let command = "/bin/sh".to_string();
+            let args = vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 30 & echo $! > '{}'; while :; do sleep 1; done",
+                    marker_for_task.display()
+                ),
+            ];
+            let env = BTreeMap::new();
+            call_stdio_json_rpc(StdioJsonRpcRequest {
+                server_name: "drop-test",
+                command: &command,
+                args: &args,
+                env: &env,
+                cwd: None,
+                method: "tools/list",
+                params: Some(serde_json::json!({})),
+                timeout_ms: 30_000,
+            })
+            .await
+        });
+
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let child_pid = std::fs::read_to_string(&marker)
+            .expect("MCP 测试服务应写出子进程 PID")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("子进程 PID 应合法");
+
+        request_task.abort();
+        let _ = request_task.await;
+        for _ in 0..100 {
+            if unsafe { libc::kill(child_pid, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_ne!(
+            unsafe { libc::kill(child_pid, 0) },
+            0,
+            "丢弃 MCP 请求 Future 后不能遗留后代进程"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn allow_list_scope_has_stable_order_independent_cache_key() {
+        let first = McpPolicy {
+            mode: ResourcePolicyMode::AllowList,
+            allowed_servers: vec!["zeta".to_string(), "alpha".to_string()],
+        };
+        let second = McpPolicy {
+            mode: ResourcePolicyMode::AllowList,
+            allowed_servers: vec!["alpha".to_string(), "zeta".to_string()],
+        };
+        assert_eq!(
+            EffectiveMcpScope::from_policy(Some(&first)).cache_key(),
+            EffectiveMcpScope::from_policy(Some(&second)).cache_key()
+        );
     }
 
     // 验证 SSE data 行中的 JSON-RPC 响应能够解析出 result。

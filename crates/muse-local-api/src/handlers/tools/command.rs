@@ -43,7 +43,6 @@ async fn tool_command_run(
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
             .arg(&command);
         // 进程必须先挂起，避免在加入 Job Object 前抢先派生不受控的子进程。
-        process.creation_flags(crate::windows_command_job::CREATE_SUSPENDED_NO_WINDOW_FLAGS);
         process
     };
     #[cfg(not(windows))]
@@ -55,12 +54,7 @@ async fn tool_command_run(
     crate::command_environment::apply_command_environment(&mut process);
     process.current_dir(&cwd);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
-    process.kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        // 让 shell 和它启动的子孙进程进入独立进程组，取消/超时时能整体终止。
-        process.process_group(0);
-    }
+    muse_core::process_supervision::configure_process_tree(&mut process);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -71,12 +65,8 @@ async fn tool_command_run(
         }
     };
     let child_pid = child.id();
-    #[cfg(unix)]
-    let mut process_group_drop_guard = UnixCommandProcessGroupDropGuard::new(child_pid);
-    #[cfg(windows)]
-    let command_job = match crate::windows_command_job::WindowsCommandJob::attach_and_resume(&child)
-    {
-        Ok(job) => job,
+    let mut process_tree_guard = match muse_core::process_supervision::ProcessTreeGuard::attach(&child) {
+        Ok(guard) => guard,
         Err(error) => {
             // 此时 PowerShell 仍处于 CREATE_SUSPENDED，失败必须先回收再返回，不能降级裸跑。
             let mut cleanup_notes = Vec::new();
@@ -130,16 +120,14 @@ async fn tool_command_run(
         _ = &mut timeout => {
             CommandRunOutcome::Timeout(terminate_command_process(
                 child_pid,
-                #[cfg(windows)]
-                &command_job,
+                &process_tree_guard,
                 &mut wait_handle,
             ).await)
         }
         _ = wait_for_turn_cancel(cancel_token) => {
             CommandRunOutcome::Cancelled(terminate_command_process(
                 child_pid,
-                #[cfg(windows)]
-                &command_job,
+                &process_tree_guard,
                 &mut wait_handle,
             ).await)
         }
@@ -148,12 +136,12 @@ async fn tool_command_run(
     // 进程组清理剩余成员，避免后台进程继续持有管道、写入文件或成为孤儿进程。
     #[cfg(unix)]
     {
-        cleanup_finished_command_group(child_pid).await;
-        process_group_drop_guard.disarm();
+        cleanup_finished_command_group(child_pid, &process_tree_guard).await;
+        process_tree_guard.disarm();
     }
     // 根进程正常退出时也立即关闭 Job；KILL_ON_JOB_CLOSE 会清理仍持有管道的后台子孙进程。
     #[cfg(windows)]
-    drop(command_job);
+    drop(process_tree_guard);
     let reader_cleanup_timeout_ms = if audit_output_enabled {
         COMMAND_AUDIT_READER_CLEANUP_TIMEOUT_MS
     } else {
@@ -348,7 +336,7 @@ async fn join_command_output_reader(
 
 async fn terminate_command_process(
     child_pid: Option<u32>,
-    #[cfg(windows)] command_job: &crate::windows_command_job::WindowsCommandJob,
+    process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
     wait_handle: &mut tokio::task::JoinHandle<std::io::Result<ExitStatus>>,
 ) -> CommandTerminationResult {
     let mut notes = Vec::<String>::new();
@@ -356,8 +344,7 @@ async fn terminate_command_process(
         tokio::time::Instant::now() + Duration::from_millis(COMMAND_TERMINATE_GRACE_MS);
     terminate_command_process_once(
         child_pid,
-        #[cfg(windows)]
-        command_job,
+        process_tree_guard,
         CommandTerminationSignal::Terminate,
         &mut notes,
     );
@@ -368,8 +355,7 @@ async fn terminate_command_process(
     tokio::time::sleep_until(grace_deadline).await;
     terminate_command_process_once(
         child_pid,
-        #[cfg(windows)]
-        command_job,
+        process_tree_guard,
         CommandTerminationSignal::Kill,
         &mut notes,
     );
@@ -392,7 +378,10 @@ async fn terminate_command_process(
 }
 
 #[cfg(unix)]
-async fn cleanup_finished_command_group(child_pid: Option<u32>) {
+async fn cleanup_finished_command_group(
+    child_pid: Option<u32>,
+    process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
+) {
     let Some(pid) = child_pid else {
         return;
     };
@@ -403,9 +392,19 @@ async fn cleanup_finished_command_group(child_pid: Option<u32>) {
         return;
     }
     let mut notes = Vec::new();
-    terminate_command_process_once(child_pid, CommandTerminationSignal::Terminate, &mut notes);
+    terminate_command_process_once(
+        child_pid,
+        process_tree_guard,
+        CommandTerminationSignal::Terminate,
+        &mut notes,
+    );
     tokio::time::sleep(Duration::from_millis(COMMAND_TERMINATE_GRACE_MS)).await;
-    terminate_command_process_once(child_pid, CommandTerminationSignal::Kill, &mut notes);
+    terminate_command_process_once(
+        child_pid,
+        process_tree_guard,
+        CommandTerminationSignal::Kill,
+        &mut notes,
+    );
     if !notes.is_empty() {
         tracing::warn!(
             target: "muse::command",
@@ -421,54 +420,15 @@ enum CommandTerminationSignal {
     Kill,
 }
 
-#[cfg(unix)]
 fn terminate_command_process_once(
     child_pid: Option<u32>,
+    process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
     signal: CommandTerminationSignal,
     notes: &mut Vec<String>,
 ) {
-    let Some(pid) = child_pid else {
-        notes.push("未取得命令进程 PID，无法发送进程组终止信号。".to_string());
-        return;
-    };
-    let signal_value = match signal {
-        CommandTerminationSignal::Terminate => libc::SIGTERM,
-        CommandTerminationSignal::Kill => libc::SIGKILL,
-    };
-    let process_group = -(pid as libc::pid_t);
-    let result = unsafe { libc::kill(process_group, signal_value) };
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            notes.push(format!("发送进程组终止信号失败：{err}"));
-        }
-    }
-}
-
-#[cfg(windows)]
-fn terminate_command_process_once(
-    _child_pid: Option<u32>,
-    command_job: &crate::windows_command_job::WindowsCommandJob,
-    signal: CommandTerminationSignal,
-    notes: &mut Vec<String>,
-) {
-    let exit_code = match signal {
-        CommandTerminationSignal::Terminate => 0xC000_013Au32,
-        CommandTerminationSignal::Kill => 1,
-    };
-    if let Err(error) = command_job.terminate(exit_code) {
+    let _ = child_pid;
+    if let Err(error) = process_tree_guard.terminate(matches!(signal, CommandTerminationSignal::Kill)) {
         notes.push(error);
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_command_process_once(
-    _child_pid: Option<u32>,
-    signal: CommandTerminationSignal,
-    notes: &mut Vec<String>,
-) {
-    if matches!(signal, CommandTerminationSignal::Kill) {
-        notes.push("当前平台暂不支持按进程组强杀；已依赖 kill_on_drop 兜底。".to_string());
     }
 }
 

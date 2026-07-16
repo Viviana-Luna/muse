@@ -13,9 +13,6 @@ pub mod security;
 mod startup_migration;
 pub mod state;
 mod tool_result_archive;
-#[cfg(windows)]
-mod windows_command_job;
-
 pub use router::build_router_with_security;
 pub use security::{LocalApiBootstrap, LocalApiSecurity, LocalApiSecurityOptions};
 pub use startup_migration::{

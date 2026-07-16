@@ -209,50 +209,19 @@ async fn tool_skill_from_workspace_with_user(
         }
         Some(Err(_)) | None => {}
     }
-    let candidate_paths = [
+    let candidate_roots = [
         // 旧工作区技能目录仅保留兼容读取，不再作为新技能的推荐写入位置。
-        workspace
-            .join(".agent-vp-data")
-            .join("skills")
-            .join(&skill_name)
-            .join("SKILL.md"),
-        workspace
-            .join(".agents")
-            .join("skills")
-            .join(&skill_name)
-            .join("SKILL.md"),
-        workspace.join("skills").join(&skill_name).join("SKILL.md"),
-        workspace
-            .join(".agent")
-            .join("skills")
-            .join(&skill_name)
-            .join("SKILL.md"),
+        workspace.join(".agent-vp-data").join("skills"),
+        workspace.join(".agents").join("skills"),
+        workspace.join("skills"),
+        workspace.join(".agent").join("skills"),
     ];
 
-    for path in &candidate_paths {
-        let Ok(metadata) = tokio::fs::metadata(path).await else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
-            return tool_failed(
-                format!(
-                    "技能 `{skill_name}` 的 SKILL.md 超过 {} KB，已拒绝载入。",
-                    MAX_SKILL_DOCUMENT_BYTES / 1024
-                ),
-                "skill_document_too_large",
-            );
-        }
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(content) => content,
-            Err(err) => {
-                return tool_failed(
-                    format!("读取技能 `{skill_name}` 失败：{err}"),
-                    "skill_read_failed",
-                );
-            }
+    for root in &candidate_roots {
+        let content = match read_compatibility_skill(root, &skill_name).await {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(result) => return result,
         };
         return ToolResult {
             status: ToolResultStatus::Success,
@@ -277,21 +246,22 @@ async fn tool_skill_from_workspace_with_user(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let search_roots = [
-        workspace.join(".agent-vp-data").join("skills"),
-        workspace.join(".agents").join("skills"),
-        workspace.join("skills"),
-        workspace.join(".agent").join("skills"),
-    ];
-    for root in &search_roots {
+    for root in &candidate_roots {
+        let Ok(root_metadata) = tokio::fs::symlink_metadata(root).await else {
+            continue;
+        };
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            continue;
+        }
         if let Ok(mut entries) = tokio::fs::read_dir(root).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Ok(file_type) = entry.file_type().await
                     && file_type.is_dir()
+                    && !file_type.is_symlink()
                 {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if valid_skill_name(&name)
-                        && entry.path().join("SKILL.md").exists()
+                        && matches!(read_compatibility_skill(root, &name).await, Ok(Some(_)))
                         && !available_skills.contains(&name)
                     {
                         available_skills.push(name);
@@ -319,6 +289,117 @@ async fn tool_skill_from_workspace_with_user(
             serde_json::json!({ "skill_name": skill_name, "available_skills": available_skills }),
         ),
     }
+}
+
+/// 安全读取旧工作区 Skill：任一层符号链接或 canonical 根逃逸都直接拒绝。
+async fn read_compatibility_skill(
+    root: &StdPath,
+    skill_name: &str,
+) -> Result<Option<String>, ToolResult> {
+    let root_metadata = match tokio::fs::symlink_metadata(root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tool_failed(
+                format!("检查兼容 Skill 根目录失败：{error}"),
+                "skill_read_failed",
+            ));
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(tool_failed(
+            "兼容 Skill 根目录必须是真实普通目录，不能是符号链接。",
+            "skill_path_boundary",
+        ));
+    }
+    let skill_dir = root.join(skill_name);
+    let skill_metadata = match tokio::fs::symlink_metadata(&skill_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tool_failed(
+                format!("检查兼容 Skill 目录失败：{error}"),
+                "skill_read_failed",
+            ));
+        }
+    };
+    if skill_metadata.file_type().is_symlink() || !skill_metadata.is_dir() {
+        return Err(tool_failed(
+            format!("Skill `{skill_name}` 的兼容目录不是安全的普通目录。"),
+            "skill_path_boundary",
+        ));
+    }
+    let path = skill_dir.join("SKILL.md");
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(tool_failed(
+                format!("检查 Skill `{skill_name}` 文档失败：{error}"),
+                "skill_read_failed",
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(tool_failed(
+            format!("Skill `{skill_name}` 的 SKILL.md 必须是普通文件，不能是符号链接。"),
+            "skill_path_boundary",
+        ));
+    }
+    if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
+        return Err(tool_failed(
+            format!(
+                "技能 `{skill_name}` 的 SKILL.md 超过 {} KB，已拒绝载入。",
+                MAX_SKILL_DOCUMENT_BYTES / 1024
+            ),
+            "skill_document_too_large",
+        ));
+    }
+    let canonical_root = tokio::fs::canonicalize(root).await.map_err(|error| {
+        tool_failed(
+            format!("解析兼容 Skill 根目录失败：{error}"),
+            "skill_path_boundary",
+        )
+    })?;
+    let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|error| {
+        tool_failed(
+            format!("解析 Skill `{skill_name}` 文档失败：{error}"),
+            "skill_path_boundary",
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(tool_failed(
+            format!("Skill `{skill_name}` 的文档超出受信根目录，已拒绝载入。"),
+            "skill_path_boundary",
+        ));
+    }
+    let content = tokio::fs::read_to_string(&canonical_path)
+        .await
+        .map_err(|error| {
+            tool_failed(
+                format!("读取技能 `{skill_name}` 失败：{error}"),
+                "skill_read_failed",
+            )
+        })?;
+    let post_metadata = tokio::fs::symlink_metadata(&canonical_path)
+        .await
+        .map_err(|error| {
+            tool_failed(
+                format!("复核技能 `{skill_name}` 文档失败：{error}"),
+                "skill_read_failed",
+            )
+        })?;
+    if !post_metadata.is_file()
+        || post_metadata.file_type().is_symlink()
+        || post_metadata.len() != metadata.len()
+        || content.len() as u64 != post_metadata.len()
+    {
+        return Err(tool_failed(
+            format!("Skill `{skill_name}` 文档在读取期间发生变化，已拒绝使用。"),
+            "skill_path_changed",
+        ));
+    }
+    Ok(Some(content))
 }
 
 fn valid_skill_name(skill_name: &str) -> bool {

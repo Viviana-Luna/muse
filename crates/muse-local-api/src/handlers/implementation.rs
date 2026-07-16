@@ -814,7 +814,7 @@ impl ConversationRuntime {
             _ = cancel_token.cancelled() => Err(TURN_CANCELLED_MESSAGE.to_string()),
             result = tokio::time::timeout(
                 preparation_remaining,
-                refresh_mcp_tool_catalog_if_needed(&self.state),
+                refresh_mcp_tool_catalog_if_needed(&self.state, Some(&active_persona)),
             ) => result.map_err(|_| "回合准备阶段超过 15 分钟硬期限。".to_string()),
         } {
             Ok(catalog) => catalog,

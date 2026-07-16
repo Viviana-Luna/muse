@@ -793,18 +793,18 @@ mod tests {
             ),
             (
                 "load_skill",
-                serde_json::json!({ "skill_name": "antigravity_guide" }),
-                "载入技能 `antigravity_guide`",
+                serde_json::json!({ "skill_name": "antigravity-guide" }),
+                "载入技能 `antigravity-guide`",
             ),
             (
                 "use_skill",
-                serde_json::json!({ "skill_name": "antigravity_guide" }),
-                "载入技能 `antigravity_guide`",
+                serde_json::json!({ "skill_name": "antigravity-guide" }),
+                "载入技能 `antigravity-guide`",
             ),
             (
                 "skill",
-                serde_json::json!({ "skill_name": "time_calculator" }),
-                "载入技能 `time_calculator`",
+                serde_json::json!({ "skill_name": "time-calculator" }),
+                "载入技能 `time-calculator`",
             ),
             (
                 "agent",
@@ -955,6 +955,39 @@ mod tests {
         assert!(!denied.is_success());
         assert_eq!(super::tool_result_reason(&denied), Some("skill_policy_denied"));
 
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(unix)]
+    async fn skill_tool_rejects_symlinked_compatibility_paths() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = unique_temp_dir("skill-tool-symlink");
+        let outside = workspace.join("outside");
+        let root = workspace.join("skills");
+        std::fs::create_dir_all(&outside).expect("应能创建外部 Skill 目录");
+        std::fs::create_dir_all(&root).expect("应能创建兼容 Skill 根目录");
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: escaped-skill\ndescription: 越界文档\n---\n",
+        )
+        .expect("应能创建越界测试文档");
+        symlink(&outside, root.join("escaped-skill")).expect("应能创建 Skill 目录符号链接");
+        let call = test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "escaped-skill" }),
+        );
+
+        let result = super::tool_skill_from_workspace(
+            &test_turn_context("skill-symlink-turn"),
+            &call,
+            &workspace,
+        )
+        .await;
+
+        assert!(!result.is_success());
+        assert_eq!(super::tool_result_reason(&result), Some("skill_path_boundary"));
+        assert!(!result.content.contains("越界文档"));
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
@@ -4273,6 +4306,12 @@ mod tests {
         {
             if std::panic::AssertUnwindSafe(skill_tool_loads_workspace_skill_and_rejects_path_like_names()).catch_unwind().await.is_err() {
                 failures.push("skill_tool_loads_workspace_skill_and_rejects_path_like_names");
+            }
+        }
+        #[cfg(unix)]
+        {
+            if std::panic::AssertUnwindSafe(skill_tool_rejects_symlinked_compatibility_paths()).catch_unwind().await.is_err() {
+                failures.push("skill_tool_rejects_symlinked_compatibility_paths");
             }
         }
         {
