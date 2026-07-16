@@ -301,6 +301,14 @@ async fn runtime_session_list_payload(
         .list_sessions()
         .await
         .map_err(|error| format!("读取会话 SQLite 索引失败：{error}"))?;
+    let existing_personas = {
+        let personas = state.personas.lock().await;
+        personas
+            .personas()
+            .iter()
+            .map(|persona| persona.id.clone())
+            .collect::<HashSet<_>>()
+    };
     if items.is_empty() {
         return Ok(RuntimeSessionListPayload {
             exists: false,
@@ -312,15 +320,20 @@ async fn runtime_session_list_payload(
         sessions: items
             .into_iter()
             .map(|item| {
+                let persona_exists = existing_personas.contains(&item.persona_id);
                 serde_json::json!({
                     "conversation_id": item.conversation_id,
+                    "persona_id": item.persona_id,
+                    "persona_name_snapshot": item.persona_name_snapshot,
+                    "persona_version_snapshot": item.persona_version_snapshot,
+                    "persona_status": if persona_exists { "bound" } else { "missing" },
                     "summary": item.summary,
                     "first_prompt": null,
                     "source_conversation_id": item.source_conversation_id,
                     "path": null,
                     "resource_uri": MCP_RUNTIME_TRANSCRIPT_URI,
                     "exists": true,
-                    "can_resume": item.records > 0,
+                    "can_resume": item.records > 0 && persona_exists,
                     "records": item.records,
                     "created_time": item.created_time,
                     "last_time": item.last_time,

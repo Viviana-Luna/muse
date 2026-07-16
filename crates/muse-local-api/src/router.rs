@@ -15,11 +15,14 @@ const SPEECH_UPLOAD_BODY_LIMIT_BYTES: usize = 25 * 1024 * 1024 + 64 * 1024;
 /// 使用调用方已经绑定的实际地址和安全上下文构建路由。
 ///
 /// 桌面宿主先绑定随机端口，再通过此入口确保 Host 校验、Bootstrap 与监听地址一致。
-pub fn build_router_with_security(
+pub async fn build_router_with_security(
     config: Config,
     security: Arc<LocalApiSecurity>,
 ) -> Result<Router, Box<dyn std::error::Error>> {
     let state = build_app_state(config)?;
+    handlers::initialize_active_persona_session(&state)
+        .await
+        .map_err(std::io::Error::other)?;
     let protected_api = api_routes()
         .layer(Extension(security.clone()))
         .layer(axum::middleware::from_fn_with_state(
@@ -150,6 +153,10 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/personas/{id}/card",
             get(handlers::handle_export_persona_card),
+        )
+        .route(
+            "/personas/{id}/deletion-impact",
+            get(handlers::handle_persona_deletion_impact),
         )
         .route(
             "/personas/{id}/activate",
@@ -1112,9 +1119,18 @@ check_on_startup = true
         let state = build_test_state(&config_dir);
         let store = state
             .runtime_service
-            .session_store()
+            .session_repository()
             .await
             .expect("应能打开测试会话存储");
+        store
+            .ensure_persona_binding(
+                "chapter-1",
+                "router-test-persona",
+                "测试角色 router-test-persona",
+                "1.0.0",
+            )
+            .await
+            .expect("应建立测试会话 v2 Persona 绑定");
         for (kind, payload) in [
             (
                 "runtime_policy_snapshot",
@@ -1255,7 +1271,11 @@ check_on_startup = true
             .events_for_conversation("chapter-1")
             .await
             .expect("应能读取事件");
-        assert_eq!(events.len(), 5, "元数据必须追加为 Session v3 事实事件");
+        assert_eq!(
+            events.len(),
+            6,
+            "v2 绑定和标题元数据都必须是 Session v3 事实事件"
+        );
         assert_eq!(
             events.last().map(|event| event.kind.as_str()),
             Some("session_metadata_updated")
@@ -1421,6 +1441,125 @@ check_on_startup = true
         assert!(runtime_payload["active_persona_id"].is_null());
         assert_eq!(active_payload["state_revision"], mutation_revision);
         assert_eq!(runtime_payload["state_revision"], mutation_revision);
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
+        let config_dir = unique_temp_dir("deleted-persona-session");
+        let _env_guard = ENV_LOCK.lock().await;
+        let _data_dir_guard = MuseDataDirEnvGuard {
+            previous: std::env::var_os("MUSE_DATA_DIR"),
+        };
+        unsafe {
+            std::env::set_var("MUSE_DATA_DIR", &config_dir);
+        }
+        let state = build_test_state(&config_dir);
+        let repository = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应能打开会话仓储");
+        repository
+            .ensure_persona_binding(
+                "deleted-persona-chat",
+                "router-test-persona",
+                "测试角色 router-test-persona",
+                "1.0.0",
+            )
+            .await
+            .expect("应能绑定待删除角色会话");
+        repository
+            .append_event(
+                "deleted-persona-chat",
+                Some("turn-deleted-persona".to_string()),
+                "user",
+                serde_json::json!({"content": "删除角色后仍需导出"}),
+            )
+            .await
+            .expect("应写入用户事件");
+        repository
+            .append_event(
+                "deleted-persona-chat",
+                Some("turn-deleted-persona".to_string()),
+                "turn_committed",
+                serde_json::json!({"outcome": "committed"}),
+            )
+            .await
+            .expect("应写入提交事件");
+        repository
+            .set_workspace_state("router-test-persona", "deleted-persona-chat")
+            .expect("应写入待删除角色工作区状态");
+        let app = api_routes().with_state(state.clone());
+
+        let impact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/personas/router-test-persona/deletion-impact")
+                    .body(Body::empty())
+                    .expect("应能构造删除影响查询"),
+            )
+            .await
+            .expect("删除影响查询应返回响应");
+        assert_eq!(impact.status(), StatusCode::OK);
+        let impact_payload = response_json(impact).await;
+        assert_eq!(impact_payload["associated_session_count"], 1);
+        assert_eq!(impact_payload["workspace_state_exists"], true);
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/personas/router-test-persona")
+                    .body(Body::empty())
+                    .expect("应能构造角色删除请求"),
+            )
+            .await
+            .expect("角色删除请求应返回响应");
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(
+            !repository
+                .workspace_state_exists("router-test-persona")
+                .expect("删除后应清理角色工作区状态")
+        );
+
+        let export = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/sessions/deleted-persona-chat/export")
+                    .body(Body::empty())
+                    .expect("应能构造 missing 角色会话导出请求"),
+            )
+            .await
+            .expect("missing 角色会话导出应返回响应");
+        assert_eq!(export.status(), StatusCode::OK);
+        let export_payload = response_json(export).await;
+        assert_eq!(export_payload["persona_status"], "missing");
+        assert_eq!(
+            export_payload["persona_name_snapshot"],
+            "测试角色 router-test-persona"
+        );
+
+        let resume = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runtime/sessions/deleted-persona-chat/resume")
+                    .body(Body::empty())
+                    .expect("应能构造 missing 角色会话恢复请求"),
+            )
+            .await
+            .expect("missing 角色会话恢复应返回响应");
+        assert_eq!(resume.status(), StatusCode::CONFLICT);
+        let resume_payload = response_json(resume).await;
+        assert!(
+            resume_payload["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("session_persona_missing"))
+        );
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
@@ -1640,6 +1779,196 @@ check_on_startup = true
     }
 
     #[tokio::test]
+    async fn cross_persona_chat_is_rejected_before_provider_and_business_events() {
+        let config_dir = unique_temp_dir("chat-persona-mismatch");
+        let state = build_test_state(&config_dir);
+        let provider = Arc::new(CountingChatProvider {
+            calls: AtomicUsize::new(0),
+        });
+        *state.provider.lock().await = Some(provider.clone());
+        let repository = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应能打开会话仓储");
+        repository
+            .ensure_persona_binding("default", "another-persona", "另一个角色", "1.0.0")
+            .await
+            .expect("应能模拟其他角色已绑定会话");
+        let app = api_routes().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "message": "不应进入模型",
+                            "conversation_id": "default",
+                            "client_request_id": "persona-mismatch-request"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应能构造跨角色聊天请求"),
+            )
+            .await
+            .expect("跨角色聊天应返回结构化流错误");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("应读取跨角色聊天响应");
+        assert!(String::from_utf8_lossy(&body).contains("session_persona_mismatch"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let events = repository
+            .session_store()
+            .events_for_conversation("default")
+            .await
+            .expect("应读取被拒会话事件");
+        assert_eq!(events.len(), 2, "拒绝请求只允许追加无副作用的终止审计事件");
+        assert_eq!(events[0].kind, "session_metadata_updated");
+        assert_eq!(events[1].kind, "turn_aborted");
+        assert!(events.iter().all(|event| event.kind != "user"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn resume_switches_to_bound_persona_and_records_workspace_state() {
+        let config_dir = unique_temp_dir("resume-bound-persona");
+        let state = build_test_state(&config_dir);
+        {
+            let mut personas = state.personas.lock().await;
+            personas
+                .create(test_persona("resume-persona"))
+                .expect("应能创建会话所属角色");
+        }
+        let repository = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应能打开会话仓储");
+        repository
+            .ensure_persona_binding(
+                "resume-chat",
+                "resume-persona",
+                "测试角色 resume-persona",
+                "1.0.0",
+            )
+            .await
+            .expect("应能绑定恢复会话");
+        repository
+            .append_event(
+                "resume-chat",
+                Some("turn-resume".to_string()),
+                "user",
+                serde_json::json!({"content": "恢复到指定角色"}),
+            )
+            .await
+            .expect("应写入恢复会话用户事件");
+        repository
+            .append_event(
+                "resume-chat",
+                Some("turn-resume".to_string()),
+                "turn_committed",
+                serde_json::json!({"outcome": "committed"}),
+            )
+            .await
+            .expect("应写入恢复会话提交事件");
+        let app = api_routes().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runtime/sessions/resume-chat/resume")
+                    .body(Body::empty())
+                    .expect("应能构造会话恢复请求"),
+            )
+            .await
+            .expect("恢复请求应返回响应");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["persona_id"], "resume-persona");
+        assert_eq!(
+            state.personas.lock().await.active_persona_id(),
+            Some("resume-persona")
+        );
+        assert_eq!(
+            state
+                .runtime_service
+                .active_conversation_id()
+                .expect("应读取活动会话"),
+            "resume-chat"
+        );
+        assert!(
+            repository
+                .workspace_state_exists("resume-persona")
+                .expect("应读取角色工作区状态")
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_restores_active_persona_workspace_session() {
+        let config_dir = unique_temp_dir("startup-persona-workspace");
+        let state = build_test_state(&config_dir);
+        let repository = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应能打开会话仓储");
+        repository
+            .ensure_persona_binding(
+                "startup-chat",
+                "router-test-persona",
+                "测试角色 router-test-persona",
+                "1.0.0",
+            )
+            .await
+            .expect("应能绑定启动恢复会话");
+        repository
+            .append_event(
+                "startup-chat",
+                Some("turn-startup".to_string()),
+                "user",
+                serde_json::json!({"content": "启动后继续"}),
+            )
+            .await
+            .expect("应写入启动恢复用户事件");
+        repository
+            .append_event(
+                "startup-chat",
+                Some("turn-startup".to_string()),
+                "turn_committed",
+                serde_json::json!({"outcome": "committed"}),
+            )
+            .await
+            .expect("应写入启动恢复提交事件");
+        repository
+            .set_workspace_state("router-test-persona", "startup-chat")
+            .expect("应保存启动工作区会话");
+
+        crate::handlers::initialize_active_persona_session(&state)
+            .await
+            .expect("启动恢复应成功");
+        assert_eq!(
+            state
+                .runtime_service
+                .active_conversation_id()
+                .expect("应读取启动后的活动会话"),
+            "startup-chat"
+        );
+        let messages = state.runtime_service.lock_conversation().await;
+        assert!(
+            messages
+                .messages
+                .iter()
+                .any(|message| message.content == "启动后继续")
+        );
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
     async fn accepted_chat_turn_atomically_wins_concurrent_persona_delete() {
         let config_dir = unique_temp_dir("chat-delete-chat-wins");
         let _env_guard = ENV_LOCK.lock().await;
@@ -1836,8 +2165,6 @@ check_on_startup = true
 
         for (method, uri, body) in [
             ("POST", "/reset", "{}"),
-            ("POST", "/runtime/sessions/source/resume", "{}"),
-            ("POST", "/runtime/sessions/source/fork", "{}"),
             ("DELETE", "/runtime/sessions/source", "{}"),
             ("POST", "/tts", r#"{"text":"不应合成"}"#),
         ] {
@@ -2559,40 +2886,56 @@ check_on_startup = true
         }
 
         let source_conversation_id = "session-source";
-        let source_dir = config_dir.join("sessions").join("conversations");
-        std::fs::create_dir_all(&source_dir).expect("应能创建测试 transcript 目录");
-        std::fs::write(
-            source_dir.join(format!("{source_conversation_id}.jsonl")),
-            [
+        let state = build_test_state(&config_dir);
+        let repository = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应打开测试会话仓储");
+        repository
+            .ensure_persona_binding(
+                source_conversation_id,
+                "router-test-persona",
+                "测试角色 router-test-persona",
+                "1.0.0",
+            )
+            .await
+            .expect("应建立来源会话绑定");
+        repository
+            .append_event(
+                source_conversation_id,
+                Some("turn-source".to_string()),
+                "user",
+                serde_json::json!({"conversation_id": source_conversation_id, "content": "继续这个任务"}),
+            )
+            .await
+            .expect("应写入来源用户事件");
+        repository
+            .append_event(
+                source_conversation_id,
+                Some("turn-source".to_string()),
+                "todo_state",
                 serde_json::json!({
-                    "time": "2026-06-24T10:00:00Z",
-                    "kind": "user",
-                    "payload": {
-                        "conversation_id": source_conversation_id,
-                        "content": "继续这个任务"
-                    }
-                })
-                .to_string(),
-                serde_json::json!({
-                    "time": "2026-06-24T10:01:00Z",
-                    "kind": "todo_state",
-                    "payload": {
-                        "conversation_id": source_conversation_id,
-                        "turn_id": "turn-source",
-                        "todos": [
-                            { "id": "build", "content": "补齐 todo 展示", "status": "in_progress", "priority": "high" }
-                        ],
-                        "summary": "来源任务清单",
-                        "updated_at": "2026-06-24T10:01:00Z"
-                    }
-                })
-                .to_string(),
-            ]
-            .join("\n"),
-        )
-        .expect("应能写入来源 transcript");
+                    "conversation_id": source_conversation_id,
+                    "turn_id": "turn-source",
+                    "todos": [{ "id": "build", "content": "补齐 todo 展示", "status": "in_progress", "priority": "high" }],
+                    "summary": "来源任务清单",
+                    "updated_at": "2026-06-24T10:01:00Z"
+                }),
+            )
+            .await
+            .expect("应写入来源任务状态");
+        repository
+            .append_event(
+                source_conversation_id,
+                Some("turn-source".to_string()),
+                "turn_committed",
+                serde_json::json!({"conversation_id": source_conversation_id, "outcome": "committed"}),
+            )
+            .await
+            .expect("应写入来源提交终态");
 
-        let app = api_routes().with_state(build_test_state(&config_dir));
+        let app = api_routes().with_state(state);
         let response = app
             .oneshot(
                 Request::builder()

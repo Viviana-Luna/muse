@@ -471,7 +471,10 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     }
   }
 
-  async function handleForkSession(conversationId?: string): Promise<boolean> {
+  async function handleForkSession(
+    conversationId?: string,
+    targetPersonaId?: string
+  ): Promise<boolean> {
     if (stream.busy) return false;
     if (rejectBlockedMutation('分叉会话')) return false;
     const target = conversationId
@@ -489,7 +492,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     try {
       stream.closeCurrentChatSource();
       stopVoice();
-      const response = await forkRuntimeSession(target.conversation_id);
+      const response = await forkRuntimeSession(target.conversation_id, undefined, targetPersonaId);
       await loadAndCommitStoryRuntimeSnapshot({
         requestedConversationId: response.conversation_id
       });

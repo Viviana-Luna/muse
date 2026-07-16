@@ -133,6 +133,7 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
     'crates/muse-local-api/src/handlers/api/app_preferences.rs',
     'crates/muse-local-api/src/handlers/api/chat_sessions_models.rs',
     'crates/muse-local-api/src/handlers/api/personas_stream.rs',
+    'crates/muse-local-api/src/handlers/api/persona_session_binding.rs',
     'crates/muse-local-api/src/handlers/tools/registry.rs',
     'crates/muse-local-api/src/handlers/tools/interaction.rs',
     'crates/muse-local-api/src/handlers/tools/files.rs',
@@ -146,7 +147,7 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   }
   const router = read('crates/muse-local-api/src/router.rs');
   assert.doesNotMatch(router.split('#[cfg(test)]')[0], /\/model-assets/);
-  const windowsJob = read('crates/muse-local-api/src/windows_command_job.rs');
+  const windowsJob = read('crates/muse-core/src/process_supervision.rs');
   for (const marker of [
     'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE',
     'AssignProcessToJobObject',

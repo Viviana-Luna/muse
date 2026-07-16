@@ -267,6 +267,10 @@ pub struct HistoryResponse {
 #[derive(Serialize)]
 pub struct RuntimeSessionResumeResponse {
     pub conversation_id: String,
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
+    pub persona_status: String,
     pub restored_messages: usize,
     pub status: String,
 }
@@ -292,6 +296,10 @@ pub struct RuntimeSessionMetadataPatch {
 #[derive(Serialize)]
 pub struct RuntimeSessionMetadataResponse {
     pub conversation_id: String,
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
+    pub persona_status: String,
     pub title: Option<String>,
     pub archived: bool,
     pub source_conversation_id: Option<String>,
@@ -309,6 +317,10 @@ pub struct RuntimeSessionExportMessage {
 pub struct RuntimeSessionExportResponse {
     pub schema_version: String,
     pub conversation_id: String,
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
+    pub persona_status: String,
     pub title: Option<String>,
     pub archived: bool,
     pub source_conversation_id: Option<String>,
@@ -329,12 +341,18 @@ pub struct RuntimeSessionContextResponse {
 pub struct RuntimeSessionForkRequest {
     #[serde(default)]
     pub before_user_message_index: Option<usize>,
+    #[serde(default)]
+    pub target_persona_id: Option<String>,
 }
 
 /// 运行时会话分叉响应体。
 #[derive(Serialize)]
 pub struct RuntimeSessionForkResponse {
     pub conversation_id: String,
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
+    pub persona_status: String,
     pub source_conversation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_user_message_index: Option<usize>,
@@ -478,6 +496,13 @@ pub struct PersonaDetailResponse {
     pub visual_pack: Option<VisualPack>,
 }
 
+#[derive(Serialize)]
+pub struct PersonaDeletionImpactResponse {
+    pub persona_id: String,
+    pub associated_session_count: usize,
+    pub workspace_state_exists: bool,
+}
+
 /// 角色变更响应体。
 #[derive(Serialize)]
 pub struct PersonaMutationResponse {
@@ -487,6 +512,8 @@ pub struct PersonaMutationResponse {
     pub visual_pack: Option<VisualPack>,
     pub runtime_reset: bool,
     pub conversation_id: String,
+    pub active_conversation_id: String,
+    pub session_restored: bool,
     pub state_revision: u64,
 }
 

@@ -203,17 +203,19 @@ export async function resumeRuntimeSession(
 
 export async function forkRuntimeSession(
   sourceConversationId = 'default',
-  beforeUserMessageIndex?: number
+  beforeUserMessageIndex?: number,
+  targetPersonaId?: string
 ): Promise<RuntimeSessionForkResponse> {
   return readJson<RuntimeSessionForkResponse>(
     await apiFetch(`/api/runtime/sessions/${encodeURIComponent(sourceConversationId)}/fork`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        beforeUserMessageIndex == null
+      body: JSON.stringify({
+        ...(beforeUserMessageIndex == null
           ? {}
-          : { before_user_message_index: beforeUserMessageIndex }
-      )
+          : { before_user_message_index: beforeUserMessageIndex }),
+        ...(targetPersonaId ? { target_persona_id: targetPersonaId } : {})
+      })
     })
   );
 }

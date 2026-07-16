@@ -91,4 +91,29 @@ describe('PersonaActionsMenu', () => {
     expect(callbacks.onDelete).toHaveBeenCalledOnce();
     await waitFor(() => expect(dialog).not.toBeInTheDocument());
   });
+
+  it('删除确认前展示关联会话数量', async () => {
+    const loadDeletionImpact = vi.fn().mockResolvedValue({
+      persona_id: 'alice',
+      associated_session_count: 3,
+      workspace_state_exists: true
+    });
+    render(
+      <PersonaActionsMenu
+        name="爱丽丝"
+        busy={false}
+        onEdit={vi.fn()}
+        onCopy={vi.fn()}
+        onExportFull={vi.fn()}
+        onExportLight={vi.fn()}
+        onDelete={vi.fn()}
+        loadDeletionImpact={loadDeletionImpact}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: '爱丽丝的更多操作' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '删除角色' }));
+
+    expect(loadDeletionImpact).toHaveBeenCalledOnce();
+    expect(await screen.findByText(/3 个关联会话会保留为只读历史/)).toBeVisible();
+  });
 });

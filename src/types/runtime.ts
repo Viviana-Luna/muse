@@ -393,6 +393,10 @@ export interface RuntimeStateResponse {
 // 运行时会话列表项。
 export interface RuntimeSessionItem {
   conversation_id: string;
+  persona_id?: string;
+  persona_name_snapshot?: string;
+  persona_version_snapshot?: string;
+  persona_status?: 'bound' | 'missing';
   summary?: string;
   first_prompt?: string | null;
   source_conversation_id?: string | null;
@@ -408,6 +412,10 @@ export interface RuntimeSessionItem {
 
 export interface RuntimeSessionMetadataResponse {
   conversation_id: string;
+  persona_id: string;
+  persona_name_snapshot: string;
+  persona_version_snapshot: string;
+  persona_status: 'bound' | 'missing';
   title: string | null;
   archived: boolean;
   source_conversation_id: string | null;
@@ -418,6 +426,10 @@ export interface RuntimeSessionMetadataResponse {
 export interface RuntimeSessionExportResponse {
   schema_version: string;
   conversation_id: string;
+  persona_id: string;
+  persona_name_snapshot: string;
+  persona_version_snapshot: string;
+  persona_status: 'bound' | 'missing';
   title: string | null;
   archived: boolean;
   source_conversation_id: string | null;
@@ -442,6 +454,10 @@ export interface RuntimeSessionListResponse {
 // 运行时会话恢复响应。
 export interface RuntimeSessionResumeResponse {
   conversation_id: string;
+  persona_id: string;
+  persona_name_snapshot: string;
+  persona_version_snapshot: string;
+  persona_status: 'bound';
   restored_messages: number;
   status: string;
 }
@@ -449,6 +465,10 @@ export interface RuntimeSessionResumeResponse {
 // 运行时会话分叉响应。
 export interface RuntimeSessionForkResponse {
   conversation_id: string;
+  persona_id: string;
+  persona_name_snapshot: string;
+  persona_version_snapshot: string;
+  persona_status: 'bound';
   source_conversation_id: string;
   before_user_message_index?: number | null;
   restored_messages: number;

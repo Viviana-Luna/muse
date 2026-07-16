@@ -278,6 +278,7 @@ async fn start_local_server(dev_url: Option<tauri::Url>) -> Result<StartedLocalS
     config.server.host = "127.0.0.1".to_string();
     config.server.port = address.port();
     let router = muse_local_api::build_router_with_security(config, security)
+        .await
         .map_err(|err| format!("无法初始化 Muse 运行时：{err}"))?;
     let (shutdown, shutdown_rx) = oneshot::channel();
     tauri::async_runtime::spawn(async move {

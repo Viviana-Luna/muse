@@ -413,6 +413,13 @@ pub(crate) async fn handle_delete_persona(
         paths
     };
     cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
+    state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+        .clear_workspace_state(&id)
+        .map_err(|error| internal_error(error.to_string()))?;
 
     if deleted_active {
         reset_conversation_for_active_persona(&state).await;
@@ -481,37 +488,6 @@ async fn cleanup_unreferenced_uploaded_assets(state: &Arc<AppState>, candidates:
     }
 }
 
-/// 激活指定角色。
-pub(crate) async fn handle_activate_persona(
-    Path(id): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<PersonaMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "activate_persona")?;
-    let active_persona = {
-        let mut personas = state.personas.lock().await;
-        personas
-            .set_active(&id)
-            .map_err(persona_store_error_response)?;
-        personas.save().map_err(persona_store_error_response)?;
-        personas.active_persona().cloned().ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("角色 `{id}` 不存在"),
-                }),
-            )
-        })?
-    };
-
-    reset_conversation_for_active_persona(&state).await;
-
-    finish_runtime_idle_lease(idle_lease)?;
-    Ok(Json(
-        persona_mutation_response(&state, active_persona, true).await,
-    ))
-}
-
 async fn persona_mutation_response(
     state: &Arc<AppState>,
     affected_persona: Persona,
@@ -534,6 +510,8 @@ async fn persona_mutation_response(
         visual_pack,
         runtime_reset,
         conversation_id: active_conversation_id(state),
+        active_conversation_id: active_conversation_id(state),
+        session_restored: false,
         state_revision,
     }
 }
@@ -1174,7 +1152,10 @@ async fn persist_fork_snapshot(
     }) {
         return Ok(());
     }
-    if !existing.is_empty() {
+    if existing
+        .iter()
+        .any(|event| event.kind != muse_runtime::session_metadata::SESSION_METADATA_EVENT_KIND)
+    {
         return Err(format!(
             "分叉目标会话 `{conversation_id}` 已存在其他事件，已拒绝覆盖。"
         ));

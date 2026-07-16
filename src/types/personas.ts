@@ -122,7 +122,15 @@ export interface PersonaMutationResponse {
   visual_pack: VisualPack | null;
   runtime_reset: boolean;
   conversation_id: string;
+  active_conversation_id: string;
+  session_restored: boolean;
   state_revision: number;
+}
+
+export interface PersonaDeletionImpactResponse {
+  persona_id: string;
+  associated_session_count: number;
+  workspace_state_exists: boolean;
 }
 
 export interface PersonaCard {

@@ -1,5 +1,6 @@
 import type { PersonaLibraryItem } from '@/types';
 import type { usePersonaController } from '@/views/personas/hooks/usePersonaController';
+import { fetchPersonaDeletionImpact } from '@/api';
 import { PersonaActionsMenu } from './PersonaActionsMenu';
 import { PersonaCardMedia } from './PersonaCardMedia';
 
@@ -54,6 +55,7 @@ export function PersonaCard({ persona, active, busy, controller }: PersonaCardPr
             onExportFull={() => void controller.handleExport(persona.id, 'with_visual_pack_ref')}
             onExportLight={() => void controller.handleExport(persona.id, 'persona_only')}
             onDelete={() => void controller.handleDelete(persona.id)}
+            loadDeletionImpact={() => fetchPersonaDeletionImpact(persona.id)}
           />
         </div>
       </div>

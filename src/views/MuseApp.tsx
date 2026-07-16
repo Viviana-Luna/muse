@@ -508,6 +508,7 @@ export function App() {
       {route.section === 'sessions' && (
         <SessionsPage
           runtime={chatRuntime}
+          activePersonaId={activePersona?.id}
           activePersonaName={activePersona?.name}
           onOpenChat={() => navigateMuseSection('chat')}
         />

@@ -40,6 +40,8 @@ const mutationResponse: PersonaMutationResponse = {
   visual_pack: null,
   runtime_reset: true,
   conversation_id: 'default',
+  active_conversation_id: 'default',
+  session_restored: false,
   state_revision: 2
 };
 

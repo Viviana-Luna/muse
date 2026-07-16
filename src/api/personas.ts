@@ -5,6 +5,7 @@ import type {
   Persona,
   PersonaCard,
   PersonaCardImportResponse,
+  PersonaDeletionImpactResponse,
   PersonaListResponse,
   PersonaMutationResponse,
   PersonaVisualPackPatch
@@ -59,6 +60,14 @@ export async function uploadPersonaImage(file: File): Promise<AssetUploadRespons
 export async function deletePersona(id: string): Promise<PersonaMutationResponse> {
   return readJson<PersonaMutationResponse>(
     await apiFetch(`/api/personas/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  );
+}
+
+export async function fetchPersonaDeletionImpact(
+  id: string
+): Promise<PersonaDeletionImpactResponse> {
+  return readJson<PersonaDeletionImpactResponse>(
+    await apiFetch(`/api/personas/${encodeURIComponent(id)}/deletion-impact`)
   );
 }
 

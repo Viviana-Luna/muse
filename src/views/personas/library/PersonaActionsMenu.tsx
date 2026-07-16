@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Copy, Download, FileDown, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
+import type { PersonaDeletionImpactResponse } from '@/types';
 
 interface PersonaActionsMenuProps {
   name: string;
@@ -11,6 +12,7 @@ interface PersonaActionsMenuProps {
   onExportFull: () => void;
   onExportLight: () => void;
   onDelete: () => void;
+  loadDeletionImpact?: () => Promise<PersonaDeletionImpactResponse>;
 }
 
 export function PersonaActionsMenu({
@@ -20,9 +22,12 @@ export function PersonaActionsMenu({
   onCopy,
   onExportFull,
   onExportLight,
-  onDelete
+  onDelete,
+  loadDeletionImpact
 }: PersonaActionsMenuProps) {
   const [open, setOpen] = useState(false);
+  const [deletionImpact, setDeletionImpact] = useState<PersonaDeletionImpactResponse | null>(null);
+  const [impactLoading, setImpactLoading] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
@@ -111,7 +116,13 @@ export function PersonaActionsMenu({
           </button>
           <ConfirmDialog
             title={`删除角色“${name}”？`}
-            description="角色配置将从本地存储中删除，此操作无法撤销。"
+            description={
+              impactLoading
+                ? '正在核对关联会话…'
+                : deletionImpact
+                  ? `角色配置将被删除；${deletionImpact.associated_session_count} 个关联会话会保留为只读历史。此操作无法撤销。`
+                  : '角色配置将从本地存储中删除；关联会话会保留为只读历史。此操作无法撤销。'
+            }
             confirmLabel="删除角色"
             tone="danger"
             onConfirm={() => {
@@ -124,6 +135,15 @@ export function PersonaActionsMenu({
               role="menuitem"
               className="danger"
               disabled={busy}
+              onClick={() => {
+                if (!loadDeletionImpact) return;
+                setImpactLoading(true);
+                setDeletionImpact(null);
+                void loadDeletionImpact()
+                  .then(setDeletionImpact)
+                  .catch(() => setDeletionImpact(null))
+                  .finally(() => setImpactLoading(false));
+              }}
             >
               <Trash2 aria-hidden="true" />
               删除角色

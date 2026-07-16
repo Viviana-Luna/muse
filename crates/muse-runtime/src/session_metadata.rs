@@ -15,7 +15,7 @@ use crate::session::{
 };
 
 pub const SESSION_METADATA_EVENT_KIND: &str = "session_metadata_updated";
-const SESSION_METADATA_PAYLOAD_SCHEMA: &str = "muse-session-metadata/v1";
+const SESSION_METADATA_PAYLOAD_SCHEMA: &str = "muse-session-metadata/v2";
 const DEFAULT_SESSION_SUMMARY: &str = "未命名会话";
 const MAX_INDEX_SUMMARY_CHARS: usize = 120;
 
@@ -62,6 +62,9 @@ impl From<rusqlite::Error> for SessionRepositoryError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
     pub title: Option<String>,
     pub archived: bool,
     pub source_conversation_id: Option<String>,
@@ -72,6 +75,9 @@ pub struct SessionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListItem {
     pub conversation_id: String,
+    pub persona_id: String,
+    pub persona_name_snapshot: String,
+    pub persona_version_snapshot: String,
     pub summary: String,
     pub source_conversation_id: Option<String>,
     pub records: u64,
@@ -82,6 +88,15 @@ pub struct SessionListItem {
     pub metadata_revision: u64,
 }
 
+struct MetadataSnapshot {
+    persona_id: String,
+    persona_name_snapshot: String,
+    persona_version_snapshot: String,
+    title: Option<String>,
+    archived: bool,
+    source_conversation_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct SessionProjection {
     conversation_id: String,
@@ -89,6 +104,9 @@ struct SessionProjection {
     title: Option<String>,
     archived: bool,
     source_conversation_id: Option<String>,
+    persona_id: Option<String>,
+    persona_name_snapshot: Option<String>,
+    persona_version_snapshot: Option<String>,
     fallback_summary: String,
     record_count: u64,
     created_time: Option<String>,
@@ -107,6 +125,9 @@ impl SessionProjection {
             title: None,
             archived: false,
             source_conversation_id: None,
+            persona_id: None,
+            persona_name_snapshot: None,
+            persona_version_snapshot: None,
             fallback_summary: DEFAULT_SESSION_SUMMARY.to_string(),
             record_count: 0,
             created_time: None,
@@ -233,38 +254,95 @@ impl SessionRepository {
         }
         self.append_metadata_snapshot_locked(
             conversation_id,
-            normalized_title,
-            next_archived,
-            current.source_conversation_id,
+            MetadataSnapshot {
+                persona_id: current.persona_id,
+                persona_name_snapshot: current.persona_name_snapshot,
+                persona_version_snapshot: current.persona_version_snapshot,
+                title: normalized_title,
+                archived: next_archived,
+                source_conversation_id: current.source_conversation_id,
+            },
             &previous_identity,
         )
         .await
     }
 
-    pub async fn record_fork(
+    /// 在首个业务事件前创建 v2 Persona 绑定，或验证既有绑定不可变。
+    pub async fn ensure_persona_binding(
+        &self,
+        conversation_id: &str,
+        persona_id: &str,
+        persona_name_snapshot: &str,
+        persona_version_snapshot: &str,
+    ) -> Result<SessionMetadata, SessionRepositoryError> {
+        validate_conversation_id(conversation_id)?;
+        let _guard = self.index_gate.lock().await;
+        let identity = self.store.index_identity().await?;
+        let events = self.store.events_for_conversation(conversation_id).await?;
+        if events.is_empty() {
+            return self
+                .append_metadata_snapshot_locked(
+                    conversation_id,
+                    MetadataSnapshot {
+                        persona_id: persona_id.to_string(),
+                        persona_name_snapshot: persona_name_snapshot.to_string(),
+                        persona_version_snapshot: persona_version_snapshot.to_string(),
+                        title: None,
+                        archived: false,
+                        source_conversation_id: None,
+                    },
+                    &identity,
+                )
+                .await;
+        }
+        let mut projection = SessionProjection::new(conversation_id.to_string(), &identity);
+        for event in &events {
+            projection.apply(event)?;
+        }
+        let metadata = metadata_from_projection(projection)?;
+        if metadata.persona_id != persona_id {
+            return Err(SessionRepositoryError::InvalidInput(format!(
+                "session_persona_mismatch：会话 `{conversation_id}` 属于 Persona `{}`，不能由 `{persona_id}` 继续。",
+                metadata.persona_id
+            )));
+        }
+        Ok(metadata)
+    }
+
+    /// 在分叉快照写入前原子建立目标会话的 v2 metadata。
+    pub async fn initialize_fork(
         &self,
         conversation_id: &str,
         source_conversation_id: &str,
+        persona_id: &str,
+        persona_name_snapshot: &str,
+        persona_version_snapshot: &str,
     ) -> Result<SessionMetadata, SessionRepositoryError> {
         validate_conversation_id(conversation_id)?;
         validate_conversation_id(source_conversation_id)?;
         let _guard = self.index_gate.lock().await;
-        let previous_identity = self.store.index_identity().await?;
-        let current = self
-            .metadata_from_jsonl_locked(conversation_id, &previous_identity)
+        let identity = self.store.index_identity().await?;
+        if !self
+            .store
+            .events_for_conversation(conversation_id)
             .await?
-            .ok_or_else(|| SessionRepositoryError::InvalidInput("分叉会话不存在。".to_string()))?;
-        if current.revision > 0
-            && current.source_conversation_id.as_deref() == Some(source_conversation_id)
+            .is_empty()
         {
-            return Ok(current);
+            return Err(SessionRepositoryError::InvalidInput(
+                "分叉目标会话已经存在。".to_string(),
+            ));
         }
         self.append_metadata_snapshot_locked(
             conversation_id,
-            current.title,
-            current.archived,
-            Some(source_conversation_id.to_string()),
-            &previous_identity,
+            MetadataSnapshot {
+                persona_id: persona_id.to_string(),
+                persona_name_snapshot: persona_name_snapshot.to_string(),
+                persona_version_snapshot: persona_version_snapshot.to_string(),
+                title: None,
+                archived: false,
+                source_conversation_id: Some(source_conversation_id.to_string()),
+            },
+            &identity,
         )
         .await
     }
@@ -285,26 +363,118 @@ impl SessionRepository {
         self.ensure_index_current_locked().await?;
         let (_, connection) = open_runtime_database(&self.data_dir)?;
         let mut statement = connection.prepare(
-            "SELECT conversation_id, summary, source_conversation_id, record_count,
-                    created_time, last_time, archived, metadata_updated_at, metadata_revision
+            "SELECT conversation_id, persona_id, persona_name_snapshot, persona_version_snapshot,
+                    summary, source_conversation_id, record_count, created_time, last_time,
+                    archived, metadata_updated_at, metadata_revision
              FROM session_index
-             WHERE recoverable = 1
+             WHERE recoverable = 1 AND persona_id IS NOT NULL
              ORDER BY COALESCE(last_time, created_time, '') DESC, conversation_id ASC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(SessionListItem {
                 conversation_id: row.get(0)?,
-                summary: row.get(1)?,
-                source_conversation_id: row.get(2)?,
-                records: row.get::<_, i64>(3)?.max(0) as u64,
-                created_time: row.get(4)?,
-                last_time: row.get(5)?,
-                archived: row.get::<_, i64>(6)? != 0,
-                metadata_updated_at: row.get(7)?,
-                metadata_revision: row.get::<_, i64>(8)?.max(0) as u64,
+                persona_id: row.get(1)?,
+                persona_name_snapshot: row.get(2)?,
+                persona_version_snapshot: row.get(3)?,
+                summary: row.get(4)?,
+                source_conversation_id: row.get(5)?,
+                records: row.get::<_, i64>(6)?.max(0) as u64,
+                created_time: row.get(7)?,
+                last_time: row.get(8)?,
+                archived: row.get::<_, i64>(9)? != 0,
+                metadata_updated_at: row.get(10)?,
+                metadata_revision: row.get::<_, i64>(11)?.max(0) as u64,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub async fn latest_conversation_for_persona(
+        &self,
+        persona_id: &str,
+    ) -> Result<Option<String>, SessionRepositoryError> {
+        Ok(self
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|item| item.persona_id == persona_id && !item.archived)
+            .map(|item| item.conversation_id))
+    }
+
+    pub async fn preferred_conversation_for_persona(
+        &self,
+        persona_id: &str,
+    ) -> Result<Option<String>, SessionRepositoryError> {
+        let (_, connection) = open_runtime_database(&self.data_dir)?;
+        let workspace_conversation = connection
+            .query_row(
+                "SELECT active_conversation_id FROM persona_workspace_state WHERE persona_id = ?1",
+                [persona_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let sessions = self.list_sessions().await?;
+        if let Some(conversation_id) = workspace_conversation
+            && sessions.iter().any(|item| {
+                item.conversation_id == conversation_id
+                    && item.persona_id == persona_id
+                    && !item.archived
+            })
+        {
+            return Ok(Some(conversation_id));
+        }
+        Ok(sessions
+            .into_iter()
+            .find(|item| item.persona_id == persona_id && !item.archived)
+            .map(|item| item.conversation_id))
+    }
+
+    pub async fn persona_session_count(
+        &self,
+        persona_id: &str,
+    ) -> Result<usize, SessionRepositoryError> {
+        Ok(self
+            .list_sessions()
+            .await?
+            .into_iter()
+            .filter(|item| item.persona_id == persona_id)
+            .count())
+    }
+
+    pub fn workspace_state_exists(&self, persona_id: &str) -> Result<bool, SessionRepositoryError> {
+        let (_, connection) = open_runtime_database(&self.data_dir)?;
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM persona_workspace_state WHERE persona_id = ?1)",
+            [persona_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn set_workspace_state(
+        &self,
+        persona_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), SessionRepositoryError> {
+        validate_conversation_id(conversation_id)?;
+        let (_, connection) = open_runtime_database(&self.data_dir)?;
+        connection.execute(
+            "INSERT INTO persona_workspace_state(persona_id, active_conversation_id, updated_at)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(persona_id) DO UPDATE SET
+                active_conversation_id = excluded.active_conversation_id,
+                updated_at = excluded.updated_at",
+            params![persona_id, conversation_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_workspace_state(&self, persona_id: &str) -> Result<(), SessionRepositoryError> {
+        let (_, connection) = open_runtime_database(&self.data_dir)?;
+        connection.execute(
+            "DELETE FROM persona_workspace_state WHERE persona_id = ?1",
+            [persona_id],
+        )?;
+        Ok(())
     }
 
     pub async fn delete_conversation(
@@ -332,6 +502,10 @@ impl SessionRepository {
                 "DELETE FROM session_index WHERE conversation_id = ?1",
                 [conversation_id],
             )?;
+            transaction.execute(
+                "DELETE FROM persona_workspace_state WHERE active_conversation_id = ?1",
+                [conversation_id],
+            )?;
             write_index_state(&transaction, &identity)?;
             transaction.commit()?;
             Ok(())
@@ -345,9 +519,7 @@ impl SessionRepository {
     async fn append_metadata_snapshot_locked(
         &self,
         conversation_id: &str,
-        title: Option<String>,
-        archived: bool,
-        source_conversation_id: Option<String>,
+        snapshot: MetadataSnapshot,
         previous_identity: &SessionIndexIdentity,
     ) -> Result<SessionMetadata, SessionRepositoryError> {
         let updated_at = Utc::now().to_rfc3339();
@@ -359,9 +531,12 @@ impl SessionRepository {
                 SESSION_METADATA_EVENT_KIND,
                 serde_json::json!({
                     "schema_version": SESSION_METADATA_PAYLOAD_SCHEMA,
-                    "title": title,
-                    "archived": archived,
-                    "source_conversation_id": source_conversation_id,
+                    "persona_id": snapshot.persona_id,
+                    "persona_name_snapshot": snapshot.persona_name_snapshot,
+                    "persona_version_snapshot": snapshot.persona_version_snapshot,
+                    "title": snapshot.title,
+                    "archived": snapshot.archived,
+                    "source_conversation_id": snapshot.source_conversation_id,
                     "updated_at": updated_at,
                 }),
             )
@@ -369,12 +544,24 @@ impl SessionRepository {
         self.update_index_after_committed_event(&event, previous_identity)
             .await;
         Ok(SessionMetadata {
+            persona_id: event.payload["persona_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            persona_name_snapshot: event.payload["persona_name_snapshot"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            persona_version_snapshot: event.payload["persona_version_snapshot"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             title: event
                 .payload
                 .get("title")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            archived,
+            archived: snapshot.archived,
             source_conversation_id: event
                 .payload
                 .get("source_conversation_id")
@@ -430,17 +617,7 @@ impl SessionRepository {
         for event in &events {
             projection.apply(event)?;
         }
-        Ok(Some(SessionMetadata {
-            title: projection.title,
-            archived: projection.archived,
-            source_conversation_id: projection.source_conversation_id,
-            updated_at: projection
-                .metadata_updated_at
-                .or(projection.created_time)
-                .or(projection.last_time)
-                .unwrap_or_default(),
-            revision: projection.metadata_revision,
-        }))
+        Ok(Some(metadata_from_projection(projection)?))
     }
 
     async fn ensure_index_current(&self) -> Result<(), SessionRepositoryError> {
@@ -476,11 +653,26 @@ impl SessionRepository {
     ) -> Result<(), SessionRepositoryError> {
         let events = self.store.aggregate_events().await?;
         let mut projections = BTreeMap::<String, SessionProjection>::new();
+        let mut invalid_conversations = std::collections::BTreeSet::<String>::new();
         for event in &events {
-            projections
+            if invalid_conversations.contains(&event.conversation_id) {
+                continue;
+            }
+            let result = projections
                 .entry(event.conversation_id.clone())
                 .or_insert_with(|| SessionProjection::new(event.conversation_id.clone(), identity))
-                .apply(event)?;
+                .apply(event);
+            if let Err(error) = result {
+                tracing::warn!(
+                    %error,
+                    conversation_id = %event.conversation_id,
+                    "忽略缺少有效 metadata v2 的测试 Session"
+                );
+                invalid_conversations.insert(event.conversation_id.clone());
+            }
+        }
+        for conversation_id in invalid_conversations {
+            projections.remove(&conversation_id);
         }
         let (_, mut connection) = open_runtime_database(&self.data_dir)?;
         let transaction = connection.transaction()?;
@@ -502,10 +694,15 @@ fn apply_metadata_event(
         != Some(SESSION_METADATA_PAYLOAD_SCHEMA)
     {
         return Err(SessionRepositoryError::InvalidData(format!(
-            "会话 `{}` 的元数据事件 `{}` schema 无效。",
+            "session_persona_unbound：会话 `{}` 的元数据事件 `{}` 不是有效的 v2 绑定。",
             event.conversation_id, event.event_id
         )));
     }
+    projection.persona_id = Some(required_metadata_string(event, "persona_id")?);
+    projection.persona_name_snapshot =
+        Some(required_metadata_string(event, "persona_name_snapshot")?);
+    projection.persona_version_snapshot =
+        Some(required_metadata_string(event, "persona_version_snapshot")?);
     projection.title = event
         .payload
         .get("title")
@@ -538,6 +735,50 @@ fn apply_metadata_event(
     Ok(())
 }
 
+fn required_metadata_string(
+    event: &SessionEventV3,
+    key: &str,
+) -> Result<String, SessionRepositoryError> {
+    event
+        .payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            SessionRepositoryError::InvalidData(format!(
+                "session_persona_unbound：会话 `{}` 的 v2 元数据事件缺少 `{key}`。",
+                event.conversation_id
+            ))
+        })
+}
+
+fn metadata_from_projection(
+    projection: SessionProjection,
+) -> Result<SessionMetadata, SessionRepositoryError> {
+    let persona_id = projection.persona_id.ok_or_else(|| {
+        SessionRepositoryError::InvalidData(format!(
+            "session_persona_unbound：会话 `{}` 缺少 v2 Persona 绑定。",
+            projection.conversation_id
+        ))
+    })?;
+    Ok(SessionMetadata {
+        persona_id,
+        persona_name_snapshot: projection.persona_name_snapshot.unwrap_or_default(),
+        persona_version_snapshot: projection.persona_version_snapshot.unwrap_or_default(),
+        title: projection.title,
+        archived: projection.archived,
+        source_conversation_id: projection.source_conversation_id,
+        updated_at: projection
+            .metadata_updated_at
+            .or(projection.created_time)
+            .or(projection.last_time)
+            .unwrap_or_default(),
+        revision: projection.metadata_revision,
+    })
+}
+
 fn load_projection(
     connection: &rusqlite::Connection,
     identity: &SessionIndexIdentity,
@@ -545,7 +786,8 @@ fn load_projection(
 ) -> Result<Option<SessionProjection>, rusqlite::Error> {
     connection
         .query_row(
-            "SELECT event_file, title, archived, source_conversation_id, fallback_summary,
+            "SELECT event_file, title, archived, source_conversation_id, persona_id,
+                    persona_name_snapshot, persona_version_snapshot, fallback_summary,
                     record_count, created_time, last_time, metadata_updated_at,
                     metadata_revision, last_commit_seq, recoverable
              FROM session_index WHERE conversation_id = ?1",
@@ -557,14 +799,17 @@ fn load_projection(
                     title: row.get(1)?,
                     archived: row.get::<_, i64>(2)? != 0,
                     source_conversation_id: row.get(3)?,
-                    fallback_summary: row.get(4)?,
-                    record_count: row.get::<_, i64>(5)?.max(0) as u64,
-                    created_time: row.get(6)?,
-                    last_time: row.get(7)?,
-                    metadata_updated_at: row.get(8)?,
-                    metadata_revision: row.get::<_, i64>(9)?.max(0) as u64,
-                    last_commit_seq: row.get::<_, i64>(10)?.max(0) as u64,
-                    recoverable: row.get::<_, i64>(11)? != 0,
+                    persona_id: row.get(4)?,
+                    persona_name_snapshot: row.get(5)?,
+                    persona_version_snapshot: row.get(6)?,
+                    fallback_summary: row.get(7)?,
+                    record_count: row.get::<_, i64>(8)?.max(0) as u64,
+                    created_time: row.get(9)?,
+                    last_time: row.get(10)?,
+                    metadata_updated_at: row.get(11)?,
+                    metadata_revision: row.get::<_, i64>(12)?.max(0) as u64,
+                    last_commit_seq: row.get::<_, i64>(13)?.max(0) as u64,
+                    recoverable: row.get::<_, i64>(14)? != 0,
                 })
             },
         )
@@ -584,14 +829,18 @@ fn write_projection(
     connection.execute(
         "INSERT INTO session_index(
              conversation_id, event_file, title, archived, source_conversation_id,
+             persona_id, persona_name_snapshot, persona_version_snapshot,
              fallback_summary, summary, record_count, created_time, last_time,
              metadata_updated_at, metadata_revision, last_commit_seq, recoverable
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(conversation_id) DO UPDATE SET
              event_file = excluded.event_file,
              title = excluded.title,
              archived = excluded.archived,
              source_conversation_id = excluded.source_conversation_id,
+             persona_id = excluded.persona_id,
+             persona_name_snapshot = excluded.persona_name_snapshot,
+             persona_version_snapshot = excluded.persona_version_snapshot,
              fallback_summary = excluded.fallback_summary,
              summary = excluded.summary,
              record_count = excluded.record_count,
@@ -607,6 +856,9 @@ fn write_projection(
             projection.title,
             i64::from(projection.archived),
             projection.source_conversation_id,
+            projection.persona_id,
+            projection.persona_name_snapshot,
+            projection.persona_version_snapshot,
             projection.fallback_summary,
             projection.summary(),
             projection.record_count as i64,
@@ -740,12 +992,20 @@ mod tests {
 
     use super::SessionRepository;
 
+    async fn bind(repository: &SessionRepository, conversation_id: &str) {
+        repository
+            .ensure_persona_binding(conversation_id, "persona-a", "角色 A", "1.0.0")
+            .await
+            .expect("应建立 v2 Persona 绑定");
+    }
+
     #[tokio::test]
     async fn uncommitted_or_aborted_turn_is_never_listed_as_recoverable_session() {
         let temp = tempdir().expect("应创建测试目录");
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "failed-chat").await;
         repository
             .append_event(
                 "failed-chat",
@@ -813,6 +1073,7 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "committed-chat").await;
         repository
             .append_event(
                 "committed-chat",
@@ -841,7 +1102,7 @@ mod tests {
         let sessions = repository.list_sessions().await.expect("应读取提交后列表");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary, "提交后才可恢复");
-        assert_eq!(sessions[0].records, 2);
+        assert_eq!(sessions[0].records, 3);
     }
 
     #[tokio::test]
@@ -850,6 +1111,7 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "chat-1").await;
         repository
             .append_event("chat-1", None, "user", json!({"content": "第一章"}))
             .await
@@ -890,6 +1152,7 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "chat-1").await;
         repository
             .append_event("chat-1", None, "user", json!({"content": "hello"}))
             .await
@@ -913,7 +1176,7 @@ mod tests {
                 .iter()
                 .filter(|event| event.kind == super::SESSION_METADATA_EVENT_KIND)
                 .count(),
-            1
+            2
         );
     }
 
@@ -923,6 +1186,7 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "chat-1").await;
         repository
             .append_event("chat-1", None, "user", json!({"content": "事实优先"}))
             .await
@@ -948,7 +1212,7 @@ mod tests {
             .events_for_conversation("chat-1")
             .await
             .expect("应读取 canonical 事件");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(
             events.last().map(|event| event.kind.as_str()),
             Some(super::SESSION_METADATA_EVENT_KIND)
@@ -976,6 +1240,10 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        let metadata = repository
+            .initialize_fork("forked", "source", "persona-a", "角色 A", "1.0.0")
+            .await
+            .expect("应先写入分叉 v2 元数据");
         repository
             .append_event(
                 "forked",
@@ -985,10 +1253,6 @@ mod tests {
             )
             .await
             .expect("应写入分叉快照");
-        let metadata = repository
-            .record_fork("forked", "source")
-            .await
-            .expect("应写入分叉元数据事实");
         assert_eq!(metadata.source_conversation_id.as_deref(), Some("source"));
         assert!(metadata.revision > 0);
         let events = repository
@@ -997,7 +1261,7 @@ mod tests {
             .await
             .expect("应读取分叉事件");
         assert_eq!(
-            events.last().map(|event| event.kind.as_str()),
+            events.first().map(|event| event.kind.as_str()),
             Some(super::SESSION_METADATA_EVENT_KIND)
         );
 
@@ -1034,6 +1298,7 @@ mod tests {
         let (repository, _) = SessionRepository::open(temp.path())
             .await
             .expect("应打开仓储");
+        bind(&repository, "secret-chat").await;
         repository
             .append_event(
                 "secret-chat",
@@ -1049,5 +1314,101 @@ mod tests {
             .expect("应读取 SQLite 索引");
         assert_eq!(sessions[0].summary, "包含敏感内容的会话");
         assert!(!sessions[0].summary.contains("sk-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn v1_metadata_is_not_accepted_or_listed() {
+        let temp = tempdir().expect("应创建测试目录");
+        let (repository, _) = SessionRepository::open(temp.path())
+            .await
+            .expect("应打开仓储");
+        repository
+            .append_event(
+                "legacy-test",
+                None,
+                super::SESSION_METADATA_EVENT_KIND,
+                json!({
+                    "schema_version": "muse-session-metadata/v1",
+                    "title": "旧测试数据",
+                    "archived": false,
+                    "source_conversation_id": null,
+                    "updated_at": "2026-07-16T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("canonical JSONL 仍可保留无效测试事件供诊断");
+        assert!(
+            repository
+                .list_sessions()
+                .await
+                .expect("列表应可重建")
+                .is_empty()
+        );
+        assert!(repository.metadata("legacy-test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn persona_binding_is_immutable() {
+        let temp = tempdir().expect("应创建测试目录");
+        let (repository, _) = SessionRepository::open(temp.path())
+            .await
+            .expect("应打开仓储");
+        bind(&repository, "bound-chat").await;
+        let error = repository
+            .ensure_persona_binding("bound-chat", "persona-b", "角色 B", "1.0.0")
+            .await
+            .expect_err("既有会话不能原地切换 Persona");
+        assert!(error.to_string().contains("session_persona_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn workspace_state_is_preferred_and_stale_state_falls_back_to_latest_session() {
+        let temp = tempdir().expect("应创建测试目录");
+        let (repository, _) = SessionRepository::open(temp.path())
+            .await
+            .expect("应打开仓储");
+        for conversation_id in ["older-chat", "newer-chat"] {
+            bind(&repository, conversation_id).await;
+            repository
+                .append_event(
+                    conversation_id,
+                    Some(format!("turn-{conversation_id}")),
+                    "user",
+                    json!({"content": conversation_id}),
+                )
+                .await
+                .expect("应写入用户事件");
+            repository
+                .append_event(
+                    conversation_id,
+                    Some(format!("turn-{conversation_id}")),
+                    "turn_committed",
+                    json!({"outcome": "committed"}),
+                )
+                .await
+                .expect("应写入提交终态");
+        }
+        repository
+            .set_workspace_state("persona-a", "older-chat")
+            .expect("应记录角色工作区会话");
+        assert_eq!(
+            repository
+                .preferred_conversation_for_persona("persona-a")
+                .await
+                .expect("应读取工作区会话")
+                .as_deref(),
+            Some("older-chat")
+        );
+        repository
+            .set_workspace_state("persona-a", "missing-chat")
+            .expect("应模拟失效工作区状态");
+        assert_eq!(
+            repository
+                .preferred_conversation_for_persona("persona-a")
+                .await
+                .expect("应回退最近会话")
+                .as_deref(),
+            Some("newer-chat")
+        );
     }
 }

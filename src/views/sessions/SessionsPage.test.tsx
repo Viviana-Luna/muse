@@ -72,6 +72,10 @@ describe('SessionsPage', () => {
     });
     vi.mocked(api.updateRuntimeSessionMetadata).mockResolvedValue({
       conversation_id: 'history',
+      persona_id: 'persona-1',
+      persona_name_snapshot: '测试角色',
+      persona_version_snapshot: '1.0.0',
+      persona_status: 'bound',
       title: '雨夜续章',
       archived: false,
       source_conversation_id: null,
@@ -169,5 +173,36 @@ describe('SessionsPage', () => {
       })
     );
     expect(runtime.applyRuntimeSessions).toHaveBeenCalled();
+  });
+
+  it('角色已删除的会话禁止恢复，并可显式分叉到当前角色', async () => {
+    const runtime = sessionRuntime();
+    const missingSession = {
+      ...runtime.runtimeSessions[1],
+      persona_id: 'deleted-persona',
+      persona_name_snapshot: '已删除角色',
+      persona_version_snapshot: '1.0.0',
+      persona_status: 'missing' as const
+    };
+    runtime.runtimeSessions[1] = missingSession;
+    runtime.selectedRuntimeSession = missingSession;
+    render(
+      <SessionsPage
+        runtime={runtime as never}
+        activePersonaId="current-persona"
+        activePersonaName="当前角色"
+        onOpenChat={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /查看会话 雨夜散步/ }));
+    await screen.findByText('继续散步吧');
+    expect(screen.getAllByText(/已删除角色（角色已删除）/)).toHaveLength(2);
+    expect(screen.getByRole('button', { name: '恢复并继续' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '分叉后继续' }));
+    await waitFor(() =>
+      expect(runtime.handleForkSession).toHaveBeenCalledWith('history', 'current-persona')
+    );
   });
 });

@@ -416,6 +416,7 @@ fn inspect_history_database(
                         | "schema_migrations"
                         | "session_index"
                         | "session_index_state"
+                        | "persona_workspace_state"
                 ))
             || table.starts_with("sqlite_");
         if !known {

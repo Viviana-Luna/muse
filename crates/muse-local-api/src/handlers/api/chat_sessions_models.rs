@@ -260,10 +260,26 @@ pub(crate) async fn handle_runtime_session_metadata_patch(
             muse_runtime::session_metadata::SessionRepositoryError::InvalidInput(message) => {
                 bad_request(&message)
             }
+            muse_runtime::session_metadata::SessionRepositoryError::InvalidData(message) => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse { error: message }),
+            ),
             other => internal_error(other.to_string()),
         })?;
+    let persona_status = {
+        let personas = state.personas.lock().await;
+        if personas.get(&metadata.persona_id).is_some() {
+            "bound"
+        } else {
+            "missing"
+        }
+    };
     Ok(Json(RuntimeSessionMetadataResponse {
         conversation_id,
+        persona_id: metadata.persona_id,
+        persona_name_snapshot: metadata.persona_name_snapshot,
+        persona_version_snapshot: metadata.persona_version_snapshot,
+        persona_status: persona_status.to_string(),
         title: metadata.title,
         archived: metadata.archived,
         source_conversation_id: metadata.source_conversation_id,
@@ -307,13 +323,22 @@ pub(crate) async fn handle_runtime_session_export(
         .map_err(|error| internal_error(error.to_string()))?
         .metadata(&conversation_id)
         .await
-        .map_err(|error| internal_error(error.to_string()))?;
+        .map_err(session_metadata_read_error)?;
+    let metadata = item.ok_or_else(|| internal_error("会话缺少 v2 Persona metadata。".to_string()))?;
+    let persona_exists = {
+        let personas = state.personas.lock().await;
+        personas.get(&metadata.persona_id).is_some()
+    };
     Ok(Json(RuntimeSessionExportResponse {
         schema_version: "muse-session-export/v1".to_string(),
         conversation_id,
-        title: item.as_ref().and_then(|item| item.title.clone()),
-        archived: item.as_ref().is_some_and(|item| item.archived),
-        source_conversation_id: item.and_then(|item| item.source_conversation_id),
+        persona_id: metadata.persona_id,
+        persona_name_snapshot: metadata.persona_name_snapshot,
+        persona_version_snapshot: metadata.persona_version_snapshot,
+        persona_status: if persona_exists { "bound" } else { "missing" }.to_string(),
+        title: metadata.title,
+        archived: metadata.archived,
+        source_conversation_id: metadata.source_conversation_id,
         exported_at: chrono::Utc::now().to_rfc3339(),
         messages,
     }))
@@ -397,16 +422,60 @@ async fn require_runtime_session(
     runtime_session_events(state, conversation_id).await.map(|_| ())
 }
 
+fn session_metadata_read_error(
+    error: muse_runtime::session_metadata::SessionRepositoryError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        muse_runtime::session_metadata::SessionRepositoryError::InvalidInput(message) => {
+            bad_request(&message)
+        }
+        muse_runtime::session_metadata::SessionRepositoryError::InvalidData(message) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: if message.starts_with("session_persona_unbound") {
+                    message
+                } else {
+                    format!("session_persona_unbound：{message}")
+                },
+            }),
+        ),
+        other => internal_error(other.to_string()),
+    }
+}
+
 /// 恢复指定运行时会话。
 pub(crate) async fn handle_runtime_session_resume(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
 ) -> Result<Json<RuntimeSessionResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _transition = state.persona_runtime_transition_gate.lock().await;
-    require_active_persona_http(&state).await?;
     let idle_lease = acquire_runtime_idle_lease(&state, "resume_session")?;
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let metadata = repository
+        .metadata(&conversation_id)
+        .await
+        .map_err(session_metadata_read_error)?
+        .ok_or_else(|| bad_request("会话缺少 v2 Persona metadata。"))?;
+    let (persona, previous_personas) = {
+        let mut personas = state.personas.lock().await;
+        let previous = personas.clone();
+        let persona = personas.get(&metadata.persona_id).cloned().ok_or_else(|| (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse { error: "session_persona_missing：会话所属角色已删除，只能查看或导出。".to_string() }),
+        ))?;
+        personas.set_active(&persona.id).map_err(persona_store_error_response)?;
+        personas.save().map_err(persona_store_error_response)?;
+        (persona, previous)
+    };
+    let previous_conversation = state.runtime_service.lock_conversation().await.clone();
+    let previous_todos = state.runtime_service.runtime_todos().await;
+    let previous_conversation_id = active_conversation_id(&state);
     let runtime = ConversationRuntime::new(state.clone(), false);
-    let outcome = runtime
+    let outcome = match runtime
         .submit(
             RuntimeOp::ResumeSession {
                 conversation_id: conversation_id.clone(),
@@ -414,7 +483,22 @@ pub(crate) async fn handle_runtime_session_resume(
             RuntimeEventEmitter::collect_only(),
         )
         .await
-        .map_err(|err| bad_request(&err))?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            rollback_persona_runtime_transition(
+                &state,
+                previous_personas,
+                previous_conversation,
+                previous_todos,
+                previous_conversation_id,
+            )
+            .await
+            .map_err(internal_error)?;
+            let _ = finish_runtime_idle_lease(idle_lease);
+            return Err(bad_request(&error));
+        }
+    };
     let restored_messages = {
         let conv = state.runtime_service.lock_conversation().await;
         conv.messages
@@ -422,11 +506,27 @@ pub(crate) async fn handle_runtime_session_resume(
             .filter(|message| message.role != Role::System)
             .count()
     };
+    if let Err(error) = repository.set_workspace_state(&persona.id, &conversation_id) {
+        rollback_persona_runtime_transition(
+            &state,
+            previous_personas,
+            previous_conversation,
+            previous_todos,
+            previous_conversation_id,
+        )
+        .await
+        .map_err(internal_error)?;
+        return Err(internal_error(error.to_string()));
+    }
     finish_runtime_idle_lease(idle_lease)?;
     state.runtime_service.touch();
 
     Ok(Json(RuntimeSessionResumeResponse {
         conversation_id,
+        persona_id: metadata.persona_id,
+        persona_name_snapshot: metadata.persona_name_snapshot,
+        persona_version_snapshot: metadata.persona_version_snapshot,
+        persona_status: "bound".to_string(),
         restored_messages,
         status: outcome.reply,
     }))
@@ -439,10 +539,37 @@ pub(crate) async fn handle_runtime_session_fork(
     Json(req): Json<RuntimeSessionForkRequest>,
 ) -> Result<Json<RuntimeSessionForkResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _transition = state.persona_runtime_transition_gate.lock().await;
-    require_active_persona_http(&state).await?;
     let idle_lease = acquire_runtime_idle_lease(&state, "fork_session")?;
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let source_metadata = repository
+        .metadata(&source_conversation_id)
+        .await
+        .map_err(session_metadata_read_error)?
+        .ok_or_else(|| bad_request("来源会话缺少 v2 Persona metadata。"))?;
+    let target_persona_id = req
+        .target_persona_id
+        .clone()
+        .unwrap_or_else(|| source_metadata.persona_id.clone());
+    let (target_persona, previous_personas) = {
+        let mut personas = state.personas.lock().await;
+        let previous = personas.clone();
+        let persona = personas.get(&target_persona_id).cloned().ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("目标角色 `{target_persona_id}` 不存在。") }),
+        ))?;
+        personas.set_active(&target_persona_id).map_err(persona_store_error_response)?;
+        personas.save().map_err(persona_store_error_response)?;
+        (persona, previous)
+    };
+    let previous_conversation = state.runtime_service.lock_conversation().await.clone();
+    let previous_todos = state.runtime_service.runtime_todos().await;
+    let previous_conversation_id = active_conversation_id(&state);
     let runtime = ConversationRuntime::new(state.clone(), false);
-    let outcome = runtime
+    let outcome = match runtime
         .submit(
             RuntimeOp::ForkSession {
                 source_conversation_id: source_conversation_id.clone(),
@@ -451,7 +578,22 @@ pub(crate) async fn handle_runtime_session_fork(
             RuntimeEventEmitter::collect_only(),
         )
         .await
-        .map_err(|err| bad_request(&err))?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            rollback_persona_runtime_transition(
+                &state,
+                previous_personas,
+                previous_conversation,
+                previous_todos,
+                previous_conversation_id,
+            )
+            .await
+            .map_err(internal_error)?;
+            let _ = finish_runtime_idle_lease(idle_lease);
+            return Err(bad_request(&error));
+        }
+    };
     let conversation_id = active_conversation_id(&state);
     let restored_messages = {
         let conv = state.runtime_service.lock_conversation().await;
@@ -460,19 +602,32 @@ pub(crate) async fn handle_runtime_session_fork(
             .filter(|message| message.role != Role::System)
             .count()
     };
+    let metadata = repository
+        .metadata(&conversation_id)
+        .await
+        .map_err(session_metadata_read_error)?
+        .ok_or_else(|| internal_error("分叉会话缺少 v2 Persona metadata。".to_string()))?;
+    if let Err(error) = repository.set_workspace_state(&target_persona.id, &conversation_id) {
+        rollback_persona_runtime_transition(
+            &state,
+            previous_personas,
+            previous_conversation,
+            previous_todos,
+            previous_conversation_id,
+        )
+        .await
+        .map_err(internal_error)?;
+        return Err(internal_error(error.to_string()));
+    }
     finish_runtime_idle_lease(idle_lease)?;
-    state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .record_fork(&conversation_id, &source_conversation_id)
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
     state.runtime_service.touch();
 
     Ok(Json(RuntimeSessionForkResponse {
         conversation_id,
+        persona_id: metadata.persona_id,
+        persona_name_snapshot: metadata.persona_name_snapshot,
+        persona_version_snapshot: metadata.persona_version_snapshot,
+        persona_status: "bound".to_string(),
         source_conversation_id,
         before_user_message_index: req.before_user_message_index,
         restored_messages,

@@ -46,7 +46,7 @@ use muse_core::domain::conversation::{Conversation, Message, Role};
 use muse_core::domain::mcp;
 use muse_core::domain::persona::Persona;
 use muse_core::domain::persona::character::card::PersonaCard;
-use muse_core::domain::persona::character::store::PersonaStoreError;
+use muse_core::domain::persona::character::store::{PersonaStore, PersonaStoreError};
 use muse_core::domain::persona::visual::VisualPack;
 use muse_core::domain::protocol::{RuntimeEvent, RuntimeOp};
 use muse_core::domain::runtime::{RuntimeModeState, RuntimeTodoItem, ToolPreset};
@@ -617,13 +617,6 @@ impl ConversationRuntime {
 
         let (conversation, stats) =
             load_conversation_from_runtime_transcript(&self.state, &conversation_id, None).await?;
-        {
-            let mut conv = self.state.runtime_service.lock_conversation().await;
-            *conv = conversation;
-        }
-        replace_runtime_todos(&self.state, stats.latest_todos.clone().unwrap_or_default()).await;
-        set_active_conversation_id(&self.state, &conversation_id)?;
-
         append_transcript_record(
             &self.state,
             "session_resumed",
@@ -635,6 +628,12 @@ impl ConversationRuntime {
             }),
         )
         .await?;
+        {
+            let mut conv = self.state.runtime_service.lock_conversation().await;
+            *conv = conversation;
+        }
+        replace_runtime_todos(&self.state, stats.latest_todos.clone().unwrap_or_default()).await;
+        set_active_conversation_id(&self.state, &conversation_id)?;
 
         let reply = format!(
             "已恢复会话：重放 {} 条 transcript 记录，恢复 {} 条上下文消息。",
@@ -675,6 +674,7 @@ impl ConversationRuntime {
             .map_err(|_| "客户端连接已断开。".to_string())?;
 
         let new_conversation_id = next_runtime_session_id();
+        let active_persona = require_active_persona(&self.state).await?;
         let (conversation, stats) = load_conversation_from_runtime_transcript(
             &self.state,
             &source_conversation_id,
@@ -682,6 +682,20 @@ impl ConversationRuntime {
         )
         .await?;
         let inherited_todos = stats.latest_todos.clone().unwrap_or_default();
+        self.state
+            .runtime_service
+            .session_repository()
+            .await
+            .map_err(|error| error.to_string())?
+            .initialize_fork(
+                &new_conversation_id,
+                &source_conversation_id,
+                &active_persona.id,
+                &active_persona.name,
+                &active_persona.version,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         persist_fork_snapshot(
             &self.state,
             &new_conversation_id,
@@ -691,13 +705,6 @@ impl ConversationRuntime {
             &inherited_todos,
         )
         .await?;
-        {
-            let mut conv = self.state.runtime_service.lock_conversation().await;
-            *conv = conversation;
-        }
-        replace_runtime_todos(&self.state, inherited_todos.clone()).await;
-        set_active_conversation_id(&self.state, &new_conversation_id)?;
-
         append_transcript_record(
             &self.state,
             "session_forked",
@@ -725,6 +732,12 @@ impl ConversationRuntime {
             )
             .await?;
         }
+        {
+            let mut conv = self.state.runtime_service.lock_conversation().await;
+            *conv = conversation;
+        }
+        replace_runtime_todos(&self.state, inherited_todos.clone()).await;
+        set_active_conversation_id(&self.state, &new_conversation_id)?;
 
         let reply = format!(
             "已分叉会话：从来源会话重放 {} 条 transcript 记录，恢复 {} 条上下文消息，新会话 `{}` 已激活。",
@@ -806,6 +819,37 @@ impl ConversationRuntime {
             None
         };
         let mode_state = current_runtime_mode_state(&self.state);
+        let binding_result = async {
+            let repository = self
+                .state
+                .runtime_service
+                .session_repository()
+                .await
+                .map_err(|error| error.to_string())?;
+            repository
+                .ensure_persona_binding(
+                    &conversation_id,
+                    &active_persona.id,
+                    &active_persona.name,
+                    &active_persona.version,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            repository
+                .set_workspace_state(&active_persona.id, &conversation_id)
+                .map_err(|error| error.to_string())
+        }
+        .await;
+        if let Err(message) = binding_result {
+            return Err(abort_preparing_turn(
+                &self.state,
+                &emitter,
+                &conversation_id,
+                &turn_id,
+                message,
+            )
+            .await);
+        }
         let preparation_remaining = TurnBudget::default()
             .max_duration
             .checked_sub(budget_started_at.elapsed())
@@ -1730,6 +1774,7 @@ include!("api/app_preferences.rs");
 include!("api/chat_sessions_models.rs");
 include!("api/runtime_policy.rs");
 include!("api/personas_stream.rs");
+include!("api/persona_session_binding.rs");
 include!("api/skills_management.rs");
 include!("api/mcp_management.rs");
 include!("tools/registry.rs");

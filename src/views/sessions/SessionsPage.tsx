@@ -32,11 +32,17 @@ type ChatRuntime = ReturnType<typeof useChatRuntime>;
 
 interface SessionsPageProps {
   runtime: ChatRuntime;
+  activePersonaId?: string;
   activePersonaName?: string;
   onOpenChat: () => void;
 }
 
-export function SessionsPage({ runtime, activePersonaName, onOpenChat }: SessionsPageProps) {
+export function SessionsPage({
+  runtime,
+  activePersonaId,
+  activePersonaName,
+  onOpenChat
+}: SessionsPageProps) {
   const [query, setQuery] = useState('');
   const [showArchived, setShowArchived] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -58,7 +64,7 @@ export function SessionsPage({ runtime, activePersonaName, onOpenChat }: Session
   const filteredSessions = sessions.filter(
     (session) =>
       (showArchived || !session.archived) &&
-      `${sessionTitle(session)} ${session.first_prompt || ''} ${session.conversation_id}`
+      `${sessionTitle(session)} ${session.first_prompt || ''} ${session.persona_name_snapshot || ''} ${session.conversation_id}`
         .toLowerCase()
         .includes(query.trim().toLowerCase())
   );
@@ -160,7 +166,13 @@ export function SessionsPage({ runtime, activePersonaName, onOpenChat }: Session
   }
 
   async function forkConversation() {
-    if (selectedSession && (await runtime.handleForkSession(selectedSession.conversation_id))) {
+    const targetPersonaId = selectedSession?.persona_status === 'missing' ? activePersonaId : undefined;
+    const forked = selectedSession
+      ? targetPersonaId
+        ? await runtime.handleForkSession(selectedSession.conversation_id, targetPersonaId)
+        : await runtime.handleForkSession(selectedSession.conversation_id)
+      : false;
+    if (selectedSession && forked) {
       onOpenChat();
     }
   }
@@ -307,7 +319,12 @@ export function SessionsPage({ runtime, activePersonaName, onOpenChat }: Session
                       <button
                         type="button"
                         className="primary"
-                        disabled={runtime.busy}
+                        disabled={runtime.busy || selectedSession.persona_status === 'missing'}
+                        title={
+                          selectedSession.persona_status === 'missing'
+                            ? '所属角色已删除，原会话只能查看或导出。'
+                            : undefined
+                        }
                         onClick={() => void resumeConversation()}
                       >
                         <RotateCcw aria-hidden="true" />
@@ -315,7 +332,10 @@ export function SessionsPage({ runtime, activePersonaName, onOpenChat }: Session
                       </button>
                       <button
                         type="button"
-                        disabled={runtime.busy}
+                        disabled={
+                          runtime.busy ||
+                          (selectedSession.persona_status === 'missing' && !activePersonaId)
+                        }
                         onClick={() => void forkConversation()}
                       >
                         <GitFork aria-hidden="true" />

@@ -30,6 +30,13 @@ export function sessionTitle(session: RuntimeSessionItem) {
 
 export function sessionMeta(session: RuntimeSessionItem) {
   const parts = [`${session.records} 条记录`];
+  if (session.persona_name_snapshot) {
+    parts.push(
+      session.persona_status === 'missing'
+        ? `${session.persona_name_snapshot}（角色已删除）`
+        : session.persona_name_snapshot
+    );
+  }
   if (session.source_conversation_id) parts.push('分叉');
   if (session.last_time) {
     const time = new Date(session.last_time);

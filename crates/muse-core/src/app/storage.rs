@@ -11,7 +11,7 @@ const RUNTIME_DATABASE_FILE: &str = "muse.sqlite";
 const LEGACY_RUNTIME_DATABASE_FILE: &str = "agent-vp.sqlite";
 const RUNTIME_DATABASE_DIR: &str = "runtime";
 const RUNTIME_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 5;
+const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 6;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 统一运行时数据库初始化、连接或迁移错误。
@@ -124,6 +124,26 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
             ALTER TABLE session_index
                 ADD COLUMN recoverable INTEGER NOT NULL DEFAULT 0
                 CHECK (recoverable IN (0, 1));
+            DELETE FROM session_index;
+            DELETE FROM session_index_state;
+        "#,
+    },
+    RuntimeMigration {
+        version: 6,
+        name: "persona_session_ownership_v2",
+        // 当前没有真实用户，Session metadata 直接硬切 v2。旧 SQLite 投影全部
+        // 清空，不保留 v1 双读或未绑定会话认领分支。
+        sql: r#"
+            ALTER TABLE session_index ADD COLUMN persona_id TEXT;
+            ALTER TABLE session_index ADD COLUMN persona_name_snapshot TEXT;
+            ALTER TABLE session_index ADD COLUMN persona_version_snapshot TEXT;
+            CREATE INDEX session_index_persona_last_time
+                ON session_index(persona_id, last_time DESC, conversation_id ASC);
+            CREATE TABLE persona_workspace_state (
+                persona_id TEXT PRIMARY KEY,
+                active_conversation_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             DELETE FROM session_index;
             DELETE FROM session_index_state;
         "#,
@@ -625,10 +645,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("应记录最新 migration");
-        assert_eq!(
-            migration,
-            (5, "session_index_recoverable_visibility".to_string())
-        );
+        assert_eq!(migration, (6, "persona_session_ownership_v2".to_string()));
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -662,7 +679,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 6);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",
@@ -706,7 +723,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取最新 migration");
-        assert_eq!(latest, 5);
+        assert_eq!(latest, 6);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
@@ -744,6 +761,61 @@ mod tests {
             .expect("应读取会话索引状态行数");
         assert_eq!(indexed_rows, 0);
         assert_eq!(index_state_rows, 0);
+        drop(migrated);
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn migration_six_rebuilds_persona_session_projection_and_workspace_state() {
+        let root = unique_root("persona-session-ownership");
+        let (_, connection) = super::open_runtime_database(&root).expect("应初始化核心库");
+        connection
+            .execute_batch(
+                "INSERT INTO session_index(
+                     conversation_id, event_file, title, archived, source_conversation_id,
+                     fallback_summary, summary, record_count, created_time, last_time,
+                     metadata_updated_at, metadata_revision, last_commit_seq, recoverable,
+                     persona_id, persona_name_snapshot, persona_version_snapshot
+                 ) VALUES(
+                     'stale-chat', 'sessions/stale.jsonl', NULL, 0, NULL,
+                     '未命名会话', '未命名会话', 1, NULL, NULL, NULL, 0, 1, 1,
+                     'persona-a', '角色 A', '1.0.0'
+                 );
+                 INSERT INTO persona_workspace_state(persona_id, active_conversation_id, updated_at)
+                 VALUES('persona-a', 'stale-chat', 'now');
+                 DELETE FROM schema_migrations WHERE version = 6;
+                 DROP TABLE persona_workspace_state;
+                 DROP INDEX session_index_persona_last_time;
+                 ALTER TABLE session_index DROP COLUMN persona_version_snapshot;
+                 ALTER TABLE session_index DROP COLUMN persona_name_snapshot;
+                 ALTER TABLE session_index DROP COLUMN persona_id;",
+            )
+            .expect("应模拟 migration v5 的旧会话索引");
+        drop(connection);
+
+        let (_, migrated) = super::open_runtime_database(&root).expect("应执行角色会话归属迁移");
+        let indexed_rows: i64 = migrated
+            .query_row("SELECT COUNT(*) FROM session_index", [], |row| row.get(0))
+            .expect("应读取重建后的会话索引");
+        let persona_columns: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_index')
+                 WHERE name IN ('persona_id', 'persona_name_snapshot', 'persona_version_snapshot')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查 Persona 投影列");
+        let workspace_table: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'persona_workspace_state')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查角色工作区状态表");
+        assert_eq!(indexed_rows, 0);
+        assert_eq!(persona_columns, 3);
+        assert!(workspace_table);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
