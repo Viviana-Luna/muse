@@ -1,0 +1,1748 @@
+/*
+ * Muse 液态玻璃主题层。
+ * 这一层只定义跨页面材质和视觉层级，业务布局仍由各领域样式维护。
+ */
+
+/* ===========================================================================
+ * 应用外壳 .app-shell：全局主题变量（深色默认）
+ * 作用于 MuseApp 根容器，定义玻璃材质、配色、阴影与主题色衍生变量。
+ * ========================================================================= */
+.runtime-shell.story-shell.app-shell {
+  --app-canvas: #070a12;
+  --glass-surface: rgba(16, 20, 31, 0.58);
+  --glass-surface-strong: rgba(12, 15, 24, 0.78);
+  --glass-surface-soft: rgba(255, 255, 255, 0.045);
+  --glass-fallback: #111621;
+  --glass-edge: rgba(255, 255, 255, 0.13);
+  --glass-edge-strong: rgba(255, 255, 255, 0.2);
+  --glass-highlight: rgba(255, 255, 255, 0.16);
+  --text-primary: rgba(250, 251, 255, 0.94);
+  --text-secondary: rgba(230, 234, 244, 0.68);
+  --text-tertiary: rgba(218, 224, 238, 0.46);
+  --shadow-window: 0 30px 90px rgba(0, 0, 0, 0.38);
+  --shadow-float: 0 18px 54px rgba(0, 0, 0, 0.28);
+  --shadow-inset: inset 0 1px 0 var(--glass-highlight);
+  --accent-solid: var(--theme-color);
+  --accent-soft: color-mix(in srgb, var(--theme-color), transparent 84%);
+  --accent-edge: color-mix(in srgb, var(--theme-color), transparent 52%);
+  min-width: 0;
+  grid-template-columns: 102px minmax(0, 1fr);
+  color: var(--text-primary);
+  color-scheme: dark;
+  border: 0;
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 78% 16%, color-mix(in srgb, var(--theme-color), transparent 82%), transparent 32%),
+    radial-gradient(circle at 18% 88%, color-mix(in srgb, var(--theme-color), transparent 91%), transparent 30%),
+    var(--app-canvas);
+  box-shadow: none;
+}
+
+/* === 应用外壳 · 亮色主题变量覆盖（.theme-light） === */
+.runtime-shell.story-shell.app-shell.theme-light {
+  --app-canvas: #e9ebf1;
+  --glass-surface: rgba(249, 249, 252, 0.72);
+  --glass-surface-strong: rgba(252, 252, 254, 0.88);
+  --glass-surface-soft: rgba(255, 255, 255, 0.58);
+  --glass-fallback: #f5f5f8;
+  --glass-edge: rgba(43, 47, 59, 0.13);
+  --glass-edge-strong: rgba(43, 47, 59, 0.2);
+  --glass-highlight: rgba(255, 255, 255, 0.92);
+  --text-primary: rgba(26, 28, 36, 0.94);
+  --text-secondary: rgba(39, 42, 53, 0.7);
+  --text-tertiary: rgba(48, 51, 63, 0.52);
+  --shadow-window: 0 30px 82px rgba(66, 69, 82, 0.18);
+  --shadow-float: 0 16px 44px rgba(72, 75, 88, 0.15);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  --accent-soft: color-mix(in srgb, var(--theme-color), white 84%);
+  --accent-edge: color-mix(in srgb, var(--theme-color), #4a4c58 45%);
+  color-scheme: light;
+  background:
+    radial-gradient(circle at 78% 14%, color-mix(in srgb, var(--theme-color), transparent 78%), transparent 34%),
+    radial-gradient(circle at 12% 90%, rgba(255, 255, 255, 0.88), transparent 34%),
+    var(--app-canvas);
+}
+
+/* ===========================================================================
+ * 主内容表面 .app-main-surface
+ * 包裹所有 section（chat / sessions / roles / skills / mcp / settings）的圆角玻璃容器。
+ * ========================================================================= */
+.app-main-surface {
+  margin: 14px 14px 14px 6px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 28px;
+  background: color-mix(in srgb, var(--glass-surface), transparent 26%);
+  box-shadow: var(--shadow-window), var(--shadow-inset);
+  isolation: isolate;
+}
+
+.app-main-surface::after {
+  content: '';
+  position: absolute;
+  z-index: 40;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-color), transparent 91%);
+  pointer-events: none;
+}
+
+.app-main-surface > [data-modal-accessibility-surface="true"] {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-main-surface > [data-modal-accessibility-surface="true"]:focus {
+  outline: none;
+}
+
+/* ===========================================================================
+ * 应用导航栏 .app-rail（AppRail 组件）
+ * 桌面端为左侧竖向导航；移动端（≤767px）变为底部 Tab 栏。
+ * ========================================================================= */
+.app-rail {
+  align-self: stretch;
+  margin: 14px 8px 14px 14px;
+  padding: 12px 8px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 26px;
+  background:
+    linear-gradient(145deg, var(--glass-highlight), transparent 22%),
+    var(--glass-surface);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(34px) saturate(1.35);
+  -webkit-backdrop-filter: blur(34px) saturate(1.35);
+}
+
+.app-rail button,
+.app-rail-build {
+  min-height: 52px;
+  border-radius: 16px;
+  color: var(--text-tertiary);
+  transition:
+    color 180ms ease,
+    border-color 180ms ease,
+    background 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.app-rail button:hover:not(:disabled) {
+  border-color: var(--glass-edge-strong);
+  color: var(--text-primary);
+  background: var(--glass-surface-soft);
+}
+
+.app-rail button.active {
+  border-color: var(--accent-edge);
+  color: var(--text-primary);
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--theme-color), white 12%), transparent 145%),
+    var(--accent-soft);
+  box-shadow: var(--shadow-inset), 0 10px 24px color-mix(in srgb, var(--theme-color), transparent 86%);
+}
+
+.app-rail-brand {
+  min-height: 72px !important;
+  margin-bottom: 4px;
+}
+
+.app-rail-brand img {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--glass-edge-strong);
+  border-radius: 13px;
+  box-shadow: var(--shadow-inset), 0 8px 20px rgba(0, 0, 0, 0.16);
+}
+
+.app-rail-brand span {
+  color: color-mix(in srgb, var(--theme-color), var(--text-primary) 38%);
+}
+
+/* ===========================================================================
+ * 故事工作区 .story-workspace（StoryWorkspace 组件 · chat 页面主区）
+ * 三列布局：历史抽屉（左）+ 阅读列（中）+ 舞台（右）。
+ * ========================================================================= */
+.app-shell .app-main-surface > .story-workspace {
+  width: auto;
+  height: calc(100% - 32px);
+  min-height: calc(100% - 32px);
+  margin: 16px;
+}
+
+/* === chat 页面 · 三列 grid（历史抽屉打开时） === */
+.app-shell .story-workspace.history-list-open.persistent-history {
+  grid-template-columns: minmax(220px, 0.58fr) minmax(420px, 1.36fr) minmax(360px, 1fr);
+  gap: 14px;
+}
+
+/* === chat 页面 · 历史抽屉 + 阅读列：玻璃面板表面（左/中列共用材质） === */
+.app-shell .persistent-history > .history-session-drawer,
+.story-reading-column {
+  border: 1px solid var(--glass-edge);
+  border-radius: 24px;
+  background:
+    linear-gradient(145deg, var(--glass-highlight), transparent 18%),
+    var(--glass-surface-strong);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(34px) saturate(1.28);
+  -webkit-backdrop-filter: blur(34px) saturate(1.28);
+}
+
+.app-shell .persistent-history > .history-session-drawer {
+  padding: 14px 12px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 24%), transparent 22%),
+    var(--glass-surface);
+}
+
+/* === chat 页面 · 历史会话抽屉 HistoryRail 内部：标题/动作/空状态（左列） === */
+.history-session-drawer-head,
+.history-session-drawer-actions,
+.story-scene-head,
+.story-reading-column .dialogue-panel {
+  border-color: var(--glass-edge);
+}
+
+.history-session-drawer-head small,
+.history-session-drawer-empty p,
+.story-dialogue-identity small,
+.story-dialogue-idle,
+.muse-runtime-item small,
+.story-message > header,
+.story-message > header small,
+.story-empty-state p {
+  color: var(--text-tertiary);
+}
+
+.history-session-drawer-head strong,
+.story-scene-head strong,
+.story-empty-state h1,
+.story-message-content,
+.muse-runtime-item strong {
+  color: var(--text-primary);
+}
+
+/* === chat 页面 · 故事阅读列：场景头、运行时摘要、消息时间线（中列） === */
+.story-scene-head {
+  min-height: 68px;
+  padding-inline: 20px 14px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 34%);
+}
+
+.story-runtime-summary {
+  gap: 10px;
+  opacity: 0.82;
+}
+
+.story-runtime-summary:hover {
+  opacity: 1;
+}
+
+.muse-runtime-track {
+  background: color-mix(in srgb, var(--text-primary), transparent 90%);
+}
+
+.story-scroll-region {
+  padding: clamp(22px, 2.6vw, 38px);
+}
+
+.story-timeline {
+  gap: 18px;
+}
+
+.story-message {
+  max-width: min(86%, 720px);
+}
+
+.story-message-content {
+  padding: 11px 14px;
+  border-color: var(--glass-edge);
+  border-radius: 6px 16px 16px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 10%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 40%);
+  font-size: 14px;
+  line-height: 1.72;
+}
+
+.story-message.user .story-message-content {
+  border-color: var(--accent-edge);
+  border-radius: 16px 6px 16px 16px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--theme-color), white 8%), transparent 170%),
+    var(--accent-soft);
+}
+
+/* === 跨页面通用列表项玻璃表面：会话 / MCP / Skill 卡片 === */
+.story-prompt-list button,
+.session-item,
+.object-list > button,
+.mcp-catalog-list article,
+.skill-preview,
+.mcp-advanced {
+  border-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 20%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 52%);
+}
+
+/* ===========================================================================
+ * 对话输入框 .composer（chat 页面中列底部 · 输入与语音控件）
+ * ========================================================================= */
+.story-reading-column .dialogue-panel.composer-shell {
+  padding: 10px 12px 12px;
+  background: color-mix(in srgb, var(--glass-surface-strong), transparent 12%);
+}
+
+.story-reading-column .composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 10px 8px;
+  overflow: visible;
+  border: 1px solid var(--glass-edge);
+  border-radius: 19px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 42%), transparent 30%),
+    color-mix(in srgb, var(--glass-surface-soft), transparent 4%);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 28%),
+    0 10px 28px rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(24px) saturate(1.2);
+  -webkit-backdrop-filter: blur(24px) saturate(1.2);
+}
+
+.story-reading-column .composer-input-layer {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.story-reading-column .composer textarea,
+.story-history-continuation textarea {
+  min-height: 48px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-primary);
+  box-shadow: none;
+  line-height: 1.55;
+}
+
+.story-reading-column .composer textarea:focus {
+  background: transparent;
+  box-shadow: none;
+}
+
+.story-reading-column .composer:focus-within {
+  border-color: var(--accent-edge);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 18%),
+    0 0 0 3px color-mix(in srgb, var(--theme-color), transparent 86%),
+    0 14px 34px rgba(0, 0, 0, 0.14);
+}
+
+.story-reading-column .composer-control-layer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-column: 1;
+  grid-row: 2;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, var(--glass-edge), transparent 18%);
+}
+
+.story-reading-column .composer-status {
+  display: flex;
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.story-reading-column .composer-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.66;
+}
+
+.story-reading-column .composer-status > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.story-reading-column .composer-status .composer-visualizer {
+  display: none;
+  width: 76px;
+  height: 18px;
+  flex: none;
+  border: 0;
+  background: transparent;
+}
+
+.story-reading-column .composer.has-voice-activity .composer-status .composer-visualizer {
+  display: block;
+}
+
+.story-reading-column .voice-panel {
+  display: flex;
+  grid-column: 2;
+  grid-row: 1;
+  width: auto;
+  justify-content: flex-end;
+  gap: 5px;
+  overflow: visible;
+}
+
+.story-reading-column .voice-panel button {
+  display: inline-flex;
+  min-width: 34px;
+  min-height: 32px;
+  max-width: none;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-color: transparent;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.story-reading-column .voice-panel button:hover:not(:disabled) {
+  border-color: var(--glass-edge);
+  background: var(--glass-surface-soft);
+  color: var(--text-primary);
+}
+
+.story-reading-column .voice-panel button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.story-reading-column .voice-panel button::before {
+  content: none;
+}
+
+.story-reading-column .voice-panel .voice-stop:disabled {
+  display: none;
+}
+
+.story-reading-column .composer-actions {
+  display: flex;
+  grid-column: 3;
+  grid-row: 1;
+  align-items: center;
+}
+
+.story-reading-column .send-button {
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  min-height: 38px;
+  border: 1px solid color-mix(in srgb, var(--theme-color), white 28%);
+  border-radius: 50%;
+  padding: 0;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--theme-color), white 18%), var(--theme-color));
+  box-shadow: var(--shadow-inset), 0 9px 20px color-mix(in srgb, var(--theme-color), transparent 68%);
+}
+
+.story-reading-column .send-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-inset), 0 12px 24px color-mix(in srgb, var(--theme-color), transparent 60%);
+}
+
+/* ===========================================================================
+ * 故事舞台 .story-stage-panel（StoryStage 组件 · chat 页面右列）
+ * 角色立绘展示区，含渐变遮罩与空状态。
+ * ========================================================================= */
+.story-stage-panel {
+  isolation: isolate;
+  border-color: color-mix(in srgb, var(--glass-edge), transparent 20%) !important;
+  border-radius: 26px !important;
+  background: color-mix(in srgb, var(--glass-surface), transparent 52%) !important;
+  box-shadow: var(--shadow-float), var(--shadow-inset) !important;
+}
+
+.story-stage-panel::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  background:
+    radial-gradient(circle at 42% 16%, rgba(255, 255, 255, 0.18), transparent 20%),
+    radial-gradient(circle at 62% 54%, color-mix(in srgb, var(--theme-color), transparent 76%), transparent 40%);
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+.story-stage-panel::after {
+  z-index: 2;
+  background:
+    linear-gradient(180deg, rgba(4, 6, 12, 0.03) 35%, rgba(4, 6, 12, 0.7) 100%),
+    linear-gradient(90deg, rgba(4, 6, 12, 0.12), transparent 48%);
+}
+
+.story-stage-portrait {
+  filter: saturate(1.04) contrast(1.03) brightness(0.92);
+  transition: filter 280ms ease, transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.story-stage-empty {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 12px;
+  background:
+    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 32%),
+    linear-gradient(160deg, rgba(255, 255, 255, 0.025), transparent 48%);
+  color: var(--text-tertiary);
+}
+
+.story-stage-empty svg {
+  width: 42px;
+  height: 42px;
+  stroke-width: 1.2;
+}
+
+.story-stage-empty span {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+/* ===========================================================================
+ * 管理页面通用主从布局 .management-page（MCP / Skills 页面共用）
+ * 左：.object-list-pane 列表列；右：.object-detail-pane 详情列。
+ * ========================================================================= */
+.management-page,
+.object-detail-pane,
+.app-main-surface .settings-modal.embedded {
+  color: var(--text-primary);
+  background: transparent;
+}
+
+/* === 管理页 · 对象列表列（左）：MCP / Skills 列表 === */
+.object-list-pane {
+  margin: 12px 0 12px 12px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 22px;
+  background:
+    linear-gradient(145deg, var(--glass-highlight), transparent 20%),
+    var(--glass-surface);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(30px) saturate(1.25);
+}
+
+/* === 管理页 · 对象详情列（右）：MCP / Skills 编辑表单 === */
+.object-detail-pane {
+  margin: 12px;
+  overflow: hidden;
+  border: 1px solid var(--glass-edge);
+  border-radius: 22px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 22%), transparent 16%),
+    var(--glass-surface-strong);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(30px) saturate(1.2);
+}
+
+.detail-toolbar,
+.detail-actions,
+.mcp-form-section + .mcp-form-section,
+.mcp-catalog-section {
+  border-color: var(--glass-edge);
+}
+
+.detail-actions {
+  background: color-mix(in srgb, var(--glass-surface-strong), transparent 2%);
+}
+
+.object-list-pane > header small,
+.object-list > button small,
+.object-list > button > i,
+.skill-meta-grid label > span,
+.mcp-form-grid label > span,
+.mcp-secret-row label > span,
+.skill-editor > span,
+.mcp-catalog-section > p,
+.mcp-catalog-list small {
+  color: var(--text-tertiary);
+}
+
+/* === 管理页 · 表单输入控件：搜索框 / MCP / Skill 字段（共用） === */
+.management-search,
+.skill-meta-grid input,
+.skill-meta-grid textarea,
+.mcp-form-grid input,
+.mcp-form-grid textarea,
+.mcp-form-grid select,
+.skill-editor textarea {
+  border-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 8%);
+  color: var(--text-primary);
+}
+
+/* ===========================================================================
+ * 设置模态框 .settings-modal.embedded（SettingsDialog · 各 section 通用骨架）
+ * 左：.settings-menu 菜单列；右：.settings-panel 面板列；底：footer 操作栏。
+ * ========================================================================= */
+.settings-modal.embedded .settings-form {
+  --settings-accent: #0a84ff;
+  --settings-sidebar-surface: color-mix(in srgb, var(--app-canvas), var(--glass-surface-strong) 74%);
+  grid-template-rows: minmax(0, 1fr) auto;
+  margin: 0;
+  width: 100% !important;
+  height: 100% !important;
+  padding: 0;
+  overflow: hidden;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.theme-light .settings-modal.embedded .settings-form {
+  --settings-accent: #007aff;
+}
+
+.settings-modal.embedded .settings-layout {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  gap: 12px;
+  width: 100%;
+  margin: 0;
+  padding: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-modal.embedded .settings-menu {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  align-content: stretch;
+  gap: 0;
+  min-height: 0;
+  padding: 14px 12px;
+  overflow: hidden;
+  border: 1px solid var(--glass-edge);
+  border-radius: 22px;
+  background:
+    linear-gradient(145deg, var(--glass-highlight), transparent 20%),
+    var(--settings-sidebar-surface);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(30px) saturate(1.25);
+  -webkit-backdrop-filter: blur(30px) saturate(1.25);
+}
+
+.settings-menu-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+}
+
+.settings-modal.embedded .settings-menu-group {
+  gap: 2px;
+  padding: 0 0 12px;
+  border: 0;
+}
+
+.settings-modal.embedded .settings-menu-group + .settings-menu-group {
+  padding-top: 2px;
+}
+
+.settings-modal.embedded .settings-menu-group > span {
+  padding: 0 8px 5px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: 0.02em;
+}
+
+.settings-modal.embedded .settings-menu button {
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 38px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-secondary);
+}
+
+.settings-modal.embedded .settings-menu button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 4%);
+  color: var(--text-primary);
+}
+
+.settings-modal.embedded .settings-menu button svg {
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+  stroke-width: 1.75;
+}
+
+.settings-modal.embedded .settings-menu button.active {
+  border: 0;
+  background: var(--settings-accent);
+  color: #fff;
+  box-shadow: none;
+}
+
+.settings-modal.embedded .settings-menu button.active svg,
+.settings-modal.embedded .settings-menu button.active strong {
+  color: #fff;
+}
+
+/* === 设置 · 右侧面板 .settings-panel：内容区与自定义滚动条 === */
+.settings-modal.embedded .settings-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid var(--glass-edge);
+  border-radius: 22px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 22%), transparent 16%),
+    var(--glass-surface-strong);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(30px) saturate(1.2);
+  -webkit-backdrop-filter: blur(30px) saturate(1.2);
+}
+
+.settings-modal.embedded .settings-panel > .settings-panel-scroll {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 26px clamp(24px, 3vw, 42px) 38px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-tertiary), transparent 18%) transparent;
+}
+
+/* 滚动发生在被外框裁切的内层画布中，轨道上下避开圆角转折区。 */
+.settings-modal.embedded .settings-panel-scroll::-webkit-scrollbar {
+  width: 12px;
+}
+
+.settings-modal.embedded .settings-panel-scroll::-webkit-scrollbar-track {
+  margin-block: 20px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 48%);
+  background-clip: padding-box;
+}
+
+.settings-modal.embedded .settings-panel-scroll::-webkit-scrollbar-thumb {
+  min-height: 52px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-tertiary), transparent 18%);
+  background-clip: padding-box;
+}
+
+.settings-modal.embedded .settings-panel-scroll::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-secondary), transparent 4%);
+  background-clip: padding-box;
+}
+
+/* 模型配置自带完整主从布局，直接使用设置面板边界，避免卡片内再次嵌套卡片。 */
+.settings-modal.embedded .settings-panel.settings-panel-flush {
+  padding: 0;
+}
+
+.settings-modal.embedded .settings-panel.settings-panel-flush > .settings-panel-scroll {
+  overflow-y: hidden;
+  padding: 0;
+}
+
+/* 非模型设置使用紧凑模块栈：不重复页面标题，只表达真实功能分区。 */
+.settings-modal.embedded .settings-panel-body {
+  display: grid;
+  width: min(100%, 1180px);
+  margin: 0 auto;
+  align-content: start;
+  gap: 18px;
+}
+
+.settings-modal.embedded .settings-panel .settings-module {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+  padding: clamp(18px, 2vw, 24px);
+  border: 1px solid var(--glass-edge);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 14%);
+  box-shadow: inset 0 1px color-mix(in srgb, var(--glass-highlight), transparent 36%);
+}
+
+.settings-modal.embedded .settings-panel .settings-module.settings-module-compact {
+  gap: 0;
+  padding: 14px 16px;
+}
+
+.settings-modal.embedded .settings-module-head,
+.settings-modal.embedded .diagnostics-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--glass-edge);
+}
+
+.settings-modal.embedded :is(.settings-module-head, .diagnostics-card-head) > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.settings-modal.embedded :is(.settings-module-head, .diagnostics-card-head) h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.settings-modal.embedded :is(.settings-module-head, .diagnostics-card-head) p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.settings-modal.embedded .settings-module-grid {
+  margin: 0;
+}
+
+.settings-modal.embedded .settings-module label {
+  display: grid;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.settings-modal.embedded .settings-module .settings-inline-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.settings-modal.embedded .settings-module-compact > :is(.settings-toggle, .web-search-safety-note) {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.settings-modal.embedded .settings-module .settings-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-modal.embedded .settings-module .settings-card-head > div {
+  display: grid;
+  gap: 3px;
+}
+
+.settings-modal.embedded .settings-module .settings-card-head > div > span,
+.settings-modal.embedded .settings-module .settings-card-head small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.settings-modal.embedded .settings-module .settings-card-head strong {
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.settings-modal.embedded .settings-panel-lead {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  margin: 0 0 18px;
+  padding: 22px 0 16px;
+  border-bottom: 1px solid var(--glass-edge);
+  background: color-mix(in srgb, var(--glass-surface-strong), var(--app-canvas) 20%);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+}
+
+.settings-modal.embedded .settings-panel-lead h1 {
+  color: var(--text-primary);
+}
+
+.settings-modal.embedded .settings-panel-lead p {
+  color: var(--text-tertiary);
+}
+
+.settings-modal.embedded :is(.settings-card, .resource-card, .diagnostics-card, .workspace-flow) {
+  border-color: var(--glass-edge);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 12%);
+  box-shadow: none;
+}
+
+.settings-modal.embedded .settings-form > footer {
+  position: relative;
+  z-index: 5;
+  display: flex;
+  flex: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  margin: 0 12px 12px;
+  padding: 10px 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 16px;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 30%), transparent 18%),
+    color-mix(in srgb, var(--glass-surface-strong), var(--app-canvas) 20%);
+  box-shadow: var(--shadow-float), var(--shadow-inset);
+  backdrop-filter: blur(20px) saturate(1.08);
+  -webkit-backdrop-filter: blur(20px) saturate(1.08);
+}
+
+.settings-modal.embedded .settings-form > footer button:last-child {
+  border-color: color-mix(in srgb, var(--settings-accent), #fff 18%);
+  background: var(--settings-accent);
+  color: #fff;
+}
+
+/* === 设置 · 模型供应商配置 .provider-settings-workspace（ChatPanel 模型配置：供应商列表 + 模型管理） === */
+/* 模型设置使用与系统设置一致的单层主从结构，表单和模型都归属当前供应商。 */
+.settings-modal.embedded .provider-settings-workspace {
+  grid-template-columns: minmax(190px, 0.48fr) minmax(0, 1.52fr);
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.settings-modal.embedded .provider-directory-column {
+  border-right-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--settings-sidebar-surface), transparent 12%);
+}
+
+.settings-modal.embedded :is(.provider-library-list, .provider-detail-scroll) {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-tertiary), transparent 18%) transparent;
+}
+
+.settings-modal.embedded :is(.provider-library-list, .provider-detail-scroll)::-webkit-scrollbar {
+  width: 10px;
+}
+
+.settings-modal.embedded :is(.provider-library-list, .provider-detail-scroll)::-webkit-scrollbar-track {
+  margin-block: 10px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 52%);
+  background-clip: padding-box;
+}
+
+.settings-modal.embedded :is(.provider-library-list, .provider-detail-scroll)::-webkit-scrollbar-thumb {
+  min-height: 42px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-tertiary), transparent 20%);
+  background-clip: padding-box;
+}
+
+.settings-modal.embedded :is(.provider-directory-head, .provider-detail-head) {
+  min-height: 58px;
+  padding: 12px 14px;
+  border-bottom-color: var(--glass-edge);
+}
+
+.settings-modal.embedded :is(
+  .provider-directory-head,
+  .provider-config-section > header,
+  .provider-model-section-head
+) small {
+  color: var(--text-tertiary);
+  font-weight: 560;
+  letter-spacing: 0.02em;
+}
+
+.settings-modal.embedded :is(.provider-directory-head, .provider-detail-head) strong,
+.settings-modal.embedded :is(.provider-config-section > header, .provider-model-section-head) h2 {
+  color: var(--text-primary);
+}
+
+.settings-modal.embedded :is(.provider-directory-head, .provider-config-section > header) > svg {
+  color: var(--text-tertiary);
+}
+
+.settings-modal.embedded .provider-detail-status {
+  border-color: var(--glass-edge);
+  color: var(--text-tertiary);
+}
+
+.settings-modal.embedded .provider-config-section {
+  padding: 16px 18px;
+  border-bottom-color: var(--glass-edge);
+}
+
+.settings-modal.embedded :is(.provider-field-label, .provider-detail-head small) {
+  color: var(--text-secondary);
+}
+
+.settings-modal.embedded :is(.provider-config-section .secret-input input, .provider-endpoint-input) {
+  border-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 8%);
+  color: var(--text-primary);
+}
+
+.settings-modal.embedded :is(.provider-field-hint, .provider-endpoint-input[readonly]) {
+  color: var(--text-tertiary);
+}
+
+.settings-modal.embedded .provider-model-section-head {
+  border-bottom-color: var(--glass-edge);
+}
+
+.settings-modal.embedded .provider-model-section-head h2 em {
+  background: var(--glass-surface-soft);
+  color: var(--text-tertiary);
+}
+
+.settings-modal.embedded .provider-library-list {
+  gap: 2px;
+  padding: 8px;
+}
+
+.settings-modal.embedded .provider-library-list > button {
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 50px;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+}
+
+.settings-modal.embedded .provider-library-list > button:hover:not(:disabled) {
+  border: 0;
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 4%);
+}
+
+.settings-modal.embedded .provider-library-list > button.active {
+  border: 0;
+  background: var(--settings-accent);
+  box-shadow: none;
+}
+
+.settings-modal.embedded .provider-library-list > button.active :is(strong, small) {
+  color: #fff;
+}
+
+.settings-modal.embedded .managed-model-list {
+  gap: 0;
+  padding: 0 14px;
+}
+
+.settings-modal.embedded .managed-model-list > article {
+  gap: 14px;
+  padding: 14px 2px;
+  border: 0;
+  border-bottom: 1px solid var(--glass-edge);
+  border-radius: 0;
+  background: transparent;
+  transition: background-color 140ms ease;
+}
+
+.settings-modal.embedded .managed-model-list > article:hover {
+  border-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 8%);
+  transform: none;
+}
+
+.settings-modal.embedded .managed-model-list > article.active {
+  border-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--settings-accent), transparent 91%);
+}
+
+.settings-modal.embedded .managed-model-main em {
+  background: color-mix(in srgb, var(--settings-accent), transparent 84%);
+  color: color-mix(in srgb, var(--settings-accent), #fff 28%);
+}
+
+.settings-modal.embedded .managed-model-main .capability-row > span {
+  border-color: var(--glass-edge);
+  background: var(--glass-surface-soft);
+  color: var(--text-secondary);
+}
+
+.settings-modal.embedded .model-library-future-note {
+  border-top-color: var(--glass-edge);
+  color: var(--text-tertiary);
+}
+
+.app-main-surface .settings-modal.embedded:focus {
+  outline: none;
+}
+
+/* ===========================================================================
+ * 角色库视图 .persona-library-view（PersonaLibraryView · roles 页面）
+ * ========================================================================= */
+.persona-library-view {
+  background:
+    radial-gradient(circle at 86% 8%, color-mix(in srgb, var(--theme-color), transparent 86%), transparent 30%),
+    transparent !important;
+}
+
+.app-shell .app-main-surface > .persona-library-view {
+  inset: 0;
+}
+
+.persona-gallery-card,
+.persona-import-dialog {
+  border-color: var(--glass-edge) !important;
+  box-shadow: var(--shadow-float), var(--shadow-inset) !important;
+}
+
+/* ===========================================================================
+ * 亮色主题覆盖（.theme-light）
+ * 针对舞台、各玻璃表面与表单控件的浅色适配。
+ * ========================================================================= */
+.theme-light .stage-background {
+  filter: blur(calc(var(--stage-background-blur) * 0.72)) saturate(0.72) contrast(0.92) brightness(1.08);
+  opacity: calc(var(--stage-background-opacity) * 0.54);
+}
+
+.theme-light .app-main-surface > .stage::after {
+  background:
+    linear-gradient(90deg, rgba(239, 240, 245, 0.92) 0%, rgba(239, 240, 245, 0.7) 44%, rgba(239, 240, 245, 0.18) 76%, rgba(239, 240, 245, 0.48) 100%),
+    linear-gradient(180deg, rgba(245, 245, 248, 0.18), rgba(229, 231, 238, 0.7));
+}
+
+.theme-light .stage-vignette {
+  background:
+    radial-gradient(circle at 76% 34%, color-mix(in srgb, var(--theme-color), transparent 78%), transparent 28%),
+    linear-gradient(90deg, rgba(235, 237, 244, 0.78), rgba(235, 237, 244, 0.12) 62%, rgba(235, 237, 244, 0.42));
+}
+
+.theme-light .story-stage-panel::after {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02) 38%, rgba(31, 34, 44, 0.28) 100%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.16), transparent 50%);
+}
+
+.theme-light .story-stage-portrait {
+  filter: saturate(0.94) contrast(0.98) brightness(1.03);
+}
+
+.theme-light .app-rail,
+.theme-light .object-list-pane,
+.theme-light .object-detail-pane,
+.theme-light .detail-actions,
+.theme-light .management-page,
+.theme-light .app-main-surface {
+  color: var(--text-primary);
+  background-color: transparent;
+}
+
+.theme-light .app-main-surface {
+  background:
+    radial-gradient(circle at 82% 12%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 30%),
+    rgba(235, 236, 242, 0.94);
+}
+
+.theme-light .app-shell .persistent-history > .history-session-drawer {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.94), transparent 24%),
+    rgba(244, 244, 248, 0.86);
+}
+
+.theme-light .app-rail button,
+.theme-light .object-list-pane button,
+.theme-light .object-detail-pane button {
+  color: var(--text-secondary);
+}
+
+.theme-light .app-rail button.active,
+.theme-light .app-rail button:hover:not(:disabled),
+.theme-light .object-list > button:hover,
+.theme-light .object-list > button.active {
+  color: var(--text-primary);
+}
+
+.theme-light .story-message.user .story-message-content {
+  color: color-mix(in srgb, var(--theme-color), #20222b 62%);
+}
+
+.theme-light .story-recap-action,
+.theme-light .story-history-continuation button {
+  border-color: var(--glass-edge);
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--text-secondary);
+}
+
+.theme-light .story-recap-action span,
+.theme-light .story-history-continuation > div > span,
+.theme-light .story-reading-column .composer-status,
+.theme-light .story-reading-column .composer-status > span,
+.theme-light .story-reading-column .voice-panel button {
+  color: var(--text-secondary);
+}
+
+.theme-light .story-reading-column .voice-panel button {
+  border-color: var(--glass-edge);
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.theme-light .object-list-empty,
+.theme-light .management-empty-detail {
+  color: var(--text-secondary);
+}
+
+.theme-light .object-list-empty strong,
+.theme-light .management-empty-detail h1,
+.theme-light .mcp-catalog-list strong {
+  color: var(--text-primary);
+}
+
+.theme-light .object-list-empty span,
+.theme-light .management-empty-detail p,
+.theme-light .mcp-catalog-list small {
+  color: var(--text-secondary);
+}
+
+.theme-light .object-list-empty svg,
+.theme-light .management-empty-detail > svg {
+  color: color-mix(in srgb, var(--theme-color), #4a4c58 46%);
+  opacity: 0.72;
+}
+
+.theme-light .story-reading-column .composer textarea,
+.theme-light .story-history-continuation textarea,
+.theme-light .management-search input,
+.theme-light .skill-meta-grid input,
+.theme-light .skill-meta-grid textarea,
+.theme-light .mcp-form-grid input,
+.theme-light .mcp-form-grid textarea,
+.theme-light .mcp-form-grid select,
+.theme-light .skill-editor textarea {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.64);
+}
+
+.theme-light .mcp-form-grid .field-hint {
+  color: var(--text-tertiary);
+}
+
+.theme-light .story-reading-column .composer textarea {
+  background: transparent;
+}
+
+.theme-light .story-reading-column .composer textarea::placeholder,
+.theme-light input::placeholder,
+.theme-light textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.theme-light .status-pill.success {
+  border: 1px solid rgba(5, 122, 82, 0.18);
+  color: #086745;
+  background: rgba(16, 185, 129, 0.13);
+}
+
+/* ===========================================================================
+ * 响应式断点
+ * ========================================================================= */
+
+/* ≤1280px：导航栏收窄，三列布局隐藏历史抽屉 */
+@media (max-width: 1280px) {
+  .runtime-shell.story-shell.app-shell {
+    grid-template-columns: 84px minmax(0, 1fr);
+  }
+
+  .app-rail {
+    margin-left: 10px;
+    padding-inline: 6px;
+  }
+
+  .app-rail-brand span,
+  .app-rail button span {
+    font-size: 10px;
+  }
+
+  .app-shell .story-workspace.history-list-open.persistent-history {
+    grid-template-areas: 'reading stage';
+    grid-template-columns: minmax(0, 1.22fr) minmax(330px, 0.9fr);
+  }
+
+  .app-shell .persistent-history:not(.history-drawer-open) > .history-session-drawer {
+    display: none;
+  }
+}
+
+/* ≤900px：故事工作区切换为上下双栏（舞台在上、阅读列在下） */
+@media (max-width: 900px) {
+  .app-main-surface {
+    margin: 10px 10px 10px 4px;
+    border-radius: 24px;
+  }
+
+  .app-shell .app-main-surface > .story-workspace {
+    grid-template-areas:
+      'stage'
+      'reading';
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: clamp(150px, 24vh, 220px) minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .app-shell .story-reading-column {
+    grid-area: reading;
+    width: 100%;
+  }
+
+  .app-shell .story-stage-panel {
+    position: relative;
+    inset: auto;
+    grid-area: stage;
+    width: 100%;
+  }
+
+  .app-shell .story-workspace.history-list-open.persistent-history {
+    grid-template-areas:
+      'stage'
+      'reading';
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: clamp(190px, 28vh, 250px) minmax(0, 1fr);
+  }
+
+  .app-shell .story-stage-panel {
+    border-radius: 22px !important;
+  }
+
+  .story-stage-portrait {
+    object-position: var(--portrait-object-x) 22%;
+  }
+}
+
+/* ≤1060px：模型供应商设置列宽收窄 */
+@media (max-width: 1060px) {
+  .settings-modal.embedded .provider-settings-workspace {
+    grid-template-columns: minmax(176px, 0.42fr) minmax(0, 1.58fr);
+  }
+}
+
+/* ≤640px：模型供应商设置改为单列 */
+@media (max-width: 640px) {
+  .settings-modal.embedded .provider-settings-workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+}
+
+/* ≤767px：移动端，导航栏转底部 Tab，各面板圆角与间距压缩 */
+@media (max-width: 767px) {
+  .runtime-shell.story-shell.app-shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) calc(68px + env(safe-area-inset-bottom));
+  }
+
+  .app-main-surface {
+    grid-row: 1;
+    margin: 8px;
+    border-radius: 22px;
+  }
+
+  .app-rail {
+    z-index: 60;
+    grid-row: 2;
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 3px;
+    margin: 0 8px 8px;
+    padding: 5px 5px calc(5px + env(safe-area-inset-bottom));
+    border-radius: 20px;
+  }
+
+  .app-rail nav {
+    display: contents;
+  }
+
+  .app-rail > .app-rail-brand,
+  .app-rail-spacer,
+  .app-rail-build {
+    display: none !important;
+  }
+
+  .app-rail button {
+    min-width: 0;
+    min-height: 48px;
+    padding: 5px 2px;
+    border-radius: 14px;
+  }
+
+  .app-rail > button:not(.app-rail-brand),
+  .app-rail nav > button {
+    width: 100%;
+    max-width: none;
+  }
+
+  .app-rail button span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .app-rail svg {
+    width: 19px;
+    height: 19px;
+  }
+
+  .app-rail button:not(.active) {
+    color: var(--text-secondary);
+  }
+
+  .app-shell .app-main-surface > .story-workspace {
+    grid-template-rows: clamp(132px, 22vh, 178px) minmax(0, 1fr);
+    gap: 8px;
+    height: calc(100% - 16px);
+    min-height: calc(100% - 16px);
+    margin: 8px;
+  }
+
+  .app-shell .story-workspace.history-list-open.persistent-history {
+    grid-template-rows: 168px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .story-reading-column,
+  .story-stage-panel {
+    border-radius: 18px !important;
+  }
+
+  .story-scene-head {
+    min-height: 56px;
+    padding: 8px 10px 8px 14px;
+  }
+
+  .story-runtime-summary .muse-runtime-metric {
+    display: none;
+  }
+
+  .story-scroll-region {
+    padding: 16px 14px;
+  }
+
+  .story-message {
+    max-width: 94%;
+  }
+
+  .story-reading-column .dialogue-panel {
+    padding: 9px;
+  }
+
+  .story-reading-column .composer {
+    gap: 6px;
+    padding: 8px;
+    border-radius: 17px;
+  }
+
+  .story-reading-column .composer-control-layer {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 5px;
+  }
+
+  .story-reading-column .voice-panel {
+    gap: 3px;
+  }
+
+  .story-reading-column .voice-panel button {
+    width: 32px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+  }
+
+  .story-reading-column .voice-panel button span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .story-reading-column .composer textarea {
+    min-height: 46px;
+  }
+
+  .management-page {
+    height: 100%;
+  }
+
+  .object-list-pane,
+  .object-detail-pane {
+    margin: 8px;
+    width: calc(100% - 16px) !important;
+    height: calc(100% - 16px) !important;
+    border-radius: 18px !important;
+  }
+
+  .settings-modal.embedded .settings-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 10px;
+    padding: 8px;
+  }
+
+  .settings-modal.embedded .settings-menu {
+    grid-template-rows: auto auto;
+    gap: 8px;
+    padding: 10px;
+    border-radius: 18px;
+  }
+
+  .settings-modal.embedded .settings-menu-scroll {
+    display: flex;
+    gap: 5px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0 0 2px;
+  }
+
+  .settings-modal.embedded .settings-menu-group {
+    display: contents;
+  }
+
+  .settings-modal.embedded .settings-menu-group > span {
+    display: none;
+  }
+
+  .settings-modal.embedded .settings-menu button {
+    width: max-content;
+    min-height: 36px;
+    padding-inline: 10px;
+  }
+
+  .settings-modal.embedded .settings-panel {
+    padding: 0;
+    border-radius: 18px;
+  }
+
+  .settings-modal.embedded .settings-panel > .settings-panel-scroll {
+    padding: 20px 16px 24px;
+  }
+
+  .settings-modal.embedded .settings-panel .settings-module {
+    padding: 16px;
+  }
+
+  .settings-modal.embedded .settings-module .settings-inline-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-modal.embedded .settings-panel-lead {
+    padding: 16px 0 12px;
+  }
+
+  .settings-modal.embedded .provider-library-list {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-modal.embedded .settings-form > footer {
+    flex-direction: row;
+    min-height: 54px;
+    margin: 0 8px 8px;
+    padding: 8px 12px;
+    border-radius: 14px;
+  }
+}
+
+/* ≤900px 且 ≤560px 高：短视口优先保证对话与输入可达（横屏手机/短屏） */
+/* 短视口优先保证对话与输入完整可达；角色身份仍保留在剧情头部。 */
+@media (max-width: 900px) and (max-height: 560px) {
+  .app-shell .app-main-surface > .story-workspace,
+  .app-shell .story-workspace.history-list-open.persistent-history {
+    grid-template-areas: 'reading';
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .app-shell .story-stage-panel {
+    display: none;
+  }
+
+  .settings-modal.embedded .settings-form {
+    grid-template-rows: minmax(0, 1fr) 52px;
+  }
+
+  .settings-workspace-head {
+    min-height: 52px;
+    padding: 7px 16px;
+  }
+
+  .settings-workspace-head small,
+  .settings-workspace-head span,
+  .settings-panel-lead p {
+    display: none;
+  }
+
+  .settings-workspace-head strong {
+    font-size: 19px;
+  }
+
+  .settings-modal.embedded .settings-layout {
+    grid-template-columns: 188px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 8px;
+    padding: 6px;
+  }
+
+  .settings-modal.embedded .settings-menu {
+    gap: 0;
+    padding: 8px;
+    border-radius: 16px;
+  }
+
+  .settings-modal.embedded .settings-menu button {
+    min-height: 32px;
+    padding-block: 4px;
+  }
+
+  .settings-modal.embedded .settings-panel {
+    padding: 0;
+    border-radius: 16px;
+  }
+
+  .settings-modal.embedded .settings-panel > .settings-panel-scroll {
+    padding: 14px 16px 18px;
+  }
+
+  .settings-modal.embedded .settings-panel-body {
+    gap: 12px;
+  }
+
+  .settings-modal.embedded .settings-panel .settings-module {
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .settings-modal.embedded .settings-panel-lead {
+    gap: 2px;
+    margin: 0 0 12px;
+    padding: 10px 0 8px;
+  }
+
+  .settings-modal.embedded .provider-settings-workspace {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .settings-modal.embedded .provider-directory-column {
+    border-right: 0;
+    border-bottom: 1px solid var(--glass-edge);
+  }
+
+  .settings-modal.embedded .provider-directory-column .provider-library-list {
+    max-height: 190px;
+  }
+
+  .settings-panel-lead h1 {
+    font-size: 22px;
+  }
+
+  .settings-modal.embedded .settings-form > footer {
+    min-height: 48px;
+    margin: 0 6px 6px;
+    padding: 5px 12px;
+    border-radius: 12px;
+  }
+
+  .settings-modal.embedded .settings-form > footer button {
+    min-height: 40px;
+  }
+
+  .role-editor-modal .persona-form {
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+  }
+
+  .role-editor-modal .persona-form > header,
+  .role-editor-modal .persona-form > footer {
+    align-items: center;
+    flex-direction: row;
+    padding: 8px 16px;
+  }
+
+  .role-editor-modal .persona-form > header button,
+  .role-editor-modal .persona-form > footer button {
+    width: auto;
+    min-width: 96px;
+    margin: 0;
+  }
+
+  .role-editor-modal .persona-form > footer button:last-child {
+    min-width: 148px;
+    margin-left: auto;
+  }
+
+  .role-editor-modal .persona-editor-layout {
+    padding: 10px 14px 6px;
+  }
+
+  .role-editor-modal .persona-advanced {
+    padding: 0 14px 6px;
+  }
+}
+
+/* 无障碍：尊重 prefers-reduced-motion，关闭过渡动效 */
+@media (prefers-reduced-motion: reduce) {
+  .story-stage-portrait,
+  .app-rail button,
+  .story-runtime-summary,
+  .muse-runtime-track i {
+    transition-duration: 1ms !important;
+  }
+}
+
+/* 降级：不支持 backdrop-filter 的浏览器改用纯色背景 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .app-rail,
+  .story-reading-column,
+  .history-session-drawer,
+  .object-list-pane,
+  .object-detail-pane,
+  .settings-modal.embedded .settings-menu,
+  .settings-modal.embedded .settings-panel {
+    background: var(--glass-fallback) !important;
+  }
+}

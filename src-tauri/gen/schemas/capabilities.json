@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"仅向 Muse 主窗口开放 Tauri 核心能力。","local":true,"windows":["muse"],"permissions":["core:default","core:window:allow-close","core:window:allow-minimize","core:window:allow-start-dragging","core:window:allow-toggle-maximize"]}}

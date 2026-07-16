@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/muse-core",
+    "crates/muse-runtime",
+    "crates/muse-local-api",
+    "src-tauri",
+]
+default-members = ["src-tauri"]
+resolver = "2"

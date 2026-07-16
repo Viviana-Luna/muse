@@ -1,0 +1,30 @@
+[package]
+name = "muse"
+version = "0.1.1"
+edition = "2024"
+description = "Muse 原生桌面宿主，负责本地运行时生命周期和窗口交付。"
+
+[features]
+default = []
+live-tests = []
+
+[lib]
+name = "muse_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = "0.8"
+muse-core = { path = "../crates/muse-core" }
+muse-local-api = { path = "../crates/muse-local-api" }
+muse-runtime = { path = "../crates/muse-runtime" }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2.4.2"
+tokio = { version = "1", features = ["net", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

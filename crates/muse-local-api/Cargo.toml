@@ -1,0 +1,40 @@
+[package]
+name = "muse-local-api"
+version = "0.1.1"
+edition = "2024"
+description = "Muse 本地 API 适配层，负责 Axum 路由、安全边界与运行时装配。"
+
+[features]
+default = []
+live-tests = []
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "multipart"] }
+base64 = "0.22"
+chrono = "0.4"
+futures = "0.3"
+getrandom = "0.3"
+libc = "0.2"
+muse-core = { path = "../muse-core" }
+muse-runtime = { path = "../muse-runtime" }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }

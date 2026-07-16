@@ -1,0 +1,1007 @@
+/* 角色库采用图片优先的稳定画廊；页面、卡片和导入流程都保持在角色领域内。 */
+.persona-library-view {
+  position: absolute;
+  z-index: var(--layer-content);
+  inset: 72px 0 0;
+  min-width: 0;
+  min-height: 0;
+  background: #0b0c11;
+}
+
+/* 角色库需要比剧情页更舒展的应用栏，避免画廊内容贴近全局导航。 */
+.runtime-shell.story-shell.view-roles {
+  grid-template-rows: 92px minmax(0, 1fr);
+}
+
+.story-shell.view-roles .muse-app-bar {
+  min-height: 92px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  background: #0b0c11;
+}
+
+.story-shell.theme-light.view-roles .muse-app-bar {
+  border-bottom-color: rgba(36, 31, 34, 0.1);
+  background: #f5f3f1;
+}
+
+.story-shell.view-roles .persona-library-view {
+  inset-block-start: 92px;
+}
+
+.persona-library-frame {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  width: min(100%, 1538px);
+  height: 100%;
+  margin: 0 auto;
+  padding: 25px clamp(28px, 3.4vw, 54px) 0;
+}
+
+.persona-library-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 74px;
+}
+
+.persona-library-heading h1 {
+  margin: 0;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: clamp(26px, 2vw, 32px);
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.persona-library-heading p {
+  margin: 8px 0 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 14px;
+}
+
+.persona-library-close {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.persona-library-close:hover {
+  border-color: rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.persona-library-close svg {
+  width: 19px;
+  height: 19px;
+}
+
+.persona-library-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 452px) minmax(150px, 196px) minmax(20px, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 70px;
+  padding: 10px 0 12px;
+}
+
+.persona-library-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.persona-library-search svg {
+  position: absolute;
+  left: 16px;
+  width: 19px;
+  height: 19px;
+  color: rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+}
+
+.persona-library-search input,
+.persona-library-filter select {
+  min-height: 54px;
+  border-color: rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(14, 15, 20, 0.88);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 14px;
+}
+
+.persona-library-search input {
+  padding-left: 48px;
+}
+
+.persona-library-toolbar button {
+  display: inline-flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 10px 22px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+.persona-library-toolbar button svg {
+  width: 19px;
+  height: 19px;
+}
+
+.persona-library-import-action {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.persona-library-create-action,
+.persona-import-submit {
+  border-color: color-mix(in srgb, var(--theme-color), #fff 14%);
+  background: var(--theme-color);
+  color: #fff;
+}
+
+.persona-library-create-action:hover:not(:disabled),
+.persona-import-submit:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--theme-color), #fff 34%);
+  background: var(--theme-color-hover);
+}
+
+.persona-library-scroll {
+  position: relative;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 2px 34px;
+}
+
+.persona-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-content: start;
+  gap: 18px;
+}
+
+.persona-gallery-card {
+  position: relative;
+  min-width: 0;
+  overflow: visible;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: #17181f;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.persona-gallery-card:focus-visible {
+  outline: 2px solid var(--theme-color);
+  outline-offset: 3px;
+}
+
+.persona-card-media {
+  position: relative;
+  aspect-ratio: 5 / 3;
+  overflow: hidden;
+  border-radius: 11px 11px 0 0;
+  background: #111218;
+}
+
+.persona-card-media img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center 32%;
+  transition: opacity 180ms ease, transform 220ms ease;
+}
+
+.persona-card-media.loading::after {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.045);
+  content: "";
+  animation: persona-media-loading 1.25s ease-in-out infinite;
+}
+
+.persona-gallery-card:hover .persona-card-media img {
+  transform: scale(1.018);
+}
+
+.persona-card-media-empty {
+  display: grid;
+  height: 100%;
+  align-content: center;
+  justify-items: center;
+  gap: 9px;
+  background:
+    radial-gradient(circle at 50% 35%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 44%),
+    rgba(255, 255, 255, 0.018);
+  color: rgba(255, 255, 255, 0.43);
+}
+
+.persona-card-media-empty svg {
+  width: 28px;
+  height: 28px;
+  stroke-width: 1.35;
+}
+
+.persona-card-media-empty span {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+
+@keyframes persona-media-loading {
+  from { opacity: 0.42; }
+  to { opacity: 1; }
+}
+
+.persona-gallery-card-body {
+  display: grid;
+  gap: 14px;
+  min-height: 104px;
+  padding: 14px;
+}
+
+.persona-gallery-identity {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.persona-gallery-identity strong {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.95);
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 18px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persona-gallery-identity small {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.54);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persona-gallery-card-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.persona-status-chip {
+  width: max-content;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 4px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 12px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persona-status-chip.active {
+  border-color: color-mix(in srgb, var(--theme-color), transparent 58%);
+  background: color-mix(in srgb, var(--theme-color), transparent 84%);
+  color: color-mix(in srgb, var(--theme-color), #fff 38%);
+}
+
+.persona-gallery-primary-action,
+.persona-actions-trigger {
+  min-height: 38px;
+  border-radius: 10px;
+}
+
+.persona-gallery-primary-action {
+  min-width: 84px;
+  padding: 7px 18px;
+  border-color: color-mix(in srgb, var(--theme-color), transparent 42%);
+  background: color-mix(in srgb, var(--theme-color), transparent 88%);
+  color: color-mix(in srgb, var(--theme-color), #fff 34%);
+  font-size: 13px;
+}
+
+.persona-actions-menu {
+  position: relative;
+}
+
+.persona-actions-trigger {
+  display: grid;
+  width: 40px;
+  padding: 0;
+  place-items: center;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.persona-actions-trigger svg {
+  width: 18px;
+  height: 18px;
+}
+
+.persona-actions-popover {
+  position: absolute;
+  z-index: 8;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: grid;
+  width: 210px;
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 12px;
+  background: #1b1c23;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+}
+
+.persona-actions-popover button {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.persona-actions-popover button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.persona-actions-popover button.danger {
+  color: #ffabb8;
+}
+
+.persona-library-empty,
+.persona-library-no-results,
+.persona-library-error {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  min-height: min(520px, 65vh);
+  padding: 32px;
+  text-align: center;
+}
+
+.persona-library-empty {
+  grid-template-columns: minmax(280px, 440px);
+  justify-content: center;
+  gap: 20px;
+  text-align: center;
+}
+
+.persona-library-empty > svg {
+  width: 42px;
+  height: 42px;
+  color: rgba(255, 255, 255, 0.42);
+  stroke-width: 1.3;
+}
+
+.persona-library-empty h2,
+.persona-library-no-results h2,
+.persona-library-error h2 {
+  margin: 0;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 26px;
+  font-weight: 500;
+}
+
+.persona-library-empty p,
+.persona-library-no-results p,
+.persona-library-error p {
+  margin: 10px 0 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.persona-library-empty > div > span {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.persona-library-no-results > svg,
+.persona-library-error > svg {
+  width: 34px;
+  height: 34px;
+  margin-bottom: 18px;
+  color: rgba(255, 255, 255, 0.44);
+}
+
+.persona-library-no-results button,
+.persona-library-error button {
+  margin-top: 18px;
+}
+
+.persona-library-warning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.09);
+  color: rgba(255, 235, 199, 0.9);
+  font-size: 13px;
+}
+
+.persona-library-warning svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.persona-library-warning span {
+  flex: 1;
+}
+
+.persona-library-warning button {
+  min-height: 34px;
+  padding: 5px 12px;
+}
+
+.persona-gallery-skeleton .persona-gallery-card {
+  display: grid;
+  gap: 13px;
+  min-height: 280px;
+  padding-bottom: 16px;
+  overflow: hidden;
+}
+
+.persona-skeleton-media,
+.persona-skeleton-line {
+  display: block;
+  background: rgba(255, 255, 255, 0.065);
+  animation: persona-skeleton-pulse 1.4s ease-in-out infinite alternate;
+}
+
+.persona-skeleton-media {
+  aspect-ratio: 16 / 10;
+}
+
+.persona-skeleton-line {
+  width: 42%;
+  height: 12px;
+  margin: 0 16px;
+  border-radius: 999px;
+}
+
+.persona-skeleton-line.wide {
+  width: 62%;
+  height: 18px;
+}
+
+@keyframes persona-skeleton-pulse {
+  from { opacity: 0.52; }
+  to { opacity: 1; }
+}
+
+.persona-import-layer {
+  position: fixed;
+  z-index: var(--layer-stacked-modal);
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.persona-import-backdrop {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: rgba(4, 5, 8, 0.74);
+  backdrop-filter: blur(10px);
+}
+
+.persona-import-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(820px, calc(100dvh - 40px));
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 18px;
+  background: #14151b;
+  box-shadow: 0 32px 90px rgba(0, 0, 0, 0.58);
+}
+
+.persona-import-dialog > header,
+.persona-import-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 20px 22px;
+}
+
+.persona-import-dialog > header {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.persona-import-dialog > header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.persona-import-dialog > header span {
+  color: color-mix(in srgb, var(--theme-color), #fff 30%);
+  font-size: 12px;
+}
+
+.persona-import-dialog > header h2 {
+  margin: 0;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.persona-import-dialog > header p {
+  margin: 2px 0 0;
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 13px;
+}
+
+.persona-import-dialog > header button {
+  display: grid;
+  width: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  place-items: center;
+  border-radius: 12px;
+}
+
+.persona-import-dialog > header button svg {
+  width: 19px;
+  height: 19px;
+}
+
+.persona-import-content {
+  display: grid;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 22px;
+}
+
+.persona-import-file {
+  display: flex;
+  min-height: 78px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 14px;
+  padding: 14px 16px;
+  border-style: dashed;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+  text-align: left;
+}
+
+.persona-import-file.ready {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--theme-color), transparent 52%);
+  background: color-mix(in srgb, var(--theme-color), transparent 91%);
+}
+
+.persona-import-file > svg {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  color: color-mix(in srgb, var(--theme-color), #fff 28%);
+}
+
+.persona-import-file > span {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.persona-import-file strong,
+.persona-import-file small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persona-import-file small {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+}
+
+.persona-import-preview {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  min-height: 132px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.persona-import-preview .persona-card-media {
+  height: 100%;
+  min-height: 132px;
+  border-radius: 0;
+}
+
+.persona-import-preview > div {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+  padding: 16px 18px;
+}
+
+.persona-import-preview > div > span,
+.persona-import-preview > div > small {
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 12px;
+}
+
+.persona-import-preview > div > strong {
+  margin-top: 3px;
+  overflow: hidden;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 21px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persona-import-preview > div > p {
+  display: -webkit-box;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.66);
+  font-size: 13px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.persona-import-invalid {
+  margin: 0;
+  padding: 11px 13px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.08);
+  color: rgba(255, 235, 199, 0.9);
+  font-size: 13px;
+}
+
+.persona-import-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.persona-import-options > label:not(.persona-import-activate) {
+  display: grid;
+  gap: 7px;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 13px;
+}
+
+.persona-import-activate {
+  display: flex;
+  min-height: 66px;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 13px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.persona-import-activate input {
+  width: 18px;
+  min-height: 18px;
+  flex: none;
+}
+
+.persona-import-activate > span {
+  display: grid;
+  gap: 3px;
+}
+
+.persona-import-activate small {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+}
+
+.persona-import-advanced {
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+  padding-top: 14px;
+}
+
+.persona-import-advanced summary {
+  width: max-content;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.persona-import-advanced textarea {
+  min-height: 150px;
+  margin-top: 12px;
+  border-radius: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.persona-import-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.persona-import-dialog > footer button {
+  min-height: 42px;
+  border-radius: 10px;
+}
+
+.persona-import-dialog > footer .persona-import-submit {
+  min-width: 124px;
+}
+
+.story-shell.theme-light .persona-library-view {
+  background: #f5f3f1;
+  color: #241f22;
+}
+
+.story-shell.theme-light .persona-library-heading p,
+.story-shell.theme-light .persona-gallery-identity small,
+.story-shell.theme-light .persona-library-empty p,
+.story-shell.theme-light .persona-library-no-results p {
+  color: rgba(36, 31, 34, 0.62);
+}
+
+.story-shell.theme-light .persona-library-close {
+  border-color: rgba(36, 31, 34, 0.14);
+  background: rgba(36, 31, 34, 0.04);
+  color: rgba(36, 31, 34, 0.72);
+}
+
+.story-shell.theme-light .persona-gallery-card,
+.story-shell.theme-light .persona-import-dialog {
+  border-color: rgba(36, 31, 34, 0.12);
+  background: #fff;
+}
+
+.story-shell.theme-light .persona-gallery-identity strong,
+.story-shell.theme-light .persona-import-dialog > header h2 {
+  color: #241f22;
+}
+
+.story-shell.theme-light .persona-card-media-empty {
+  background:
+    radial-gradient(circle at 50% 35%, color-mix(in srgb, var(--theme-color), transparent 90%), transparent 44%),
+    rgba(36, 31, 34, 0.025);
+  color: rgba(36, 31, 34, 0.46);
+}
+
+.story-shell.theme-light .persona-library-empty > svg {
+  color: rgba(36, 31, 34, 0.44);
+}
+
+.story-shell.theme-light .persona-library-search input,
+.story-shell.theme-light .persona-library-filter select {
+  border-color: rgba(36, 31, 34, 0.16);
+  background: #fff;
+  color: #241f22;
+}
+
+@media (max-width: 1120px) {
+  .persona-gallery-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .persona-library-toolbar {
+    grid-template-columns: minmax(240px, 1fr) minmax(150px, 190px) auto auto;
+  }
+
+  .persona-library-toolbar-spacer {
+    display: none;
+  }
+}
+
+@media (max-width: 840px) {
+  .persona-library-frame {
+    padding-right: 22px;
+    padding-left: 22px;
+  }
+
+  .persona-library-toolbar {
+    grid-template-columns: minmax(0, 1fr) minmax(140px, 0.5fr);
+  }
+
+  .persona-library-toolbar button {
+    width: 100%;
+  }
+
+  .persona-gallery-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .persona-library-empty {
+    max-width: 520px;
+    margin: 0 auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .runtime-shell.story-shell.view-roles {
+    grid-template-rows: 64px minmax(0, 1fr);
+  }
+
+  .story-shell.view-roles .muse-app-bar {
+    min-height: 64px;
+  }
+
+  .persona-library-view {
+    inset-block-start: 64px;
+  }
+
+  .persona-library-frame {
+    padding: 18px 16px 0;
+  }
+
+  .persona-library-heading {
+    min-height: 62px;
+  }
+
+  .persona-library-toolbar {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .persona-library-search {
+    grid-column: 1 / -1;
+  }
+
+  .persona-library-filter {
+    grid-column: 1 / -1;
+  }
+
+  .persona-library-toolbar button {
+    min-height: 46px;
+    padding: 8px 10px;
+  }
+
+  .persona-gallery-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .persona-import-layer {
+    padding: 8px;
+  }
+
+  .persona-import-dialog {
+    width: 100%;
+    max-height: calc(100dvh - 16px);
+    border-radius: 14px;
+  }
+
+  .persona-import-dialog > header,
+  .persona-import-dialog > footer,
+  .persona-import-content {
+    padding: 16px;
+  }
+
+  .persona-import-preview,
+  .persona-import-options {
+    grid-template-columns: 1fr;
+  }
+
+  .persona-import-preview .persona-card-media {
+    min-height: 180px;
+  }
+}
+
+/* 平板短视口压缩筛选区，把角色与空状态留在主要可视区域。 */
+@media (min-width: 561px) and (max-width: 900px) and (max-height: 560px) {
+  .persona-library-frame {
+    padding: 10px 18px 0;
+  }
+
+  .persona-library-heading {
+    min-height: 52px;
+  }
+
+  .persona-library-heading p {
+    margin-top: 3px;
+    font-size: 12px;
+  }
+
+  .persona-library-toolbar {
+    grid-template-columns: minmax(220px, 1fr) minmax(140px, 180px) 46px 46px;
+    gap: 8px;
+    min-height: 56px;
+    padding: 4px 0 6px;
+  }
+
+  .persona-library-search input,
+  .persona-library-filter select,
+  .persona-library-toolbar button {
+    min-height: 46px;
+  }
+
+  .persona-library-toolbar button {
+    width: 46px;
+    padding: 0;
+    font-size: 0;
+  }
+
+  .persona-library-scroll {
+    padding: 8px 2px 16px;
+  }
+
+  .persona-library-empty,
+  .persona-library-no-results,
+  .persona-library-error {
+    min-height: 100%;
+    padding: 16px;
+  }
+
+  .persona-library-empty {
+    gap: 12px;
+  }
+
+  .persona-library-empty > svg {
+    width: 34px;
+    height: 34px;
+  }
+
+  .persona-library-empty h2,
+  .persona-library-no-results h2,
+  .persona-library-error h2 {
+    font-size: 22px;
+  }
+
+  .persona-library-empty p,
+  .persona-library-no-results p,
+  .persona-library-error p {
+    margin-top: 6px;
+  }
+
+  .persona-library-empty > div > span {
+    margin-top: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .persona-card-media.loading::after,
+  .persona-card-media img,
+  .persona-skeleton-media,
+  .persona-skeleton-line {
+    animation: none;
+    transition: none;
+  }
+}

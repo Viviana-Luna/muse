@@ -1,0 +1,217 @@
+.app-loading-screen {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 100%;
+  place-items: center;
+  padding: 32px;
+  background: #090a0f;
+  color: rgba(248, 246, 249, 0.94);
+}
+
+.app-loading-content {
+  display: grid;
+  width: min(100%, 360px);
+  justify-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.app-loading-brand {
+  display: grid;
+  width: 72px;
+  height: 72px;
+  margin-bottom: 10px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 18px;
+  background: #f7f7f8;
+}
+
+.app-loading-brand img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  animation: muse-brand-breathe 1.7s ease-in-out infinite;
+}
+
+.app-loading-content > strong {
+  font-family: Georgia, "Songti SC", "STSong", serif;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.app-loading-content > span:last-child {
+  color: rgba(239, 235, 241, 0.55);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.muse-section-loading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: rgba(239, 235, 241, 0.72);
+}
+
+.muse-section-loading.is-page {
+  width: 100%;
+  height: 100%;
+  min-height: 240px;
+}
+
+.muse-section-loading.is-surface {
+  width: min(100%, 420px);
+  min-height: 180px;
+  padding: 28px;
+}
+
+.muse-section-loading.is-inline {
+  min-height: 28px;
+  justify-content: flex-start;
+  gap: 9px;
+  font-size: 13px;
+}
+
+.muse-loading-spinner {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border: 2px solid rgba(239, 235, 241, 0.22);
+  border-top-color: rgba(239, 235, 241, 0.86);
+  border-radius: 50%;
+  animation: muse-loading-spin 0.9s linear infinite;
+}
+
+.is-inline .muse-loading-spinner {
+  width: 16px;
+  height: 16px;
+  border-width: 1.5px;
+}
+
+.muse-loading-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.muse-loading-copy strong {
+  color: inherit;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.muse-loading-copy small {
+  color: rgba(239, 235, 241, 0.46);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.object-detail-pane > .muse-section-loading.is-page {
+  grid-row: 1 / -1;
+}
+
+.theme-light .muse-section-loading {
+  color: rgba(45, 38, 43, 0.72);
+}
+
+.theme-light .muse-loading-spinner {
+  border-color: rgba(45, 38, 43, 0.2);
+  border-top-color: rgba(45, 38, 43, 0.78);
+}
+
+.theme-light .muse-loading-copy small {
+  color: rgba(45, 38, 43, 0.52);
+}
+
+@keyframes muse-brand-breathe {
+  0%,
+  100% {
+    opacity: 0.56;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes muse-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-loading-brand img,
+  .muse-loading-spinner {
+    animation: none;
+  }
+
+  .app-loading-brand img {
+    opacity: 0.9;
+  }
+}
+
+.lazy-surface-error {
+  display: grid;
+  width: min(520px, calc(100vw - 32px));
+  gap: 18px;
+  padding: 24px;
+  border: 1px solid rgba(232, 133, 147, 0.28);
+  border-radius: 18px;
+  background: rgba(20, 20, 27, 0.98);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.4);
+}
+
+.lazy-surface-error header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.lazy-surface-error header span {
+  display: grid;
+  gap: 4px;
+}
+
+.lazy-surface-error header small,
+.lazy-surface-error p {
+  color: rgba(239, 235, 241, 0.58);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.lazy-surface-error header strong {
+  font-family: Georgia, "Songti SC", "STSong", serif;
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.lazy-surface-error p {
+  margin: 0;
+}
+
+.lazy-surface-error header button {
+  display: grid;
+  width: 36px;
+  min-height: 36px;
+  place-items: center;
+  padding: 0;
+  border-radius: 10px;
+}
+
+.lazy-surface-error > button {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}

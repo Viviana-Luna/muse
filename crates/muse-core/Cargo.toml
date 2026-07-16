@@ -1,0 +1,35 @@
+[package]
+name = "muse-core"
+version = "0.1.1"
+edition = "2024"
+description = "Muse 核心领域层，承载配置、角色、模型、工具、语音与存储能力。"
+
+[features]
+default = []
+live-tests = []
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = "0.4"
+directories = "6"
+futures = "0.3"
+getrandom = "0.3"
+keyring = { version = "3", default-features = false }
+libc = "0.2"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml_edit = { version = "0.22.27", features = ["serde"] }
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }

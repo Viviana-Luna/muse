@@ -1,0 +1,29 @@
+[
+  {
+    "choices": [
+      {
+        "delta": {
+          "tool_calls": [
+            {
+              "index": 0,
+              "id": "call-weather",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"上海\"}"
+              }
+            },
+            {
+              "index": 1,
+              "id": "call-clock",
+              "function": {
+                "name": "clock",
+                "arguments": "{\"timezone\":\"Asia/Shanghai\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ]
+  }
+]

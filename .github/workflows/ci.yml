@@ -1,0 +1,683 @@
+name: Muse CI
+
+on:
+  push:
+    branches:
+      - dev
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - dev
+      - master
+  workflow_dispatch:
+    inputs:
+      build_test_packages:
+        description: 构建临时桌面测试安装包并执行安装冒烟（不创建 Release）
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muse-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: 代码质量与完整测试
+    runs-on: macos-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 验证构建产物清理边界
+        run: bash scripts/clean-build-artifacts.test.sh
+
+      - name: 校验 Rust 格式
+        run: cargo fmt --all --check
+
+      - name: 执行严格 Clippy 检查
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: 执行 Rust 全量测试
+        run: cargo test --workspace --all-targets --locked
+
+      - name: 执行前端测试
+        run: npm run test
+
+      - name: 构建前端
+        run: npm run build
+
+      - name: 校验工作流 YAML 语法
+        run: ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/ci.yml")'
+
+      - name: 校验 CI 与标准目录静态契约
+        run: npm run test:ci-contract
+
+  live_tests:
+    name: 平台专项环境测试（${{ matrix.os }}）
+    if: >-
+      github.repository == 'Viviana-Luna/muse' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      inputs.build_test_packages && github.ref == 'refs/heads/dev'))
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: 执行平台专项环境测试
+        run: cargo test --workspace --all-targets --locked --features live-tests
+
+  package_policy:
+    name: 校验安装包构建来源
+    if: >-
+      github.repository == 'Viviana-Luna/muse' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_test_packages))
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出完整分支历史
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 限制手动测试包只能来自 dev
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/dev"
+
+      - name: 校验正式标签提交属于 master
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            '+refs/heads/master:refs/remotes/origin/master'
+          tag_commit="$(git rev-list -n 1 "${GITHUB_REF}")"
+          git merge-base --is-ancestor "${tag_commit}" "refs/remotes/origin/master"
+
+  package:
+    name: 打包 ${{ matrix.label }}
+    if: >-
+      github.repository == 'Viviana-Luna/muse' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      inputs.build_test_packages && github.ref == 'refs/heads/dev'))
+    needs:
+      - quality
+      - package_policy
+      - live_tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS 未签名社区 DMG
+            bundle: dmg
+            target: universal-apple-darwin
+            artifact_name: Muse-macOS-Unsigned-DMG
+            artifact_path: target/universal-apple-darwin/release/bundle/dmg/*_unsigned.dmg
+          - os: windows-latest
+            label: Windows NSIS
+            bundle: nsis
+            artifact_name: Muse-Windows-NSIS
+            artifact_path: target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 安装 macOS Universal Rust 目标
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: 校验当前平台全部 Rust 目标
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: 执行 Windows 专属入口测试
+        if: runner.os == 'Windows'
+        run: cargo test -p muse --all-targets --locked
+
+      - name: 构建 macOS Universal 未签名社区安装包
+        if: runner.os == 'macOS'
+        run: npm run tauri -- build --bundles ${{ matrix.bundle }} --target ${{ matrix.target }}
+
+      - name: 标记 macOS 未签名社区产物
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          test "${#bundles[@]}" -eq 1
+          unsigned_bundle="${bundles[0]%.dmg}_unsigned.dmg"
+          mv "${bundles[0]}" "${unsigned_bundle}"
+          test -s "${unsigned_bundle}"
+
+      - name: 构建 Windows 安装包
+        if: runner.os == 'Windows'
+        run: npm run tauri -- build --bundles ${{ matrix.bundle }}
+
+      - name: 校验 macOS 安装包产物
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(${{ matrix.artifact_path }})
+          test "${#bundles[@]}" -eq 1
+          test -s "${bundles[0]}"
+          hdiutil verify "${bundles[0]}"
+          mount_dir="$(mktemp -d "${RUNNER_TEMP}/muse-community-bundle.XXXXXX")"
+          trap 'hdiutil detach "${mount_dir}" -force >/dev/null 2>&1 || true; rm -rf "${mount_dir}"' EXIT
+          hdiutil attach "${bundles[0]}" -nobrowse -readonly -mountpoint "${mount_dir}" >/dev/null
+          apps=("${mount_dir}"/*.app)
+          test "${#apps[@]}" -eq 1
+          plutil -lint "${apps[0]}/Contents/Info.plist"
+          if codesign --verify --deep --strict "${apps[0]}" >/dev/null 2>&1; then
+            echo "unsigned 社区产物意外带有有效代码签名，拒绝发布身份不明确的 DMG。" >&2
+            exit 1
+          fi
+          executables=("${apps[0]}"/Contents/MacOS/*)
+          test "${#executables[@]}" -eq 1
+          test -x "${executables[0]}"
+          lipo "${executables[0]}" -verify_arch x86_64
+          lipo "${executables[0]}" -verify_arch arm64
+          hdiutil detach "${mount_dir}" >/dev/null
+          rm -rf "${mount_dir}"
+          trap - EXIT
+
+      - name: 校验 Windows 安装包产物
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundles = @(Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -File)
+          if ($bundles.Count -eq 0) {
+            throw "未生成 Windows NSIS 安装包。"
+          }
+          foreach ($bundle in $bundles) {
+            if ($bundle.Length -le 0) {
+              throw "Windows NSIS 安装包为空：$($bundle.FullName)"
+            }
+          }
+
+          $desktop = Get-Item target/release/muse.exe
+          $stream = [System.IO.File]::OpenRead($desktop.FullName)
+          $reader = [System.IO.BinaryReader]::new($stream)
+          try {
+            if ($reader.ReadUInt16() -ne 0x5A4D) {
+              throw 'muse.exe 缺少合法的 DOS/PE 文件头。'
+            }
+
+            $stream.Position = 0x3C
+            $peOffset = $reader.ReadUInt32()
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) {
+              throw 'muse.exe 缺少合法的 PE 签名。'
+            }
+
+            # PE32 与 PE32+ 的 Subsystem 字段都位于可选头起点后的第 68 字节。
+            $optionalHeaderOffset = $peOffset + 24
+            $stream.Position = $optionalHeaderOffset
+            $magic = $reader.ReadUInt16()
+            if ($magic -ne 0x010B -and $magic -ne 0x020B) {
+              throw ("muse.exe 使用了未知的 PE 可选头格式：0x{0:X4}。" -f $magic)
+            }
+
+            $stream.Position = $optionalHeaderOffset + 68
+            $subsystem = $reader.ReadUInt16()
+            if ($subsystem -ne 2) {
+              throw "muse.exe 的 PE subsystem 不是 Windows GUI，实际值为 $subsystem。"
+            }
+          }
+          finally {
+            $reader.Dispose()
+            $stream.Dispose()
+          }
+
+      - name: 从 DMG 任意目录执行桌面单实例冒烟
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          run_root="$(mktemp -d "${RUNNER_TEMP}/muse-smoke.XXXXXX")"
+          mount_dir="${run_root}/mounted"
+          run_cwd_one="${run_root}/cwd-one"
+          run_cwd_two="${run_root}/cwd-two"
+          isolated_home="${run_root}/home"
+          ready_file="${run_root}/desktop-ready.json"
+          single_instance_marker="${run_root}/single-instance.json"
+          first_log="${run_root}/first.log"
+          second_log="${run_root}/second.log"
+          first_pid=""
+          second_pid=""
+
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            for pid in "${second_pid}" "${first_pid}"; do
+              if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+                kill -TERM "${pid}" 2>/dev/null || true
+                wait "${pid}" 2>/dev/null || true
+              fi
+            done
+            if mount | grep -Fq -- "${mount_dir}"; then
+              hdiutil detach "${mount_dir}" -force >/dev/null || true
+            fi
+            rm -rf "${run_root}"
+            exit "${status}"
+          }
+          trap cleanup EXIT
+
+          mkdir -p "${mount_dir}" "${run_cwd_one}" "${run_cwd_two}" "${isolated_home}"
+          bundles=(${{ matrix.artifact_path }})
+          test "${#bundles[@]}" -gt 0
+          hdiutil attach "${bundles[0]}" -nobrowse -readonly -mountpoint "${mount_dir}" >/dev/null
+          executables=("${mount_dir}"/*.app/Contents/MacOS/*)
+          test "${#executables[@]}" -eq 1
+          executable="${executables[0]}"
+          test -x "${executable}"
+
+          original_cwd="${PWD}"
+          cd "${run_cwd_one}"
+          HOME="${isolated_home}" \
+            MUSE_DESKTOP_READY_FILE="${ready_file}" \
+            MUSE_DESKTOP_CI_SINGLE_INSTANCE_MARKER_FILE="${single_instance_marker}" \
+            "${executable}" >"${first_log}" 2>&1 &
+          first_pid=$!
+          cd "${original_cwd}"
+          for _ in {1..300}; do
+            kill -0 "${first_pid}" 2>/dev/null || {
+              echo "桌面主实例在内嵌页就绪前退出。" >&2
+              exit 1
+            }
+            [[ -s "${ready_file}" ]] && break
+            sleep 0.1
+          done
+          test -s "${ready_file}"
+          READY_FILE="${ready_file}" ISOLATED_HOME="${isolated_home}" node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const ready = JSON.parse(fs.readFileSync(process.env.READY_FILE, 'utf8'));
+          const expected = path.join(path.resolve(process.env.ISOLATED_HOME), '.muse');
+          if (ready.protocol_version !== 'muse-local-api/v1') {
+            throw new Error('桌面就绪证明的协议版本不匹配。');
+          }
+          if (typeof ready.instance_id !== 'string' || ready.instance_id.length < 16) {
+            throw new Error('桌面就绪证明缺少有效实例 ID。');
+          }
+          if (path.resolve(ready.data_dir) !== expected || !fs.statSync(expected).isDirectory()) {
+            throw new Error('桌面应用没有使用稳定的默认 ~/.muse。');
+          }
+          if ('access_token' in ready || 'token' in ready) {
+            throw new Error('桌面就绪证明不得包含 Bearer。');
+          }
+          NODE
+
+          cd "${run_cwd_two}"
+          HOME="${isolated_home}" \
+            MUSE_DESKTOP_READY_FILE="${ready_file}" \
+            MUSE_DESKTOP_CI_SINGLE_INSTANCE_MARKER_FILE="${single_instance_marker}" \
+            "${executable}" --muse-ci-secondary-probe >"${second_log}" 2>&1 &
+          second_pid=$!
+          cd "${original_cwd}"
+          for _ in {1..200}; do
+            kill -0 "${second_pid}" 2>/dev/null || break
+            sleep 0.1
+          done
+          if kill -0 "${second_pid}" 2>/dev/null; then
+            echo "第二个桌面实例未被单实例协议回收。" >&2
+            exit 1
+          fi
+          set +e
+          wait "${second_pid}" 2>/dev/null
+          second_status=$?
+          set -e
+          if [[ "${second_status}" -ne 0 ]]; then
+            echo "第二个桌面实例没有通过单实例协议正常退出，退出码 ${second_status}。" >&2
+            exit 1
+          fi
+          second_pid=""
+          kill -0 "${first_pid}"
+          for _ in {1..100}; do
+            [[ -s "${single_instance_marker}" ]] && break
+            sleep 0.1
+          done
+          test -s "${single_instance_marker}"
+          MARKER_FILE="${single_instance_marker}" EXPECTED_CWD="${run_cwd_two}" node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const marker = JSON.parse(fs.readFileSync(process.env.MARKER_FILE, 'utf8'));
+          if (marker.schema_version !== 'muse-single-instance-probe/v1') {
+            throw new Error('单实例回调 marker 协议版本不匹配。');
+          }
+          if (path.resolve(marker.cwd) !== path.resolve(process.env.EXPECTED_CWD)) {
+            throw new Error('主实例收到的第二次启动 cwd 不匹配。');
+          }
+          if (!Array.isArray(marker.args) || !marker.args.includes('--muse-ci-secondary-probe')) {
+            throw new Error('主实例没有收到第二次启动的探针参数。');
+          }
+          if ((fs.statSync(process.env.MARKER_FILE).mode & 0o777) !== 0o600) {
+            throw new Error('单实例回调 marker 必须使用 0600 权限。');
+          }
+          NODE
+
+          descendant_pids="$(pgrep -P "${first_pid}" 2>/dev/null || true)"
+          kill -TERM "${first_pid}"
+          for _ in {1..100}; do
+            kill -0 "${first_pid}" 2>/dev/null || break
+            sleep 0.1
+          done
+          if kill -0 "${first_pid}" 2>/dev/null; then
+            echo "桌面主实例退出后仍在运行。" >&2
+            exit 1
+          fi
+          wait "${first_pid}" 2>/dev/null || true
+          first_pid=""
+          for pid in ${descendant_pids}; do
+            for _ in {1..100}; do
+              kill -0 "${pid}" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "${pid}" 2>/dev/null; then
+              echo "桌面退出后遗留子进程 ${pid}。" >&2
+              exit 1
+            fi
+          done
+
+      - name: 静默安装 NSIS 并从任意目录执行桌面单实例冒烟
+        if: runner.os == 'Windows'
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runRoot = Join-Path $env:RUNNER_TEMP ("muse-smoke-" + [guid]::NewGuid())
+          $installDir = Join-Path $runRoot 'installed'
+          $runCwdOne = Join-Path $runRoot 'cwd-one'
+          $runCwdTwo = Join-Path $runRoot 'cwd-two'
+          $readyFile = Join-Path $runRoot 'desktop-ready.json'
+          $singleInstanceMarker = Join-Path $runRoot 'single-instance.json'
+          $firstLog = Join-Path $runRoot 'first.log'
+          $secondLog = Join-Path $runRoot 'second.log'
+          $first = $null
+          $second = $null
+          $originalMuseDataDir = $env:MUSE_DATA_DIR
+          $isolatedHome = Join-Path $runRoot 'home'
+
+          function Get-DescendantProcessIds([int]$RootPid) {
+            $all = @(Get-CimInstance Win32_Process)
+            $queue = [System.Collections.Generic.Queue[int]]::new()
+            $result = [System.Collections.Generic.List[int]]::new()
+            $queue.Enqueue($RootPid)
+            while ($queue.Count -gt 0) {
+              $parent = $queue.Dequeue()
+              foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $parent }) {
+                $childPid = [int]$child.ProcessId
+                $result.Add($childPid)
+                $queue.Enqueue($childPid)
+              }
+            }
+            return @($result)
+          }
+
+          try {
+            New-Item -ItemType Directory -Force `
+              -Path $installDir, $runCwdOne, $runCwdTwo, $isolatedHome | Out-Null
+            $installer = Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -File |
+              Select-Object -First 1
+            if ($null -eq $installer) {
+              throw '未找到 NSIS 安装包。'
+            }
+            $install = Start-Process -FilePath $installer.FullName `
+              -ArgumentList @('/S', '/NS', "/D=$installDir") -PassThru -Wait
+            if ($install.ExitCode -ne 0) {
+              throw "NSIS 静默安装失败，退出码：$($install.ExitCode)"
+            }
+            $executable = Get-ChildItem -Path $installDir -Filter *.exe -File -Recurse |
+              Where-Object { $_.Name -notmatch 'uninstall' } |
+              Select-Object -First 1
+            if ($null -eq $executable) {
+              throw '安装目录中没有找到 Muse 可执行文件。'
+            }
+
+            $env:MUSE_DESKTOP_READY_FILE = $readyFile
+            $env:MUSE_DESKTOP_CI_SINGLE_INSTANCE_MARKER_FILE = $singleInstanceMarker
+            $expectedDataDir = [IO.Path]::GetFullPath((Join-Path $isolatedHome '.muse'))
+            $env:MUSE_DATA_DIR = $expectedDataDir
+            if (Test-Path -LiteralPath $expectedDataDir) {
+              throw "Windows 冒烟运行前隔离数据目录已存在，拒绝覆盖：$expectedDataDir"
+            }
+            $first = Start-Process -FilePath $executable.FullName -WorkingDirectory $runCwdOne `
+              -RedirectStandardOutput $firstLog -RedirectStandardError "$firstLog.err" -PassThru
+            for ($attempt = 0; $attempt -lt 300; $attempt++) {
+              $first.Refresh()
+              if ($first.HasExited) {
+                throw "桌面主实例在内嵌页就绪前退出，退出码：$($first.ExitCode)"
+              }
+              if (Test-Path -LiteralPath $readyFile -PathType Leaf) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path -LiteralPath $readyFile -PathType Leaf)) {
+              throw '桌面内嵌页未在时限内完成 Bootstrap 与鉴权 health。'
+            }
+            $ready = Get-Content -LiteralPath $readyFile -Raw | ConvertFrom-Json
+            if ($ready.protocol_version -ne 'muse-local-api/v1' -or
+                [string]::IsNullOrWhiteSpace($ready.instance_id) -or
+                [IO.Path]::GetFullPath([string]$ready.data_dir) -ne $expectedDataDir -or
+                -not (Test-Path -LiteralPath $expectedDataDir -PathType Container)) {
+              throw '桌面就绪证明或隔离数据目录不符合发布契约。'
+            }
+            if ($null -ne $ready.access_token -or $null -ne $ready.token) {
+              throw '桌面就绪证明不得包含 Bearer。'
+            }
+
+            & ./scripts/check-windows-private-acl.ps1 -DataDir $expectedDataDir
+
+            $second = Start-Process -FilePath $executable.FullName `
+              -ArgumentList @('--muse-ci-secondary-probe') -WorkingDirectory $runCwdTwo `
+              -RedirectStandardOutput $secondLog -RedirectStandardError "$secondLog.err" -PassThru
+            if (-not $second.WaitForExit(20000)) {
+              throw '第二个桌面实例未被单实例协议回收。'
+            }
+            if ($second.ExitCode -ne 0) {
+              throw "第二个桌面实例没有通过单实例协议正常退出，退出码：$($second.ExitCode)"
+            }
+            $first.Refresh()
+            if ($first.HasExited) {
+              throw '第二次启动不应终止桌面主实例。'
+            }
+            for ($attempt = 0; $attempt -lt 100; $attempt++) {
+              if (Test-Path -LiteralPath $singleInstanceMarker -PathType Leaf) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path -LiteralPath $singleInstanceMarker -PathType Leaf)) {
+              throw '主实例没有写入第二次启动回调 marker。'
+            }
+            $marker = Get-Content -LiteralPath $singleInstanceMarker -Raw | ConvertFrom-Json
+            if ($marker.schema_version -ne 'muse-single-instance-probe/v1' -or
+                [IO.Path]::GetFullPath([string]$marker.cwd) -ne [IO.Path]::GetFullPath($runCwdTwo) -or
+                -not (@($marker.args) -contains '--muse-ci-secondary-probe')) {
+              throw '单实例回调 marker 没有记录预期的第二次启动 cwd/args。'
+            }
+
+            $descendantIds = @(Get-DescendantProcessIds -RootPid $first.Id)
+            Stop-Process -Id $first.Id
+            if (-not $first.WaitForExit(10000)) {
+              throw '桌面主实例未在退出时限内结束。'
+            }
+            foreach ($descendantPid in $descendantIds) {
+              $deadline = [DateTime]::UtcNow.AddSeconds(10)
+              while ([DateTime]::UtcNow -lt $deadline -and
+                     $null -ne (Get-Process -Id $descendantPid -ErrorAction SilentlyContinue)) {
+                Start-Sleep -Milliseconds 100
+              }
+              if ($null -ne (Get-Process -Id $descendantPid -ErrorAction SilentlyContinue)) {
+                throw "桌面退出后遗留子进程 $descendantPid。"
+              }
+            }
+          }
+          finally {
+            foreach ($process in @($second, $first)) {
+              if ($null -ne $process) {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                  Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
+              }
+            }
+            if ($null -eq $originalMuseDataDir) {
+              Remove-Item Env:MUSE_DATA_DIR -ErrorAction SilentlyContinue
+            } else {
+              $env:MUSE_DATA_DIR = $originalMuseDataDir
+            }
+            Remove-Item Env:MUSE_DESKTOP_READY_FILE -ErrorAction SilentlyContinue
+            Remove-Item Env:MUSE_DESKTOP_CI_SINGLE_INSTANCE_MARKER_FILE `
+              -ErrorAction SilentlyContinue
+            if ($null -ne $expectedDataDir -and (Test-Path -LiteralPath $expectedDataDir)) {
+              Remove-Item -LiteralPath $expectedDataDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -Path $runRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: 上传桌面安装包
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact_name }}-${{ github.sha }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: 发布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'Viviana-Luna/muse'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: 下载双平台安装包
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: Muse-*-${{ github.sha }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: 校验标签、版本与发布资产
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_version="${GITHUB_REF_NAME#v}"
+          test "${expected_version}" != "${GITHUB_REF_NAME}"
+          test "$(jq -r '.version' src-tauri/tauri.conf.json)" = "${expected_version}"
+          test "$(jq -r '.version' package.json)" = "${expected_version}"
+          test "$(jq -r '.version' package-lock.json)" = "${expected_version}"
+
+          for manifest in \
+            crates/muse-core/Cargo.toml \
+            crates/muse-local-api/Cargo.toml \
+            crates/muse-runtime/Cargo.toml \
+            src-tauri/Cargo.toml; do
+            manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${manifest}" | head -n 1)"
+            test "${manifest_version}" = "${expected_version}"
+          done
+
+          mapfile -d '' installers < <(
+            find release-assets -type f \( -name '*.dmg' -o -name '*.exe' \) -print0 | sort -z
+          )
+          test "${#installers[@]}" -eq 2
+          test "$(find release-assets -type f -name '*.dmg' | wc -l | tr -d ' ')" -eq 1
+          test "$(find release-assets -type f -name '*.exe' | wc -l | tr -d ' ')" -eq 1
+          dmg_asset="$(find release-assets -type f -name '*.dmg')"
+          [[ "$(basename "${dmg_asset}")" == *_unsigned.dmg ]]
+
+          (
+            cd release-assets
+            find . -type f \( -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} + | sort -k2
+          ) > release-assets/SHA256SUMS
+          test -s release-assets/SHA256SUMS
+
+      - name: 创建 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' assets < <(find release-assets -type f -print0 | sort -z)
+          test "${#assets[@]}" -eq 3
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ -f "${notes}" ]]; then
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+              --verify-tag \
+              --title "Muse ${GITHUB_REF_NAME}" \
+              --notes-file "${notes}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+              --verify-tag \
+              --title "Muse ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

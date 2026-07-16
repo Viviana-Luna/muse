@@ -1,0 +1,391 @@
+/*
+ * Muse 语义字体系统。
+ * 展示与阅读使用中文衬线字体建立叙事感，操作与技术信息保留清晰的系统无衬线。
+ */
+.runtime-shell.story-shell.app-shell {
+  --font-display:
+    "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC",
+    "Source Han Serif CN", "SimSun", Georgia, serif;
+  --font-reading:
+    "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC",
+    "Source Han Serif CN", "SimSun", serif;
+  --font-ui:
+    "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei",
+    "Segoe UI", sans-serif;
+  --font-mono:
+    "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-family: var(--font-ui);
+  font-weight: 400;
+  letter-spacing: 0.006em;
+  font-kerning: normal;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+.app-shell button,
+.app-shell input,
+.app-shell select,
+.app-shell textarea {
+  font-family: var(--font-ui);
+  letter-spacing: 0.01em;
+}
+
+.app-shell button {
+  font-weight: 560;
+}
+
+.app-rail button,
+.app-rail-brand span,
+.muse-runtime-item,
+.status-pill,
+.sessions-list button,
+.sessions-search,
+.settings-dirty-indicator {
+  font-variant-numeric: tabular-nums;
+}
+
+.app-rail button span {
+  font-family: var(--font-ui);
+  font-weight: 520;
+  letter-spacing: 0.035em;
+}
+
+.app-rail-brand span {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: 0.055em;
+}
+
+:is(
+  .settings-workspace-head strong,
+  .settings-panel-lead h1,
+  .story-scene-head strong,
+  .story-empty-state h1,
+  .story-status-card h1,
+  .sessions-page-head h1,
+  .sessions-preview-head h2,
+  .persona-library-head h1,
+  .persona-gallery-card h2,
+  .persona-import-dialog h2,
+  .management-empty-detail h1
+) {
+  font-family: var(--font-display);
+  font-weight: 400;
+  line-height: 1.24;
+  letter-spacing: 0.045em;
+  text-wrap: balance;
+}
+
+:is(
+  .settings-workspace-head small,
+  .settings-panel-lead > span,
+  .story-empty-eyebrow,
+  .story-status-eyebrow,
+  .sessions-page-head small,
+  .sessions-preview-head small
+) {
+  font-family: var(--font-ui);
+  font-weight: 620;
+  letter-spacing: 0.15em;
+}
+
+.settings-workspace-head strong {
+  font-size: clamp(24px, 2.2vw, 29px);
+}
+
+.settings-workspace-head span,
+.settings-panel-lead p,
+.sessions-page-head p,
+.sessions-preview-head p {
+  font-family: var(--font-ui);
+  font-weight: 400;
+  line-height: 1.7;
+  letter-spacing: 0.012em;
+}
+
+.settings-panel-lead h1 {
+  font-family: var(--font-ui);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.22;
+  letter-spacing: 0;
+}
+
+.settings-panel-lead p {
+  max-width: 68ch;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-menu-group > span {
+  font-family: var(--font-ui);
+  font-weight: 620;
+  letter-spacing: 0.12em;
+}
+
+.settings-modal .settings-menu button strong {
+  font-family: var(--font-ui);
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.015em;
+}
+
+.settings-modal .settings-menu button small {
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.025em;
+}
+
+.settings-panel,
+.settings-card {
+  font-family: var(--font-ui);
+}
+
+.settings-panel :is(label, dt, summary),
+.settings-card :is(label, strong) {
+  font-weight: 560;
+  letter-spacing: 0.018em;
+}
+
+.settings-panel :is(p, dd, .field-hint),
+.settings-card :is(p, small, .field-hint) {
+  font-weight: 400;
+  line-height: 1.68;
+  letter-spacing: 0.012em;
+}
+
+.settings-panel :is(input, select, textarea) {
+  font-size: 14px;
+  font-weight: 450;
+  line-height: 1.55;
+}
+
+.settings-panel :is(input, textarea)::placeholder {
+  font-weight: 400;
+  letter-spacing: 0.018em;
+}
+
+.settings-form > footer button {
+  font-weight: 580;
+  letter-spacing: 0.02em;
+}
+
+.story-message > header {
+  font-family: var(--font-ui);
+  font-weight: 450;
+  letter-spacing: 0.035em;
+}
+
+.story-message.role-voice > header span {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 0.075em;
+}
+
+.story-message-content,
+.story-empty-state p,
+.story-prompt-list button,
+.story-reading-column .composer textarea,
+.story-history-continuation textarea {
+  font-family: var(--font-reading);
+  font-weight: 400;
+}
+
+.story-message-content {
+  font-size: 15px;
+  line-height: 1.82;
+  letter-spacing: 0.018em;
+  text-wrap: pretty;
+}
+
+.story-message-content :is(h1, h2, h3, h4) {
+  font-family: var(--font-display);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0.035em;
+}
+
+.story-message-content :is(code, pre, kbd),
+.skill-editor textarea,
+.mcp-form-grid code,
+.persona-package-id {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+}
+
+.story-empty-state h1 {
+  letter-spacing: 0.055em;
+}
+
+.story-empty-state p {
+  font-size: 15px;
+  line-height: 1.85;
+  letter-spacing: 0.025em;
+}
+
+.story-prompt-list button {
+  font-size: 14px;
+  line-height: 1.55;
+  letter-spacing: 0.025em;
+}
+
+.story-reading-column .composer textarea,
+.story-history-continuation textarea {
+  font-size: 15px;
+  line-height: 1.76;
+  letter-spacing: 0.022em;
+}
+
+.story-reading-column .composer textarea::placeholder,
+.story-history-continuation textarea::placeholder {
+  font-family: var(--font-reading);
+  font-weight: 400;
+  letter-spacing: 0.03em;
+}
+
+.story-reading-column .composer-status,
+.story-reading-column .voice-panel button {
+  font-family: var(--font-ui);
+  font-weight: 480;
+  letter-spacing: 0.025em;
+}
+
+.sessions-list button strong {
+  font-family: var(--font-ui);
+  font-weight: 590;
+  letter-spacing: 0.012em;
+}
+
+.sessions-list button small,
+.sessions-list button em,
+.sessions-list-panel > header,
+.sessions-search input {
+  font-family: var(--font-ui);
+  font-weight: 430;
+  letter-spacing: 0.018em;
+}
+
+.sessions-list-empty strong,
+.sessions-preview-empty strong {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+}
+
+.persona-gallery-card h2,
+.persona-library-head h1 {
+  font-family: var(--font-display);
+}
+
+@keyframes muse-title-reveal {
+  from {
+    opacity: 0;
+    filter: blur(2px);
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0);
+  }
+}
+
+@keyframes muse-dialogue-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(5px) scale(0.995);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes muse-opacity-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.motion-full :is(
+  .settings-workspace-head > div,
+  .settings-panel-lead,
+  .sessions-page-head > span,
+  .story-empty-state
+) {
+  animation: muse-title-reveal 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.motion-full .story-message {
+  animation: muse-dialogue-reveal 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.motion-reduced :is(
+  .settings-workspace-head > div,
+  .settings-panel-lead,
+  .sessions-page-head > span,
+  .story-empty-state,
+  .story-message
+) {
+  animation: muse-opacity-reveal 140ms ease-out both;
+}
+
+@media (max-width: 767px) {
+  .settings-workspace-head strong {
+    font-size: 23px;
+  }
+
+  .settings-panel-lead h1 {
+    font-size: 28px;
+  }
+
+  .story-message-content,
+  .story-reading-column .composer textarea,
+  .story-history-continuation textarea {
+    font-size: 14.5px;
+  }
+
+  .settings-modal.embedded .settings-form > footer {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.25fr);
+    gap: 10px;
+  }
+
+  .settings-modal.embedded .settings-form > footer button {
+    width: 100%;
+    min-width: 0;
+    min-height: 42px;
+    margin: 0;
+    padding-inline: 10px;
+    white-space: nowrap;
+  }
+}
+
+.motion-none :is(
+  .settings-workspace-head > div,
+  .settings-panel-lead,
+  .sessions-page-head > span,
+  .story-empty-state,
+  .story-message
+) {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .runtime-shell :is(
+    .settings-workspace-head > div,
+    .settings-panel-lead,
+    .sessions-page-head > span,
+    .story-empty-state,
+    .story-message
+  ) {
+    animation: none !important;
+  }
+}

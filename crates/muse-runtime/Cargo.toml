@@ -1,0 +1,29 @@
+[package]
+name = "muse-runtime"
+version = "0.1.1"
+edition = "2024"
+description = "Muse 运行时协调层，承载会话状态、回合快照、预算与安全边界。"
+
+[features]
+default = []
+live-tests = []
+
+[dependencies]
+chrono = "0.4"
+muse-core = { path = "../muse-core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
