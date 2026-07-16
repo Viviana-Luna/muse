@@ -358,6 +358,13 @@ fn acquire_data_dir_lock(data_dir: &Path) -> Result<DataDirLock, DataDirError> {
         options.share_mode(0);
     }
     let mut file = options.open(&lock_path).map_err(|error| {
+        #[cfg(windows)]
+        if matches!(error.raw_os_error(), Some(32 | 33)) {
+            return DataDirError::new(format!(
+                "数据目录 `{}` 正被另一个 Muse 进程使用。",
+                data_dir.display()
+            ));
+        }
         DataDirError::new(format!(
             "无法取得数据目录排他锁 `{}`：{error}",
             lock_path.display()

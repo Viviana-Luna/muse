@@ -436,12 +436,12 @@ fn validate_database_for_storage(path: &Path) -> Result<(), RuntimeStorageError>
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
     fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -457,16 +457,26 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error>
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // SAFETY: 两个 UTF-16 缓冲区均以 NUL 结尾并在调用期间有效。
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
+    for attempt in 0..20 {
+        // SAFETY: 两个 UTF-16 缓冲区均以 NUL 结尾并在调用期间有效。
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let transient_sharing_conflict = matches!(error.raw_os_error(), Some(5 | 32 | 33));
+        if !transient_sharing_conflict || attempt == 19 {
+            return Err(error);
+        }
+        // Windows 的文件替换会短暂撞上 SQLite、杀毒软件或并发发布持有的句柄。
+        // 有界重试只吸收共享冲突，不掩盖路径、ACL 等其他真实错误。
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
@@ -826,6 +836,7 @@ mod tests {
             .expect("应读取迁移数据");
         assert_eq!(value, "legacy");
         assert!(!legacy.exists(), "当前数据目录不应继续保留旧数据库名");
+        drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
 

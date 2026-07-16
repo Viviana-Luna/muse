@@ -1369,14 +1369,37 @@ mod tests {
         let (_coordinator, _lease, cancel_token) = test_cancel_token("command-deadline");
         let policy = test_execution_policy();
 
+        let mut command = Box::pin(super::tool_command_run(
+            &policy,
+            &call,
+            None,
+            true,
+            &cancel_token,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if started.exists() {
+                    break;
+                }
+                tokio::select! {
+                    result = command.as_mut() => {
+                        panic!("测试命令在写入启动标记前意外结束：{result:?}");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("测试命令必须真实启动后再触发硬期限");
+
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            super::tool_command_run(&policy, &call, None, true, &cancel_token),
+            std::time::Duration::from_millis(100),
+            command.as_mut(),
         )
         .await;
-
         assert!(result.is_err(), "外层整回合期限应先于命令自身 timeout 到达");
-        assert!(started.exists(), "测试命令必须真实启动后再触发硬期限");
+        // timeout 只丢弃借用的 Future；显式丢弃完整工具 Future 才等价于整回合硬期限。
+        drop(command);
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert!(
             !leaked.exists(),

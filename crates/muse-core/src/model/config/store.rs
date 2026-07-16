@@ -647,41 +647,9 @@ fn create_unique_temporary_file(path: &Path) -> Result<(PathBuf, File), std::io:
     ))
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 fn replace_config_path(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    std::fs::rename(source, destination)
-}
-
-#[cfg(all(test, windows))]
-fn replace_config_path(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source_wide = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination_wide = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: 两个 UTF-16 缓冲区均以 NUL 结尾并在调用期间有效；标志要求替换
-    // 已存在目标，并在返回前把复制或移动操作刷新到磁盘。
-    let result = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    crate::app::storage::replace_file(source, destination)
 }
 
 #[cfg(all(test, unix))]
