@@ -384,7 +384,11 @@ pub fn backup_runtime_database(
         drop(target);
         drop(source);
         validate_database_for_storage(&temporary)?;
-        File::open(&temporary)?.sync_all()?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
         replace_file(&temporary, destination)?;
         sync_parent_directory(parent);
         Ok(destination.to_path_buf())
