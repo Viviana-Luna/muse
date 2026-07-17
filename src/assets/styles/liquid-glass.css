@@ -31,10 +31,7 @@
   color-scheme: dark;
   border: 0;
   border-radius: 0;
-  background:
-    radial-gradient(circle at 78% 16%, color-mix(in srgb, var(--theme-color), transparent 82%), transparent 32%),
-    radial-gradient(circle at 18% 88%, color-mix(in srgb, var(--theme-color), transparent 91%), transparent 30%),
-    var(--app-canvas);
+  background: var(--app-canvas);
   box-shadow: none;
 }
 
@@ -57,10 +54,7 @@
   --accent-soft: color-mix(in srgb, var(--theme-color), white 84%);
   --accent-edge: color-mix(in srgb, var(--theme-color), #4a4c58 45%);
   color-scheme: light;
-  background:
-    radial-gradient(circle at 78% 14%, color-mix(in srgb, var(--theme-color), transparent 78%), transparent 34%),
-    radial-gradient(circle at 12% 90%, rgba(255, 255, 255, 0.88), transparent 34%),
-    var(--app-canvas);
+  background: var(--app-canvas);
 }
 
 /* ===========================================================================
@@ -107,9 +101,7 @@
   padding: 12px 8px;
   border: 1px solid var(--glass-edge);
   border-radius: 26px;
-  background:
-    linear-gradient(145deg, var(--glass-highlight), transparent 22%),
-    var(--glass-surface);
+  background: var(--glass-surface);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(34px) saturate(1.35);
   -webkit-backdrop-filter: blur(34px) saturate(1.35);
@@ -181,9 +173,7 @@
 .story-reading-column {
   border: 1px solid var(--glass-edge);
   border-radius: 24px;
-  background:
-    linear-gradient(145deg, var(--glass-highlight), transparent 18%),
-    var(--glass-surface-strong);
+  background: var(--glass-surface-strong);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(34px) saturate(1.28);
   -webkit-backdrop-filter: blur(34px) saturate(1.28);
@@ -191,9 +181,7 @@
 
 .app-shell .persistent-history > .history-session-drawer {
   padding: 14px 12px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 24%), transparent 22%),
-    var(--glass-surface);
+  background: var(--glass-surface);
 }
 
 /* === chat 页面 · 历史会话抽屉 HistoryRail 内部：标题/动作/空状态（左列） === */
@@ -301,9 +289,7 @@
   overflow: visible;
   border: 1px solid var(--glass-edge);
   border-radius: 19px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 42%), transparent 30%),
-    color-mix(in srgb, var(--glass-surface-soft), transparent 4%);
+  background: color-mix(in srgb, var(--glass-surface-soft), transparent 4%);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 28%),
     0 10px 28px rgba(0, 0, 0, 0.12);
@@ -476,6 +462,10 @@
   box-shadow: var(--shadow-float), var(--shadow-inset) !important;
 }
 
+.story-stage-panel.is-empty {
+  background: var(--glass-fallback) !important;
+}
+
 .story-stage-panel::before {
   content: '';
   position: absolute;
@@ -495,6 +485,11 @@
     linear-gradient(90deg, rgba(4, 6, 12, 0.12), transparent 48%);
 }
 
+.story-stage-panel.is-empty::before,
+.story-stage-panel.is-empty::after {
+  background: none;
+}
+
 .story-stage-portrait {
   filter: saturate(1.04) contrast(1.03) brightness(0.92);
   transition: filter 280ms ease, transform 420ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -508,9 +503,7 @@
   align-content: center;
   justify-items: center;
   gap: 12px;
-  background:
-    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 32%),
-    linear-gradient(160deg, rgba(255, 255, 255, 0.025), transparent 48%);
+  background: transparent;
   color: var(--text-tertiary);
 }
 
@@ -542,9 +535,7 @@
   margin: 12px 0 12px 12px;
   border: 1px solid var(--glass-edge);
   border-radius: 22px;
-  background:
-    linear-gradient(145deg, var(--glass-highlight), transparent 20%),
-    var(--glass-surface);
+  background: var(--glass-surface);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(30px) saturate(1.25);
 }
@@ -555,9 +546,7 @@
   overflow: hidden;
   border: 1px solid var(--glass-edge);
   border-radius: 22px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 22%), transparent 16%),
-    var(--glass-surface-strong);
+  background: var(--glass-surface-strong);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(30px) saturate(1.2);
 }
@@ -644,9 +633,7 @@
   overflow: hidden;
   border: 1px solid var(--glass-edge);
   border-radius: 22px;
-  background:
-    linear-gradient(145deg, var(--glass-highlight), transparent 20%),
-    var(--settings-sidebar-surface);
+  background: var(--settings-sidebar-surface);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(30px) saturate(1.25);
   -webkit-backdrop-filter: blur(30px) saturate(1.25);
@@ -719,9 +706,7 @@
   padding: 0;
   border: 1px solid var(--glass-edge);
   border-radius: 22px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 22%), transparent 16%),
-    var(--glass-surface-strong);
+  background: var(--glass-surface-strong);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(30px) saturate(1.2);
   -webkit-backdrop-filter: blur(30px) saturate(1.2);
@@ -920,9 +905,7 @@
   padding: 10px 16px;
   border: 1px solid var(--glass-edge);
   border-radius: 16px;
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--glass-highlight), transparent 30%), transparent 18%),
-    color-mix(in srgb, var(--glass-surface-strong), var(--app-canvas) 20%);
+  background: color-mix(in srgb, var(--glass-surface-strong), var(--app-canvas) 20%);
   box-shadow: var(--shadow-float), var(--shadow-inset);
   backdrop-filter: blur(20px) saturate(1.08);
   -webkit-backdrop-filter: blur(20px) saturate(1.08);
@@ -1115,9 +1098,7 @@
  * 角色库视图 .persona-library-view（PersonaLibraryView · roles 页面）
  * ========================================================================= */
 .persona-library-view {
-  background:
-    radial-gradient(circle at 86% 8%, color-mix(in srgb, var(--theme-color), transparent 86%), transparent 30%),
-    transparent !important;
+  background: transparent !important;
 }
 
 .app-shell .app-main-surface > .persona-library-view {
@@ -1172,15 +1153,11 @@
 }
 
 .theme-light .app-main-surface {
-  background:
-    radial-gradient(circle at 82% 12%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 30%),
-    rgba(235, 236, 242, 0.94);
+  background: rgba(235, 236, 242, 0.94);
 }
 
 .theme-light .app-shell .persistent-history > .history-session-drawer {
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.94), transparent 24%),
-    rgba(244, 244, 248, 0.86);
+  background: rgba(244, 244, 248, 0.86);
 }
 
 .theme-light .app-rail button,
