@@ -54,6 +54,7 @@ where
     category: String,
     risk: ToolRisk,
     requires_approval: bool,
+    expose_to_model: bool,
     execution_owner: ToolExecutionOwner,
     available: bool,
     disabled_reason: Option<String>,
@@ -61,7 +62,7 @@ where
     handler: H,
 }
 
-/// 注册单个可见工具。
+/// 注册单个工具；兼容 dispatch 可以注册但不向新 Turn 暴露。
 fn register_tool<H>(registry: &mut ToolRegistry, registration: ToolRegistration<H>)
 where
     H: Fn(serde_json::Value) -> ToolResult + Send + Sync + 'static,
@@ -73,7 +74,7 @@ where
         category: registration.category,
         risk: registration.risk,
         requires_approval: registration.requires_approval,
-        expose_to_model: true,
+        expose_to_model: registration.expose_to_model,
         execution_owner: registration.execution_owner,
         available: registration.available,
         disabled_reason: registration.disabled_reason,
@@ -91,6 +92,29 @@ fn register_web_runtime_tool(
     requires_approval: bool,
     parameters: serde_json::Value,
 ) {
+    register_web_runtime_tool_with_visibility(
+        registry,
+        name,
+        description,
+        category,
+        risk,
+        requires_approval,
+        parameters,
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_web_runtime_tool_with_visibility(
+    registry: &mut ToolRegistry,
+    name: &str,
+    description: &str,
+    category: &str,
+    risk: ToolRisk,
+    requires_approval: bool,
+    parameters: serde_json::Value,
+    expose_to_model: bool,
+) {
     let tool_name = name.to_string();
     register_tool(
         registry,
@@ -100,6 +124,7 @@ fn register_web_runtime_tool(
             category: category.to_string(),
             risk,
             requires_approval,
+            expose_to_model,
             execution_owner: ToolExecutionOwner::WebRuntime,
             available: true,
             disabled_reason: None,
@@ -139,6 +164,7 @@ fn register_external_query_tools(
             category: "network".to_string(),
             risk: ToolRisk::Network,
             requires_approval: true,
+            expose_to_model: true,
             execution_owner,
             available: web_search_available,
             disabled_reason: web_search_disabled_reason,
@@ -364,7 +390,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
             "additionalProperties": false
         }),
     );
-    register_web_runtime_tool(
+    register_web_runtime_tool_with_visibility(
         registry,
         "use_skill",
         "load_skill 的别名；当任务需要专用本地技能包时读取对应 SKILL.md。",
@@ -379,8 +405,9 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
             "required": ["skill_name"],
             "additionalProperties": false
         }),
+        false,
     );
-    register_web_runtime_tool(
+    register_web_runtime_tool_with_visibility(
         registry,
         "skill",
         "load_skill 的兼容别名；动态读取本地技能说明并注入当前轮次上下文。",
@@ -395,6 +422,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
             "required": ["skill_name"],
             "additionalProperties": false
         }),
+        false,
     );
     register_web_runtime_tool(
         registry,

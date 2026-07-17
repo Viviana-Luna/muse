@@ -141,7 +141,7 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
         mutating: false,
         interrupt_behavior: RuntimeToolInterruptBehavior::Block,
         writes_transcript: true,
-        has_context_effect: true,
+        has_context_effect: false,
     },
     RuntimeToolCapability {
         name: "use_skill",
@@ -149,7 +149,7 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
         mutating: false,
         interrupt_behavior: RuntimeToolInterruptBehavior::Block,
         writes_transcript: true,
-        has_context_effect: true,
+        has_context_effect: false,
     },
     RuntimeToolCapability {
         name: "skill",
@@ -157,7 +157,7 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
         mutating: false,
         interrupt_behavior: RuntimeToolInterruptBehavior::Block,
         writes_transcript: true,
-        has_context_effect: true,
+        has_context_effect: false,
     },
     RuntimeToolCapability {
         name: "agent",

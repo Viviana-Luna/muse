@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const api = vi.hoisted(() => ({
@@ -24,7 +24,11 @@ const skill = {
 describe('SkillsPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    api.listSkills.mockResolvedValue([skill]);
+    api.listSkills.mockResolvedValue({
+      skills: [skill],
+      diagnostics: [],
+      omitted_diagnostic_count: 0
+    });
     api.getSkill.mockResolvedValue(skill);
     api.updateSkill.mockResolvedValue({ ...skill, description: '新的描述', revision: 'r2' });
   });
@@ -53,5 +57,22 @@ describe('SkillsPage', () => {
       description: 'Skill 名称必须为 1-64 个小写字母、数字或单连字符组合，格式如 `git-release`。',
       tone: 'error'
     });
+  });
+
+  it('保留正常 Skill 并展示损坏目录的有界诊断', async () => {
+    api.listSkills.mockResolvedValue({
+      skills: [skill],
+      diagnostics: [{ name: 'broken', code: 'skill_invalid', message: '目录与 frontmatter 名称不一致。' }],
+      omitted_diagnostic_count: 2
+    });
+
+    render(<SkillsPage selectedName="writer" onSelectedNameChange={vi.fn()} notify={vi.fn()} />);
+
+    expect(await screen.findByText('3 个 Skill 未载入')).toBeInTheDocument();
+    expect(screen.getByText('broken')).toBeInTheDocument();
+    expect(
+      within(screen.getByRole('list', { name: 'Skill 列表' })).getByRole('listitem')
+    ).toHaveTextContent('整理写作工作流');
+    expect(screen.getByText('另有 2 条诊断因本地展示预算已省略。')).toBeInTheDocument();
   });
 });

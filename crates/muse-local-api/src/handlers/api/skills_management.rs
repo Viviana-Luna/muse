@@ -1,7 +1,7 @@
 // 用户 Skill 管理 API，只操作 Muse 数据目录下的 `skills/`。
 
 use muse_core::domain::skill::{
-    SkillDraft, SkillRecord, SkillStore, SkillStoreError, SkillStoreErrorKind, SkillSummary,
+    SkillCatalogSnapshot, SkillDraft, SkillRecord, SkillStore, SkillStoreError, SkillStoreErrorKind,
 };
 
 fn user_skill_store(state: &AppState) -> SkillStore {
@@ -30,14 +30,14 @@ fn skill_store_error_response(
 
 pub(crate) async fn handle_skills(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<SkillSummary>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<SkillCatalogSnapshot>, (StatusCode, Json<ErrorResponse>)> {
     let mut config = state.user_config.lock().await;
     config
         .refresh_from_disk()
         .map_err(SkillStoreError::from_config)
         .map_err(skill_store_error_response)?;
     user_skill_store(&state)
-        .list(config.skill_preferences())
+        .catalog_snapshot(config.skill_preferences())
         .map(Json)
         .map_err(skill_store_error_response)
 }

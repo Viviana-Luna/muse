@@ -898,6 +898,7 @@ impl ConversationRuntime {
             &full_tool_defs,
         )
         .await;
+        let system_prompt = turn_context.system_prompt.clone();
         let provider_snapshot = match self.state.provider.lock().await.clone() {
             Some(provider) => provider,
             None => {
@@ -1363,11 +1364,16 @@ impl ConversationRuntime {
                                 turn_snapshot.full_tool_definitions().to_vec(),
                                 next_mode.tool_preset(),
                             );
-                            let next_prompt = build_runtime_system_prompt_with_mode_state(
+                            let mut next_prompt = build_runtime_system_prompt_with_mode_state(
                                 &self.state.config,
                                 Some(&active_persona),
                                 &visible_tools,
                                 next_mode,
+                            );
+                            append_frozen_skill_catalog(
+                                &mut next_prompt,
+                                &turn_snapshot.context.runtime_policy.skill_catalog,
+                                turn_snapshot.context.runtime_policy.omitted_skill_count,
                             );
                             turn_snapshot.transition_runtime_mode(
                                 next_mode.mode.as_str(),

@@ -934,6 +934,13 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("time-calculator")
         );
+        let structured = result.structured.as_ref().expect("应包含加载审计字段");
+        assert_eq!(structured["source"], "compatibility_read_only");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(
+            structured["content_hash"].as_str().map(str::len),
+            Some(64)
+        );
 
         let invalid = test_tool_call(
             "load_skill",
@@ -956,6 +963,95 @@ mod tests {
         assert_eq!(super::tool_result_reason(&denied), Some("skill_policy_denied"));
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    async fn user_skill_load_uses_frozen_catalog_revision_and_records_audit_fields() {
+        let data_dir = unique_temp_dir("frozen-user-skill");
+        let workspace = unique_temp_dir("frozen-user-skill-workspace");
+        let skill_dir = data_dir.join("skills/calendar");
+        std::fs::create_dir_all(&skill_dir).expect("应能创建测试 Skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: calendar\ndescription: 日历助手\n---\n# 日历\n\n先读取日期。\n",
+        )
+        .expect("应能写入测试 Skill");
+        let config = muse_core::app::preferences::MuseConfigStore::load_from_dir(&data_dir)
+            .expect("应能加载测试配置");
+        let preferences = config.skill_preferences().clone();
+        let record = muse_core::domain::skill::SkillStore::from_data_dir(&data_dir)
+            .get("calendar", &preferences)
+            .expect("应能读取测试 Skill");
+        let mut turn = test_turn_context("frozen-user-skill-turn");
+        turn.runtime_policy.schema_version = 1;
+        let call = test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "calendar" }),
+        );
+        let legacy_loaded = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert!(
+            legacy_loaded.is_success(),
+            "v1 历史快照应保留 dispatch 兼容"
+        );
+
+        turn.runtime_policy.schema_version = 2;
+        turn.runtime_policy.skill_catalog = vec![
+            muse_core::domain::turn::RuntimeSkillCatalogEntry {
+                name: record.name.clone(),
+                description: record.description.clone(),
+                revision: record.revision.clone(),
+            },
+        ];
+        let loaded = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert!(loaded.is_success());
+        let structured = loaded.structured.as_ref().expect("应包含加载审计字段");
+        assert_eq!(structured["source"], "user_store");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(structured["content_hash"].as_str().map(str::len), Some(64));
+
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: calendar\ndescription: 日历助手\n---\n# 日历\n\n内容已变更。\n",
+        )
+        .expect("应能修改测试 Skill");
+        let changed = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert_eq!(
+            super::tool_result_reason(&changed),
+            Some("skill_revision_changed")
+        );
+
+        turn.runtime_policy.skill_catalog.clear();
+        let not_frozen = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert_eq!(
+            super::tool_result_reason(&not_frozen),
+            Some("skill_catalog_denied")
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[cfg(unix)]
@@ -2817,6 +2913,54 @@ mod tests {
         assert!(!compact_context.contains("10 条消息 -> 4 条消息"));
     }
 
+    fn skill_result_enters_model_context_once() {
+        let result = ToolResult {
+            status: ToolResultStatus::Success,
+            content: "已成功载入 Skill：SKILL-BODY-UNIQUE".to_string(),
+            structured: Some(serde_json::json!({
+                "skill_name": "calendar",
+                "revision": "revision-a"
+            })),
+        };
+
+        for tool_name in ["load_skill", "use_skill", "skill"] {
+            let content = super::tool_result_content_for_model(tool_name, &result);
+            assert_eq!(content.matches("SKILL-BODY-UNIQUE").count(), 1);
+            assert!(!content.contains("上下文更新（已载入技能）"));
+        }
+    }
+
+    fn skill_catalog_budget_is_bounded() {
+        let summaries = (0..70)
+            .map(|index| muse_core::domain::skill::SkillSummary {
+                name: format!("skill-{index}"),
+                description: format!("第 {index} 项 {}", "x".repeat(1_000)),
+                enabled: true,
+                revision: format!("revision-{index}"),
+                updated_at: "2026-07-17T00:00:00Z".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let (catalog, omitted) =
+            super::freeze_skill_catalog(summaries, &Default::default());
+        assert_eq!(catalog.len() + omitted, 70);
+        assert!(catalog.len() <= super::MAX_TURN_SKILL_CATALOG_ITEMS);
+        assert!(omitted > 0);
+        assert!(catalog.iter().all(|entry| {
+            entry.description.chars().count() <= super::MAX_TURN_SKILL_DESCRIPTION_CHARS
+        }));
+        let used_chars = catalog
+            .iter()
+            .map(|entry| entry.name.chars().count() + entry.description.chars().count() + 4)
+            .sum::<usize>();
+        assert!(used_chars <= super::MAX_TURN_SKILL_CATALOG_CHARS);
+
+        let mut prompt = String::new();
+        super::append_frozen_skill_catalog(&mut prompt, &catalog, omitted);
+        assert!(prompt.contains("只调用 load_skill"));
+        assert!(prompt.contains("不要猜测其名称"));
+    }
+
     fn chat_status_payload_uses_structured_summary_fields() {
         let payload = chat_status_payload(
             "tool_running",
@@ -3692,7 +3836,12 @@ mod tests {
 
     fn persona_mcp_allow_list_is_frozen_before_global_tool_policy() {
         let dir = unique_temp_dir("persona-mcp-policy");
-        let state = build_test_state(&dir);
+        let mut state = build_test_state(&dir);
+        muse_core::domain::tool::builtin::register_all(
+            &mut Arc::get_mut(&mut state)
+                .expect("测试状态尚未共享")
+                .tools,
+        );
         let mut catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
             dir.join("mcp").join("servers.json"),
         );
@@ -3725,6 +3874,7 @@ mod tests {
                 allowed_tools: vec![
                     "mcp__alpha__search".to_string(),
                     "mcp__beta__search".to_string(),
+                    "load_skill".to_string(),
                 ],
             },
             skill_policy: Default::default(),
@@ -3751,6 +3901,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["mcp__alpha__search"]
         );
+        assert!(allowed.iter().any(|tool| tool.name == "load_skill"));
+        assert!(!allowed
+            .iter()
+            .any(|tool| matches!(tool.name.as_str(), "use_skill" | "skill")));
+
+        persona.skill_policy.mode = muse_core::domain::persona::ResourcePolicyMode::Disabled;
+        let skill_disabled = super::runtime_frozen_tool_defs_for_policy_with_catalog(
+            &state,
+            Some(&persona),
+            &catalog,
+        );
+        assert!(!skill_disabled
+            .iter()
+            .any(|tool| matches!(tool.name.as_str(), "load_skill" | "use_skill" | "skill")));
+        persona.skill_policy = Default::default();
 
         persona.tool_policy.mode = muse_core::domain::persona::ToolPolicyMode::Disabled;
         let denied = super::runtime_frozen_tool_defs_for_policy_with_catalog(
@@ -3822,6 +3987,118 @@ mod tests {
         assert_eq!(turn.runtime_policy.mcp_policy.allowed_servers, vec!["docs"]);
         assert!(!serialized.contains(dir.to_string_lossy().as_ref()));
         assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn turn_skill_catalog_is_isolated_policy_filtered_and_frozen() {
+        let dir = unique_temp_dir("turn-skill-catalog");
+        for (directory, name, description) in [
+            ("calendar", "calendar", "日历助手"),
+            ("private-notes", "private-notes", "私人笔记"),
+            ("broken", "different-name", "损坏项"),
+        ] {
+            let skill_dir = dir.join("skills").join(directory);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {description}\n---\n# 规则\n\n按说明执行。\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state = build_test_state(&dir);
+        let persona = Persona {
+            id: "skill-catalog-persona".to_string(),
+            name: "目录角色".to_string(),
+            summary: String::new(),
+            character_profile: "可靠".to_string(),
+            world_profile: String::new(),
+            scenario: String::new(),
+            system_prompt: "保持角色。".to_string(),
+            style: String::new(),
+            roleplay_style: RoleplayStyle::Dialogue,
+            dialogue_examples: String::new(),
+            author_note: String::new(),
+            opening_message: String::new(),
+            tool_policy: ToolPolicy::default(),
+            skill_policy: muse_core::domain::persona::SkillPolicy {
+                mode: muse_core::domain::persona::ResourcePolicyMode::AllowList,
+                allowed_skills: vec!["calendar".to_string(), "broken".to_string()],
+            },
+            mcp_policy: Default::default(),
+            default_visual_pack_id: "default".to_string(),
+            author: String::new(),
+            version: "1.0.0".to_string(),
+            notes: String::new(),
+        };
+
+        let turn = super::build_turn_context(
+            &state,
+            "conversation-skill-catalog".to_string(),
+            "turn-skill-catalog".to_string(),
+            Some(&persona),
+            false,
+            "system".to_string(),
+            &[],
+        )
+        .await;
+
+        assert_eq!(turn.runtime_policy.schema_version, 2);
+        assert_eq!(
+            turn.runtime_policy.policy_version,
+            "persona-resource-policy/v2"
+        );
+        assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
+        assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
+        assert_eq!(turn.runtime_policy.skill_catalog[0].description, "日历助手");
+        assert!(!turn.runtime_policy.skill_catalog[0].revision.is_empty());
+        assert!(turn.runtime_policy.skill_revision.starts_with("calendar="));
+        assert_eq!(turn.runtime_policy.skill_catalog_hash.len(), 64);
+        assert_eq!(turn.runtime_policy.omitted_skill_count, 0);
+        assert!(turn.system_prompt.contains("【当前可用 Skill】"));
+        assert_eq!(turn.system_prompt.matches("日历助手").count(), 1);
+        assert!(!turn.system_prompt.contains("私人笔记"));
+        assert!(!turn.system_prompt.contains("损坏项"));
+        assert!(!turn.system_prompt.contains("SKILL.md 中的 name"));
+
+        let original_hash = turn.runtime_policy.skill_catalog_hash.clone();
+        std::fs::write(
+            dir.join("skills/calendar/SKILL.md"),
+            "---\nname: calendar\ndescription: 日历助手\n---\n# 规则\n\n内容已在回合外变更。\n",
+        )
+        .unwrap();
+        let next_turn = super::build_turn_context(
+            &state,
+            "conversation-skill-catalog".to_string(),
+            "turn-skill-catalog-next".to_string(),
+            Some(&persona),
+            false,
+            "system".to_string(),
+            &[],
+        )
+        .await;
+        assert_ne!(next_turn.runtime_policy.skill_catalog_hash, original_hash);
+        assert_ne!(
+            next_turn.runtime_policy.skill_revision,
+            turn.runtime_policy.skill_revision
+        );
+
+        let mut disabled_persona = persona.clone();
+        disabled_persona.skill_policy.mode =
+            muse_core::domain::persona::ResourcePolicyMode::Disabled;
+        let disabled_turn = super::build_turn_context(
+            &state,
+            "conversation-skill-catalog".to_string(),
+            "turn-skill-catalog-disabled".to_string(),
+            Some(&disabled_persona),
+            false,
+            "system".to_string(),
+            &[],
+        )
+        .await;
+        assert!(disabled_turn.runtime_policy.skill_catalog.is_empty());
+        assert!(!disabled_turn.system_prompt.contains("【当前可用 Skill】"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4167,6 +4444,16 @@ mod tests {
             }
         }
         {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(skill_result_enters_model_context_once)).is_err() {
+                failures.push("skill_result_enters_model_context_once");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(skill_catalog_budget_is_bounded)).is_err() {
+                failures.push("skill_catalog_budget_is_bounded");
+            }
+        }
+        {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(chat_status_payload_uses_structured_summary_fields)).is_err() {
                 failures.push("chat_status_payload_uses_structured_summary_fields");
             }
@@ -4308,6 +4595,11 @@ mod tests {
                 failures.push("skill_tool_loads_workspace_skill_and_rejects_path_like_names");
             }
         }
+        {
+            if std::panic::AssertUnwindSafe(user_skill_load_uses_frozen_catalog_revision_and_records_audit_fields()).catch_unwind().await.is_err() {
+                failures.push("user_skill_load_uses_frozen_catalog_revision_and_records_audit_fields");
+            }
+        }
         #[cfg(unix)]
         {
             if std::panic::AssertUnwindSafe(skill_tool_rejects_symlinked_compatibility_paths()).catch_unwind().await.is_err() {
@@ -4441,6 +4733,11 @@ mod tests {
         {
             if std::panic::AssertUnwindSafe(runtime_policy_snapshot_contains_only_frozen_public_facts()).catch_unwind().await.is_err() {
                 failures.push("runtime_policy_snapshot_contains_only_frozen_public_facts");
+            }
+        }
+        {
+            if std::panic::AssertUnwindSafe(turn_skill_catalog_is_isolated_policy_filtered_and_frozen()).catch_unwind().await.is_err() {
+                failures.push("turn_skill_catalog_is_isolated_policy_filtered_and_frozen");
             }
         }
         assert!(failures.is_empty(), "聚合测试失败：{}", failures.join(", "));

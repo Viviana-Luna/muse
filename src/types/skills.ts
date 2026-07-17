@@ -10,6 +10,18 @@ export interface SkillRecord extends SkillSummary {
   content: string;
 }
 
+export interface SkillCatalogDiagnostic {
+  name: string;
+  code: string;
+  message: string;
+}
+
+export interface SkillCatalogSnapshot {
+  skills: SkillSummary[];
+  diagnostics: SkillCatalogDiagnostic[];
+  omitted_diagnostic_count: number;
+}
+
 export interface SkillDraft {
   name: string;
   description: string;

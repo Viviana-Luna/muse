@@ -4,6 +4,14 @@ use crate::domain::persona::{McpPolicy, SkillPolicy, ToolPolicy};
 use crate::domain::tool::ToolDef;
 use serde::{Deserialize, Serialize};
 
+/// 冻结到单轮模型上下文中的 Skill 元数据；不包含正文和本机路径。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimeSkillCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RuntimePolicySnapshot {
     pub schema_version: u32,
@@ -20,6 +28,10 @@ pub struct RuntimePolicySnapshot {
     pub mcp_policy: McpPolicy,
     pub skill_revision: String,
     pub skill_catalog_hash: String,
+    #[serde(default)]
+    pub skill_catalog: Vec<RuntimeSkillCatalogEntry>,
+    #[serde(default)]
+    pub omitted_skill_count: usize,
     pub mcp_revision: u64,
     pub mcp_catalog_hash: String,
 }

@@ -14,6 +14,8 @@ use super::config::SkillPreferences;
 
 /// `SKILL.md` 的最大体积，与运行时加载上限保持一致。
 pub const MAX_SKILL_DOCUMENT_BYTES: usize = 128 * 1024;
+const MAX_SKILL_CATALOG_DIAGNOSTICS: usize = 64;
+const MAX_SKILL_DIAGNOSTIC_MESSAGE_CHARS: usize = 512;
 const LEGACY_ENABLED_MIGRATION_MARKER: &str = ".muse-migrations/skill-frontmatter-enabled-v1";
 const INVALID_NAME_MESSAGE: &str =
     "Skill 名称必须为 1-64 个小写字母、数字或单连字符组合，格式如 `git-release`。";
@@ -26,6 +28,22 @@ pub struct SkillSummary {
     pub enabled: bool,
     pub revision: String,
     pub updated_at: String,
+}
+
+/// 单个 Skill 目录扫描失败的有界诊断；只进入本地诊断，不进入模型上下文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillCatalogDiagnostic {
+    pub name: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Skill 目录的按项隔离扫描结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillCatalogSnapshot {
+    pub skills: Vec<SkillSummary>,
+    pub diagnostics: Vec<SkillCatalogDiagnostic>,
+    pub omitted_diagnostic_count: usize,
 }
 
 /// Skill 详情。页面只编辑正文，完整 frontmatter 由服务端无损保留。
@@ -121,29 +139,93 @@ impl SkillStore {
         }
     }
 
-    /// 列出 Muse 用户目录中的标准 Skill。非标准目录名会产生稳定诊断，不会被静默忽略。
+    /// 列出 Muse 用户目录中的标准 Skill；损坏项不会隐藏其他正常项。
     pub fn list(
         &self,
         preferences: &SkillPreferences,
     ) -> Result<Vec<SkillSummary>, SkillStoreError> {
+        Ok(self.catalog_snapshot(preferences)?.skills)
+    }
+
+    /// 按项隔离扫描 Skill 目录，同时保留不进入模型上下文的诊断。
+    pub fn catalog_snapshot(
+        &self,
+        preferences: &SkillPreferences,
+    ) -> Result<SkillCatalogSnapshot, SkillStoreError> {
         self.ensure_root()?;
-        let mut output = Vec::new();
+        let mut skills = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut omitted_diagnostic_count = 0usize;
         for entry in fs::read_dir(&self.root).map_err(io_error)? {
-            let entry = entry.map_err(io_error)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    push_catalog_diagnostic(
+                        &mut diagnostics,
+                        &mut omitted_diagnostic_count,
+                        "unknown".to_string(),
+                        io_error(error),
+                    );
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
                 continue;
             }
-            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    push_catalog_diagnostic(
+                        &mut diagnostics,
+                        &mut omitted_diagnostic_count,
+                        name,
+                        io_error(error),
+                    );
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                push_catalog_diagnostic(
+                    &mut diagnostics,
+                    &mut omitted_diagnostic_count,
+                    name,
+                    SkillStoreError::new(
+                        SkillStoreErrorKind::Invalid,
+                        "Skill 目录不能是符号链接。",
+                    ),
+                );
                 continue;
             }
-            validate_skill_name(&name)?;
-            let record = self.read_from_dir(&entry.path(), Some(&name), preferences)?;
-            output.push(SkillSummary::from(&record));
+            if !metadata.file_type().is_dir() {
+                continue;
+            }
+            if let Err(error) = validate_skill_name(&name) {
+                push_catalog_diagnostic(
+                    &mut diagnostics,
+                    &mut omitted_diagnostic_count,
+                    name,
+                    error,
+                );
+                continue;
+            }
+            match self.read_from_dir(&entry.path(), Some(&name), preferences) {
+                Ok(record) => skills.push(SkillSummary::from(&record)),
+                Err(error) => push_catalog_diagnostic(
+                    &mut diagnostics,
+                    &mut omitted_diagnostic_count,
+                    name,
+                    error,
+                ),
+            }
         }
-        output.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(output)
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        diagnostics.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(SkillCatalogSnapshot {
+            skills,
+            diagnostics,
+            omitted_diagnostic_count,
+        })
     }
 
     /// 读取指定 Skill。
@@ -817,6 +899,49 @@ fn revision_conflict() -> SkillStoreError {
     )
 }
 
+fn catalog_diagnostic(name: String, error: SkillStoreError) -> SkillCatalogDiagnostic {
+    let code = match error.kind {
+        SkillStoreErrorKind::Invalid => "skill_invalid",
+        SkillStoreErrorKind::NotFound => "skill_not_found",
+        SkillStoreErrorKind::Conflict => "skill_conflict",
+        SkillStoreErrorKind::RevisionConflict => "skill_revision_conflict",
+        SkillStoreErrorKind::Io => "skill_io_error",
+    };
+    let normalized_message = error
+        .message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = if normalized_message.chars().count() <= MAX_SKILL_DIAGNOSTIC_MESSAGE_CHARS {
+        normalized_message
+    } else {
+        let mut truncated = normalized_message
+            .chars()
+            .take(MAX_SKILL_DIAGNOSTIC_MESSAGE_CHARS.saturating_sub(1))
+            .collect::<String>();
+        truncated.push('…');
+        truncated
+    };
+    SkillCatalogDiagnostic {
+        name,
+        code: code.to_string(),
+        message,
+    }
+}
+
+fn push_catalog_diagnostic(
+    diagnostics: &mut Vec<SkillCatalogDiagnostic>,
+    omitted_count: &mut usize,
+    name: String,
+    error: SkillStoreError,
+) {
+    if diagnostics.len() >= MAX_SKILL_CATALOG_DIAGNOSTICS {
+        *omitted_count = omitted_count.saturating_add(1);
+        return;
+    }
+    diagnostics.push(catalog_diagnostic(name, error));
+}
+
 fn combine_rollback_error(
     operation: SkillStoreError,
     rollback: Result<(), SkillStoreError>,
@@ -928,8 +1053,60 @@ mod tests {
             "---\nname: beta\ndescription: mismatch\n---\nbody\n",
         )
         .unwrap();
-        let error = store.list(&SkillPreferences::default()).unwrap_err();
-        assert!(error.message.contains("不一致"));
+        fs::create_dir_all(root.join("skills/calendar")).unwrap();
+        fs::write(
+            root.join("skills/calendar/SKILL.md"),
+            "---\nname: calendar\ndescription: 日历助手\n---\nbody\n",
+        )
+        .unwrap();
+        let snapshot = store
+            .catalog_snapshot(&SkillPreferences::default())
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["calendar"]
+        );
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].name, "alpha");
+        assert_eq!(snapshot.diagnostics[0].code, "skill_invalid");
+        assert!(snapshot.diagnostics[0].message.contains("不一致"));
+        assert_eq!(
+            store.list(&SkillPreferences::default()).unwrap().len(),
+            1,
+            "损坏项不得让正常 Skill 从管理列表消失"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_diagnostics_are_bounded_without_hiding_valid_skills() {
+        let root = temp_dir();
+        let store = SkillStore::from_data_dir(&root);
+        fs::create_dir_all(root.join("skills/calendar")).unwrap();
+        fs::write(
+            root.join("skills/calendar/SKILL.md"),
+            "---\nname: calendar\ndescription: 日历助手\n---\nbody\n",
+        )
+        .unwrap();
+        for index in 0..70 {
+            fs::create_dir_all(root.join("skills").join(format!("Invalid-{index}"))).unwrap();
+        }
+
+        let snapshot = store
+            .catalog_snapshot(&SkillPreferences::default())
+            .unwrap();
+
+        assert_eq!(snapshot.skills.len(), 1);
+        assert_eq!(snapshot.skills[0].name, "calendar");
+        assert_eq!(snapshot.diagnostics.len(), MAX_SKILL_CATALOG_DIAGNOSTICS);
+        assert_eq!(snapshot.omitted_diagnostic_count, 6);
+        assert!(snapshot.diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.chars().count() <= MAX_SKILL_DIAGNOSTIC_MESSAGE_CHARS
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1134,15 +1311,17 @@ mod tests {
         migrate_legacy_skill_enabled(&root, &mut config)
             .expect("损坏 Skill 不应阻止应用完成启动迁移");
         let store = SkillStore::from_data_dir(&root);
-        let error = store.list(config.skill_preferences()).unwrap_err();
-        assert_eq!(error.kind, SkillStoreErrorKind::Invalid);
-        assert!(error.message.contains("缺少 description"));
+        let snapshot = store.catalog_snapshot(config.skill_preferences()).unwrap();
+        assert!(snapshot.skills.is_empty());
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].code, "skill_invalid");
+        assert!(snapshot.diagnostics[0].message.contains("缺少 description"));
         fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn ignores_symlinked_skill_directories_but_rejects_invalid_real_names() {
+    fn isolates_symlinked_skill_directories_and_invalid_real_names() {
         use std::os::unix::fs::symlink;
         let root = temp_dir();
         let outside = temp_dir();
@@ -1151,9 +1330,16 @@ mod tests {
         symlink(&outside, root.join("skills/linked")).unwrap();
         assert!(store.list(&SkillPreferences::default()).unwrap().is_empty());
         fs::create_dir_all(root.join("skills/测试")).unwrap();
-        assert_eq!(
-            store.list(&SkillPreferences::default()).unwrap_err().kind,
-            SkillStoreErrorKind::Invalid
+        let snapshot = store
+            .catalog_snapshot(&SkillPreferences::default())
+            .unwrap();
+        assert!(snapshot.skills.is_empty());
+        assert_eq!(snapshot.diagnostics.len(), 2);
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "skill_invalid")
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();

@@ -176,6 +176,12 @@ async fn tool_skill_from_workspace_with_user(
     let user_store = user_skill_context.map(|(data_dir, _)| {
         muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
     });
+    let frozen_catalog_entry = turn
+        .runtime_policy
+        .skill_catalog
+        .iter()
+        .find(|entry| entry.name == skill_name);
+    let frozen_catalog_required = turn.runtime_policy.schema_version >= 2;
     let user_skill = user_skill_context.and_then(|(_, preferences)| {
         user_store
             .as_ref()
@@ -188,7 +194,23 @@ async fn tool_skill_from_workspace_with_user(
                 "skill_disabled",
             );
         }
+        Some(Ok(_)) if frozen_catalog_required && frozen_catalog_entry.is_none() => {
+            return tool_failed(
+                format!("Skill `{skill_name}` 不在当前 Turn 冻结目录中。"),
+                "skill_catalog_denied",
+            );
+        }
+        Some(Ok(ref skill))
+            if frozen_catalog_entry
+                .is_some_and(|entry| entry.revision != skill.revision) =>
+        {
+            return tool_failed(
+                format!("Skill `{skill_name}` 已在当前 Turn 开始后变更，请发起新请求后重试。"),
+                "skill_revision_changed",
+            );
+        }
         Some(Ok(skill)) => {
+            let content_hash = content_hash_hex(skill.content.as_bytes());
             return ToolResult {
                 status: ToolResultStatus::Success,
                 content: format!(
@@ -199,8 +221,20 @@ async fn tool_skill_from_workspace_with_user(
                     "skill_name": skill.name,
                     "description": skill.description,
                     "revision": skill.revision,
+                    "content_hash": content_hash,
+                    "source": "user_store",
+                    "activated": true,
                 })),
             };
+        }
+        Some(Err(error))
+            if error.kind == muse_core::domain::skill::SkillStoreErrorKind::NotFound
+                && frozen_catalog_entry.is_some() =>
+        {
+            return tool_failed(
+                format!("Skill `{skill_name}` 已在当前 Turn 开始后移除，请发起新请求后重试。"),
+                "skill_revision_changed",
+            );
         }
         Some(Err(error))
             if error.kind != muse_core::domain::skill::SkillStoreErrorKind::NotFound =>
@@ -229,6 +263,8 @@ async fn tool_skill_from_workspace_with_user(
             structured: Some(serde_json::json!({
                 "skill_name": skill_name,
                 "source": "compatibility_read_only",
+                "content_hash": content_hash_hex(content.as_bytes()),
+                "activated": true,
             })),
         };
     }

@@ -390,7 +390,7 @@ impl ToolRegistry {
         }
         s.push_str("当需要调用工具时，优先使用 provider 原生工具调用，不要把工具参数写进普通 assistant 文本。只有在当前模型或服务不支持原生工具调用时，才使用兼容文本协议：只在回复开头输出一行 JSON：{\"tool_call\":{\"name\":\"工具名\",\"arguments\":{...}}}，不要同时写最终回复；系统会把工具调用转成结构化 ToolCall，拿到工具结果后再继续生成最终回复。需要审批的工具会先暂停等待用户确认。\n");
         s.push_str("阶段简报规则：长任务或多步任务执行中应适时调用 send_user_message 向用户同步阶段进展；只有确实需要用户立即确认才能继续时，才设置 requires_reply=true。brief 是不等待回复的短别名。\n");
-        s.push_str("技能规则：当任务明显需要本地专用流程、项目技能或 SKILL.md 指引时，优先调用 load_skill 读取对应技能；use_skill 和 skill 只是兼容别名。\n");
+        s.push_str("技能规则：先根据本轮冻结的 Skill 元数据目录判断是否适用；需要完整指引时只调用 load_skill。旧 use_skill 和 skill 仅用于历史协议兼容，不会暴露给新 Turn。\n");
         s.push_str("子任务规则：agent 只用于登记当前运行时内的轻量子任务、刷新任务清单并回灌上下文；它不会启动并发子模型，也不代表后台任务队列。\n");
         s.push_str("路径定位规则：运行环境上下文已经提供当前工作区、权限模式和沙箱模式。优先使用运行环境上下文、用户明确给出的路径、`~`/用户 Home、当前项目工作区和消息上下文解析目标路径。用户说“下载文件夹、桌面、文稿、项目目录”等模糊位置时，先推导最小候选路径；候选唯一就直接调用目标工具，让 harness 负责审批；候选多个时按 Codex 风格选择最像用户意图的路径：当前工作区优先，其次 Home 下浅层的非隐藏用户目录，再其次用户明确提到的隐藏目录或配置目录，并在最终回复中说明选择依据；只有候选含义完全等价或缺少文件名时再向用户澄清。不要为了确认权限或寻找用户目录去调用 file_list 列出 `/`、`/Users`、用户 Home 根目录等宽泛目录。\n");
         s.push_str("文件工具规则：file_list 只用于用户明确要求列目录，或在已知的狭窄目录中查找；模糊路径、文件夹名、文件名定位优先使用 file_search。对“docker 文件夹”这类描述，先在当前工作区用 file_search 搜 directory/name，找不到再在 `~` 下做有限深度搜索；默认不要包含隐藏目录，除非用户明确说隐藏目录、配置目录或点开头目录。如果返回多个候选，优先选择 Home 下浅层、非隐藏、语义上最像用户个人目录的候选；不要把 `.docker` 这类配置目录当成普通“docker 文件夹”，除非用户明确说隐藏目录或 Docker 配置目录。写入/编辑外部目录不代表被允许，harness 会根据权限模式暂停审批或拒绝。\n");
@@ -829,6 +829,24 @@ mod tests {
         let defs = registry.list_definitions_for_policy(Some(&policy));
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "voice_current");
+    }
+
+    // 新 Turn 只看见 canonical 工具，旧别名仍保留在注册表供历史 dispatch 兼容。
+    #[test]
+    fn skill_aliases_are_dispatch_only() {
+        let mut registry = ToolRegistry::new();
+        builtin::register_all(&mut registry);
+
+        let names = registry
+            .list_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"load_skill".to_string()));
+        assert!(!names.contains(&"use_skill".to_string()));
+        assert!(!names.contains(&"skill".to_string()));
+        assert!(registry.tool_def("use_skill").is_some());
+        assert!(registry.tool_def("skill").is_some());
     }
 
     // 验证未授权工具执行会被注册表拦截。

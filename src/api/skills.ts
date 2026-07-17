@@ -1,7 +1,7 @@
 import { apiFetch, readJson } from './client';
-import type { SkillDraft, SkillRecord, SkillSummary, SkillUpdate } from '@/types';
+import type { SkillCatalogSnapshot, SkillDraft, SkillRecord, SkillUpdate } from '@/types';
 
-export async function listSkills(): Promise<SkillSummary[]> {
+export async function listSkills(): Promise<SkillCatalogSnapshot> {
   return readJson(await apiFetch('/api/skills'));
 }
 

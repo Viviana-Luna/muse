@@ -1,10 +1,16 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
-import { ArrowLeft, Eye, FileText, Plus, Save, Search, Sparkles, Trash2 } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Eye, FileText, Plus, Save, Search, Sparkles, Trash2 } from 'lucide-react';
 import { createSkill, deleteSkill, getSkill, listSkills, updateSkill } from '@/api';
 import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
 import { SectionLoading } from '@/components/feedback/LoadingState';
 import type { AppToastInput } from '@/hooks/useAppToast';
-import { validateSkillName, type SkillDraft, type SkillRecord, type SkillSummary } from '@/types';
+import {
+  validateSkillName,
+  type SkillCatalogDiagnostic,
+  type SkillDraft,
+  type SkillRecord,
+  type SkillSummary
+} from '@/types';
 
 const EMPTY_SKILL: SkillDraft = {
   name: '',
@@ -36,6 +42,8 @@ function toDraft(skill: SkillRecord): SkillDraft {
 
 export function SkillsPage({ selectedName, onSelectedNameChange, notify }: SkillsPageProps) {
   const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [catalogDiagnostics, setCatalogDiagnostics] = useState<SkillCatalogDiagnostic[]>([]);
+  const [omittedDiagnosticCount, setOmittedDiagnosticCount] = useState(0);
   const [record, setRecord] = useState<SkillRecord | null>(null);
   const [draft, setDraft] = useState<SkillDraft>(EMPTY_SKILL);
   const [query, setQuery] = useState('');
@@ -55,9 +63,11 @@ export function SkillsPage({ selectedName, onSelectedNameChange, notify }: Skill
   const showRecordLoading = Boolean(selectedName && !creating && recordLoading);
 
   const reloadList = useCallback(async () => {
-    const next = await listSkills();
-    setSkills(next);
-    return next;
+    const snapshot = await listSkills();
+    setSkills(snapshot.skills);
+    setCatalogDiagnostics(snapshot.diagnostics);
+    setOmittedDiagnosticCount(snapshot.omitted_diagnostic_count);
+    return snapshot.skills;
   }, []);
 
   useEffect(() => {
@@ -170,11 +180,32 @@ export function SkillsPage({ selectedName, onSelectedNameChange, notify }: Skill
             新建
           </button>
         </header>
-        <label className="management-search">
-          <Search aria-hidden="true" />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Skill" />
-        </label>
-        <div className="object-list" role="list">
+        <div className="management-list-controls">
+          <label className="management-search">
+            <Search aria-hidden="true" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Skill" />
+          </label>
+          {(catalogDiagnostics.length > 0 || omittedDiagnosticCount > 0) && (
+            <section className="skill-catalog-diagnostics" aria-label="Skill 目录诊断">
+              <AlertTriangle aria-hidden="true" />
+              <div>
+                <strong>{catalogDiagnostics.length + omittedDiagnosticCount} 个 Skill 未载入</strong>
+                <ul>
+                  {catalogDiagnostics.map((diagnostic) => (
+                    <li key={`${diagnostic.name}-${diagnostic.code}`}>
+                      <code>{diagnostic.name}</code>
+                      <span>{diagnostic.message}</span>
+                    </li>
+                  ))}
+                </ul>
+                {omittedDiagnosticCount > 0 && (
+                  <small>另有 {omittedDiagnosticCount} 条诊断因本地展示预算已省略。</small>
+                )}
+              </div>
+            </section>
+          )}
+        </div>
+        <div className="object-list" role="list" aria-label="Skill 列表">
           {listLoading && skills.length === 0 && (
             <SectionLoading label="正在读取 Skill 列表" variant="surface" />
           )}

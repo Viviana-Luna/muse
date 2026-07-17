@@ -810,12 +810,64 @@
 .management-search svg { width: 17px; color: rgba(255, 255, 255, 0.38); }
 .management-search input { width: 100%; padding: 0; border: 0; background: transparent; }
 
+.management-list-controls {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
 .object-list {
   display: flex;
   min-height: 0;
   flex-direction: column;
   gap: 7px;
   overflow: auto;
+}
+
+.skill-catalog-diagnostics {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--color-warning), transparent 58%);
+  border-radius: 10px;
+  color: rgba(255, 255, 255, 0.72);
+  background: color-mix(in srgb, var(--color-warning-bg), transparent 22%);
+  max-height: 190px;
+  overflow: auto;
+}
+
+.skill-catalog-diagnostics > svg {
+  width: 18px;
+  color: var(--color-warning);
+}
+
+.skill-catalog-diagnostics > div,
+.skill-catalog-diagnostics li {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.skill-catalog-diagnostics ul {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.skill-catalog-diagnostics code,
+.skill-catalog-diagnostics span,
+.skill-catalog-diagnostics small {
+  overflow-wrap: anywhere;
+}
+
+.skill-catalog-diagnostics span,
+.skill-catalog-diagnostics small {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .object-list > button {
@@ -1179,6 +1231,9 @@
 .theme-light .object-list-pane,
 .theme-light .detail-toolbar,
 .theme-light .detail-actions { border-color: rgba(41, 31, 38, 0.1); }
+.theme-light .skill-catalog-diagnostics { color: rgba(30, 24, 29, 0.78); }
+.theme-light .skill-catalog-diagnostics span,
+.theme-light .skill-catalog-diagnostics small { color: rgba(54, 42, 50, 0.62); }
 
 @media (prefers-reduced-motion: reduce) {
   .runtime-shell.story-shell.app-shell,

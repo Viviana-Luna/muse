@@ -907,16 +907,6 @@ impl RuntimeToolHandler for SkillHandler {
         true
     }
 
-    fn context_effect(&self, result: &ToolResult) -> Option<RuntimeToolContextEffect> {
-        if !result.is_success() {
-            return None;
-        }
-        Some(RuntimeToolContextEffect::Append {
-            title: "已载入技能",
-            content: result.content.clone(),
-        })
-    }
-
     fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a> {
         Box::pin(async move {
             tool_skill(invocation.state, invocation.turn, invocation.call).await

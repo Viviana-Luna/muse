@@ -1007,6 +1007,7 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
     catalog: &mcp::McpToolCatalog,
 ) -> Vec<ToolDef> {
     let mut defs = state.tools.list_definitions();
+    defs.retain(|definition| !matches!(definition.name.as_str(), "use_skill" | "skill"));
     defs.extend(catalog.tool_defs());
     if let Some(persona) = active_persona {
         match persona.mcp_policy.mode {
@@ -1031,7 +1032,7 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
             persona.skill_policy.mode,
             muse_core::domain::persona::ResourcePolicyMode::Disabled
         ) {
-            defs.retain(|definition| definition.name != "skill");
+            defs.retain(|definition| definition.name != "load_skill");
         }
     }
     let web_search_configured = matches!(
