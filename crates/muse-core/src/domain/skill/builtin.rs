@@ -14,6 +14,8 @@ pub struct BuiltinSkill {
     pub description: String,
     pub content: String,
     pub revision: String,
+    /// 用户显式激活该内置 Skill 时，本轮模型完成工作所必需的工具。
+    pub required_tools: Vec<String>,
 }
 
 impl From<&BuiltinSkill> for SkillSummary {
@@ -31,8 +33,18 @@ impl From<&BuiltinSkill> for SkillSummary {
 
 const SKILL_CREATOR_DOCUMENT: &str = include_str!("builtin/skill-creator/SKILL.md");
 
-fn builtin_documents() -> &'static [(&'static str, &'static str)] {
-    &[("skill-creator", SKILL_CREATOR_DOCUMENT)]
+struct BuiltinSkillDocument {
+    name: &'static str,
+    document: &'static str,
+    required_tools: &'static [&'static str],
+}
+
+fn builtin_documents() -> &'static [BuiltinSkillDocument] {
+    &[BuiltinSkillDocument {
+        name: "skill-creator",
+        document: SKILL_CREATOR_DOCUMENT,
+        required_tools: &["create_skill"],
+    }]
 }
 
 static REGISTRY: OnceLock<Vec<BuiltinSkill>> = OnceLock::new();
@@ -42,19 +54,24 @@ pub fn builtin_skills() -> &'static [BuiltinSkill] {
     REGISTRY.get_or_init(|| {
         builtin_documents()
             .iter()
-            .map(|(expected_name, text)| {
-                let parsed = parse_skill_document(text).unwrap_or_else(|error| {
-                    panic!("内置 Skill `{expected_name}` 解析失败：{error}")
+            .map(|definition| {
+                let parsed = parse_skill_document(definition.document).unwrap_or_else(|error| {
+                    panic!("内置 Skill `{}` 解析失败：{error}", definition.name)
                 });
                 assert_eq!(
-                    parsed.name, *expected_name,
+                    parsed.name, definition.name,
                     "内置 Skill 目录登记名必须与文档 name 一致"
                 );
                 BuiltinSkill {
                     name: parsed.name,
                     description: parsed.description,
                     content: parsed.content,
-                    revision: revision_for(text.as_bytes(), true),
+                    revision: revision_for(definition.document.as_bytes(), true),
+                    required_tools: definition
+                        .required_tools
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
                 }
             })
             .collect()
@@ -82,6 +99,7 @@ mod tests {
         assert!(creator.content.contains("Skill 创建工艺"));
         assert!(creator.content.contains("`create_skill`"));
         assert!(!creator.content.contains("用户 Skill 目录"));
+        assert_eq!(creator.required_tools, ["create_skill"]);
         assert_eq!(creator.revision.len(), 64, "revision 应为 sha256 十六进制");
         assert!(
             SKILL_CREATOR_DOCUMENT.len() <= MAX_SKILL_DOCUMENT_BYTES,

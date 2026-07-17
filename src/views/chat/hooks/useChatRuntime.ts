@@ -14,7 +14,8 @@ import {
   fetchRuntimeTokenUsage,
   forkRuntimeSession,
   resetConversation,
-  resumeRuntimeSession
+  resumeRuntimeSession,
+  updateRuntimeMode
 } from '@/api';
 import type { AppToastInput } from '@/hooks/useAppToast';
 import { formatModelInfoLabel } from '@/types';
@@ -34,6 +35,7 @@ import type {
   RuntimeStateResponse,
   RuntimeTokenUsage
 } from '@/types';
+import type { RuntimeModeChoice } from '@/views/chat/components/RuntimeModeSelector';
 import {
   normalizeConversationId,
   readConversationIdFromUrl,
@@ -123,6 +125,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
   const [runtimeMode, setRuntimeMode] = useState('daily');
   const [runtimeFocusPhase, setRuntimeFocusPhase] = useState('plan');
   const [runtimeToolPreset, setRuntimeToolPreset] = useState('daily');
+  const [runtimeModeSwitching, setRuntimeModeSwitching] = useState(false);
 
   const session = useSessionState();
   const revision = useRuntimeStateRevision();
@@ -424,6 +427,42 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     }
   }
 
+  async function handleRuntimeModeChange(nextPreset: RuntimeModeChoice): Promise<void> {
+    if (stream.busy || runtimeModeSwitching || nextPreset === runtimeToolPreset) return;
+    if (rejectBlockedMutation('切换运行模式')) return;
+    if (session.selectedConversationReadOnly) {
+      optionsRef.current.notify({
+        title: '当前会话为只读历史',
+        description: session.selectedConversationReadOnlyReason,
+        tone: 'info'
+      });
+      return;
+    }
+    const target = {
+      daily: { mode: 'daily' as const, phase: undefined, label: '日常' },
+      focus_build: { mode: 'focus' as const, phase: 'build' as const, label: '工作' },
+      focus_plan: { mode: 'focus' as const, phase: 'plan' as const, label: '计划' }
+    }[nextPreset];
+    setRuntimeModeSwitching(true);
+    try {
+      const response = await updateRuntimeMode(target.mode, target.phase);
+      applyRuntimeMode(response.mode, response.focus_phase, response.tool_preset);
+      optionsRef.current.notify({
+        title: `已切换为${target.label}模式`,
+        description: '后续新回合将使用对应的工具范围。',
+        tone: 'success'
+      });
+    } catch (error) {
+      optionsRef.current.notify({
+        title: '切换运行模式失败',
+        description: error instanceof Error ? error.message : '运行时未接受本次模式切换。',
+        tone: 'error'
+      });
+    } finally {
+      setRuntimeModeSwitching(false);
+    }
+  }
+
   async function handleReset(): Promise<boolean> {
     if (stream.busy) return false;
     if (rejectBlockedMutation('新建会话')) return false;
@@ -658,6 +697,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     runtimeMode,
     runtimeFocusPhase,
     runtimeToolPreset,
+    runtimeModeSwitching,
     ...session,
     ...overview,
     messages: stream.messages,
@@ -690,6 +730,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     retryBootstrap,
     synchronizeRuntimeAfterPersonaReset,
     handleSend,
+    handleRuntimeModeChange,
     handleReset,
     handleResumeSession,
     handleForkSession,

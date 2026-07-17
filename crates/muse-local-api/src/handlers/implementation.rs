@@ -874,14 +874,37 @@ impl ConversationRuntime {
                 .await);
             }
         };
-        let full_tool_defs = runtime_frozen_tool_defs_for_policy_with_catalog(
+        let (skill_catalog, omitted_skill_count) =
+            frozen_runtime_skill_catalog(&self.state, Some(&active_persona)).await;
+        let required_skill_tools =
+            selected_builtin_skill_required_tools(&skill_catalog, selected_skill.as_deref());
+        let mut full_tool_defs = runtime_frozen_tool_defs_for_policy_with_catalog(
             &self.state,
             Some(&active_persona),
             &frozen_mcp_catalog,
         );
-        let tool_defs = ToolRegistry::filter_definitions_for_preset(
-            full_tool_defs.clone(),
+        let skill_tool_ids = match grant_selected_skill_required_tools(
+            &self.state,
+            Some(&active_persona),
+            &mut full_tool_defs,
+            &required_skill_tools,
+        ) {
+            Ok(tool_ids) => tool_ids,
+            Err(message) => {
+                return Err(abort_preparing_turn(
+                    &self.state,
+                    &emitter,
+                    &conversation_id,
+                    &turn_id,
+                    message,
+                )
+                .await);
+            }
+        };
+        let tool_defs = visible_tool_definitions_for_turn(
+            &full_tool_defs,
             mode_state.tool_preset(),
+            &skill_tool_ids,
         );
         let system_prompt = build_runtime_system_prompt_with_mode_state(
             &self.state.config,
@@ -899,6 +922,10 @@ impl ConversationRuntime {
             FrozenTurnToolCatalog {
                 definitions: &full_tool_defs,
                 mcp: Some(&frozen_mcp_catalog),
+                skills: Some(FrozenTurnSkillCatalog {
+                    entries: &skill_catalog,
+                    omitted_count: omitted_skill_count,
+                }),
             },
         )
         .await
@@ -916,6 +943,7 @@ impl ConversationRuntime {
             }
         };
         let mut turn_context = frozen_runtime.context;
+        turn_context.runtime_policy.skill_tool_ids = skill_tool_ids.clone();
         let provider_snapshot = frozen_runtime.provider;
         let activated_skill_prompt = if let Some(skill_name) = selected_skill.as_deref() {
             match activate_selected_skill(&self.state, &turn_context, skill_name).await {
@@ -1394,9 +1422,10 @@ impl ConversationRuntime {
                                         tool_call.name
                                     )
                                 })?;
-                            let visible_tools = ToolRegistry::filter_definitions_for_preset(
-                                turn_snapshot.full_tool_definitions().to_vec(),
+                            let visible_tools = visible_tool_definitions_for_turn(
+                                turn_snapshot.full_tool_definitions(),
                                 next_mode.tool_preset(),
+                                &turn_snapshot.context.runtime_policy.skill_tool_ids,
                             );
                             let mut next_prompt = build_runtime_system_prompt_with_mode_state(
                                 &self.state.config,

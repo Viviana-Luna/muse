@@ -1057,17 +1057,6 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
     defs
 }
 
-fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
-    let preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::Daily);
-    ToolRegistry::filter_definitions_for_preset_and_policy(
-        turn.tool_definitions.clone(),
-        preset,
-        Some(&turn.tool_policy),
-    )
-    .iter()
-    .any(|definition| definition.name == name)
-}
-
 async fn current_runtime_system_prompt(state: &Arc<AppState>) -> String {
     let active_persona = current_active_persona(state).await;
     let tool_defs = runtime_tool_defs_for_policy(state, active_persona.as_ref()).await;

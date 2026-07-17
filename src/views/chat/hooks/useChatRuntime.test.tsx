@@ -27,7 +27,8 @@ const api = vi.hoisted(() => ({
   resumeRuntimeSession: vi.fn(),
   streamRuntimeChat: vi.fn(),
   synthesizeSpeech: vi.fn(),
-  transcribeAudio: vi.fn()
+  transcribeAudio: vi.fn(),
+  updateRuntimeMode: vi.fn()
 }));
 
 vi.mock('@/api', () => api);
@@ -152,6 +153,12 @@ describe('useChatRuntime', () => {
       ],
       omitted_skill_count: 0
     });
+    api.updateRuntimeMode.mockResolvedValue({
+      mode: 'daily',
+      focus_phase: 'plan',
+      tool_preset: 'daily',
+      status: 'ok'
+    });
   });
 
   it('录音开始后任一输入、运行时或角色事实变化都拒绝过期转写', () => {
@@ -209,6 +216,47 @@ describe('useChatRuntime', () => {
     await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
 
     expect(result.current.modelLabel).toBe('火山方舟 Agent Plan / GLM 5.2');
+  });
+
+  it('通过后端事实切换日常、工作和计划模式', async () => {
+    api.updateRuntimeMode.mockResolvedValue({
+      mode: 'focus',
+      focus_phase: 'build',
+      tool_preset: 'focus_build',
+      status: '已切换'
+    });
+    const { result, notify } = setup();
+    await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
+
+    await act(async () => {
+      await result.current.handleRuntimeModeChange('focus_build');
+    });
+
+    expect(api.updateRuntimeMode).toHaveBeenCalledWith('focus', 'build');
+    expect(result.current.runtimeToolPreset).toBe('focus_build');
+    expect(result.current.runtimeModeSwitching).toBe(false);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ title: '已切换为工作模式', tone: 'success' })
+    );
+  });
+
+  it('模式切换失败时保留原有后端事实并提示错误', async () => {
+    api.updateRuntimeMode.mockRejectedValue(new Error('运行时忙碌'));
+    const { result, notify } = setup();
+    await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
+
+    await act(async () => {
+      await result.current.handleRuntimeModeChange('focus_plan');
+    });
+
+    expect(result.current.runtimeToolPreset).toBe('daily');
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: '切换运行模式失败',
+        description: '运行时忙碌',
+        tone: 'error'
+      })
+    );
   });
 
   it('后端为新回合分配真实会话 ID 时不以空历史覆盖流式消息', async () => {

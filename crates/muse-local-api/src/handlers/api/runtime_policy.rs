@@ -152,10 +152,147 @@ pub(crate) async fn handle_runtime_skills(
     }))
 }
 
+async fn frozen_runtime_skill_catalog(
+    state: &Arc<AppState>,
+    active_persona: Option<&Persona>,
+) -> (
+    Vec<muse_core::domain::turn::RuntimeSkillCatalogEntry>,
+    usize,
+) {
+    let skill_policy = active_persona
+        .map(|persona| persona.skill_policy.clone())
+        .unwrap_or_default();
+    let preferences = {
+        let mut store = state.user_config.lock().await;
+        if let Err(error) = store.refresh_from_disk() {
+            tracing::warn!(error = %error, "刷新已选 Skill 工具依赖快照失败");
+        }
+        store.skill_preferences().clone()
+    };
+    effective_runtime_skill_catalog(
+        state.runtime_service.data_dir(),
+        &preferences,
+        &skill_policy,
+    )
+}
+
+fn selected_builtin_skill_required_tools(
+    catalog: &[muse_core::domain::turn::RuntimeSkillCatalogEntry],
+    selected_skill: Option<&str>,
+) -> Vec<String> {
+    let Some(selected_skill) = selected_skill else {
+        return Vec::new();
+    };
+    let is_selected_builtin = catalog
+        .iter()
+        .any(|skill| skill.name == selected_skill && skill.source == "builtin");
+    if !is_selected_builtin {
+        return Vec::new();
+    }
+    muse_core::domain::skill::builtin_skill(selected_skill)
+        .map(|skill| skill.required_tools.clone())
+        .unwrap_or_default()
+}
+
+fn grant_selected_skill_required_tools(
+    state: &Arc<AppState>,
+    active_persona: Option<&Persona>,
+    definitions: &mut Vec<ToolDef>,
+    required_tools: &[String],
+) -> Result<Vec<String>, String> {
+    if required_tools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let policy = active_persona
+        .map(|persona| persona.tool_policy.clone())
+        .unwrap_or_default();
+    let mut granted = Vec::with_capacity(required_tools.len());
+    for name in required_tools {
+        let allowed = match policy.mode {
+            muse_core::domain::persona::ToolPolicyMode::Inherit => true,
+            muse_core::domain::persona::ToolPolicyMode::Disabled => false,
+            muse_core::domain::persona::ToolPolicyMode::AllowList => {
+                policy.allowed_tools.iter().any(|allowed| allowed == name)
+            }
+        };
+        if !allowed {
+            return Err(format!(
+                "已选择的内置 Skill 需要工具 `{name}`，但当前角色工具策略未允许它。"
+            ));
+        }
+        let definition = state
+            .tools
+            .tool_def(name)
+            .filter(|definition| definition.available)
+            .ok_or_else(|| format!("已选择的内置 Skill 需要工具 `{name}`，但工具当前不可用。"))?;
+        if !definitions.iter().any(|current| current.name == *name) {
+            definitions.push(definition);
+        }
+        granted.push(name.clone());
+    }
+    definitions.sort_by(|left, right| left.name.cmp(&right.name));
+    granted.sort();
+    granted.dedup();
+    Ok(granted)
+}
+
+fn visible_tool_definitions_for_turn(
+    full_definitions: &[ToolDef],
+    preset: ToolPreset,
+    skill_tool_ids: &[String],
+) -> Vec<ToolDef> {
+    let mut visible =
+        ToolRegistry::filter_definitions_for_preset(full_definitions.to_vec(), preset);
+    for name in skill_tool_ids {
+        if visible
+            .iter()
+            .any(|definition| definition.name == *name)
+        {
+            continue;
+        }
+        if let Some(definition) = full_definitions
+            .iter()
+            .find(|definition| definition.name == *name)
+        {
+            visible.push(definition.clone());
+        }
+    }
+    visible.sort_by(|left, right| left.name.cmp(&right.name));
+    visible
+}
+
+fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
+    if turn
+        .runtime_policy
+        .skill_tool_ids
+        .iter()
+        .any(|granted| granted == name)
+    {
+        return turn
+            .tool_definitions
+            .iter()
+            .any(|definition| definition.available && definition.name == name);
+    }
+    let preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::Daily);
+    ToolRegistry::filter_definitions_for_preset_and_policy(
+        turn.tool_definitions.clone(),
+        preset,
+        Some(&turn.tool_policy),
+    )
+    .iter()
+    .any(|definition| definition.name == name)
+}
+
 /// 在回合入口冻结角色、模型、工具、Skill 与 MCP 的公共运行事实。
+struct FrozenTurnSkillCatalog<'a> {
+    entries: &'a [muse_core::domain::turn::RuntimeSkillCatalogEntry],
+    omitted_count: usize,
+}
+
 struct FrozenTurnToolCatalog<'a> {
     definitions: &'a [ToolDef],
     mcp: Option<&'a mcp::McpToolCatalog>,
+    skills: Option<FrozenTurnSkillCatalog<'a>>,
 }
 
 struct FrozenTurnRuntime {
@@ -375,11 +512,14 @@ async fn build_turn_context(
             store.skill_preferences().clone(),
         )
     };
-    let (skill_catalog, omitted_skill_count) = effective_runtime_skill_catalog(
-        state.runtime_service.data_dir(),
-        &skill_preferences,
-        &skill_policy,
-    );
+    let (skill_catalog, omitted_skill_count) = match tools.skills {
+        Some(skills) => (skills.entries.to_vec(), skills.omitted_count),
+        None => effective_runtime_skill_catalog(
+            state.runtime_service.data_dir(),
+            &skill_preferences,
+            &skill_policy,
+        ),
+    };
     append_frozen_skill_catalog(&mut system_prompt, &skill_catalog, omitted_skill_count);
     let skill_catalog_hash = format!(
         "{:x}",
@@ -406,8 +546,8 @@ async fn build_turn_context(
         .unwrap_or_default();
 
     let runtime_policy = muse_core::domain::turn::RuntimePolicySnapshot {
-        schema_version: 5,
-        policy_version: "persona-runtime-policy/v5".to_string(),
+        schema_version: 6,
+        policy_version: "persona-runtime-policy/v6".to_string(),
         persona_version: active_persona.map(|persona| persona.version.clone()),
         provider: chat.config.provider.clone(),
         model: chat.config.model.clone(),
@@ -423,6 +563,7 @@ async fn build_turn_context(
         voice_fallback_reason: voice.fallback_reason.clone(),
         tool_preset: mode_state.tool_preset().as_str().to_string(),
         tool_ids,
+        skill_tool_ids: Vec::new(),
         tool_policy: tool_policy.clone(),
         skill_policy: skill_policy.clone(),
         mcp_policy: mcp_policy.clone(),

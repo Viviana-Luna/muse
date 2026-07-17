@@ -144,6 +144,8 @@ function ActiveWorkspace({
     inputValue,
     setInputValue,
     skillPicker,
+    runtimeToolPreset,
+    runtimeModeSwitching,
     selectedRuntimeSession,
     selectedConversationReadOnly,
     messages,
@@ -164,6 +166,7 @@ function ActiveWorkspace({
     handleChatScroll,
     scrollToLatest,
     handleSend,
+    handleRuntimeModeChange,
     handleResumeSession,
     handleForkSession,
     retryBootstrap
@@ -231,6 +234,8 @@ function ActiveWorkspace({
               canceling={canceling}
               canCancel={canCancel}
               inputValue={inputValue}
+              runtimeToolPreset={runtimeToolPreset}
+              runtimeModeSwitching={runtimeModeSwitching}
               skillPicker={skillPicker}
               voice={voice}
               visualizerCanvasRef={visualizerCanvasRef}
@@ -238,6 +243,7 @@ function ActiveWorkspace({
               sendDisabledReason={mutationLockReason || undefined}
               placeholder={`对${persona.name}说点什么…`}
               onInputValueChange={setInputValue}
+              onRuntimeModeChange={handleRuntimeModeChange}
               onSend={handleSend}
               onStartVoiceInput={startVoiceInput}
               onToggleVoice={() => toggleVoice(dialogue)}

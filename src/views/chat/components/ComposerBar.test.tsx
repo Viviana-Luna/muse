@@ -31,6 +31,7 @@ describe('ComposerBar', () => {
       <ComposerBar
         busy={false}
         inputValue=""
+        runtimeToolPreset="daily"
         skillPicker={createSkillPicker()}
         voice={{
           status: '语音未启用',
@@ -41,6 +42,7 @@ describe('ComposerBar', () => {
         } as never}
         sendIcon={<span>发送图标</span>}
         onInputValueChange={vi.fn()}
+        onRuntimeModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}
@@ -60,6 +62,7 @@ describe('ComposerBar', () => {
       <ComposerBar
         busy={false}
         inputValue="尚未发送的消息"
+        runtimeToolPreset="focus_plan"
         skillPicker={createSkillPicker()}
         voice={{
           status: '语音已就绪',
@@ -71,6 +74,7 @@ describe('ComposerBar', () => {
         sendIcon={<span>发送图标</span>}
         sendDisabledReason="角色状态已过期，请先重试同步。"
         onInputValueChange={vi.fn()}
+        onRuntimeModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}
@@ -88,6 +92,7 @@ describe('ComposerBar', () => {
     expect(onStopVoice).toHaveBeenCalledTimes(1);
     expect(composer.getByRole('button', { name: '发送' })).toBeDisabled();
     expect(composer.getByRole('button', { name: 'Skill' })).toBeDisabled();
+    expect(composer.getByRole('button', { name: '运行模式：计划' })).toBeDisabled();
   });
 
   it('展示已选择的 Skill 附件并允许在空闲时移除', () => {
@@ -97,6 +102,7 @@ describe('ComposerBar', () => {
       <ComposerBar
         busy={false}
         inputValue="生成一份报告"
+        runtimeToolPreset="daily"
         skillPicker={createSkillPicker({
           selectedSkill: {
             name: 'pdf',
@@ -116,6 +122,7 @@ describe('ComposerBar', () => {
         } as never}
         sendIcon={<span>发送图标</span>}
         onInputValueChange={vi.fn()}
+        onRuntimeModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}

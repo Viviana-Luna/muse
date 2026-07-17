@@ -65,6 +65,9 @@ pub struct RuntimePolicySnapshot {
     pub voice_fallback_reason: Option<String>,
     pub tool_preset: String,
     pub tool_ids: Vec<String>,
+    /// 用户显式选择的内置 Skill 在本轮额外获得的最小工具集合。
+    #[serde(default)]
+    pub skill_tool_ids: Vec<String>,
     pub tool_policy: ToolPolicy,
     #[serde(default)]
     pub skill_policy: SkillPolicy,

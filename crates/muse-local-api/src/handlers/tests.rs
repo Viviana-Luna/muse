@@ -1341,6 +1341,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -1421,6 +1422,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -1461,9 +1463,62 @@ mod tests {
     #[tokio::test]
     async fn selected_skill_is_loaded_from_frozen_catalog_before_model_call() {
         let data_dir = unique_temp_dir("selected-skill-activation");
-        let state = build_test_state(&data_dir);
+        let mut state = build_test_state(&data_dir);
+        muse_core::domain::tool::builtin::register_all(
+            &mut Arc::get_mut(&mut state)
+                .expect("测试状态尚未共享")
+                .tools,
+        );
         configure_test_chat(&state).await;
-        let turn = super::build_turn_context(
+        let mcp_catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
+            data_dir.join("mcp").join("servers.json"),
+        );
+        let (skill_catalog, _) = super::frozen_runtime_skill_catalog(&state, None).await;
+        let required_tools = super::selected_builtin_skill_required_tools(
+            &skill_catalog,
+            Some("skill-creator"),
+        );
+        assert_eq!(required_tools, ["create_skill"]);
+        let mut full_tool_defs = super::runtime_frozen_tool_defs_for_policy_with_catalog(
+            &state,
+            None,
+            &mcp_catalog,
+        );
+        assert!(!full_tool_defs.iter().any(|tool| tool.name == "create_skill"));
+        let skill_tool_ids = super::grant_selected_skill_required_tools(
+            &state,
+            None,
+            &mut full_tool_defs,
+            &required_tools,
+        )
+        .expect("默认角色应允许已选内置 Skill 的最小工具依赖");
+        let restricted_persona: Persona = serde_json::from_value(serde_json::json!({
+            "id": "restricted-skill-persona",
+            "name": "受限角色",
+            "system_prompt": "保持角色。",
+            "default_visual_pack_id": "default",
+            "tool_policy": {
+                "mode": "allow_list",
+                "allowed_tools": []
+            }
+        }))
+        .expect("应构造受限角色");
+        let policy_error = super::grant_selected_skill_required_tools(
+            &state,
+            Some(&restricted_persona),
+            &mut Vec::new(),
+            &required_tools,
+        )
+        .expect_err("显式白名单缺少必需工具时必须拒绝 Turn");
+        assert!(policy_error.contains("当前角色工具策略未允许"));
+        let visible_tool_defs = super::visible_tool_definitions_for_turn(
+            &full_tool_defs,
+            muse_core::domain::runtime::ToolPreset::Daily,
+            &skill_tool_ids,
+        );
+        assert!(visible_tool_defs.iter().any(|tool| tool.name == "create_skill"));
+
+        let mut turn = super::build_turn_context(
             &state,
             "selected-skill-conversation".to_string(),
             "selected-skill-turn".to_string(),
@@ -1471,13 +1526,16 @@ mod tests {
             false,
             "system".to_string(),
             super::FrozenTurnToolCatalog {
-                definitions: &[],
+                definitions: &full_tool_defs,
                 mcp: None,
+                skills: None,
             },
         )
         .await
         .expect("应冻结包含内置 Skill 的 Turn")
         .context;
+        turn.runtime_policy.skill_tool_ids = skill_tool_ids;
+        assert!(super::runtime_tool_allowed(&turn, "create_skill"));
 
         let (prompt, activated) =
             super::activate_selected_skill(&state, &turn, "skill-creator")
@@ -4470,6 +4528,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &definitions,
                 mcp: Some(&catalog),
+                skills: None,
             },
         )
         .await
@@ -4547,6 +4606,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &tools,
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -4603,6 +4663,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -4627,6 +4688,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -4705,16 +4767,17 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
         .expect("应冻结 Turn 运行时")
         .context;
 
-        assert_eq!(turn.runtime_policy.schema_version, 5);
+        assert_eq!(turn.runtime_policy.schema_version, 6);
         assert_eq!(
             turn.runtime_policy.policy_version,
-            "persona-runtime-policy/v5"
+            "persona-runtime-policy/v6"
         );
         assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
         assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
@@ -4747,6 +4810,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
@@ -4771,6 +4835,7 @@ mod tests {
             super::FrozenTurnToolCatalog {
                 definitions: &[],
                 mcp: None,
+                skills: None,
             },
         )
         .await
