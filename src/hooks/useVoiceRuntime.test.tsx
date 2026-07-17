@@ -289,4 +289,33 @@ describe('useVoiceRuntime', () => {
     await expect(playback).resolves.toBe('语音播放已停止。');
     expect(result.current.voice.phase).toBe('idle');
   });
+
+  it('手动开启角色播报时沿用冻结的角色音色', async () => {
+    const { result } = renderHook(() =>
+      useVoiceRuntime({ onTranscript: vi.fn(), getTranscriptContext: transcriptContext })
+    );
+    await waitFor(() => expect(result.current.voice.ttsAvailable).toBe(true));
+
+    const audio = document.createElement('audio');
+    vi.spyOn(audio, 'play').mockResolvedValue();
+    vi.spyOn(audio, 'pause').mockImplementation(() => undefined);
+    vi.spyOn(audio, 'load').mockImplementation(() => undefined);
+    result.current.audioRef.current = audio;
+
+    act(() => {
+      result.current.toggleVoice({
+        role: 'assistant',
+        text: '使用角色音色播报',
+        voiceId: 'persona-voice'
+      });
+    });
+
+    await waitFor(() =>
+      expect(api.synthesizeSpeech).toHaveBeenCalledWith(
+        '使用角色音色播报',
+        expect.any(AbortSignal),
+        'persona-voice'
+      )
+    );
+  });
 });

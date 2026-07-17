@@ -235,7 +235,7 @@ fn normalize_json_text(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{PersonaStore, PersonaStoreError};
-    use crate::domain::persona::{Persona, RoleplayStyle, ToolPolicy};
+    use crate::domain::persona::{Persona, PersonaModelReference, RoleplayStyle, ToolPolicy};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -268,6 +268,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "room-default".to_string(),
             author: "rainy".to_string(),
             version: "1.0.0".to_string(),
@@ -299,6 +301,31 @@ mod tests {
         assert_eq!(reloaded.personas().len(), 1);
         assert_eq!(reloaded.active_persona_id(), Some("persona-a"));
         assert_eq!(reloaded.list()[0].id, "persona-a");
+    }
+
+    #[test]
+    fn preserves_unavailable_model_and_voice_references_for_repair() {
+        let dir = unique_temp_dir();
+        let mut store = PersonaStore::load_from_dir(&dir).expect("首次加载失败");
+        let mut persona = sample_persona("persona-reference");
+        persona.preferred_model_ref = Some(PersonaModelReference {
+            provider_id: "removed-provider".to_string(),
+            model_id: "removed-model".to_string(),
+        });
+        persona.preferred_voice_id = Some("legacy-voice".to_string());
+        store.upsert(persona).expect("写入角色失败");
+        store.save().expect("保存角色失败");
+
+        let reloaded = PersonaStore::load_from_dir(&dir).expect("重载角色失败");
+        let saved = reloaded.get("persona-reference").expect("角色应存在");
+        assert_eq!(
+            saved
+                .preferred_model_ref
+                .as_ref()
+                .map(|reference| (reference.provider_id.as_str(), reference.model_id.as_str())),
+            Some(("removed-provider", "removed-model"))
+        );
+        assert_eq!(saved.preferred_voice_id.as_deref(), Some("legacy-voice"));
     }
 
     #[test]

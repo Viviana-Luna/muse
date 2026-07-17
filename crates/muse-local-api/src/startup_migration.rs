@@ -200,6 +200,8 @@ fn historical_default_persona() -> Persona {
         tool_policy: ToolPolicy::default(),
         skill_policy: Default::default(),
         mcp_policy: Default::default(),
+        preferred_model_ref: None,
+        preferred_voice_id: None,
         default_visual_pack_id: "default-visual-pack".to_string(),
         author: "system".to_string(),
         version: "1.0.0".to_string(),

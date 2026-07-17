@@ -38,8 +38,20 @@ pub enum RuntimeEvent {
         persona_id: Option<String>,
         model_provider: String,
         model_name: String,
+        #[serde(default)]
+        model_source: String,
+        #[serde(default)]
+        model_fallback: bool,
+        #[serde(default)]
+        model_fallback_reason: Option<String>,
         voice_enabled: bool,
         active_voice_id: Option<String>,
+        #[serde(default)]
+        voice_source: String,
+        #[serde(default)]
+        voice_fallback: bool,
+        #[serde(default)]
+        voice_fallback_reason: Option<String>,
         runtime_mode: String,
         focus_phase: String,
         tool_preset: String,
@@ -131,4 +143,43 @@ pub enum RuntimeEvent {
         message: String,
     },
     Done,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeEvent;
+
+    #[test]
+    fn legacy_turn_started_defaults_new_runtime_audit_fields() {
+        let event: RuntimeEvent = serde_json::from_value(serde_json::json!({
+            "type": "turn_started",
+            "turn_id": "turn-legacy",
+            "conversation_id": "conversation-legacy",
+            "persona_id": "persona-legacy",
+            "model_provider": "deepseek",
+            "model_name": "deepseek-v4-pro",
+            "voice_enabled": false,
+            "active_voice_id": null,
+            "runtime_mode": "daily",
+            "focus_phase": "plan",
+            "tool_preset": "daily"
+        }))
+        .expect("旧 turn_started 应继续可读");
+
+        match event {
+            RuntimeEvent::TurnStarted {
+                model_source,
+                model_fallback,
+                voice_source,
+                voice_fallback,
+                ..
+            } => {
+                assert!(model_source.is_empty());
+                assert!(!model_fallback);
+                assert!(voice_source.is_empty());
+                assert!(!voice_fallback);
+            }
+            _ => panic!("应解析为 turn_started"),
+        }
+    }
 }

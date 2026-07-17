@@ -8,7 +8,13 @@ import type { AppToastInput } from '@/hooks/useAppToast';
 import { useAuthenticatedAssetUrl } from '@/hooks/useAuthenticatedAsset';
 import { useModalAccessibility } from '@/hooks/useModalAccessibility';
 import { detectImageTheme } from '@/hooks/usePersonaTheme';
-import type { Persona, PersonaVisualPackPatch } from '@/types';
+import type {
+  ModelCatalog,
+  ModelsConfig,
+  Persona,
+  PersonaModelReference,
+  PersonaVisualPackPatch
+} from '@/types';
 import type {
   PersonaEditorMode,
   PersonaEditorState
@@ -85,6 +91,8 @@ interface PersonaValidationIssue {
 
 interface PersonaEditorDialogProps {
   editor: PersonaEditorState;
+  modelCatalog?: ModelCatalog | null;
+  modelsConfig?: ModelsConfig | null;
   busy: boolean;
   notify: (input: AppToastInput) => void;
   onClose: () => void;
@@ -102,6 +110,29 @@ interface PersonaEditorDialogProps {
   updateEditorToolPolicyMode: (mode: Persona['tool_policy']['mode']) => void;
   updateEditorAllowedTools: (value: string) => void;
   primaryActionLabel?: string;
+}
+
+function modelReferenceValue(reference: PersonaModelReference | null): string {
+  return reference
+    ? JSON.stringify([reference.provider_id, reference.model_id])
+    : '';
+}
+
+function parseModelReference(value: string): PersonaModelReference | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      parsed.every((item) => typeof item === 'string' && item.trim())
+    ) {
+      return { provider_id: parsed[0], model_id: parsed[1] };
+    }
+  } catch {
+    // 选择值只由当前表单生成；解析失败时保持继承全局，避免写入残缺引用。
+  }
+  return null;
 }
 
 function clampVisualNumber(
@@ -191,6 +222,8 @@ function resolveEditorFrameRatio(value?: string): string {
 
 export function PersonaEditorDialog({
   editor,
+  modelCatalog = null,
+  modelsConfig = null,
   busy,
   notify,
   onClose,
@@ -212,6 +245,43 @@ export function PersonaEditorDialog({
   const portraitPreviewPath = useAuthenticatedAssetUrl(portraitPath);
   const avatarPreviewPath = useAuthenticatedAssetUrl(avatarPath);
   const backgroundPreviewPath = useAuthenticatedAssetUrl(backgroundPath);
+  const preferredModelRef = editor.persona.preferred_model_ref;
+  const preferredModelValue = modelReferenceValue(preferredModelRef);
+  const chatModels = (modelCatalog?.models ?? []).filter((model) =>
+    model.functions.includes('chat')
+  );
+  const preferredCatalogModel = preferredModelRef
+    ? modelCatalog?.models.find(
+        (model) =>
+          model.provider_id === preferredModelRef.provider_id &&
+          model.model === preferredModelRef.model_id
+      )
+    : undefined;
+  const preferredChatModel = preferredModelRef
+    ? chatModels.find(
+        (model) =>
+          model.provider_id === preferredModelRef.provider_id &&
+          model.model === preferredModelRef.model_id
+      )
+    : undefined;
+  const preferredProvider = preferredModelRef
+    ? modelCatalog?.providers.find((provider) => provider.id === preferredModelRef.provider_id)
+    : undefined;
+  const preferredModelInvalid = Boolean(
+    preferredModelRef &&
+      modelCatalog &&
+      (!preferredCatalogModel ||
+        !preferredCatalogModel.enabled ||
+        !preferredCatalogModel.functions.includes('chat') ||
+        !preferredProvider?.enabled ||
+        preferredProvider.status !== 'supported' ||
+        !preferredProvider.api_key_configured)
+  );
+  const globalChatModel = modelsConfig?.chat;
+  const globalModelLabel = globalChatModel?.provider && globalChatModel.model
+    ? `${globalChatModel.provider} / ${globalChatModel.model}`
+    : '尚未配置';
+  const globalVoiceId = modelsConfig?.tts.voice_id.trim() || '尚未配置';
   const previewPaths: Record<PersonaImageSlot, string> = {
     portrait_path: portraitPreviewPath,
     avatar_path: avatarPreviewPath,
@@ -756,6 +826,71 @@ export function PersonaEditorDialog({
                   })
                 }
               />
+            </label>
+            <label className="wide persona-runtime-reference-field">
+              偏好聊天模型
+              <select
+                name="preferred_model_ref"
+                aria-label="偏好聊天模型"
+                value={preferredModelValue}
+                onChange={(event) =>
+                  updatePersona('preferred_model_ref', parseModelReference(event.target.value))
+                }
+              >
+                <option value="">继承全局活动模型（{globalModelLabel}）</option>
+                {preferredModelRef && !preferredChatModel && (
+                  <option value={preferredModelValue} disabled>
+                    当前引用已失效（{preferredModelRef.provider_id} / {preferredModelRef.model_id}）
+                  </option>
+                )}
+                {chatModels.map((model) => {
+                  const provider = modelCatalog?.providers.find(
+                    (candidate) => candidate.id === model.provider_id
+                  );
+                  const available = Boolean(
+                    provider?.enabled &&
+                      provider.status === 'supported' &&
+                      provider.api_key_configured &&
+                      model.enabled
+                  );
+                  return (
+                    <option
+                      key={model.id}
+                      value={modelReferenceValue({
+                        provider_id: model.provider_id,
+                        model_id: model.model
+                      })}
+                      disabled={!available}
+                    >
+                      {provider?.name ?? model.provider_id} / {model.name}
+                      {available ? '' : '（不可用）'}
+                    </option>
+                  );
+                })}
+              </select>
+              {preferredModelInvalid && (
+                <span className="persona-reference-warning" role="status">
+                  引用已失效或缺少 Provider 凭据。引用会继续保留；若全局活动模型可用，对话时将显式回退，否则会在请求前报错。请在此重新选择修复。
+                </span>
+              )}
+              {!modelCatalog && (
+                <small>模型目录暂不可用；已有引用不会被清空。</small>
+              )}
+            </label>
+            <label className="wide persona-runtime-reference-field">
+              偏好音色 ID
+              <input
+                name="preferred_voice_id"
+                aria-label="偏好音色 ID"
+                value={editor.persona.preferred_voice_id ?? ''}
+                placeholder={`留空继承全局音色（${globalVoiceId}）`}
+                onChange={(event) =>
+                  updatePersona('preferred_voice_id', event.target.value || null)
+                }
+              />
+              <small>
+                音色 ID 由当前 TTS 供应商解释，本地不会伪造可用性；上游拒绝后不会静默切换音色。
+              </small>
             </label>
             <label className="wide">
               备注

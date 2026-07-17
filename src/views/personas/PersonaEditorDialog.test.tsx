@@ -3,7 +3,7 @@ import type { ComponentProps } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '@/api/client';
-import type { Persona } from '@/types';
+import type { ModelCatalog, Persona } from '@/types';
 import type { PersonaEditorState } from '@/views/personas/hooks/usePersonaState';
 import { PersonaEditorDialog } from './PersonaEditorDialog';
 
@@ -33,10 +33,54 @@ const persona: Persona = {
   tool_policy: { mode: 'inherit', allowed_tools: [] },
   skill_policy: { mode: 'inherit', allowed_skills: [] },
   mcp_policy: { mode: 'inherit', allowed_servers: [] },
+  preferred_model_ref: null,
+  preferred_voice_id: null,
   default_visual_pack_id: 'default',
   author: '',
   version: '1.0.0',
   notes: ''
+};
+
+const modelCatalog: ModelCatalog = {
+  providers: [
+    {
+      id: 'deepseek',
+      name: 'DeepSeek',
+      default_api_base: 'https://api.deepseek.com',
+      chat_model_list_url: '',
+      tts_model_list_url: '',
+      enabled: true,
+      notes: '',
+      supports_balance_check: true,
+      capabilities: ['chat'],
+      model_list_auth: 'required',
+      allow_custom_base: false,
+      connection_validation: 'model_list',
+      status: 'supported',
+      api_key_configured: true
+    }
+  ],
+  models: [
+    {
+      id: 'deepseek:deepseek-v4-pro',
+      provider_id: 'deepseek',
+      name: 'DeepSeek V4 Pro',
+      model: 'deepseek-v4-pro',
+      default_api_base: 'https://api.deepseek.com',
+      enabled: true,
+      notes: '',
+      tags: ['reasoning'],
+      functions: ['chat'],
+      capabilities: ['chat', 'reasoning'],
+      context_window: 1_000_000,
+      default_max_output_tokens: 384_000,
+      supports_usage: true,
+      supports_cached_tokens: true,
+      supports_reasoning_tokens: true,
+      tokenizer_family: 'deepseek'
+    }
+  ],
+  capabilities: ['chat', 'reasoning']
 };
 
 function renderEditor(
@@ -226,5 +270,70 @@ describe('PersonaEditorDialog', () => {
       mode: 'inherit',
       allowed_servers: ['docs', 'search']
     });
+  });
+
+  it('保留失效模型引用并提供显式修复，同时允许填写角色音色', () => {
+    const updateEditor = vi.fn();
+    renderEditor(
+      {
+        persona: {
+          ...persona,
+          preferred_model_ref: {
+            provider_id: 'removed-provider',
+            model_id: 'removed-model'
+          }
+        }
+      },
+      { updateEditor, modelCatalog }
+    );
+
+    expect(screen.getByRole('status')).toHaveTextContent('引用会继续保留');
+    fireEvent.change(screen.getByLabelText('偏好聊天模型'), {
+      target: { value: JSON.stringify(['deepseek', 'deepseek-v4-pro']) }
+    });
+    fireEvent.change(screen.getByLabelText('偏好音色 ID'), {
+      target: { value: 'persona-voice' }
+    });
+
+    expect(updateEditor).toHaveBeenCalledWith('preferred_model_ref', {
+      provider_id: 'deepseek',
+      model_id: 'deepseek-v4-pro'
+    });
+    expect(updateEditor).toHaveBeenCalledWith('preferred_voice_id', 'persona-voice');
+  });
+
+  it('存在但不支持聊天的模型仍以失效引用展示', () => {
+    renderEditor(
+      {
+        persona: {
+          ...persona,
+          preferred_model_ref: {
+            provider_id: 'deepseek',
+            model_id: 'audio-only-model'
+          }
+        }
+      },
+      {
+        modelCatalog: {
+          ...modelCatalog,
+          models: [
+            ...modelCatalog.models,
+            {
+              ...modelCatalog.models[0],
+              id: 'deepseek:audio-only-model',
+              model: 'audio-only-model',
+              name: '仅音频模型',
+              functions: ['audio_understanding'],
+              capabilities: ['audio_understanding']
+            }
+          ]
+        }
+      }
+    );
+
+    expect(screen.getByLabelText('偏好聊天模型')).toHaveValue(
+      JSON.stringify(['deepseek', 'audio-only-model'])
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('引用会继续保留');
   });
 });

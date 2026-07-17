@@ -18,6 +18,11 @@ export interface McpPolicy {
 export type RoleplayStyle = 'dialogue' | 'light_narration' | 'immersive' | 'text_adventure';
 export type VisualThemeMode = 'auto' | 'dark' | 'light';
 
+export interface PersonaModelReference {
+  provider_id: string;
+  model_id: string;
+}
+
 export interface Persona {
   id: string;
   name: string;
@@ -34,6 +39,8 @@ export interface Persona {
   tool_policy: ToolPolicy;
   skill_policy: SkillPolicy;
   mcp_policy: McpPolicy;
+  preferred_model_ref: PersonaModelReference | null;
+  preferred_voice_id: string | null;
   default_visual_pack_id: string;
   author: string;
   version: string;

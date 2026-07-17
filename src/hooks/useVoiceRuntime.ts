@@ -10,6 +10,7 @@ type VoiceDialogueRole = 'system' | 'user' | 'assistant';
 interface VoiceDialogueSnapshot {
   role: VoiceDialogueRole;
   text: string;
+  voiceId?: string;
 }
 
 // 录音开始时捕获的写入上下文，用于拒绝跨角色或跨状态版本的迟到转写。
@@ -580,7 +581,7 @@ export function useVoiceRuntime({
         });
       }
       if (nextEnabled && dialogue?.role === 'assistant') {
-        void speak(dialogue.text, { forceEnabled: true });
+        void speak(dialogue.text, { forceEnabled: true, voiceId: dialogue.voiceId });
       }
     },
     [resumeAnalyserContext, speak, stopVoice, voice.ttsAvailable, voice.voiceEnabled]

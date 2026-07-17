@@ -75,6 +75,15 @@ pub enum RoleplayStyle {
     TextAdventure,
 }
 
+/// Persona 对聊天模型的非敏感引用。
+///
+/// Provider 端点与 API Key 仍只属于 `config.toml`；角色卡仅保存可修复的目录身份。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaModelReference {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
 /// 角色资产主体。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Persona {
@@ -105,6 +114,10 @@ pub struct Persona {
     pub skill_policy: SkillPolicy,
     #[serde(default)]
     pub mcp_policy: McpPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model_ref: Option<PersonaModelReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_voice_id: Option<String>,
     pub default_visual_pack_id: String,
     #[serde(default)]
     pub author: String,
@@ -184,6 +197,25 @@ impl Persona {
         if self.default_visual_pack_id.trim().is_empty() {
             return Err(PersonaValidationError::EmptyField("default_visual_pack_id"));
         }
+        if let Some(model_ref) = &self.preferred_model_ref {
+            if model_ref.provider_id.trim().is_empty() {
+                return Err(PersonaValidationError::EmptyField(
+                    "preferred_model_ref.provider_id",
+                ));
+            }
+            if model_ref.model_id.trim().is_empty() {
+                return Err(PersonaValidationError::EmptyField(
+                    "preferred_model_ref.model_id",
+                ));
+            }
+        }
+        if self
+            .preferred_voice_id
+            .as_deref()
+            .is_some_and(|voice_id| voice_id.trim().is_empty())
+        {
+            return Err(PersonaValidationError::EmptyField("preferred_voice_id"));
+        }
         Ok(())
     }
 
@@ -227,6 +259,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: SkillPolicy::default(),
             mcp_policy: McpPolicy::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default-room".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),

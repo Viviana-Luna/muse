@@ -396,6 +396,12 @@ mod tests {
             system_prompt: "测试系统提示".to_string(),
             model_provider: "test-provider".to_string(),
             model_name: "test-model".to_string(),
+            model_source: "global_active".to_string(),
+            model_fallback: false,
+            model_fallback_reason: None,
+            model_capabilities: vec!["chat".to_string()],
+            model_context_window: 128_000,
+            model_max_output_tokens: 8_192,
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
@@ -404,6 +410,9 @@ mod tests {
             tool_preset: "focus_build".to_string(),
             voice_enabled: false,
             active_voice_id: None,
+            voice_source: "unavailable".to_string(),
+            voice_fallback: false,
+            voice_fallback_reason: None,
             created_at: "2026-07-05T00:00:00Z".to_string(),
             runtime_policy: Default::default(),
             tool_definitions: Vec::new(),
@@ -521,6 +530,16 @@ mod tests {
             ),
             emotion_tx: tokio::sync::broadcast::channel(1).0,
         })
+    }
+
+    async fn configure_test_chat(state: &Arc<AppState>) {
+        let mut config = state.model_config.lock().await;
+        config
+            .update_provider_api_key("deepseek", Some("test-secret".to_string()))
+            .expect("应配置测试 Provider Key");
+        config
+            .update_active_chat_model("deepseek", "deepseek-v4-pro")
+            .expect("应配置测试活动模型");
     }
 
     fn test_execution_policy() -> muse_runtime::FrozenExecutionPolicy {
@@ -3060,6 +3079,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -3702,6 +3723,8 @@ mod tests {
                 tool_policy: ToolPolicy::default(),
                 skill_policy: Default::default(),
                 mcp_policy: Default::default(),
+                preferred_model_ref: None,
+                preferred_voice_id: None,
                 default_visual_pack_id: "default-visual-pack".to_string(),
                 author: String::new(),
                 version: "1.0.0".to_string(),
@@ -3771,6 +3794,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "visual-persona-slots".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -3820,6 +3845,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -3910,6 +3937,8 @@ mod tests {
                 mode: muse_core::domain::persona::ResourcePolicyMode::AllowList,
                 allowed_servers: vec!["alpha".to_string()],
             },
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -3958,6 +3987,7 @@ mod tests {
     async fn turn_freezes_mcp_approval_revision_and_annotations_hash() {
         let dir = unique_temp_dir("turn-mcp-approval");
         let state = build_test_state(&dir);
+        configure_test_chat(&state).await;
         let mut catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
             dir.join("config.toml"),
         );
@@ -3991,7 +4021,9 @@ mod tests {
                 mcp: Some(&catalog),
             },
         )
-        .await;
+        .await
+        .expect("应冻结 Turn 运行时")
+        .context;
 
         assert_eq!(turn.runtime_policy.mcp_tool_policies.len(), 1);
         let frozen = &turn.runtime_policy.mcp_tool_policies[0];
@@ -4011,6 +4043,7 @@ mod tests {
     async fn runtime_policy_snapshot_contains_only_frozen_public_facts() {
         let dir = unique_temp_dir("runtime-policy-snapshot");
         let state = build_test_state(&dir);
+        configure_test_chat(&state).await;
         let mut persona = Persona {
             id: "snapshot-persona".to_string(),
             name: "快照角色".to_string(),
@@ -4033,6 +4066,8 @@ mod tests {
                 mode: muse_core::domain::persona::ResourcePolicyMode::AllowList,
                 allowed_servers: vec!["docs".to_string()],
             },
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "2.0.0".to_string(),
@@ -4063,7 +4098,9 @@ mod tests {
                 mcp: None,
             },
         )
-        .await;
+        .await
+        .expect("应冻结 Turn 运行时")
+        .context;
         let serialized = serde_json::to_string(&turn.runtime_policy).expect("策略快照应可序列化");
 
         assert_eq!(turn.runtime_policy.persona_version.as_deref(), Some("2.0.0"));
@@ -4071,6 +4108,93 @@ mod tests {
         assert_eq!(turn.runtime_policy.mcp_policy.allowed_servers, vec!["docs"]);
         assert!(!serialized.contains(dir.to_string_lossy().as_ref()));
         assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn turn_resolves_persona_model_and_records_explicit_fallback() {
+        let dir = unique_temp_dir("turn-persona-model");
+        let state = build_test_state(&dir);
+        configure_test_chat(&state).await;
+        let mut persona = Persona {
+            id: "model-persona".to_string(),
+            name: "模型角色".to_string(),
+            summary: String::new(),
+            character_profile: "可靠".to_string(),
+            world_profile: String::new(),
+            scenario: String::new(),
+            system_prompt: "保持角色。".to_string(),
+            style: String::new(),
+            roleplay_style: RoleplayStyle::Dialogue,
+            dialogue_examples: String::new(),
+            author_note: String::new(),
+            opening_message: String::new(),
+            tool_policy: ToolPolicy::default(),
+            skill_policy: Default::default(),
+            mcp_policy: Default::default(),
+            preferred_model_ref: Some(muse_core::domain::persona::PersonaModelReference {
+                provider_id: "deepseek".to_string(),
+                model_id: "deepseek-v4-flash".to_string(),
+            }),
+            preferred_voice_id: None,
+            default_visual_pack_id: "default".to_string(),
+            author: String::new(),
+            version: "1.0.0".to_string(),
+            notes: String::new(),
+        };
+
+        let preferred = super::build_turn_context(
+            &state,
+            "conversation-persona-model".to_string(),
+            "turn-persona-model".to_string(),
+            Some(&persona),
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
+        )
+        .await
+        .expect("角色模型应可冻结")
+        .context;
+        assert_eq!(preferred.model_name, "deepseek-v4-flash");
+        assert_eq!(preferred.model_source, "persona_preference");
+        assert!(!preferred.model_fallback);
+        assert!(preferred.model_context_window > 0);
+
+        persona.preferred_model_ref = Some(muse_core::domain::persona::PersonaModelReference {
+            provider_id: "deepseek".to_string(),
+            model_id: "deleted-model".to_string(),
+        });
+        let fallback = super::build_turn_context(
+            &state,
+            "conversation-persona-model".to_string(),
+            "turn-persona-model-fallback".to_string(),
+            Some(&persona),
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
+        )
+        .await
+        .expect("失效角色引用应回退到全局模型")
+        .context;
+        assert_eq!(fallback.model_name, "deepseek-v4-pro");
+        assert_eq!(fallback.model_source, "global_active");
+        assert!(fallback.model_fallback);
+        assert!(
+            fallback
+                .model_fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("deleted-model"))
+        );
+        assert_eq!(
+            state.model_config.lock().await.chat().model,
+            "deepseek-v4-pro",
+            "回退不得改写全局活动模型"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4092,6 +4216,7 @@ mod tests {
             .unwrap();
         }
         let state = build_test_state(&dir);
+        configure_test_chat(&state).await;
         let persona = Persona {
             id: "skill-catalog-persona".to_string(),
             name: "目录角色".to_string(),
@@ -4111,6 +4236,8 @@ mod tests {
                 allowed_skills: vec!["calendar".to_string(), "broken".to_string()],
             },
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4129,12 +4256,14 @@ mod tests {
                 mcp: None,
             },
         )
-        .await;
+        .await
+        .expect("应冻结 Turn 运行时")
+        .context;
 
-        assert_eq!(turn.runtime_policy.schema_version, 3);
+        assert_eq!(turn.runtime_policy.schema_version, 4);
         assert_eq!(
             turn.runtime_policy.policy_version,
-            "persona-resource-policy/v3"
+            "persona-runtime-policy/v4"
         );
         assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
         assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
@@ -4167,7 +4296,9 @@ mod tests {
                 mcp: None,
             },
         )
-        .await;
+        .await
+        .expect("应冻结下一 Turn 运行时")
+        .context;
         assert_ne!(next_turn.runtime_policy.skill_catalog_hash, original_hash);
         assert_ne!(
             next_turn.runtime_policy.skill_revision,
@@ -4189,7 +4320,9 @@ mod tests {
                 mcp: None,
             },
         )
-        .await;
+        .await
+        .expect("应冻结禁用 Skill 的 Turn 运行时")
+        .context;
         assert!(disabled_turn.runtime_policy.skill_catalog.is_empty());
         assert!(!disabled_turn.system_prompt.contains("【当前可用 Skill】"));
         let _ = std::fs::remove_dir_all(dir);
@@ -4212,6 +4345,8 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            preferred_model_ref: None,
+            preferred_voice_id: None,
             default_visual_pack_id: "visual-a".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4831,6 +4966,11 @@ mod tests {
         {
             if std::panic::AssertUnwindSafe(runtime_policy_snapshot_contains_only_frozen_public_facts()).catch_unwind().await.is_err() {
                 failures.push("runtime_policy_snapshot_contains_only_frozen_public_facts");
+            }
+        }
+        {
+            if std::panic::AssertUnwindSafe(turn_resolves_persona_model_and_records_explicit_fallback()).catch_unwind().await.is_err() {
+                failures.push("turn_resolves_persona_model_and_records_explicit_fallback");
             }
         }
         {

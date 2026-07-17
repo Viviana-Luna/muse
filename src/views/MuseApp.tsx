@@ -2,6 +2,7 @@
 
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { Check } from 'lucide-react';
+import { fetchModelCatalog, fetchModelsConfig } from '@/api';
 import { reportDesktopReady } from '@/api/client';
 import {
   migrateLegacyMuseUrl,
@@ -39,6 +40,7 @@ import {
 import { SessionsPage } from '@/views/sessions/SessionsPage';
 import { SkillsPage } from '@/views/skills/SkillsPage';
 import { McpPage } from '@/views/mcp/McpPage';
+import type { ModelCatalog, ModelsConfig } from '@/types';
 
 const loadSettingsDialog = () =>
   import('@/views/settings/SettingsDialog').then((module) => ({ default: module.SettingsDialog }));
@@ -59,6 +61,10 @@ export function App() {
   });
   const [settingsChunkAttempt, setSettingsChunkAttempt] = useState(0);
   const [personaEditorChunkAttempt, setPersonaEditorChunkAttempt] = useState(0);
+  const [personaEditorModelCatalog, setPersonaEditorModelCatalog] =
+    useState<ModelCatalog | null>(null);
+  const [personaEditorModelsConfig, setPersonaEditorModelsConfig] =
+    useState<ModelsConfig | null>(null);
   const SettingsDialog = useMemo(() => lazy(loadSettingsDialog), [settingsChunkAttempt]);
   const PersonaEditorDialog = useMemo(
     () => lazy(loadPersonaEditorDialog),
@@ -167,12 +173,37 @@ export function App() {
     synchronizeRuntimeAfterPersonaReset,
     closeCurrentChatSource,
     stopVoice,
+    prepareEditorResources: preparePersonaEditorResources,
     navigateToStory: () => navigateMuseSection('chat'),
     onPersonaRefreshStart: storyState.beginLoad,
     onPersonaRefreshSuccess: storyState.commitSnapshot,
     onPersonaRefreshError: storyState.failLoad
   });
   const { transitionState, handleActivate, openEditor, saveEditorDraft } = personaController;
+
+  async function preparePersonaEditorResources() {
+    const [configResult, catalogResult] = await Promise.allSettled([
+      fetchModelsConfig(),
+      fetchModelCatalog()
+    ]);
+    setPersonaEditorModelsConfig(
+      configResult.status === 'fulfilled' ? configResult.value : null
+    );
+    setPersonaEditorModelCatalog(
+      catalogResult.status === 'fulfilled' ? catalogResult.value : null
+    );
+    const failed = [
+      configResult.status === 'rejected' ? '全局模型配置' : '',
+      catalogResult.status === 'rejected' ? '模型目录' : ''
+    ].filter(Boolean);
+    if (failed.length > 0) {
+      notify({
+        title: '角色运行偏好读取不完整',
+        description: `${failed.join('、')}暂时无法读取；已有引用仍会保留，可稍后重新打开修复。`,
+        tone: 'warning'
+      });
+    }
+  }
   const {
     initializeAppearancePreferences,
     openSettings,
@@ -565,6 +596,8 @@ export function App() {
           >
             <PersonaEditorDialog
               editor={editor}
+              modelCatalog={personaEditorModelCatalog}
+              modelsConfig={personaEditorModelsConfig}
               busy={busy || Boolean(storyState.mutationBlockReason)}
               notify={notify}
               onClose={closeEditor}

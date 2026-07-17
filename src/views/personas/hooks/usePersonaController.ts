@@ -51,6 +51,7 @@ interface UsePersonaControllerOptions {
   closeCurrentChatSource: () => void;
   stopVoice: () => void;
   navigateToStory: () => void;
+  prepareEditorResources?: () => void | Promise<void>;
   onPersonaRefreshStart?: () => void;
   onPersonaRefreshSuccess?: (snapshot: StoryPersonaSnapshot) => void;
   onPersonaRefreshError?: (error: unknown) => void;
@@ -234,6 +235,7 @@ export function usePersonaController(options: UsePersonaControllerOptions) {
   }
 
   async function openEditor(mode: PersonaEditorMode, summary?: { id: string }) {
+    await options.prepareEditorResources?.();
     if (mode === 'create') {
       state.setEditor({
         open: true,

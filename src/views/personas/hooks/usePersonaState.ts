@@ -51,6 +51,8 @@ export const DEFAULT_PERSONA: Persona = {
     mode: 'inherit',
     allowed_servers: []
   },
+  preferred_model_ref: null,
+  preferred_voice_id: null,
   default_visual_pack_id: 'default-visual-pack',
   author: '',
   version: '1.0.0',

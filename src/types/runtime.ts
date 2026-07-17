@@ -62,8 +62,16 @@ export interface RuntimeTurnStartedEvent extends RuntimeEventBase {
   conversation_id?: string;
   persona_id?: string | null;
   model?: string;
+  model_provider?: string;
+  model_name?: string;
+  model_source?: 'persona_preference' | 'global_active' | string;
+  model_fallback?: boolean;
+  model_fallback_reason?: string | null;
   voice_enabled?: boolean;
   active_voice_id?: string | null;
+  voice_source?: 'persona_preference' | 'global_active' | 'unavailable' | string;
+  voice_fallback?: boolean;
+  voice_fallback_reason?: string | null;
   runtime_mode?: RuntimeMode;
   focus_phase?: RuntimeFocusPhase;
   tool_preset?: RuntimeToolPreset;

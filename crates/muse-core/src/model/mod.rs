@@ -20,8 +20,8 @@ pub use profile::{
     chat_completions_request_options, model_capability_defaults,
 };
 pub use profile_config::{
-    ActiveModelSelection, ActiveModelsConfig, ModelProfileConfig, ProviderModelConfig,
-    ProviderProfileConfig,
+    ActiveModelSelection, ActiveModelsConfig, ChatModelReferenceError, ModelProfileConfig,
+    ProviderModelConfig, ProviderProfileConfig, ResolvedChatModel,
 };
 pub use vendor::{
     ProviderBalance, ProviderBalanceInfo, ProviderSupportCapabilities, ProviderSupportError,

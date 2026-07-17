@@ -1005,3 +1005,23 @@
     transition: none;
   }
 }
+
+.persona-runtime-reference-field small,
+.persona-reference-warning {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.persona-runtime-reference-field small {
+  color: var(--text-secondary);
+}
+
+.persona-reference-warning {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-warning), transparent 58%);
+  border-radius: 8px;
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning-bg), transparent 20%);
+}

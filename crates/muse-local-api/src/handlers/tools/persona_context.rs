@@ -334,35 +334,10 @@ struct RuntimeContextProfile {
     reserved_output_tokens: u64,
 }
 
-async fn runtime_context_profile(
-    state: &Arc<AppState>,
-    turn: &TurnContext,
-) -> RuntimeContextProfile {
-    let (reserved_output_tokens, catalog) = {
-        let config = state.model_config.lock().await;
-        (
-            u64::from(config.chat().max_tokens.max(1)),
-            config.model_catalog(),
-        )
-    };
-    let context_window = catalog
-        .models
-        .into_iter()
-        .find(|model| {
-            model.provider_id == turn.model_provider
-                && model
-                    .model
-                    .trim()
-                    .eq_ignore_ascii_case(turn.model_name.trim())
-        })
-        .map(|model| model.context_window.max(1))
-        .unwrap_or_else(|| {
-            model_capability_defaults(&turn.model_provider, "", &turn.model_name).context_window
-        });
-
+fn runtime_context_profile(turn: &TurnContext) -> RuntimeContextProfile {
     RuntimeContextProfile {
-        context_window,
-        reserved_output_tokens,
+        context_window: turn.model_context_window.max(1),
+        reserved_output_tokens: u64::from(turn.model_max_output_tokens.max(1)),
     }
 }
 

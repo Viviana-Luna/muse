@@ -12,6 +12,7 @@ import type {
   Message,
   RuntimeContextSnapshot,
   RuntimeEvent,
+  RuntimeTurnStartedEvent,
   RuntimeTodoItem,
   RuntimeTokenUsage,
   RuntimeUserQuestionItem
@@ -80,6 +81,7 @@ export interface RuntimeDialogueLine {
   speaker: string;
   text: string;
   role: RuntimeSpeaker;
+  voiceId?: string;
 }
 
 interface UseRuntimeStreamOptions {
@@ -92,8 +94,33 @@ interface UseRuntimeStreamOptions {
   onRuntimeTodosChange?: (todos: RuntimeTodoItem[]) => void;
   onRuntimeTokenUsage?: (usage: RuntimeTokenUsage) => void;
   onRuntimeContextSnapshot?: (snapshot: RuntimeContextSnapshot) => void;
+  onTurnStarted?: (event: RuntimeTurnStartedEvent) => void;
   onReplyComplete?: (reply: string) => void | Promise<void>;
-  onSpeech?: (text: string) => void | Promise<void>;
+  onSpeech?: (text: string, voiceId?: string) => void | Promise<void>;
+}
+
+function runtimePreferenceSourceLabel(source?: string): string {
+  if (source === 'persona_preference') return '角色偏好';
+  if (source === 'global_active') return '全局活动配置';
+  if (source === 'unavailable') return '不可用';
+  return source || '未记录';
+}
+
+function turnRuntimeDetail(payload: RuntimeTurnStartedEvent): string | undefined {
+  const details: string[] = [];
+  if (payload.model) {
+    details.push(`模型：${payload.model}（${runtimePreferenceSourceLabel(payload.model_source)}）`);
+  }
+  if (payload.active_voice_id) {
+    details.push(
+      `音色：${payload.active_voice_id}（${runtimePreferenceSourceLabel(payload.voice_source)}）`
+    );
+  } else if (payload.voice_source === 'unavailable') {
+    details.push('音色：不可用，本轮仅文本回复');
+  }
+  if (payload.model_fallback_reason) details.push(`模型回退：${payload.model_fallback_reason}`);
+  if (payload.voice_fallback_reason) details.push(`语音说明：${payload.voice_fallback_reason}`);
+  return details.length > 0 ? details.join(' · ') : undefined;
 }
 
 function createMessageId(prefix: string) {
@@ -327,6 +354,7 @@ export function useRuntimeStream({
   onRuntimeTodosChange,
   onRuntimeTokenUsage,
   onRuntimeContextSnapshot,
+  onTurnStarted,
   onReplyComplete,
   onSpeech
 }: UseRuntimeStreamOptions) {
@@ -337,6 +365,7 @@ export function useRuntimeStream({
   const currentReplyRef = useRef('');
   const activeAssistantMessageIdRef = useRef<string | null>(null);
   const activeTurnIdRef = useRef<string | null>(null);
+  const activeTurnVoiceIdRef = useRef<string | undefined>(undefined);
   const cancelRequestedRef = useRef(false);
   const currentChatAbortRef = useRef<AbortController | null>(null);
   const deltaFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -391,6 +420,7 @@ export function useRuntimeStream({
     pendingDeltaFlushRef.current = null;
     activeAssistantMessageIdRef.current = null;
     activeTurnIdRef.current = null;
+    activeTurnVoiceIdRef.current = undefined;
     cancelRequestedRef.current = false;
     setCanceling(false);
   }, []);
@@ -440,7 +470,8 @@ export function useRuntimeStream({
       onDialogue({
         speaker: activePersonaName || '当前角色',
         text: content || '......',
-        role: 'assistant'
+        role: 'assistant',
+        voiceId: activeTurnVoiceIdRef.current
       });
     }
   }, [activePersonaName, onDialogue, updateChatMessage]);
@@ -613,7 +644,9 @@ export function useRuntimeStream({
           payload.type === 'tool_output_delta';
         if (!highFrequencyDelta) flushRuntimeDeltas();
         if (payload.type === 'turn_started') {
+          onTurnStarted?.(payload);
           activeTurnIdRef.current = payload.turn_id ?? null;
+          activeTurnVoiceIdRef.current = payload.active_voice_id ?? undefined;
           if (payload.conversation_id) {
             onConversationChange?.(payload.conversation_id);
           }
@@ -628,7 +661,7 @@ export function useRuntimeStream({
             type: 'status',
             phase: 'queued',
             message: '运行时已创建本轮对话快照。',
-            detail: payload.model ? `模型：${payload.model}` : undefined,
+            detail: turnRuntimeDetail(payload),
             state: 'active'
           });
         }
@@ -654,7 +687,8 @@ export function useRuntimeStream({
             onDialogue({
               speaker: activePersonaName || '当前角色',
               text: currentReplyRef.current,
-              role: 'assistant'
+              role: 'assistant',
+              voiceId: activeTurnVoiceIdRef.current
             });
           }
         }
@@ -678,7 +712,8 @@ export function useRuntimeStream({
           onDialogue({
             speaker: activePersonaName || '当前角色',
             text: content || '......',
-            role: 'assistant'
+            role: 'assistant',
+            voiceId: activeTurnVoiceIdRef.current
           });
         }
         if (payload.type === 'tool_call') {
@@ -817,7 +852,7 @@ export function useRuntimeStream({
             callId: payload.call_id
           });
           if (payload.text) {
-            void Promise.resolve(onSpeech?.(payload.text))
+            void Promise.resolve(onSpeech?.(payload.text, payload.voice_id ?? undefined))
               .then(() => {
                 appendChatProcess(currentAssistantId, {
                   type: 'status',
@@ -905,6 +940,7 @@ export function useRuntimeStream({
       onConversationChange,
       onRuntimeModeChange,
       onRuntimeContextSnapshot,
+      onTurnStarted,
       onRuntimeTodosChange,
       onRuntimeTokenUsage,
       onSpeech,

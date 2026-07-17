@@ -17,9 +17,16 @@ vi.mock('@/api', () => api);
 import { useRuntimeStream } from './useRuntimeStream';
 
 type RuntimeHook = ReturnType<typeof useRuntimeStream>;
+type RuntimeOptions = Parameters<typeof useRuntimeStream>[0];
 
-function Harness({ current }: { current: { value?: RuntimeHook } }) {
-  current.value = useRuntimeStream({ onDialogue: vi.fn() });
+function Harness({
+  current,
+  options = {}
+}: {
+  current: { value?: RuntimeHook };
+  options?: Partial<RuntimeOptions>;
+}) {
+  current.value = useRuntimeStream({ onDialogue: vi.fn(), ...options });
   return null;
 }
 
@@ -30,7 +37,7 @@ describe('useRuntimeStream 交互恢复', () => {
     vi.useRealTimers();
   });
 
-  function setup() {
+  function setup(options: Partial<RuntimeOptions> = {}) {
     const current: { value?: RuntimeHook } = {};
     let onEvent: ((event: RuntimeEvent) => void) | undefined;
     api.streamRuntimeChat.mockImplementation((_request, options) => {
@@ -39,7 +46,7 @@ describe('useRuntimeStream 交互恢复', () => {
         options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       });
     });
-    render(<Harness current={current} />);
+    render(<Harness current={current} options={options} />);
     return { current, emit: (event: RuntimeEvent) => onEvent?.(event) };
   }
 
@@ -178,5 +185,45 @@ describe('useRuntimeStream 交互恢复', () => {
     expect(current.value?.messages[1].reasoning).toBe('尾部推理');
     expect(current.value?.messages[1].status).toBe('completed');
     expect(current.value?.messages[1].streaming).toBe(false);
+  });
+
+  it('展示每轮实际模型与回退来源，并把冻结音色传给合成请求', async () => {
+    const onTurnStarted = vi.fn();
+    const onSpeech = vi.fn().mockResolvedValue(undefined);
+    const onDialogue = vi.fn();
+    const { current, emit } = setup({ onTurnStarted, onSpeech, onDialogue });
+    await act(async () => {
+      await current.value?.sendMessage('检查角色偏好');
+      emit({
+        type: 'turn_started',
+        turn_id: 'turn-runtime-preference',
+        model: 'deepseek / deepseek-v4-pro',
+        model_source: 'global_active',
+        model_fallback: true,
+        model_fallback_reason: '角色引用失效；已使用全局活动模型。',
+        active_voice_id: 'persona-voice',
+        voice_source: 'persona_preference'
+      });
+      emit({
+        type: 'speech_started',
+        text: '你好',
+        voice_id: 'persona-voice'
+      });
+      emit({ type: 'assistant_message', content: '你好' });
+    });
+
+    const snapshotStep = current.value?.messages[1].process.find(
+      (step) => step.message === '运行时已创建本轮对话快照。'
+    );
+    expect(onTurnStarted).toHaveBeenCalledWith(
+      expect.objectContaining({ model_source: 'global_active', model_fallback: true })
+    );
+    expect(snapshotStep?.detail).toContain('全局活动配置');
+    expect(snapshotStep?.detail).toContain('模型回退');
+    expect(snapshotStep?.detail).toContain('persona-voice（角色偏好）');
+    expect(onSpeech).toHaveBeenCalledWith('你好', 'persona-voice');
+    expect(onDialogue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ role: 'assistant', voiceId: 'persona-voice' })
+    );
   });
 });

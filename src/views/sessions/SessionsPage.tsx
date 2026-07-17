@@ -37,6 +37,13 @@ interface SessionsPageProps {
   onOpenChat: () => void;
 }
 
+function preferenceSourceLabel(value: unknown): string {
+  if (value === 'persona_preference') return '角色偏好';
+  if (value === 'global_active') return '全局活动配置';
+  if (value === 'unavailable') return '不可用';
+  return typeof value === 'string' && value ? value : '未记录';
+}
+
 export function SessionsPage({
   runtime,
   activePersonaId,
@@ -388,7 +395,25 @@ export function SessionsPage({
                       <article>
                         <small>角色与模型</small>
                         <strong>{String(context.runtime_policy_snapshot?.provider || '未记录')} / {String(context.runtime_policy_snapshot?.model || '未记录')}</strong>
-                        <p>角色版本：{String(context.runtime_policy_snapshot?.persona_version || '未记录')}</p>
+                        <p>
+                          来源：{preferenceSourceLabel(context.runtime_policy_snapshot?.model_source)}
+                          {context.runtime_policy_snapshot?.model_fallback ? '（已回退）' : ''}
+                          {' · '}角色版本：{String(context.runtime_policy_snapshot?.persona_version || '未记录')}
+                        </p>
+                        {typeof context.runtime_policy_snapshot?.model_fallback_reason === 'string' && (
+                          <p>回退原因：{String(context.runtime_policy_snapshot.model_fallback_reason)}</p>
+                        )}
+                      </article>
+                      <article>
+                        <small>语音</small>
+                        <strong>{String(context.runtime_policy_snapshot?.voice_id || '本轮不可用')}</strong>
+                        <p>
+                          来源：{preferenceSourceLabel(context.runtime_policy_snapshot?.voice_source)}
+                          {context.runtime_policy_snapshot?.voice_fallback ? '（已回退）' : ''}
+                        </p>
+                        {typeof context.runtime_policy_snapshot?.voice_fallback_reason === 'string' && (
+                          <p>说明：{String(context.runtime_policy_snapshot.voice_fallback_reason)}</p>
+                        )}
                       </article>
                       <article>
                         <small>Tool · Skill · MCP</small>

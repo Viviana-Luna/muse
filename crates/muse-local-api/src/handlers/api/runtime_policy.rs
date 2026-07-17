@@ -84,6 +84,111 @@ struct FrozenTurnToolCatalog<'a> {
     mcp: Option<&'a mcp::McpToolCatalog>,
 }
 
+struct FrozenTurnRuntime {
+    context: TurnContext,
+    provider: Arc<dyn muse_core::model::provider::ChatModelProvider>,
+}
+
+struct FrozenChatSelection {
+    config: muse_core::model::LlmConfig,
+    capabilities: Vec<String>,
+    context_window: u64,
+    max_output_tokens: u32,
+}
+
+impl FrozenChatSelection {
+    fn from_resolved(model: muse_core::model::ResolvedChatModel) -> Self {
+        Self {
+            config: model.config,
+            capabilities: model.catalog.capabilities,
+            context_window: model.catalog.context_window,
+            max_output_tokens: model.catalog.default_max_output_tokens,
+        }
+    }
+
+    fn from_global_snapshot(
+        profiles: &muse_core::model::ModelProfileConfig,
+        config: muse_core::model::LlmConfig,
+    ) -> Self {
+        if let Some(model) = profiles.model(&config.provider, &config.model) {
+            return Self {
+                config,
+                capabilities: model.capabilities,
+                context_window: model.context_window,
+                max_output_tokens: model.default_max_output_tokens,
+            };
+        }
+
+        // `AppState::provider` 可能仍承载一次已经原子发布的旧配置快照。
+        // 缺少目录项时只冻结保守的公开能力元数据，不据此推断额外能力。
+        let defaults = model_capability_defaults(&config.provider, &config.api_base, &config.model);
+        let max_output_tokens = if config.max_tokens == 0 {
+            defaults.default_max_output_tokens
+        } else {
+            config.max_tokens
+        };
+        Self {
+            config,
+            capabilities: vec!["chat".to_string()],
+            context_window: defaults.context_window,
+            max_output_tokens,
+        }
+    }
+}
+
+struct FrozenVoiceSelection {
+    voice_id: Option<String>,
+    source: String,
+    fallback: bool,
+    fallback_reason: Option<String>,
+}
+
+fn resolve_turn_voice(tts: &TtsConfig, active_persona: Option<&Persona>) -> FrozenVoiceSelection {
+    let preferred_voice = active_persona
+        .and_then(|persona| persona.preferred_voice_id.as_deref())
+        .map(str::trim)
+        .filter(|voice_id| !voice_id.is_empty());
+
+    if let Some(preferred_voice) = preferred_voice {
+        let mut effective = tts.clone();
+        effective.voice_id = preferred_voice.to_string();
+        if effective.enabled() {
+            return FrozenVoiceSelection {
+                voice_id: Some(preferred_voice.to_string()),
+                source: "persona_preference".to_string(),
+                fallback: false,
+                fallback_reason: None,
+            };
+        }
+
+        return FrozenVoiceSelection {
+            voice_id: None,
+            source: "unavailable".to_string(),
+            fallback: true,
+            fallback_reason: Some(
+                "角色音色引用已保留，但全局 TTS 未启用或配置不完整；本轮仅继续文本回复。"
+                    .to_string(),
+            ),
+        };
+    }
+
+    if tts.enabled() {
+        return FrozenVoiceSelection {
+            voice_id: Some(tts.voice_id.trim().to_string()),
+            source: "global_active".to_string(),
+            fallback: false,
+            fallback_reason: None,
+        };
+    }
+
+    FrozenVoiceSelection {
+        voice_id: None,
+        source: "unavailable".to_string(),
+        fallback: false,
+        fallback_reason: Some("全局 TTS 未启用或配置不完整；本轮仅继续文本回复。".to_string()),
+    }
+}
+
 async fn build_turn_context(
     state: &Arc<AppState>,
     conversation_id: String,
@@ -92,15 +197,82 @@ async fn build_turn_context(
     voice_enabled: bool,
     mut system_prompt: String,
     tools: FrozenTurnToolCatalog<'_>,
-) -> TurnContext {
+) -> Result<FrozenTurnRuntime, muse_core::model::provider::ChatModelError> {
     let mode_state = current_runtime_mode_state(state);
-    let (chat, active_voice_id) = {
+    let (profiles, global_chat_config, tts, global_provider) = {
+        let _transition = state.model_configuration_transition_gate.lock().await;
         let config = state.model_config.lock().await;
-        let chat = config.chat().clone();
-        let voice_id = config.tts().voice_id.trim();
-        let active_voice_id = (!voice_id.is_empty()).then(|| voice_id.to_string());
-        (chat, active_voice_id)
+        let snapshot = (
+            config.model_profiles().clone(),
+            config.chat().clone(),
+            config.tts().clone(),
+        );
+        drop(config);
+        let provider = state.provider.lock().await.clone();
+        (snapshot.0, snapshot.1, snapshot.2, provider)
     };
+    let global_chat = || {
+        profiles
+            .resolve_active_chat_model()
+            .map(FrozenChatSelection::from_resolved)
+            .unwrap_or_else(|_| {
+                FrozenChatSelection::from_global_snapshot(&profiles, global_chat_config.clone())
+            })
+    };
+    let global_provider_for = |chat: &FrozenChatSelection| {
+        if let Some(provider) = global_provider.clone() {
+            return Ok(provider);
+        }
+        if !chat.config.enabled() {
+            return Err(missing_chat_provider_error());
+        }
+        muse_core::model::provider::factory::create_provider(&chat.config).map(Arc::from)
+    };
+    let (chat, provider, model_source, model_fallback, model_fallback_reason) =
+        if let Some(preferred) = active_persona.and_then(|persona| persona.preferred_model_ref.as_ref())
+        {
+            match profiles.resolve_chat_model_reference(
+                &preferred.provider_id,
+                &preferred.model_id,
+            ) {
+                Ok(chat) => {
+                    let chat = FrozenChatSelection::from_resolved(chat);
+                    let provider: Arc<dyn muse_core::model::provider::ChatModelProvider> =
+                        Arc::from(muse_core::model::provider::factory::create_provider(
+                            &chat.config,
+                        )?);
+                    (
+                        chat,
+                        provider,
+                        "persona_preference".to_string(),
+                        false,
+                        None,
+                    )
+                }
+                Err(error) => {
+                    let chat = global_chat();
+                    let provider = global_provider_for(&chat)?;
+                    (
+                        chat,
+                        provider,
+                        "global_active".to_string(),
+                        true,
+                        Some(format!("{}；本轮已使用全局活动模型。", error)),
+                    )
+                }
+            }
+        } else {
+            let chat = global_chat();
+            let provider = global_provider_for(&chat)?;
+            (
+                chat,
+                provider,
+                "global_active".to_string(),
+                false,
+                None,
+            )
+        };
+    let voice = resolve_turn_voice(&tts, active_persona);
     let created_at = chrono::Utc::now().to_rfc3339();
     let local_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z");
     system_prompt.push_str(&format!(
@@ -184,11 +356,21 @@ async fn build_turn_context(
         .unwrap_or_default();
 
     let runtime_policy = muse_core::domain::turn::RuntimePolicySnapshot {
-        schema_version: 3,
-        policy_version: "persona-resource-policy/v3".to_string(),
+        schema_version: 4,
+        policy_version: "persona-runtime-policy/v4".to_string(),
         persona_version: active_persona.map(|persona| persona.version.clone()),
-        provider: chat.provider.clone(),
-        model: chat.model.clone(),
+        provider: chat.config.provider.clone(),
+        model: chat.config.model.clone(),
+        model_source: model_source.clone(),
+        model_fallback,
+        model_fallback_reason: model_fallback_reason.clone(),
+        model_capabilities: chat.capabilities.clone(),
+        model_context_window: chat.context_window,
+        model_max_output_tokens: chat.max_output_tokens,
+        voice_id: voice.voice_id.clone(),
+        voice_source: voice.source.clone(),
+        voice_fallback: voice.fallback,
+        voice_fallback_reason: voice.fallback_reason.clone(),
         tool_preset: mode_state.tool_preset().as_str().to_string(),
         tool_ids,
         tool_policy: tool_policy.clone(),
@@ -202,13 +384,19 @@ async fn build_turn_context(
         mcp_catalog_hash,
         mcp_tool_policies,
     };
-    TurnContext {
+    let context = TurnContext {
         conversation_id,
         turn_id,
         persona_id: active_persona.map(|persona| persona.id.clone()),
         system_prompt,
-        model_provider: chat.provider,
-        model_name: chat.model,
+        model_provider: chat.config.provider,
+        model_name: chat.config.model,
+        model_source,
+        model_fallback,
+        model_fallback_reason,
+        model_capabilities: chat.capabilities,
+        model_context_window: chat.context_window,
+        model_max_output_tokens: chat.max_output_tokens,
         tool_policy,
         skill_policy,
         mcp_policy,
@@ -216,9 +404,13 @@ async fn build_turn_context(
         focus_phase: mode_state.focus_phase.as_str().to_string(),
         tool_preset: mode_state.tool_preset().as_str().to_string(),
         voice_enabled,
-        active_voice_id,
+        active_voice_id: voice.voice_id,
+        voice_source: voice.source,
+        voice_fallback: voice.fallback,
+        voice_fallback_reason: voice.fallback_reason,
         created_at,
         runtime_policy,
         tool_definitions: tools.definitions.to_vec(),
-    }
+    };
+    Ok(FrozenTurnRuntime { context, provider })
 }

@@ -318,8 +318,15 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       void overview.refreshRuntimeUsage(usage.conversation_id);
     },
     onRuntimeContextSnapshot: overview.setRuntimeContextSnapshot,
-    onSpeech: async (text) => {
-      const message = await speak(text, { forceEnabled: true, waitUntilEnded: true });
+    onTurnStarted: (event) => {
+      if (event.model) setModelLabel(event.model);
+    },
+    onSpeech: async (text, voiceId) => {
+      const message = await speak(text, {
+        forceEnabled: true,
+        voiceId,
+        waitUntilEnded: true
+      });
       if (message) throw new Error(message);
     }
   });

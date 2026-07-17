@@ -730,7 +730,6 @@ pub(crate) async fn handle_models(State(state): State<Arc<AppState>>) -> Json<Mo
 pub(crate) async fn handle_models_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<muse_core::model::catalog::ModelCatalog>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.model_configuration_transition_gate.lock().await;
     load_verified_model_catalog(&state).await.map(Json)
 }
 
@@ -801,6 +800,7 @@ async fn load_verified_model_catalog(
 async fn refresh_model_config_from_disk(
     state: &Arc<AppState>,
 ) -> Result<ModelsConfig, (StatusCode, Json<ErrorResponse>)> {
+    let _transition = state.model_configuration_transition_gate.lock().await;
     let (changed, models) = {
         let mut store = state.model_config.lock().await;
         let changed = store.refresh_from_disk().map_err(|_| {
@@ -1607,7 +1607,6 @@ fn content_hash_hex(bytes: &[u8]) -> String {
 pub(crate) async fn handle_get_models_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ModelsConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.model_configuration_transition_gate.lock().await;
     let cfg = refresh_model_config_from_disk(&state).await?;
     let chat = &cfg.chat;
     let tts = &cfg.tts;

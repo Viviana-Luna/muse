@@ -23,6 +23,8 @@ const persona: Persona = {
   tool_policy: { mode: 'inherit', allowed_tools: [] },
   skill_policy: { mode: 'inherit', allowed_skills: [] },
   mcp_policy: { mode: 'inherit', allowed_servers: [] },
+  preferred_model_ref: null,
+  preferred_voice_id: null,
   default_visual_pack_id: 'alice-visual',
   author: 'Muse',
   version: '1.0.0',

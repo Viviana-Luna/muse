@@ -888,10 +888,10 @@ impl ConversationRuntime {
             &tool_defs,
             mode_state,
         );
-        let mut turn_context = build_turn_context(
+        let frozen_runtime = match build_turn_context(
             &self.state,
-            conversation_id,
-            turn_id,
+            conversation_id.clone(),
+            turn_id.clone(),
             Some(&active_persona),
             self.voice_enabled,
             system_prompt.clone(),
@@ -900,21 +900,23 @@ impl ConversationRuntime {
                 mcp: Some(&frozen_mcp_catalog),
             },
         )
-        .await;
-        let system_prompt = turn_context.system_prompt.clone();
-        let provider_snapshot = match self.state.provider.lock().await.clone() {
-            Some(provider) => provider,
-            None => {
-                let message = missing_chat_provider_error().to_string();
-                return Err(rollback_runtime_turn(
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Err(abort_preparing_turn(
                     &self.state,
                     &emitter,
-                    message,
-                    Some(&turn_context),
+                    &conversation_id,
+                    &turn_id,
+                    error.to_string(),
                 )
                 .await);
             }
         };
+        let mut turn_context = frozen_runtime.context;
+        let provider_snapshot = frozen_runtime.provider;
+        let system_prompt = turn_context.system_prompt.clone();
         let frozen_execution_policy = self
             .state
             .runtime_service
@@ -989,8 +991,14 @@ impl ConversationRuntime {
                 persona_id: turn_context.persona_id.clone(),
                 model_provider: turn_context.model_provider.clone(),
                 model_name: turn_context.model_name.clone(),
+                model_source: turn_context.model_source.clone(),
+                model_fallback: turn_context.model_fallback,
+                model_fallback_reason: turn_context.model_fallback_reason.clone(),
                 voice_enabled: turn_context.voice_enabled,
                 active_voice_id: turn_context.active_voice_id.clone(),
+                voice_source: turn_context.voice_source.clone(),
+                voice_fallback: turn_context.voice_fallback,
+                voice_fallback_reason: turn_context.voice_fallback_reason.clone(),
                 runtime_mode: mode_state.mode.as_str().to_string(),
                 focus_phase: mode_state.focus_phase.as_str().to_string(),
                 tool_preset: mode_state.tool_preset().as_str().to_string(),
@@ -1034,7 +1042,7 @@ impl ConversationRuntime {
             return Err(message);
         }
 
-        let frozen_context_profile = runtime_context_profile(&self.state, &turn_context).await;
+        let frozen_context_profile = runtime_context_profile(&turn_context);
         let context_snapshot = build_runtime_context_snapshot(
             &turn_context,
             &conversation_for_model,

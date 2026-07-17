@@ -25,6 +25,28 @@ const TTS_MODALITY: &str = "tts";
 const ASR_MODALITY: &str = "asr";
 const AUDIO_UNDERSTANDING_MODALITY: &str = "audio_understanding";
 
+/// 已校验、可直接冻结到 Turn 的聊天模型配置与公开能力事实。
+#[derive(Debug, Clone)]
+pub struct ResolvedChatModel {
+    pub config: LlmConfig,
+    pub catalog: ModelCatalogItem,
+}
+
+/// Persona 或全局活动模型引用无法用于聊天时的稳定诊断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatModelReferenceError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ChatModelReferenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}：{}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ChatModelReferenceError {}
+
 /// 一个供应商下的模型声明和默认运行参数。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModelConfig {
@@ -209,7 +231,7 @@ impl ProviderProfileConfig {
     fn catalog_provider(&self, id: &str) -> ModelProviderCatalog {
         let support = provider_support_capabilities(&self.kind, &self.base_url);
         let requires_chat_probe = self.kind == VOLCENGINE_AGENT_PLAN_PROVIDER_PROFILE.id;
-        let supported = matches!(self.kind.as_str(), "deepseek" | "volcengine_agent_plan");
+        let supported = chat_provider_runtime_supported(id);
         let mut capabilities = self
             .models
             .values()
@@ -384,6 +406,88 @@ impl ModelProfileConfig {
             .get(model_id)
             .filter(|model| model.enabled)
             .map(|model| model.catalog_item(provider_id, provider, model_id))
+    }
+
+    /// 解析全局活动聊天模型，供 Turn 回退路径与 Persona 引用使用同一套可用性门禁。
+    pub fn resolve_active_chat_model(&self) -> Result<ResolvedChatModel, ChatModelReferenceError> {
+        let selection = &self.active_models.chat;
+        if selection.provider.trim().is_empty() || selection.model.trim().is_empty() {
+            return Err(chat_reference_error(
+                "global_chat_model_missing",
+                "尚未配置全局活动聊天模型。",
+            ));
+        }
+        self.resolve_chat_model_reference(&selection.provider, &selection.model)
+    }
+
+    /// 把一个非敏感 Provider/模型引用解析为完整运行配置；不会改写活动模型。
+    pub fn resolve_chat_model_reference(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ResolvedChatModel, ChatModelReferenceError> {
+        let provider_id = provider_id.trim();
+        let model_id = model_id.trim();
+        let provider = self.providers.get(provider_id).ok_or_else(|| {
+            chat_reference_error(
+                "persona_model_provider_missing",
+                format!("供应商 `{provider_id}` 不存在。"),
+            )
+        })?;
+        if !provider.enabled {
+            return Err(chat_reference_error(
+                "persona_model_provider_disabled",
+                format!("供应商 `{provider_id}` 已停用。"),
+            ));
+        }
+        if !chat_provider_runtime_supported(provider_id) {
+            return Err(chat_reference_error(
+                "persona_model_provider_unsupported",
+                format!("供应商 `{provider_id}` 暂不支持聊天运行时。"),
+            ));
+        }
+        if !provider.api_key_configured() {
+            return Err(chat_reference_error(
+                "persona_model_api_key_missing",
+                format!("供应商 `{provider_id}` 尚未配置 API Key。"),
+            ));
+        }
+        let model = provider.models.get(model_id).ok_or_else(|| {
+            chat_reference_error(
+                "persona_model_missing",
+                format!("模型 `{provider_id}:{model_id}` 不存在。"),
+            )
+        })?;
+        if !model.enabled {
+            return Err(chat_reference_error(
+                "persona_model_disabled",
+                format!("模型 `{provider_id}:{model_id}` 已停用。"),
+            ));
+        }
+        let supports_chat = model.modality == CHAT_MODALITY
+            || model
+                .functions
+                .iter()
+                .any(|function| function == CHAT_MODALITY);
+        if !supports_chat {
+            return Err(chat_reference_error(
+                "persona_model_not_chat_capable",
+                format!("模型 `{provider_id}:{model_id}` 未声明聊天能力。"),
+            ));
+        }
+
+        Ok(ResolvedChatModel {
+            config: LlmConfig {
+                provider: provider_id.to_string(),
+                api_base: provider.base_url.clone(),
+                api_key: provider.api_key.clone(),
+                api_protocol: "chat_completions".to_string(),
+                model: model_id.to_string(),
+                max_tokens: model.default_max_output_tokens,
+                temperature: model.temperature,
+            },
+            catalog: model.catalog_item(provider_id, provider, model_id),
+        })
     }
 
     pub fn create_model(
@@ -760,6 +864,16 @@ impl ModelProfileConfig {
     }
 }
 
+fn chat_reference_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> ChatModelReferenceError {
+    ChatModelReferenceError {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
 fn validate_shared_provider_identity(config: &ModelsConfig) -> Result<(), ModelCatalogError> {
     let mut identities = BTreeMap::<String, (String, Option<String>)>::new();
     for (provider, base_url, api_key) in [
@@ -951,6 +1065,10 @@ fn default_true() -> bool {
     true
 }
 
+fn chat_provider_runtime_supported(provider_id: &str) -> bool {
+    matches!(provider_id, "deepseek" | "volcengine_agent_plan")
+}
+
 #[cfg(test)]
 mod tests {
     use super::ModelProfileConfig;
@@ -972,6 +1090,75 @@ mod tests {
         assert_eq!(runtime.chat.model, "deepseek-v4-pro");
         assert_eq!(runtime.chat.max_tokens, 384_000);
         assert_eq!(runtime.chat.temperature, 0.7);
+    }
+
+    #[test]
+    fn resolves_persona_chat_reference_without_mutating_global_selection() {
+        let mut profiles = ModelProfileConfig::default();
+        profiles
+            .set_provider_api_key("deepseek", Some("profile-secret".to_string()))
+            .expect("应保存 Provider Key");
+        profiles
+            .set_active_chat("deepseek", "deepseek-v4-pro")
+            .expect("应选择全局活动模型");
+
+        let resolved = profiles
+            .resolve_chat_model_reference("deepseek", "deepseek-v4-flash")
+            .expect("角色引用应可解析");
+
+        assert_eq!(resolved.config.model, "deepseek-v4-flash");
+        assert!(
+            resolved
+                .catalog
+                .capabilities
+                .iter()
+                .any(|item| item == "chat")
+        );
+        assert_eq!(
+            profiles.resolve_runtime().chat.model,
+            "deepseek-v4-pro",
+            "解析角色偏好不得改写全局活动模型"
+        );
+    }
+
+    #[test]
+    fn reports_stable_diagnostic_for_missing_persona_model() {
+        let mut profiles = ModelProfileConfig::default();
+        profiles
+            .set_provider_api_key("deepseek", Some("profile-secret".to_string()))
+            .expect("应保存 Provider Key");
+
+        let error = profiles
+            .resolve_chat_model_reference("deepseek", "deleted-model")
+            .expect_err("失效引用必须返回可审计诊断");
+
+        assert_eq!(error.code, "persona_model_missing");
+        assert!(error.message.contains("deleted-model"));
+        assert!(!error.to_string().contains("profile-secret"));
+    }
+
+    #[test]
+    fn rejects_provider_alias_that_runtime_factory_cannot_create() {
+        let mut profiles = ModelProfileConfig::default();
+        let mut alias = profiles.providers["deepseek"].clone();
+        alias.api_key = Some("profile-secret".to_string());
+        profiles
+            .providers
+            .insert("deepseek-alias".to_string(), alias);
+
+        let catalog = profiles.catalog();
+        let alias_provider = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepseek-alias")
+            .expect("目录应保留自定义 Provider 引用");
+        assert_eq!(alias_provider.status, "legacy_unsupported");
+
+        let error = profiles
+            .resolve_chat_model_reference("deepseek-alias", "deepseek-v4-flash")
+            .expect_err("运行时工厂不支持的 Provider ID 必须在请求前拒绝");
+        assert_eq!(error.code, "persona_model_provider_unsupported");
+        assert!(!error.to_string().contains("profile-secret"));
     }
 
     #[test]
