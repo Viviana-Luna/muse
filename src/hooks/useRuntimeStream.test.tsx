@@ -50,6 +50,21 @@ describe('useRuntimeStream 交互恢复', () => {
     return { current, emit: (event: RuntimeEvent) => onEvent?.(event) };
   }
 
+  it('把用户选择的 Skill 作为结构化字段发送，不改写消息正文', async () => {
+    const { current } = setup();
+    await act(async () => {
+      await current.value?.sendMessage('生成一份报告', 'pdf');
+    });
+
+    expect(api.streamRuntimeChat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: '生成一份报告',
+        selected_skill: 'pdf'
+      }),
+      expect.any(Object)
+    );
+  });
+
   it('审批请求失败后保留 waiting 卡片并附带可见错误', async () => {
     api.approveRuntimeTool.mockRejectedValue(new Error('网络不可用'));
     const { current, emit } = setup();

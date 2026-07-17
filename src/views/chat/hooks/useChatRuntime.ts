@@ -51,6 +51,7 @@ import type {
 } from '@/views/story/types';
 import { useFollowLatest } from './useFollowLatest';
 import { useRuntimeOverview } from './useRuntimeOverview';
+import { useSkillPicker } from './useSkillPicker';
 
 export type PersonaBootstrapSnapshot = StoryPersonaSnapshot;
 
@@ -126,6 +127,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
   const session = useSessionState();
   const revision = useRuntimeStateRevision();
   const overview = useRuntimeOverview();
+  const skillPicker = useSkillPicker(options.activePersona?.id ?? null);
   const currentVoiceTranscriptContext = useCallback(
     (): VoiceTranscriptContext => ({
       inputRevision: inputRevisionRef.current,
@@ -320,6 +322,8 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     onRuntimeContextSnapshot: overview.setRuntimeContextSnapshot,
     onTurnStarted: (event) => {
       if (event.model) setModelLabel(event.model);
+      skillPicker.clearSelection();
+      skillPicker.closePicker();
     },
     onSpeech: async (text, voiceId) => {
       const message = await speak(text, {
@@ -414,8 +418,10 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       return;
     }
     follow.followOutgoingMessage();
-    const accepted = await stream.sendMessage(text);
-    if (accepted) setInputValue('');
+    const accepted = await stream.sendMessage(text, skillPicker.selectedSkill?.name);
+    if (accepted) {
+      setInputValue('');
+    }
   }
 
   async function handleReset(): Promise<boolean> {
@@ -648,6 +654,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     dialogue,
     inputValue,
     setInputValue,
+    skillPicker,
     runtimeMode,
     runtimeFocusPhase,
     runtimeToolPreset,

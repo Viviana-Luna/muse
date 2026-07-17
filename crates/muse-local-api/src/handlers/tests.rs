@@ -810,6 +810,62 @@ mod tests {
         assert_eq!(merged[0].description, "用户定制创建工艺");
     }
 
+    fn runtime_skill_catalog_marks_effective_source_and_filters_policy() {
+        let data_dir = unique_temp_dir("runtime-skill-source");
+        let preferences = muse_core::domain::skill::SkillPreferences::default();
+        let (builtin_catalog, omitted) = super::effective_runtime_skill_catalog(
+            &data_dir,
+            &preferences,
+            &Default::default(),
+        );
+        assert_eq!(omitted, 0);
+        let builtin = builtin_catalog
+            .iter()
+            .find(|skill| skill.name == "skill-creator")
+            .expect("运行时目录应包含内置 Skill");
+        assert_eq!(builtin.source, "builtin");
+
+        let skill_dir = data_dir.join("skills/skill-creator");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: skill-creator\ndescription: 用户定制创建流程\n---\n# 用户指引\n\n先澄清目标。\n",
+        )
+        .unwrap();
+        let (shadowed_catalog, _) = super::effective_runtime_skill_catalog(
+            &data_dir,
+            &preferences,
+            &Default::default(),
+        );
+        let shadowed = shadowed_catalog
+            .iter()
+            .find(|skill| skill.name == "skill-creator")
+            .expect("同名用户 Skill 应遮蔽内置项");
+        assert_eq!(shadowed.source, "user_store");
+        assert_eq!(shadowed.description, "用户定制创建流程");
+
+        let disabled_policy = muse_core::domain::persona::SkillPolicy {
+            mode: muse_core::domain::persona::ResourcePolicyMode::Disabled,
+            allowed_skills: Vec::new(),
+        };
+        let (disabled_catalog, _) = super::effective_runtime_skill_catalog(
+            &data_dir,
+            &preferences,
+            &disabled_policy,
+        );
+        assert!(disabled_catalog.is_empty());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    fn selected_skill_request_name_is_normalized_and_validated() {
+        assert_eq!(
+            super::normalize_selected_skill(Some("  skill-creator  ".to_string())).unwrap(),
+            Some("skill-creator".to_string())
+        );
+        assert!(super::normalize_selected_skill(Some("../secret".to_string())).is_err());
+        assert!(super::normalize_selected_skill(Some(String::new())).is_err());
+    }
+
     fn runtime_tool_handlers_own_approval_summaries() {
         let cases = [
             (
@@ -1065,6 +1121,7 @@ mod tests {
                 name: record.name.clone(),
                 description: record.description.clone(),
                 revision: record.revision.clone(),
+                source: "user_store".to_string(),
             },
         ];
         let loaded = super::tool_skill_from_workspace_with_user(
@@ -1130,6 +1187,7 @@ mod tests {
                 name: builtin.name.clone(),
                 description: builtin.description.clone(),
                 revision: builtin.revision.clone(),
+                source: "builtin".to_string(),
             }];
         let call = test_tool_call(
             "load_skill",
@@ -1176,6 +1234,7 @@ mod tests {
                 name: record.name.clone(),
                 description: record.description.clone(),
                 revision: record.revision.clone(),
+                source: "user_store".to_string(),
             }];
         let call = test_tool_call(
             "load_skill",
@@ -1397,6 +1456,47 @@ mod tests {
         );
         assert!(!data_dir.join("skills/blocked-skill").exists());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn selected_skill_is_loaded_from_frozen_catalog_before_model_call() {
+        let data_dir = unique_temp_dir("selected-skill-activation");
+        let state = build_test_state(&data_dir);
+        configure_test_chat(&state).await;
+        let turn = super::build_turn_context(
+            &state,
+            "selected-skill-conversation".to_string(),
+            "selected-skill-turn".to_string(),
+            None,
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
+        )
+        .await
+        .expect("应冻结包含内置 Skill 的 Turn")
+        .context;
+
+        let (prompt, activated) =
+            super::activate_selected_skill(&state, &turn, "skill-creator")
+                .await
+                .expect("冻结目录中的显式 Skill 应能激活");
+        assert!(prompt.contains("【用户显式选择的 Skill：`skill-creator`】"));
+        assert!(prompt.contains("Skill 创建工艺"));
+        assert_eq!(activated.name, "skill-creator");
+        assert_eq!(activated.source, "builtin");
+        assert_eq!(activated.content_hash.len(), 64);
+        assert!(!serde_json::to_string(&activated).unwrap().contains("SKILL.md"));
+
+        let mut denied_turn = turn;
+        denied_turn.runtime_policy.skill_catalog.clear();
+        let denied = super::activate_selected_skill(&state, &denied_turn, "skill-creator")
+            .await
+            .expect_err("目录外 Skill 必须在供应商调用前拒绝");
+        assert!(denied.contains("不在当前 Turn 冻结目录"));
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[cfg(unix)]
@@ -4611,15 +4711,17 @@ mod tests {
         .expect("应冻结 Turn 运行时")
         .context;
 
-        assert_eq!(turn.runtime_policy.schema_version, 4);
+        assert_eq!(turn.runtime_policy.schema_version, 5);
         assert_eq!(
             turn.runtime_policy.policy_version,
-            "persona-runtime-policy/v4"
+            "persona-runtime-policy/v5"
         );
         assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
         assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
         assert_eq!(turn.runtime_policy.skill_catalog[0].description, "日历助手");
         assert!(!turn.runtime_policy.skill_catalog[0].revision.is_empty());
+        assert_eq!(turn.runtime_policy.skill_catalog[0].source, "user_store");
+        assert!(turn.runtime_policy.activated_skill.is_none());
         assert!(turn.runtime_policy.skill_revision.starts_with("calendar="));
         assert_eq!(turn.runtime_policy.skill_catalog_hash.len(), 64);
         assert_eq!(turn.runtime_policy.omitted_skill_count, 0);
@@ -4842,6 +4944,16 @@ mod tests {
         {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(builtin_skill_keeps_priority_and_user_shadowing)).is_err() {
                 failures.push("builtin_skill_keeps_priority_and_user_shadowing");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(runtime_skill_catalog_marks_effective_source_and_filters_policy)).is_err() {
+                failures.push("runtime_skill_catalog_marks_effective_source_and_filters_policy");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(selected_skill_request_name_is_normalized_and_validated)).is_err() {
+                failures.push("selected_skill_request_name_is_normalized_and_validated");
             }
         }
         {

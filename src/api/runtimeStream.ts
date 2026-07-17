@@ -7,6 +7,7 @@ export interface RuntimeChatStreamRequest {
   conversation_id: string;
   client_request_id: string;
   voice_enabled?: boolean;
+  selected_skill?: string;
 }
 
 export interface RuntimeChatStreamOptions {

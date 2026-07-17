@@ -595,7 +595,7 @@ export function useRuntimeStream({
   );
 
   const sendMessage = useCallback(
-    async (rawText: string): Promise<boolean> => {
+    async (rawText: string, selectedSkill?: string): Promise<boolean> => {
       const text = rawText.trim();
       if (!text || busy) return false;
       setBusy(true);
@@ -907,7 +907,8 @@ export function useRuntimeStream({
             typeof crypto.randomUUID === 'function'
               ? crypto.randomUUID()
               : createMessageId('request'),
-          voice_enabled: voiceEnabled
+          voice_enabled: voiceEnabled,
+          ...(selectedSkill ? { selected_skill: selectedSkill } : {})
         },
         { signal: controller.signal, onEvent: handleEvent }
       )

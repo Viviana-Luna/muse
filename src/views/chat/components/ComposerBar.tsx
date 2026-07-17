@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import type { FormEvent, ReactNode, RefObject } from 'react';
-import { Mic, MicOff, Square, Volume2, VolumeX } from 'lucide-react';
+import { Mic, MicOff, Sparkles, Square, Volume2, VolumeX, X } from 'lucide-react';
 
 import type { VoiceRuntime } from '@/hooks/useVoiceRuntime';
+import type { SkillPickerController } from '@/views/chat/hooks/useSkillPicker';
+import { SkillPickerDrawer } from './SkillPickerDrawer';
 
 interface ComposerBarProps {
   busy: boolean;
   canceling?: boolean;
   canCancel?: boolean;
   inputValue: string;
+  skillPicker: SkillPickerController;
   voice: VoiceRuntime;
   sendIcon: ReactNode;
   sendDisabledReason?: string;
@@ -27,6 +30,7 @@ export function ComposerBar({
   canceling = false,
   canCancel = false,
   inputValue,
+  skillPicker,
   voice,
   sendIcon,
   sendDisabledReason,
@@ -105,8 +109,41 @@ export function ComposerBar({
               }
             }}
           />
+          {skillPicker.selectedSkill && (
+            <div
+              className="composer-skill-attachment"
+              title={skillPicker.selectedSkill.description}
+              aria-label={`已选择 Skill：${skillPicker.selectedSkill.name}`}
+            >
+              <Sparkles aria-hidden="true" />
+              <span>{skillPicker.selectedSkill.name}</span>
+              <button
+                type="button"
+                onClick={skillPicker.clearSelection}
+                disabled={busy || writeLocked}
+                aria-label={`移除 Skill ${skillPicker.selectedSkill.name}`}
+              >
+                <X aria-hidden="true" />
+              </button>
+            </div>
+          )}
         </div>
         <div className="composer-control-layer">
+          <div className="composer-insertions">
+            <button
+              type="button"
+              className={`skill-picker-trigger${skillPicker.selectedSkill ? ' is-selected' : ''}`}
+              onClick={skillPicker.openPicker}
+              disabled={busy || writeLocked}
+              aria-haspopup="dialog"
+              aria-expanded={skillPicker.open}
+              aria-controls="skill-picker-drawer"
+              title={sendDisabledReason || '选择本轮要使用的 Skill'}
+            >
+              <Sparkles aria-hidden="true" />
+              <span>Skill</span>
+            </button>
+          </div>
           <div className="composer-status">
             <span>{sendDisabledReason || voice.status}</span>
             <canvas
@@ -187,6 +224,17 @@ export function ComposerBar({
           </div>
         </div>
       </form>
+      <SkillPickerDrawer
+        open={skillPicker.open}
+        skills={skillPicker.skills}
+        loading={skillPicker.loading}
+        error={skillPicker.error}
+        omittedSkillCount={skillPicker.omittedSkillCount}
+        selectedName={skillPicker.selectedSkill?.name}
+        onSelect={skillPicker.selectSkill}
+        onClose={skillPicker.closePicker}
+        onRetry={skillPicker.refresh}
+      />
     </section>
   );
 }

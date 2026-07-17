@@ -22,6 +22,18 @@ export interface SkillCatalogSnapshot {
   omitted_diagnostic_count: number;
 }
 
+export interface RuntimeSkillSummary {
+  name: string;
+  description: string;
+  revision: string;
+  source: 'builtin' | 'user_store' | string;
+}
+
+export interface RuntimeSkillCatalogResponse {
+  skills: RuntimeSkillSummary[];
+  omitted_skill_count: number;
+}
+
 export interface SkillDraft {
   name: string;
   description: string;

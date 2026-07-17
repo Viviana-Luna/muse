@@ -122,6 +122,58 @@ async fn tool_skill(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) 
     .await
 }
 
+async fn activate_selected_skill(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    skill_name: &str,
+) -> Result<(String, muse_core::domain::turn::RuntimeActivatedSkill), String> {
+    let call = ToolCall {
+        call_id: format!("selected-skill-{}", turn.turn_id),
+        name: "load_skill".to_string(),
+        arguments: serde_json::json!({ "skill_name": skill_name }),
+        source: muse_core::domain::tool::ToolCallSource::Native,
+    };
+    let result = tool_skill(state, turn, &call).await;
+    if !result.status.is_success() {
+        return Err(format!("无法激活已选择的 Skill `{skill_name}`：{}", result.content));
+    }
+    let structured = result
+        .structured
+        .as_ref()
+        .ok_or_else(|| format!("Skill `{skill_name}` 缺少激活摘要，已拒绝开始本轮。"))?;
+    let required_string = |field: &str| {
+        structured
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!("Skill `{skill_name}` 的激活摘要缺少 `{field}`，已拒绝开始本轮。")
+            })
+    };
+    let loaded_name = required_string("skill_name")?;
+    if loaded_name != skill_name {
+        return Err(format!(
+            "已选择的 Skill `{skill_name}` 与实际载入项 `{loaded_name}` 不一致，已拒绝开始本轮。"
+        ));
+    }
+    let (_, content) = result.content.split_once("\n\n").ok_or_else(|| {
+        format!("Skill `{skill_name}` 未返回可注入的完整指引，已拒绝开始本轮。")
+    })?;
+    let prompt = format!(
+        "\n\n【用户显式选择的 Skill：`{skill_name}`】用户已在本轮输入区明确选择此 Skill。必须优先遵循下列指引完成当前请求；若它与系统、安全或运行时约束冲突，以上位约束为准。\n\n{content}"
+    );
+    Ok((
+        prompt,
+        muse_core::domain::turn::RuntimeActivatedSkill {
+            name: loaded_name,
+            revision: required_string("revision")?,
+            source: required_string("source")?,
+            content_hash: required_string("content_hash")?,
+        },
+    ))
+}
+
 fn create_skill_draft_from_call(
     call: &ToolCall,
 ) -> Result<muse_core::domain::skill::SkillDraft, ToolResult> {

@@ -45,6 +45,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/runtime/health", get(handlers::handle_runtime_health))
         .route("/runtime/state", get(handlers::handle_runtime_state))
+        .route("/runtime/skills", get(handlers::handle_runtime_skills))
         .route(
             "/runtime/ws-ticket",
             post(handlers::handle_runtime_ws_ticket),
@@ -1190,6 +1191,40 @@ check_on_startup = true
         let config = std::fs::read_to_string(config_dir.join("config.toml"))
             .expect("应回读删除后的 Skill 配置");
         assert!(!config.contains("skills/api-helper-next/SKILL.md"));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_skill_catalog_exposes_only_safe_effective_metadata() {
+        let config_dir = unique_temp_dir("runtime-skill-catalog-api");
+        let state = build_test_state(&config_dir);
+        let response = api_routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/skills")
+                    .body(Body::empty())
+                    .expect("应构造运行时 Skill 目录请求"),
+            )
+            .await
+            .expect("运行时 Skill 目录应返回响应");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let creator = payload["skills"]
+            .as_array()
+            .expect("应返回 Skill 数组")
+            .iter()
+            .find(|skill| skill["name"] == "skill-creator")
+            .expect("有效目录应包含内置 skill-creator");
+        assert_eq!(creator["source"], "builtin");
+        assert!(
+            creator["revision"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+        );
+        assert!(creator.get("content").is_none());
+        assert!(creator.get("path").is_none());
+        assert_eq!(payload["omitted_skill_count"], 0);
         let _ = std::fs::remove_dir_all(config_dir);
     }
 

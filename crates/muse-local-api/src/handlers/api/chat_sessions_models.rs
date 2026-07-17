@@ -3,6 +3,7 @@ pub(crate) async fn handle_chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let selected_skill = normalize_selected_skill(req.selected_skill)?;
     let runtime = ConversationRuntime::new(state.clone(), false);
     let prepared = {
         let _transition = state.persona_runtime_transition_gate.lock().await;
@@ -12,7 +13,12 @@ pub(crate) async fn handle_chat(
             .map_err(runtime_turn_prepare_error_response)?
     };
     Ok(match runtime
-        .run_prepared_user_turn(req.message, RuntimeEventEmitter::collect_only(), prepared)
+        .run_prepared_user_turn(
+            req.message,
+            selected_skill,
+            RuntimeEventEmitter::collect_only(),
+            prepared,
+        )
         .await
     {
         Ok(outcome) => Json(ChatResponse {
@@ -30,6 +36,7 @@ pub(crate) async fn handle_chat_stream(
     Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
+    let selected_skill = normalize_selected_skill(request.selected_skill.clone())?;
     let client_request_id = request.client_request_id.trim();
     if client_request_id.is_empty()
         || client_request_id.len() > 128
@@ -98,7 +105,7 @@ pub(crate) async fn handle_chat_stream(
     tokio::spawn(async move {
         if !emitter.is_closed() {
             let _ = runtime
-                .run_prepared_user_turn(message, emitter.clone(), prepared)
+                .run_prepared_user_turn(message, selected_skill, emitter.clone(), prepared)
                 .await;
         }
         if let Err(error) = request_state
@@ -122,6 +129,18 @@ pub(crate) async fn handle_chat_stream(
                 .text("keep-alive"),
         ),
     )
+}
+
+fn normalize_selected_skill(
+    selected_skill: Option<String>,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(skill_name) = selected_skill else {
+        return Ok(None);
+    };
+    let skill_name = skill_name.trim().to_string();
+    muse_core::domain::skill::validate_skill_name(&skill_name)
+        .map_err(|error| bad_request(&error.to_string()))?;
+    Ok(Some(skill_name))
 }
 
 /// 明确拒绝旧版 GET 流式聊天，避免查询字符串触发有副作用的用户轮次。

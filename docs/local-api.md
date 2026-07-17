@@ -55,11 +55,12 @@ Accept: text/event-stream
   "message": "你好",
   "conversation_id": "<会话 ID>",
   "client_request_id": "<客户端生成的唯一请求 ID>",
-  "voice_enabled": false
+  "voice_enabled": false,
+  "selected_skill": "<可选的 Skill 名称>"
 }
 ```
 
-响应为 `text/event-stream`。客户端应使用 `fetch` 读取 `ReadableStream`，按 SSE 帧边界解析事件，并在用户取消时中止请求。`client_request_id` 在客户端重试和请求关联范围内必须唯一。
+响应为 `text/event-stream`。客户端应使用 `fetch` 读取 `ReadableStream`，按 SSE 帧边界解析事件，并在用户取消时中止请求。`client_request_id` 在客户端重试和请求关联范围内必须唯一。`selected_skill` 只能来自 `GET /api/runtime/skills` 返回的当前有效目录；服务端仍会在 Turn 开始时重新校验名称、Persona 策略、冻结 revision 和真实来源，失败时在调用模型供应商前终止准备。
 
 旧的 `GET /api/chat/stream` 固定返回 `405 Method Not Allowed` 和错误码 `stream_post_required`，响应头只允许 `POST`，且不会创建回合或写入会话。
 
@@ -101,6 +102,10 @@ Skill `revision` 同时覆盖 `SKILL.md` 字节与当前启停状态。手工编
 运行时内置只读 `skill-creator`，用于指导模型生成符合规范的 Skill。用户目录存在同名项时由用户版本遮蔽内置版本；内置项不进入用户 Skill 管理 API，也不能通过管理页修改或删除。
 
 模型创建入口为 `create_skill`，只接收 `name`、`description`、Markdown `content` 和可选 `enabled`，不接收文件路径。该工具属于持久写入操作，每次调用都需要用户审批，并同时受角色工具策略和 Skill 策略约束；服务端复用与管理 API 相同的 `SkillStore` 完成校验、暂存、原子发布、启停配置提交和失败回滚，不覆盖同名 Skill。创建成功不会改变当前 Turn 的冻结目录；启用的新 Skill 从下一 Turn 起进入目录并可由 `load_skill` 加载，禁用项需要先在管理页启用。
+
+`GET /api/runtime/skills` 返回当前角色在新 Turn 中实际可选择的有效目录，包含内置项、用户同名遮蔽结果、名称、描述、revision 与来源摘要；禁用项、坏项和 Persona 策略拒绝项不会返回，正文与本机路径永不进入响应。该接口服务于聊天输入区选择器，不替代只管理用户 Skill 的 `/api/skills`。
+
+用户在输入区选择 Skill 后，前端以结构化 `selected_skill` 发送，消息正文保持原样。后端把安全载入的完整指引加入本轮系统上下文，并在运行策略快照和用户事件中只记录名称、revision、来源与内容哈希；运行模式切换重建系统提示词时会重新附加同一冻结指引。系统、安全和运行时约束始终高于 Skill 内容。
 
 ## 用户级外观偏好
 

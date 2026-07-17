@@ -143,6 +143,7 @@ function ActiveWorkspace({
     dialogue,
     inputValue,
     setInputValue,
+    skillPicker,
     selectedRuntimeSession,
     selectedConversationReadOnly,
     messages,
@@ -230,6 +231,7 @@ function ActiveWorkspace({
               canceling={canceling}
               canCancel={canCancel}
               inputValue={inputValue}
+              skillPicker={skillPicker}
               voice={voice}
               visualizerCanvasRef={visualizerCanvasRef}
               sendIcon={<SendHorizontal aria-hidden="true" />}

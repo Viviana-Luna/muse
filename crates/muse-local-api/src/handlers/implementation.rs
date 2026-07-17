@@ -763,7 +763,7 @@ impl ConversationRuntime {
         emitter: RuntimeEventEmitter,
     ) -> Result<RuntimeTurnOutcome, String> {
         let prepared = self.prepare_user_turn().await?;
-        self.run_prepared_user_turn(message, emitter, prepared)
+        self.run_prepared_user_turn(message, None, emitter, prepared)
             .await
     }
 
@@ -797,6 +797,7 @@ impl ConversationRuntime {
     async fn run_prepared_user_turn(
         &self,
         message: String,
+        selected_skill: Option<String>,
         emitter: RuntimeEventEmitter,
         prepared: PreparedUserTurn,
     ) -> Result<RuntimeTurnOutcome, String> {
@@ -916,6 +917,27 @@ impl ConversationRuntime {
         };
         let mut turn_context = frozen_runtime.context;
         let provider_snapshot = frozen_runtime.provider;
+        let activated_skill_prompt = if let Some(skill_name) = selected_skill.as_deref() {
+            match activate_selected_skill(&self.state, &turn_context, skill_name).await {
+                Ok((prompt, activated_skill)) => {
+                    turn_context.system_prompt.push_str(&prompt);
+                    turn_context.runtime_policy.activated_skill = Some(activated_skill);
+                    Some(prompt)
+                }
+                Err(message) => {
+                    return Err(abort_preparing_turn(
+                        &self.state,
+                        &emitter,
+                        &conversation_id,
+                        &turn_id,
+                        message,
+                    )
+                    .await);
+                }
+            }
+        } else {
+            None
+        };
         let system_prompt = turn_context.system_prompt.clone();
         let frozen_execution_policy = self
             .state
@@ -964,6 +986,7 @@ impl ConversationRuntime {
                 "conversation_id": turn_context.conversation_id,
                 "turn_id": turn_context.turn_id,
                 "content": message,
+                "selected_skill": turn_context.runtime_policy.activated_skill,
             }),
         )
         .await
@@ -1386,6 +1409,9 @@ impl ConversationRuntime {
                                 &turn_snapshot.context.runtime_policy.skill_catalog,
                                 turn_snapshot.context.runtime_policy.omitted_skill_count,
                             );
+                            if let Some(prompt) = activated_skill_prompt.as_deref() {
+                                next_prompt.push_str(prompt);
+                            }
                             turn_snapshot.transition_runtime_mode(
                                 next_mode.mode.as_str(),
                                 next_mode.focus_phase.as_str(),

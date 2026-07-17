@@ -52,6 +52,7 @@ fn freeze_skill_catalog(
             name: summary.name,
             description,
             revision: summary.revision,
+            source: String::new(),
         });
     }
     (entries, omitted)
@@ -76,6 +77,79 @@ fn append_frozen_skill_catalog(
             "\n- 另有 {omitted} 个允许的 Skill 因本轮目录预算未暴露；不要猜测其名称。"
         ));
     }
+}
+
+fn effective_runtime_skill_catalog(
+    data_dir: &StdPath,
+    preferences: &muse_core::domain::skill::SkillPreferences,
+    policy: &muse_core::domain::persona::SkillPolicy,
+) -> (
+    Vec<muse_core::domain::turn::RuntimeSkillCatalogEntry>,
+    usize,
+) {
+    let user_skills =
+        match muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
+            .catalog_snapshot(preferences)
+        {
+            Ok(snapshot) => {
+                if snapshot.omitted_diagnostic_count > 0 {
+                    tracing::warn!(
+                        omitted_count = snapshot.omitted_diagnostic_count,
+                        "Skill 目录诊断超过本地预算，其余异常项已省略"
+                    );
+                }
+                for diagnostic in snapshot.diagnostics {
+                    tracing::warn!(
+                        skill_name = %diagnostic.name,
+                        code = %diagnostic.code,
+                        message = %diagnostic.message,
+                        "Skill 目录项损坏，已从当前 Turn 目录隔离"
+                    );
+                }
+                snapshot.skills
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "扫描 Skill 目录失败，当前 Turn 使用空目录");
+                Vec::new()
+            }
+        };
+    let user_skill_names = user_skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<BTreeSet<_>>();
+    let merged = merge_builtin_skill_summaries(user_skills);
+    let (mut catalog, omitted) = freeze_skill_catalog(merged, policy);
+    for skill in &mut catalog {
+        skill.source = if user_skill_names.contains(&skill.name) {
+            "user_store".to_string()
+        } else {
+            "builtin".to_string()
+        };
+    }
+    (catalog, omitted)
+}
+
+/// 返回当前角色在新 Turn 中实际可选择的 Skill 目录。
+pub(crate) async fn handle_runtime_skills(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RuntimeSkillCatalogResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let active_persona = require_active_persona_http(&state).await?;
+    let preferences = {
+        let mut store = state.user_config.lock().await;
+        if let Err(error) = store.refresh_from_disk() {
+            tracing::warn!(error = %error, "刷新 Skill config.toml 运行时快照失败");
+        }
+        store.skill_preferences().clone()
+    };
+    let (skills, omitted_skill_count) = effective_runtime_skill_catalog(
+        state.runtime_service.data_dir(),
+        &preferences,
+        &active_persona.skill_policy,
+    );
+    Ok(Json(RuntimeSkillCatalogResponse {
+        skills,
+        omitted_skill_count,
+    }))
 }
 
 /// 在回合入口冻结角色、模型、工具、Skill 与 MCP 的公共运行事实。
@@ -301,36 +375,11 @@ async fn build_turn_context(
             store.skill_preferences().clone(),
         )
     };
-    let data_dir = state.runtime_service.data_dir().to_path_buf();
-    let skill_summaries =
-        match muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
-            .catalog_snapshot(&skill_preferences)
-        {
-            Ok(snapshot) => {
-                if snapshot.omitted_diagnostic_count > 0 {
-                    tracing::warn!(
-                        omitted_count = snapshot.omitted_diagnostic_count,
-                        "Skill 目录诊断超过本地预算，其余异常项已省略"
-                    );
-                }
-                for diagnostic in snapshot.diagnostics {
-                    tracing::warn!(
-                        skill_name = %diagnostic.name,
-                        code = %diagnostic.code,
-                        message = %diagnostic.message,
-                        "Skill 目录项损坏，已从当前 Turn 目录隔离"
-                    );
-                }
-                snapshot.skills
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "扫描 Skill 目录失败，当前 Turn 使用空目录");
-                Vec::new()
-            }
-        };
-    let skill_summaries = merge_builtin_skill_summaries(skill_summaries);
-    let (skill_catalog, omitted_skill_count) =
-        freeze_skill_catalog(skill_summaries, &skill_policy);
+    let (skill_catalog, omitted_skill_count) = effective_runtime_skill_catalog(
+        state.runtime_service.data_dir(),
+        &skill_preferences,
+        &skill_policy,
+    );
     append_frozen_skill_catalog(&mut system_prompt, &skill_catalog, omitted_skill_count);
     let skill_catalog_hash = format!(
         "{:x}",
@@ -357,8 +406,8 @@ async fn build_turn_context(
         .unwrap_or_default();
 
     let runtime_policy = muse_core::domain::turn::RuntimePolicySnapshot {
-        schema_version: 4,
-        policy_version: "persona-runtime-policy/v4".to_string(),
+        schema_version: 5,
+        policy_version: "persona-runtime-policy/v5".to_string(),
         persona_version: active_persona.map(|persona| persona.version.clone()),
         provider: chat.config.provider.clone(),
         model: chat.config.model.clone(),
@@ -381,6 +430,7 @@ async fn build_turn_context(
         skill_catalog_hash,
         skill_catalog,
         omitted_skill_count,
+        activated_skill: None,
         mcp_revision,
         mcp_catalog_hash,
         mcp_tool_policies,

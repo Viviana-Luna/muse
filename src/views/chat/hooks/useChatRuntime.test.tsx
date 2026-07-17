@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Message, Persona, RuntimeStateResponse } from '@/types';
+import type { Message, Persona, RuntimeEvent, RuntimeStateResponse } from '@/types';
 
 const api = vi.hoisted(() => ({
   answerRuntimeUserQuestion: vi.fn(),
@@ -22,6 +22,7 @@ const api = vi.hoisted(() => ({
   fetchRuntimeTokenUsage: vi.fn(),
   fetchVoiceCapabilities: vi.fn(),
   forkRuntimeSession: vi.fn(),
+  listRuntimeSkills: vi.fn(),
   resetConversation: vi.fn(),
   resumeRuntimeSession: vi.fn(),
   streamRuntimeChat: vi.fn(),
@@ -140,6 +141,17 @@ describe('useChatRuntime', () => {
       tts: false,
       speech_recognition: false
     });
+    api.listRuntimeSkills.mockResolvedValue({
+      skills: [
+        {
+          name: 'pdf',
+          description: '读取和生成 PDF',
+          revision: 'pdf-revision',
+          source: 'user_store'
+        }
+      ],
+      omitted_skill_count: 0
+    });
   });
 
   it('录音开始后任一输入、运行时或角色事实变化都拒绝过期转写', () => {
@@ -228,6 +240,62 @@ describe('useChatRuntime', () => {
     expect(result.current.activeConversationId).toBe('runtime-conversation-1');
     expect(result.current.selectedConversationId).toBe('runtime-conversation-1');
     expect(api.fetchHistory).toHaveBeenCalledTimes(historyCallsBeforeSend);
+  });
+
+  it('仅在后端完成 Turn 冻结后清除 Skill', async () => {
+    let emit: ((event: RuntimeEvent) => void) | undefined;
+    let finishStream: (() => void) | undefined;
+    api.streamRuntimeChat.mockImplementation(
+      async (_request, options) =>
+        new Promise<void>((resolve) => {
+          emit = options.onEvent;
+          finishStream = resolve;
+        })
+    );
+    const { result } = setup();
+    await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
+
+    act(() => result.current.skillPicker.openPicker());
+    await waitFor(() => expect(result.current.skillPicker.skills).toHaveLength(1));
+    act(() => result.current.skillPicker.selectSkill(result.current.skillPicker.skills[0]));
+    act(() => result.current.setInputValue('生成报告'));
+    await act(async () => {
+      await result.current.handleSend();
+    });
+
+    expect(result.current.skillPicker.selectedSkill?.name).toBe('pdf');
+    expect(api.streamRuntimeChat).toHaveBeenCalledWith(
+      expect.objectContaining({ selected_skill: 'pdf' }),
+      expect.any(Object)
+    );
+
+    act(() => {
+      emit?.({ type: 'turn_started', turn_id: 'turn-with-skill', conversation_id: 'active' });
+    });
+    expect(result.current.skillPicker.selectedSkill).toBeNull();
+
+    act(() => {
+      emit?.({ type: 'done' });
+      finishStream?.();
+    });
+    await waitFor(() => expect(result.current.busy).toBe(false));
+  });
+
+  it('后端准备失败时保留已选择的 Skill', async () => {
+    api.streamRuntimeChat.mockRejectedValue(new Error('Skill revision 已变化'));
+    const { result } = setup();
+    await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
+
+    act(() => result.current.skillPicker.openPicker());
+    await waitFor(() => expect(result.current.skillPicker.skills).toHaveLength(1));
+    act(() => result.current.skillPicker.selectSkill(result.current.skillPicker.skills[0]));
+    act(() => result.current.setInputValue('生成报告'));
+    await act(async () => {
+      await result.current.handleSend();
+    });
+
+    await waitFor(() => expect(result.current.busy).toBe(false));
+    expect(result.current.skillPicker.selectedSkill?.name).toBe('pdf');
   });
 
   it('角色与历史之间 revision 变化时整批重试，不提交旧角色快照', async () => {

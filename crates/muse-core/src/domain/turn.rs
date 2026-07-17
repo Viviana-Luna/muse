@@ -10,6 +10,17 @@ pub struct RuntimeSkillCatalogEntry {
     pub name: String,
     pub description: String,
     pub revision: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+/// 用户在输入区为当前回合显式激活的 Skill 摘要；不包含正文和本机路径。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimeActivatedSkill {
+    pub name: String,
+    pub revision: String,
+    pub source: String,
+    pub content_hash: String,
 }
 
 /// 单轮冻结的 MCP 工具审批事实；不包含远端描述、参数或本机秘密。
@@ -65,6 +76,8 @@ pub struct RuntimePolicySnapshot {
     pub skill_catalog: Vec<RuntimeSkillCatalogEntry>,
     #[serde(default)]
     pub omitted_skill_count: usize,
+    #[serde(default)]
+    pub activated_skill: Option<RuntimeActivatedSkill>,
     pub mcp_revision: u64,
     pub mcp_catalog_hash: String,
     #[serde(default)]
@@ -116,7 +129,7 @@ pub struct TurnContext {
 
 #[cfg(test)]
 mod tests {
-    use super::TurnContext;
+    use super::{RuntimePolicySnapshot, RuntimeSkillCatalogEntry, TurnContext};
     use crate::domain::persona::{McpPolicy, SkillPolicy, ToolPolicy};
 
     #[test]
@@ -171,5 +184,26 @@ mod tests {
         assert!(restored.model_capabilities.is_empty());
         assert_eq!(restored.model_context_window, 0);
         assert!(restored.voice_source.is_empty());
+    }
+
+    #[test]
+    fn legacy_runtime_skill_snapshots_default_source_and_activation() {
+        let entry: RuntimeSkillCatalogEntry = serde_json::from_value(serde_json::json!({
+            "name": "legacy-skill",
+            "description": "旧目录项",
+            "revision": "legacy-revision"
+        }))
+        .expect("旧 Skill 目录项应继续可读");
+        assert!(entry.source.is_empty());
+
+        let policy = RuntimePolicySnapshot::default();
+        let mut value = serde_json::to_value(policy).expect("运行策略应可序列化");
+        value
+            .as_object_mut()
+            .expect("运行策略应为对象")
+            .remove("activated_skill");
+        let restored: RuntimePolicySnapshot =
+            serde_json::from_value(value).expect("旧运行策略应继续可读");
+        assert!(restored.activated_skill.is_none());
     }
 }
