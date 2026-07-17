@@ -6,9 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod builtin;
 pub mod config;
 pub mod store;
 
+pub use builtin::{BuiltinSkill, builtin_skill, builtin_skills};
 pub use config::{SkillConfigOverride, SkillPreferences, skill_document_path};
 pub use store::{
     MAX_SKILL_DOCUMENT_BYTES, SkillCatalogDiagnostic, SkillCatalogSnapshot, SkillDraft,

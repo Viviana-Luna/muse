@@ -614,12 +614,12 @@ pub fn migrate_legacy_skill_enabled(
 }
 
 #[derive(Debug)]
-struct ParsedSkillDocument {
-    name: String,
-    description: String,
-    content: String,
-    frontmatter_lines: Vec<String>,
-    legacy_enabled: Option<bool>,
+pub(crate) struct ParsedSkillDocument {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) content: String,
+    pub(crate) frontmatter_lines: Vec<String>,
+    pub(crate) legacy_enabled: Option<bool>,
 }
 
 fn validate_draft(mut draft: SkillDraft) -> Result<SkillDraft, SkillStoreError> {
@@ -713,7 +713,7 @@ fn render_updated_skill_document(
     ))
 }
 
-fn parse_skill_document(text: &str) -> Result<ParsedSkillDocument, SkillStoreError> {
+pub(crate) fn parse_skill_document(text: &str) -> Result<ParsedSkillDocument, SkillStoreError> {
     let normalized = text
         .strip_prefix('\u{feff}')
         .unwrap_or(text)
@@ -869,7 +869,7 @@ fn validate_document_size(bytes: &[u8]) -> Result<(), SkillStoreError> {
     Ok(())
 }
 
-fn revision_for(bytes: &[u8], enabled: bool) -> String {
+pub(crate) fn revision_for(bytes: &[u8], enabled: bool) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
     digest.update(if enabled {
