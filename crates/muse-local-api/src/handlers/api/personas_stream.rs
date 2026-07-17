@@ -1037,7 +1037,9 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
             persona.skill_policy.mode,
             muse_core::domain::persona::ResourcePolicyMode::Disabled
         ) {
-            defs.retain(|definition| definition.name != "load_skill");
+            defs.retain(|definition| {
+                !matches!(definition.name.as_str(), "load_skill" | "create_skill")
+            });
         }
     }
     let web_search_configured = matches!(

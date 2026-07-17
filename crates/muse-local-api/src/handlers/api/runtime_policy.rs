@@ -328,6 +328,7 @@ async fn build_turn_context(
                 Vec::new()
             }
         };
+    let skill_summaries = merge_builtin_skill_summaries(skill_summaries);
     let (skill_catalog, omitted_skill_count) =
         freeze_skill_catalog(skill_summaries, &skill_policy);
     append_frozen_skill_catalog(&mut system_prompt, &skill_catalog, omitted_skill_count);
@@ -413,4 +414,25 @@ async fn build_turn_context(
         tool_definitions: tools.definitions.to_vec(),
     };
     Ok(FrozenTurnRuntime { context, provider })
+}
+
+/// 内置项优先占用冻结目录预算；用户同名项在相同位置遮蔽内置版本。
+fn merge_builtin_skill_summaries(
+    mut user_skills: Vec<muse_core::domain::skill::SkillSummary>,
+) -> Vec<muse_core::domain::skill::SkillSummary> {
+    let mut merged = Vec::with_capacity(
+        user_skills.len() + muse_core::domain::skill::builtin_skills().len(),
+    );
+    for builtin in muse_core::domain::skill::builtin_skills() {
+        if let Some(index) = user_skills
+            .iter()
+            .position(|skill| skill.name == builtin.name)
+        {
+            merged.push(user_skills.remove(index));
+        } else {
+            merged.push(muse_core::domain::skill::SkillSummary::from(builtin));
+        }
+    }
+    merged.extend(user_skills);
+    merged
 }

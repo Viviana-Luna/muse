@@ -390,6 +390,40 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
             "additionalProperties": false
         }),
     );
+    register_web_runtime_tool(
+        registry,
+        "create_skill",
+        "创建一个新的用户 Skill。服务端会校验并原子发布 SKILL.md；每次创建都需要用户审批，同名内容不会被覆盖，启用的新 Skill 从下一轮对话起可加载。",
+        "knowledge",
+        ToolRisk::WriteFile,
+        true,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill 名称，1-64 位小写字母、数字和单连字符；不能使用保留名称 list 或 help",
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                    "maxLength": 64
+                },
+                "description": {
+                    "type": "string",
+                    "description": "说明 Skill 做什么以及何时使用，不能为空，最多 1024 个字符",
+                    "maxLength": 1024
+                },
+                "content": {
+                    "type": "string",
+                    "description": "SKILL.md 的 Markdown 正文，不包含 frontmatter，不能为空"
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "是否立即启用，默认 true"
+                }
+            },
+            "required": ["name", "description", "content"],
+            "additionalProperties": false
+        }),
+    );
     register_web_runtime_tool_with_visibility(
         registry,
         "use_skill",

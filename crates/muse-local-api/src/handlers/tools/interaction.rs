@@ -122,6 +122,163 @@ async fn tool_skill(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) 
     .await
 }
 
+fn create_skill_draft_from_call(
+    call: &ToolCall,
+) -> Result<muse_core::domain::skill::SkillDraft, ToolResult> {
+    let name = call
+        .arguments
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err(tool_failed(
+            "create_skill 缺少 name 参数。",
+            "missing_name",
+        ));
+    }
+    if let Err(error) = muse_core::domain::skill::validate_skill_name(&name) {
+        return Err(tool_failed(error.to_string(), "skill_invalid"));
+    }
+    if matches!(name.as_str(), "list" | "help") {
+        return Err(tool_failed(
+            format!("Skill 名称 `{name}` 是 load_skill 的保留参数，请改用其他名称。"),
+            "skill_name_reserved",
+        ));
+    }
+
+    let description = call
+        .arguments
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if description.is_empty() {
+        return Err(tool_failed(
+            "create_skill 缺少 description 参数。",
+            "missing_description",
+        ));
+    }
+    if description.chars().count() > 1024 {
+        return Err(tool_failed(
+            "Skill description 不能超过 1024 个字符。",
+            "skill_invalid",
+        ));
+    }
+
+    let content = call
+        .arguments
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return Err(tool_failed(
+            "create_skill 缺少 content 参数。",
+            "missing_content",
+        ));
+    }
+
+    let enabled = match call.arguments.get("enabled") {
+        None => true,
+        Some(value) => match value.as_bool() {
+            Some(enabled) => enabled,
+            None => {
+                return Err(tool_failed(
+                    "create_skill 的 enabled 参数必须是布尔值。",
+                    "invalid_enabled",
+                ));
+            }
+        },
+    };
+
+    Ok(muse_core::domain::skill::SkillDraft {
+        name,
+        description,
+        content,
+        enabled,
+    })
+}
+
+async fn tool_create_skill(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
+    let draft = match create_skill_draft_from_call(call) {
+        Ok(draft) => draft,
+        Err(result) => return result,
+    };
+    match turn.skill_policy.mode {
+        muse_core::domain::persona::ResourcePolicyMode::Inherit => {}
+        muse_core::domain::persona::ResourcePolicyMode::Disabled => {
+            return tool_failed("当前角色已禁用 Skill。", "skill_policy_disabled");
+        }
+        muse_core::domain::persona::ResourcePolicyMode::AllowList
+            if !turn
+                .skill_policy
+                .allowed_skills
+                .iter()
+                .any(|allowed| allowed == &draft.name) =>
+        {
+            return tool_failed(
+                format!("Skill `{}` 不在当前角色白名单中。", draft.name),
+                "skill_policy_denied",
+            );
+        }
+        muse_core::domain::persona::ResourcePolicyMode::AllowList => {}
+    }
+
+    let record = {
+        let mut config = state.user_config.lock().await;
+        match muse_core::domain::skill::SkillStore::from_data_dir(
+            state.runtime_service.data_dir(),
+        )
+        .create(draft, &mut config)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = match error.kind {
+                    muse_core::domain::skill::SkillStoreErrorKind::Invalid => "skill_invalid",
+                    muse_core::domain::skill::SkillStoreErrorKind::NotFound => "skill_not_found",
+                    muse_core::domain::skill::SkillStoreErrorKind::Conflict => "skill_conflict",
+                    muse_core::domain::skill::SkillStoreErrorKind::RevisionConflict => {
+                        "skill_revision_conflict"
+                    }
+                    muse_core::domain::skill::SkillStoreErrorKind::Io => "skill_io_error",
+                };
+                return tool_failed(error.to_string(), reason);
+            }
+        }
+    };
+    state.runtime_service.touch();
+    let available_next_turn = record.enabled;
+    let availability_message = if available_next_turn {
+        "当前 Turn 的冻结目录保持不变，下一轮对话起可以加载。"
+    } else {
+        "该 Skill 当前处于禁用状态；请先在 Skill 管理页启用，之后的新对话才能加载。"
+    };
+
+    ToolResult {
+        status: ToolResultStatus::Success,
+        content: format!(
+            "已创建 Skill `{}`。服务端已完成格式校验与原子发布；{availability_message}",
+            record.name,
+        ),
+        structured: Some(serde_json::json!({
+            "name": record.name,
+            "description": record.description,
+            "revision": record.revision,
+            "enabled": record.enabled,
+            "source": "user_store",
+            "available_next_turn": available_next_turn,
+        })),
+    }
+}
+
 #[cfg(test)]
 async fn tool_skill_from_workspace(
     turn: &TurnContext,
@@ -182,6 +339,7 @@ async fn tool_skill_from_workspace_with_user(
         .iter()
         .find(|entry| entry.name == skill_name);
     let frozen_catalog_required = turn.runtime_policy.schema_version >= 2;
+    let builtin = muse_core::domain::skill::builtin_skill(&skill_name);
     let user_skill = user_skill_context.and_then(|(_, preferences)| {
         user_store
             .as_ref()
@@ -196,7 +354,7 @@ async fn tool_skill_from_workspace_with_user(
         }
         Some(Ok(_)) if frozen_catalog_required && frozen_catalog_entry.is_none() => {
             return tool_failed(
-                format!("Skill `{skill_name}` 不在当前 Turn 冻结目录中。"),
+                format!("Skill `{skill_name}` 不在当前 Turn 冻结目录中。若它是本轮对话中新建的，无需重试，下一轮对话起自动生效；否则不要猜测目录之外的 Skill 名称。"),
                 "skill_catalog_denied",
             );
         }
@@ -229,7 +387,8 @@ async fn tool_skill_from_workspace_with_user(
         }
         Some(Err(error))
             if error.kind == muse_core::domain::skill::SkillStoreErrorKind::NotFound
-                && frozen_catalog_entry.is_some() =>
+                && frozen_catalog_entry.is_some()
+                && builtin.is_none() =>
         {
             return tool_failed(
                 format!("Skill `{skill_name}` 已在当前 Turn 开始后移除，请发起新请求后重试。"),
@@ -242,6 +401,34 @@ async fn tool_skill_from_workspace_with_user(
             return tool_failed(error.to_string(), "skill_read_failed");
         }
         Some(Err(_)) | None => {}
+    }
+    // 用户目录未命中时回退到内置 Skill；用户同名 Skill 已在上面优先返回。
+    if let Some(builtin) = builtin {
+        if frozen_catalog_required && frozen_catalog_entry.is_none() {
+            return tool_failed(
+                format!("内置 Skill `{skill_name}` 不在当前 Turn 冻结目录中，不要猜测目录之外的 Skill 名称。"),
+                "skill_catalog_denied",
+            );
+        }
+        if frozen_catalog_entry.is_some_and(|entry| entry.revision != builtin.revision) {
+            return tool_failed(
+                format!("内置 Skill `{skill_name}` 已在当前 Turn 开始后变更，请发起新请求后重试。"),
+                "skill_revision_changed",
+            );
+        }
+        let content_hash = content_hash_hex(builtin.content.as_bytes());
+        return ToolResult {
+            status: ToolResultStatus::Success,
+            content: format!("已成功载入内置 Skill `{skill_name}` 指引：\n\n{}", builtin.content),
+            structured: Some(serde_json::json!({
+                "skill_name": builtin.name,
+                "description": builtin.description,
+                "revision": builtin.revision,
+                "content_hash": content_hash,
+                "source": "builtin",
+                "activated": true,
+            })),
+        };
     }
     let candidate_roots = [
         // 旧工作区技能目录仅保留兼容读取，不再作为新技能的推荐写入位置。
@@ -307,6 +494,12 @@ async fn tool_skill_from_workspace_with_user(
         }
     }
 
+    for builtin_skill in muse_core::domain::skill::builtin_skills() {
+        if !available_skills.contains(&builtin_skill.name) {
+            available_skills.push(builtin_skill.name.clone());
+        }
+    }
+
     if skill_name == "list" || skill_name == "help" {
         return ToolResult {
             status: ToolResultStatus::Success,
@@ -318,7 +511,7 @@ async fn tool_skill_from_workspace_with_user(
     ToolResult {
         status: ToolResultStatus::Failed,
         content: format!(
-            "未能找到名为 `{skill_name}` 的技能说明。当前可用技能库有：{:?}。如需新建技能，请在 Muse 数据目录的 skills/<技能名>/ 目录下创建 SKILL.md。",
+            "未能找到名为 `{skill_name}` 的技能说明。当前可用技能库有：{:?}。如需创建新技能且列表中包含 `skill-creator`，先加载它获取创建指引。",
             available_skills,
         ),
         structured: Some(

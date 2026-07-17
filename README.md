@@ -22,7 +22,7 @@ macOS 是当前主要开发、长期自用和真实桌面验证环境，但这�
 - 语音能力：TTS 与 ASR 均通过 OpenAI-compatible API 接入，密钥和测试状态彼此隔离。
 - 会话与上下文：支持独立会话页、恢复、分叉、重命名、归档、安全导出，以及只读 Context Inspector。
 - 运行时事件：支持 SSE 流式输出、工具事件、审批、用户问答、取消和按回合冻结的运行策略快照。
-- 工具、Skill 与 MCP：提供统一授权边界、角色级允许策略、受控文件与命令工具、网页搜索、独立 Skill 管理和 MCP 连接管理；Skill 正文采用 `skills/<skill-name>/SKILL.md` 标准目录，启停覆盖写入 `config.toml`，MCP Server、普通参数与明文 API Key 作为同一 Profile 保存在同一配置文件。
+- 工具、Skill 与 MCP：提供统一授权边界、角色级允许策略、受控文件与命令工具、网页搜索、独立 Skill 管理和 MCP 连接管理；内置 `skill-creator` 可指导模型通过需审批的 `create_skill` 安全创建用户 Skill，服务端原子发布且从下一 Turn 起生效；Skill 正文采用 `skills/<skill-name>/SKILL.md` 标准目录，启停覆盖写入 `config.toml`，MCP Server、普通参数与明文 API Key 作为同一 Profile 保存在同一配置文件。
 - 原生桌面交付：Tauri 从安装包内嵌资源加载 UI，不依赖源码目录、外部 Vite 服务或固定 localhost 页面；官方单实例插件会把重复启动聚焦回既有主窗口。
 
 ## 技术栈

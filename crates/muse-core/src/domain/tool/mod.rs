@@ -812,7 +812,7 @@ fn tool_call_id(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::builtin;
-    use super::{ToolExecutionOwner, ToolRegistry};
+    use super::{ToolExecutionOwner, ToolRegistry, ToolRisk};
     use crate::domain::persona::{ToolPolicy, ToolPolicyMode};
     use crate::domain::runtime::ToolPreset;
 
@@ -917,6 +917,7 @@ mod tests {
         assert!(!names.contains(&"mcp_read_resource"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"file_edit"));
+        assert!(!names.contains(&"create_skill"));
         assert!(!names.contains(&"command_run"));
     }
 
@@ -934,6 +935,7 @@ mod tests {
                 "command_run".to_string(),
                 "mcp_list_resources".to_string(),
                 "agent".to_string(),
+                "create_skill".to_string(),
             ],
         };
         let defs =
@@ -948,6 +950,25 @@ mod tests {
         assert!(names.contains(&"command_run"));
         assert!(names.contains(&"mcp_list_resources"));
         assert!(names.contains(&"agent"));
+        assert!(names.contains(&"create_skill"));
+    }
+
+    #[test]
+    fn create_skill_declares_persistent_write_boundary() {
+        let mut registry = ToolRegistry::new();
+        builtin::register_all(&mut registry);
+
+        let definition = registry
+            .tool_def("create_skill")
+            .expect("create_skill 应注册为运行底座工具");
+        assert_eq!(definition.risk, ToolRisk::WriteFile);
+        assert!(definition.requires_approval);
+        assert_eq!(definition.execution_owner, ToolExecutionOwner::WebRuntime);
+        assert_eq!(
+            definition.parameters["required"],
+            serde_json::json!(["name", "description", "content"])
+        );
+        assert!(definition.parameters["properties"].get("path").is_none());
     }
 
     // 验证运行底座工具不再伪装成 core 闭包工具，而是声明真实 Web runtime 归属。

@@ -618,8 +618,8 @@ pub(crate) struct ParsedSkillDocument {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) content: String,
-    pub(crate) frontmatter_lines: Vec<String>,
-    pub(crate) legacy_enabled: Option<bool>,
+    frontmatter_lines: Vec<String>,
+    legacy_enabled: Option<bool>,
 }
 
 fn validate_draft(mut draft: SkillDraft) -> Result<SkillDraft, SkillStoreError> {

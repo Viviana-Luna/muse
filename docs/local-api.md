@@ -98,6 +98,10 @@ Muse 不再解释或写入 frontmatter `enabled`。现有 API 的 `enabled` 字�
 
 Skill `revision` 同时覆盖 `SKILL.md` 字节与当前启停状态。手工编辑正文或 `config.toml` 后，使用旧 revision 的更新与删除返回 HTTP 409，并带 `skill_revision_conflict` 前缀；无效名称返回 HTTP 400 和 `skill_invalid` 前缀。
 
+运行时内置只读 `skill-creator`，用于指导模型生成符合规范的 Skill。用户目录存在同名项时由用户版本遮蔽内置版本；内置项不进入用户 Skill 管理 API，也不能通过管理页修改或删除。
+
+模型创建入口为 `create_skill`，只接收 `name`、`description`、Markdown `content` 和可选 `enabled`，不接收文件路径。该工具属于持久写入操作，每次调用都需要用户审批，并同时受角色工具策略和 Skill 策略约束；服务端复用与管理 API 相同的 `SkillStore` 完成校验、暂存、原子发布、启停配置提交和失败回滚，不覆盖同名 Skill。创建成功不会改变当前 Turn 的冻结目录；启用的新 Skill 从下一 Turn 起进入目录并可由 `load_skill` 加载，禁用项需要先在管理页启用。
+
 ## 用户级外观偏好
 
 `GET /api/preferences/appearance` 读取用户数据目录中的 `config.toml`，返回 `schema_version`、外观偏好和字段诊断。`PUT /api/preferences/appearance` 只接受当前界面可编辑的 `background_blur`、`background_opacity` 与 `motion_level`；主题、语言、其他配置段、注释、顺序和未知字段由服务端原样保留。

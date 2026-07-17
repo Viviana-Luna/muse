@@ -37,22 +37,25 @@ fn builtin_documents() -> &'static [(&'static str, &'static str)] {
 
 static REGISTRY: OnceLock<Vec<BuiltinSkill>> = OnceLock::new();
 
-/// 全部内置 Skill。内嵌文档在编译期确定，解析失败项会被跳过并由测试兜底。
+/// 全部内置 Skill。内嵌文档属于应用自身不变量，损坏时必须立即暴露缺陷。
 pub fn builtin_skills() -> &'static [BuiltinSkill] {
     REGISTRY.get_or_init(|| {
         builtin_documents()
             .iter()
-            .filter_map(|(expected_name, text)| {
-                let parsed = parse_skill_document(text).ok()?;
-                if parsed.name != *expected_name {
-                    return None;
-                }
-                Some(BuiltinSkill {
+            .map(|(expected_name, text)| {
+                let parsed = parse_skill_document(text).unwrap_or_else(|error| {
+                    panic!("内置 Skill `{expected_name}` 解析失败：{error}")
+                });
+                assert_eq!(
+                    parsed.name, *expected_name,
+                    "内置 Skill 目录登记名必须与文档 name 一致"
+                );
+                BuiltinSkill {
                     name: parsed.name,
                     description: parsed.description,
                     content: parsed.content,
                     revision: revision_for(text.as_bytes(), true),
-                })
+                }
             })
             .collect()
     })
@@ -77,6 +80,8 @@ mod tests {
         assert!(!creator.description.is_empty());
         assert!(creator.description.chars().count() <= 1024);
         assert!(creator.content.contains("Skill 创建工艺"));
+        assert!(creator.content.contains("`create_skill`"));
+        assert!(!creator.content.contains("用户 Skill 目录"));
         assert_eq!(creator.revision.len(), 64, "revision 应为 sha256 十六进制");
         assert!(
             SKILL_CREATOR_DOCUMENT.len() <= MAX_SKILL_DOCUMENT_BYTES,
@@ -87,7 +92,10 @@ mod tests {
     #[test]
     fn lookup_by_name_and_revision_is_stable() {
         let creator = builtin_skill("skill-creator").expect("应能按名称找到内置 Skill");
-        assert_eq!(creator.revision, builtin_skill("skill-creator").unwrap().revision);
+        assert_eq!(
+            creator.revision,
+            builtin_skill("skill-creator").unwrap().revision
+        );
         assert!(builtin_skill("missing-skill").is_none());
         assert!(crate::domain::skill::validate_skill_name(&creator.name).is_ok());
     }

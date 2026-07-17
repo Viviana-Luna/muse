@@ -144,6 +144,14 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
         has_context_effect: false,
     },
     RuntimeToolCapability {
+        name: "create_skill",
+        family: RuntimeToolFamily::Skill,
+        mutating: true,
+        interrupt_behavior: RuntimeToolInterruptBehavior::Block,
+        writes_transcript: true,
+        has_context_effect: true,
+    },
+    RuntimeToolCapability {
         name: "use_skill",
         family: RuntimeToolFamily::Skill,
         mutating: false,

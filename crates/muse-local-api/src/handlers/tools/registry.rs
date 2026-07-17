@@ -661,6 +661,7 @@ struct BriefHandler;
 struct SkillHandler {
     name: &'static str,
 }
+struct CreateSkillHandler;
 struct AgentHandler;
 struct TaskStopHandler;
 
@@ -910,6 +911,53 @@ impl RuntimeToolHandler for SkillHandler {
     fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a> {
         Box::pin(async move {
             tool_skill(invocation.state, invocation.turn, invocation.call).await
+        })
+    }
+}
+
+impl RuntimeToolHandler for CreateSkillHandler {
+    fn name(&self) -> &'static str {
+        "create_skill"
+    }
+
+    fn validate_input(&self, call: &ToolCall) -> Result<(), ToolResult> {
+        create_skill_draft_from_call(call).map(|_| ())
+    }
+
+    fn approval_summary(&self, call: &ToolCall) -> String {
+        let name = call
+            .arguments
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        format!("创建持久化 Skill `{name}`")
+    }
+
+    fn safety_notes(&self, _call: &ToolCall) -> Vec<String> {
+        vec!["新 Skill 会写入用户数据目录并在后续对话中持续可用。".to_string()]
+    }
+
+    fn is_read_only(&self, _call: &ToolCall) -> bool {
+        false
+    }
+
+    fn is_concurrency_safe(&self, _call: &ToolCall) -> bool {
+        false
+    }
+
+    fn context_effect(&self, result: &ToolResult) -> Option<RuntimeToolContextEffect> {
+        if !result.is_success() {
+            return None;
+        }
+        Some(RuntimeToolContextEffect::Append {
+            title: "Skill 创建结果",
+            content: result.content.clone(),
+        })
+    }
+
+    fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a> {
+        Box::pin(async move {
+            tool_create_skill(invocation.state, invocation.turn, invocation.call).await
         })
     }
 }
@@ -1790,6 +1838,7 @@ static BRIEF_HANDLER: BriefHandler = BriefHandler;
 static LOAD_SKILL_HANDLER: SkillHandler = SkillHandler { name: "load_skill" };
 static USE_SKILL_HANDLER: SkillHandler = SkillHandler { name: "use_skill" };
 static SKILL_HANDLER: SkillHandler = SkillHandler { name: "skill" };
+static CREATE_SKILL_HANDLER: CreateSkillHandler = CreateSkillHandler;
 static AGENT_HANDLER: AgentHandler = AgentHandler;
 static TASK_STOP_HANDLER: TaskStopHandler = TaskStopHandler;
 
@@ -1802,6 +1851,7 @@ static RUNTIME_TOOL_HANDLERS: &[&dyn RuntimeToolHandler] = &[
     &LOAD_SKILL_HANDLER,
     &USE_SKILL_HANDLER,
     &SKILL_HANDLER,
+    &CREATE_SKILL_HANDLER,
     &AGENT_HANDLER,
     &TASK_STOP_HANDLER,
     &ASK_USER_QUESTION_HANDLER,

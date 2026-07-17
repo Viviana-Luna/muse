@@ -12,13 +12,14 @@ description: 创建新 Skill 的完整工艺：何时沉淀、命名规则、des
 - 用户明确要求"创建 Skill"、"记住这个流程"或"沉淀这个做法"。
 - 某类任务有稳定的多步打法，且用户表达了复用意图。
 - 一次性任务、纯闲聊、没有复注意图时，不要主动创建。
-- 创建前先确认没有同名或同用途的 Skill：查看系统提示中的冻结目录，必要时用 load_skill 试探。
+- 创建前先确认没有同名或同用途的 Skill：查看系统提示中的冻结目录，必要时用 `load_skill` 读取候选项。
 
-## 写入位置
+## 创建入口
 
-- 唯一合法位置：运行环境上下文给出的「用户 Skill 目录」下的 `<skill-name>/SKILL.md`。
-- 不要猜测路径；如果运行环境上下文中没有「用户 Skill 目录」一行，告知用户无法定位并停止。
-- 该目录在工作区外，file_write 会触发用户审批；写入前先用一句话说明要创建的 Skill 名称和用途。
+- 使用 `create_skill` 提交 `name`、`description`、`content` 和可选的 `enabled`。
+- 不要猜测或请求用户数据目录，也不要用 `file_write`、`command_run` 等通用工具绕过 Skill 存储。
+- `create_skill` 会触发用户审批；调用前用一句话说明要创建的 Skill 名称和用途。
+- 同名 Skill 已存在时不要覆盖。先读取现有内容，再引导用户在 Skill 管理页更新或重命名。
 
 ## 命名
 
@@ -27,37 +28,27 @@ description: 创建新 Skill 的完整工艺：何时沉淀、命名规则、des
 - 用动词短语或领域名词，见名知意，如 `weekly-report`、`pr-review`。
 - `list` 和 `help` 是 load_skill 的保留参数，禁止用作名称。
 
-## 文件格式
+## 参数格式
 
-```markdown
----
-name: skill-name
-description: 一句话说明用途与触发场景
----
-
-# 工作流
-
-正文……
-```
-
-- frontmatter 只有 `name` 和 `description` 两个必填字段；不要写 `enabled`，启停由应用配置管理。
+- `name`：合法 Skill 名称，不要自行拼接目录或文件名。
 - description 决定以后能否被命中：写清"做什么 + 什么时候用它"，单行，不超过 1024 字符。
-- 正文必须非空，整个文件不超过 128KB。
+- `content`：只写 frontmatter 之后的 Markdown 正文，不要重复写 `---`、`name` 或 `description`；正文必须非空。
+- `enabled`：默认 `true`；只有用户明确要求先保存但不启用时才传 `false`。
+- Muse 会生成并校验完整 `SKILL.md`，文档总大小不得超过 128KB。
 
 ## 正文写法
 
 - 面向模型写操作指引：先做什么、再做什么、边界和禁区、输出格式。
 - 具体、可执行、有顺序；避免空泛口号。
-- 只创建单个 SKILL.md；不要创建 scripts/、references/、assets/ 等辅助文件，当前运行时不会把它们暴露给模型。
+- 当前工具只创建单个 `SKILL.md`；不要承诺同时生成 `scripts/`、`references/`、`assets/` 等辅助资源。
 
-## 更新已有 Skill
+## 已有 Skill
 
-- 先 load_skill 或 file_read 读取现有 SKILL.md。
-- 保留 frontmatter 中除 name/description 外的所有扩展字段（license、metadata 等），原样写回。
-- 不要自行重命名或移动目录；需要重命名时引导用户在 Skill 管理页操作，管理页会保留辅助文件并同步配置。
+- `create_skill` 不覆盖已有 Skill。出现同名冲突时，停止重复创建并说明冲突。
+- 需要更新、重命名、启停或删除时，引导用户在 Skill 管理页操作；不要用通用文件工具直接改内部目录。
 
 ## 创建之后
 
-- 新 Skill 本轮不会进入冻结目录；不要调用 load_skill 验证，返回 skill_catalog_denied 是预期行为。
-- 告知用户：已创建 `<skill-name>`，下一轮对话起生效，可在 Skill 管理页查看或停用。
-- 如果下一轮 load_skill 返回校验错误（如缺少 description），按错误信息修正文件。
+- `create_skill` 成功即表示服务端已经完成格式校验和原子发布，不要在本轮调用 `load_skill` 重复验证。
+- 新 Skill 不会改变当前 Turn 的冻结目录；告知用户它从下一轮对话起可加载，并可在 Skill 管理页查看或停用。
+- 创建失败时依据工具返回的稳定原因修正输入；同名冲突和存储错误不得靠换路径或通用文件工具规避。

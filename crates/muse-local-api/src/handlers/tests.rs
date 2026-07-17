@@ -703,6 +703,7 @@ mod tests {
             "send_user_message",
             "brief",
             "load_skill",
+            "create_skill",
             "use_skill",
             "skill",
             "agent",
@@ -778,6 +779,37 @@ mod tests {
         }
     }
 
+    fn builtin_skill_keeps_priority_and_user_shadowing() {
+        let user_skills = (0..64)
+            .map(|index| muse_core::domain::skill::SkillSummary {
+                name: format!("user-skill-{index}"),
+                description: format!("用户 Skill {index}"),
+                enabled: true,
+                revision: format!("revision-{index}"),
+                updated_at: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let merged = super::merge_builtin_skill_summaries(user_skills);
+        assert_eq!(merged[0].name, "skill-creator");
+        let (frozen, omitted) = super::freeze_skill_catalog(merged, &Default::default());
+        assert_eq!(frozen[0].name, "skill-creator");
+        assert_eq!(frozen.len(), 64);
+        assert_eq!(omitted, 1);
+
+        let user_revision = "user-shadow-revision".to_string();
+        let shadow = muse_core::domain::skill::SkillSummary {
+            name: "skill-creator".to_string(),
+            description: "用户定制创建工艺".to_string(),
+            enabled: true,
+            revision: user_revision.clone(),
+            updated_at: String::new(),
+        };
+        let merged = super::merge_builtin_skill_summaries(vec![shadow]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].revision, user_revision);
+        assert_eq!(merged[0].description, "用户定制创建工艺");
+    }
+
     fn runtime_tool_handlers_own_approval_summaries() {
         let cases = [
             (
@@ -814,6 +846,15 @@ mod tests {
                 "load_skill",
                 serde_json::json!({ "skill_name": "antigravity-guide" }),
                 "载入技能 `antigravity-guide`",
+            ),
+            (
+                "create_skill",
+                serde_json::json!({
+                    "name": "weekly-report",
+                    "description": "整理周报",
+                    "content": "# 工作流\n\n整理本周进展。"
+                }),
+                "创建持久化 Skill `weekly-report`",
             ),
             (
                 "use_skill",
@@ -1071,6 +1112,291 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(data_dir);
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_loads_through_frozen_catalog() {
+        let data_dir = unique_temp_dir("builtin-skill");
+        let workspace = unique_temp_dir("builtin-skill-workspace");
+        let config = muse_core::app::preferences::MuseConfigStore::load_from_dir(&data_dir)
+            .expect("应能加载测试配置");
+        let preferences = config.skill_preferences().clone();
+        let builtin = muse_core::domain::skill::builtin_skill("skill-creator")
+            .expect("应注册内置 skill-creator");
+        let mut turn = test_turn_context("builtin-skill-turn");
+        turn.runtime_policy.schema_version = 2;
+        turn.runtime_policy.skill_catalog =
+            vec![muse_core::domain::turn::RuntimeSkillCatalogEntry {
+                name: builtin.name.clone(),
+                description: builtin.description.clone(),
+                revision: builtin.revision.clone(),
+            }];
+        let call = test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "skill-creator" }),
+        );
+        let loaded = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert!(loaded.is_success(), "内置 Skill 应能通过冻结目录加载");
+        assert!(loaded.content.contains("Skill 创建工艺"));
+        let structured = loaded.structured.as_ref().expect("应包含加载审计字段");
+        assert_eq!(structured["source"], "builtin");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(structured["revision"], builtin.revision.as_str());
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn user_skill_shadows_builtin_with_same_name() {
+        let data_dir = unique_temp_dir("shadow-builtin");
+        let workspace = unique_temp_dir("shadow-builtin-workspace");
+        let skill_dir = data_dir.join("skills/skill-creator");
+        std::fs::create_dir_all(&skill_dir).expect("应能创建同名用户 Skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: skill-creator\ndescription: 用户定制版创建工艺\n---\n用户自定义内容。\n",
+        )
+        .expect("应能写入同名用户 Skill");
+        let config = muse_core::app::preferences::MuseConfigStore::load_from_dir(&data_dir)
+            .expect("应能加载测试配置");
+        let preferences = config.skill_preferences().clone();
+        let record = muse_core::domain::skill::SkillStore::from_data_dir(&data_dir)
+            .get("skill-creator", &preferences)
+            .expect("应能读取同名用户 Skill");
+        let mut turn = test_turn_context("shadow-builtin-turn");
+        turn.runtime_policy.schema_version = 2;
+        turn.runtime_policy.skill_catalog =
+            vec![muse_core::domain::turn::RuntimeSkillCatalogEntry {
+                name: record.name.clone(),
+                description: record.description.clone(),
+                revision: record.revision.clone(),
+            }];
+        let call = test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "skill-creator" }),
+        );
+        let loaded = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert!(loaded.is_success());
+        assert!(loaded.content.contains("用户自定义内容"));
+        let structured = loaded.structured.as_ref().expect("应包含加载审计字段");
+        assert_eq!(structured["source"], "user_store");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_created_skill_gets_next_turn_guidance() {
+        let data_dir = unique_temp_dir("mid-turn-skill");
+        let workspace = unique_temp_dir("mid-turn-skill-workspace");
+        let skill_dir = data_dir.join("skills/fresh-skill");
+        std::fs::create_dir_all(&skill_dir).expect("应能创建新 Skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fresh-skill\ndescription: 本轮新建\n---\n正文。\n",
+        )
+        .expect("应能写入新 Skill");
+        let config = muse_core::app::preferences::MuseConfigStore::load_from_dir(&data_dir)
+            .expect("应能加载测试配置");
+        let preferences = config.skill_preferences().clone();
+        let mut turn = test_turn_context("mid-turn-skill-turn");
+        turn.runtime_policy.schema_version = 2;
+        let call = test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "fresh-skill" }),
+        );
+        let denied = super::tool_skill_from_workspace_with_user(
+            &turn,
+            &call,
+            &workspace,
+            Some((&data_dir, &preferences)),
+        )
+        .await;
+        assert!(!denied.is_success());
+        assert_eq!(
+            super::tool_result_reason(&denied),
+            Some("skill_catalog_denied")
+        );
+        assert!(
+            denied.content.contains("下一轮对话起自动生效"),
+            "当轮新建应得到明确的下一轮生效指引：{}",
+            denied.content
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn create_skill_uses_store_and_becomes_loadable_next_turn() {
+        let data_dir = unique_temp_dir("create-skill-e2e");
+        let state = build_test_state(&data_dir);
+        configure_test_chat(&state).await;
+        let mut current_turn = test_turn_context("create-skill-current-turn");
+        current_turn.runtime_policy.schema_version = 2;
+        let create_call = test_tool_call(
+            "create_skill",
+            serde_json::json!({
+                "name": "weekly-report",
+                "description": "整理每周工作进展与风险时使用",
+                "content": "# 工作流\n\n先汇总已完成事项，再列出风险和下一步。"
+            }),
+        );
+
+        let created = super::tool_create_skill(&state, &current_turn, &create_call).await;
+        assert!(created.is_success(), "真实创建入口应成功：{}", created.content);
+        let structured = created.structured.as_ref().expect("应返回创建审计字段");
+        assert_eq!(structured["source"], "user_store");
+        assert_eq!(structured["available_next_turn"], true);
+        assert_eq!(structured["enabled"], true);
+        assert!(data_dir.join("skills/weekly-report/SKILL.md").is_file());
+
+        let current_load = super::tool_skill(&state, &current_turn, &test_tool_call(
+            "load_skill",
+            serde_json::json!({ "skill_name": "weekly-report" }),
+        ))
+        .await;
+        assert_eq!(
+            super::tool_result_reason(&current_load),
+            Some("skill_catalog_denied"),
+            "当前 Turn 的冻结目录不得被创建动作改写"
+        );
+
+        let next_turn = super::build_turn_context(
+            &state,
+            "create-skill-conversation".to_string(),
+            "create-skill-next-turn".to_string(),
+            None,
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
+        )
+        .await
+        .expect("应构建真实下一 Turn")
+        .context;
+        let frozen = next_turn
+            .runtime_policy
+            .skill_catalog
+            .iter()
+            .find(|skill| skill.name == "weekly-report")
+            .expect("下一 Turn 应冻结新 Skill");
+        assert_eq!(frozen.revision, structured["revision"]);
+
+        let loaded = super::tool_skill(
+            &state,
+            &next_turn,
+            &test_tool_call(
+                "load_skill",
+                serde_json::json!({ "skill_name": "weekly-report" }),
+            ),
+        )
+        .await;
+        assert!(loaded.is_success());
+        assert!(loaded.content.contains("先汇总已完成事项"));
+        assert_eq!(loaded.structured.as_ref().unwrap()["source"], "user_store");
+
+        let duplicate = super::tool_create_skill(&state, &current_turn, &create_call).await;
+        assert_eq!(
+            super::tool_result_reason(&duplicate),
+            Some("skill_conflict")
+        );
+        let reserved = super::tool_create_skill(
+            &state,
+            &current_turn,
+            &test_tool_call(
+                "create_skill",
+                serde_json::json!({
+                    "name": "list",
+                    "description": "保留名称",
+                    "content": "正文"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            super::tool_result_reason(&reserved),
+            Some("skill_name_reserved")
+        );
+        assert!(!data_dir.join("skills/list").exists());
+
+        let disabled = super::tool_create_skill(
+            &state,
+            &current_turn,
+            &test_tool_call(
+                "create_skill",
+                serde_json::json!({
+                    "name": "disabled-skill",
+                    "description": "暂不启用的 Skill",
+                    "content": "# 工作流\n\n等待用户启用。",
+                    "enabled": false
+                }),
+            ),
+        )
+        .await;
+        assert!(disabled.is_success());
+        assert_eq!(
+            disabled.structured.as_ref().unwrap()["available_next_turn"],
+            false
+        );
+        assert!(disabled.content.contains("当前处于禁用状态"));
+        let after_disabled = super::build_turn_context(
+            &state,
+            "create-skill-conversation".to_string(),
+            "create-skill-after-disabled".to_string(),
+            None,
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
+        )
+        .await
+        .expect("应构建禁用创建后的 Turn")
+        .context;
+        assert!(
+            !after_disabled
+                .runtime_policy
+                .skill_catalog
+                .iter()
+                .any(|skill| skill.name == "disabled-skill")
+        );
+
+        let mut blocked_turn = current_turn.clone();
+        blocked_turn.skill_policy.mode =
+            muse_core::domain::persona::ResourcePolicyMode::Disabled;
+        let blocked = super::tool_create_skill(
+            &state,
+            &blocked_turn,
+            &test_tool_call(
+                "create_skill",
+                serde_json::json!({
+                    "name": "blocked-skill",
+                    "description": "不应创建",
+                    "content": "正文"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            super::tool_result_reason(&blocked),
+            Some("skill_policy_disabled")
+        );
+        assert!(!data_dir.join("skills/blocked-skill").exists());
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[cfg(unix)]
@@ -1789,6 +2115,20 @@ mod tests {
         assert!(agent_handler.is_mutating(&agent_call));
         assert!(!agent_handler.is_concurrency_safe(&agent_call));
 
+        let create_skill_call = test_tool_call(
+            "create_skill",
+            serde_json::json!({
+                "name": "weekly-report",
+                "description": "整理周报",
+                "content": "# 工作流\n\n整理本周进展。"
+            }),
+        );
+        let create_skill_handler = super::runtime_tool_handler("create_skill")
+            .expect("runtime handler registry 应包含 create_skill");
+        assert!(!create_skill_handler.is_read_only(&create_skill_call));
+        assert!(create_skill_handler.is_mutating(&create_skill_call));
+        assert!(!create_skill_handler.is_concurrency_safe(&create_skill_call));
+
         let search_call = test_tool_call("web_search", serde_json::json!({ "query": "harness" }));
         let search_handler = super::runtime_tool_handler("web_search")
             .expect("runtime handler registry 应包含 web_search");
@@ -1852,6 +2192,15 @@ mod tests {
                 "file_write",
                 serde_json::json!({ "path": "tmp/example.txt" }),
                 "missing_content",
+            ),
+            (
+                "create_skill",
+                serde_json::json!({
+                    "name": "list",
+                    "description": "保留名称",
+                    "content": "正文"
+                }),
+                "skill_name_reserved",
             ),
             (
                 "file_edit",
@@ -3930,6 +4279,7 @@ mod tests {
                     "mcp__alpha__search".to_string(),
                     "mcp__beta__search".to_string(),
                     "load_skill".to_string(),
+                    "create_skill".to_string(),
                 ],
             },
             skill_policy: Default::default(),
@@ -3959,6 +4309,7 @@ mod tests {
             vec!["mcp__alpha__search"]
         );
         assert!(allowed.iter().any(|tool| tool.name == "load_skill"));
+        assert!(allowed.iter().any(|tool| tool.name == "create_skill"));
         assert!(!allowed
             .iter()
             .any(|tool| matches!(tool.name.as_str(), "use_skill" | "skill")));
@@ -3971,7 +4322,7 @@ mod tests {
         );
         assert!(!skill_disabled
             .iter()
-            .any(|tool| matches!(tool.name.as_str(), "load_skill" | "use_skill" | "skill")));
+            .any(|tool| matches!(tool.name.as_str(), "load_skill" | "create_skill" | "use_skill" | "skill")));
         persona.skill_policy = Default::default();
 
         persona.tool_policy.mode = muse_core::domain::persona::ToolPolicyMode::Disabled;
@@ -4486,6 +4837,11 @@ mod tests {
         {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(runtime_tool_capability_matrix_matches_handler_registry)).is_err() {
                 failures.push("runtime_tool_capability_matrix_matches_handler_registry");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(builtin_skill_keeps_priority_and_user_shadowing)).is_err() {
+                failures.push("builtin_skill_keeps_priority_and_user_shadowing");
             }
         }
         {
