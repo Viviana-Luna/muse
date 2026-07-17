@@ -895,7 +895,10 @@ impl ConversationRuntime {
             Some(&active_persona),
             self.voice_enabled,
             system_prompt.clone(),
-            &full_tool_defs,
+            FrozenTurnToolCatalog {
+                definitions: &full_tool_defs,
+                mcp: Some(&frozen_mcp_catalog),
+            },
         )
         .await;
         let system_prompt = turn_context.system_prompt.clone();

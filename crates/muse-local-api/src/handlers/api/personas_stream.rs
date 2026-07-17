@@ -2021,6 +2021,11 @@ fn should_require_tool_approval(
     risk: &str,
     default_requires_approval: bool,
 ) -> bool {
+    // 外部 MCP 的本地信任已经冻结在 ToolDef 中。全局完全访问模式不得再放宽
+    // MCP 写操作；可信只读工具则保持本地策略给出的免审结果。
+    if mcp::is_external_mcp_tool_name(&call.name) {
+        return default_requires_approval;
+    }
     match policy.permission_mode.as_str() {
         "full_access" => false,
         "approve_for_me" => match call.name.as_str() {
@@ -3373,6 +3378,11 @@ async fn emit_and_record_tool_call(
     let safety_notes = runtime_tool_handler(&call.name)
         .map(|handler| handler.safety_notes(call))
         .unwrap_or_default();
+    let mcp_policy = turn
+        .runtime_policy
+        .mcp_tool_policies
+        .iter()
+        .find(|entry| entry.name == call.name);
     if let Some(tx) = tx {
         emit_json_event(
             tx,
@@ -3401,6 +3411,10 @@ async fn emit_and_record_tool_call(
             "available": definition.map(|definition| definition.available),
             "disabled_reason": definition.and_then(|definition| definition.disabled_reason.clone()),
             "requires_approval": policy.requires_approval,
+            "mcp_server_revision": mcp_policy.map(|entry| entry.server_revision.clone()),
+            "mcp_annotations_hash": mcp_policy.map(|entry| entry.annotations_hash.clone()),
+            "mcp_approval_policy": mcp_policy.map(|entry| entry.approval_policy.clone()),
+            "mcp_approval_source": mcp_policy.map(|entry| entry.approval_source.clone()),
             "requires_workspace_boundary_approval": policy.requires_workspace_boundary_approval,
             "read_only": policy.is_read_only,
             "mutating": policy.is_mutating,

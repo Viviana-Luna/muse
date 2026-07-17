@@ -13,6 +13,26 @@ fn default_enabled() -> bool {
     true
 }
 
+/// MCP 工具的本地审批策略。远端 annotations 只能参与只读证明，不能自行授权。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpApprovalPolicy {
+    /// 所有调用都需要逐次审批。
+    #[default]
+    AlwaysAsk,
+    /// 仅当远端同时声明 readOnlyHint 时，允许免审批执行。
+    TrustedReadOnly,
+}
+
+impl McpApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysAsk => "always_ask",
+            Self::TrustedReadOnly => "trusted_read_only",
+        }
+    }
+}
+
 /// 单个 MCP Server 的完整声明式配置。
 ///
 /// API Key 明文与普通传输参数保存在同一个 Profile 中；自定义 `Debug` 严禁输出秘密。
@@ -28,6 +48,10 @@ pub struct McpServerProfile {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub approval_policy: McpApprovalPolicy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_approval_overrides: BTreeMap<String, McpApprovalPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +77,11 @@ impl std::fmt::Debug for McpServerProfile {
             .field("transport", &self.transport)
             .field("enabled", &self.enabled)
             .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("approval_policy", &self.approval_policy)
+            .field(
+                "tool_approval_override_names",
+                &self.tool_approval_overrides.keys(),
+            )
             .field("command", &self.command)
             .field("url", &self.url)
             .field("secret_env_fields", &self.secret_env.keys())
@@ -74,6 +103,16 @@ impl McpServerProfile {
         }
         validate_secret_fields(name, "secret_env", &self.secret_env)?;
         validate_secret_fields(name, "secret_headers", &self.secret_headers)?;
+        for tool_name in self.tool_approval_overrides.keys() {
+            if tool_name.trim().is_empty()
+                || tool_name.len() > 256
+                || tool_name.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "外部 MCP server `{name}` 包含无效的逐工具审批覆盖名称。"
+                ));
+            }
+        }
         if self.secret_env.keys().any(|key| self.env.contains_key(key)) {
             return Err(format!(
                 "外部 MCP server `{name}` 的同一环境变量不能同时出现在 env 和 secret_env。"
@@ -103,6 +142,11 @@ impl McpServerProfile {
                 for key in self.env.keys().chain(self.secret_env.keys()) {
                     validate_environment_name(name, key)?;
                 }
+                if self.env.keys().any(|key| looks_sensitive_env_name(key)) {
+                    return Err(format!(
+                        "外部 MCP server `{name}` 的敏感环境变量必须放入 secret_env。"
+                    ));
+                }
             }
             "streamable_http" => {
                 if self
@@ -113,12 +157,23 @@ impl McpServerProfile {
                     return Err(format!("外部 MCP server `{name}` 缺少 url。"));
                 }
                 let url = self.url.as_deref().unwrap_or_default();
-                if reqwest::Url::parse(url)
-                    .ok()
+                let parsed = reqwest::Url::parse(url).ok();
+                if parsed
+                    .as_ref()
                     .is_none_or(|url| !matches!(url.scheme(), "http" | "https"))
                 {
                     return Err(format!(
                         "外部 MCP server `{name}` 的 url 必须是有效的 HTTP 或 HTTPS 地址。"
+                    ));
+                }
+                let parsed = parsed.expect("上方已经确认 URL 可解析");
+                if parsed.host_str().is_none()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(format!(
+                        "外部 MCP server `{name}` 的 url 必须包含主机，且不能携带用户凭据或 fragment。"
                     ));
                 }
                 if self.command.is_some()
@@ -139,6 +194,15 @@ impl McpServerProfile {
                     if !normalized_headers.insert(key.to_ascii_lowercase()) {
                         return Err(format!("外部 MCP server `{name}` 包含重复的 Header 名称。"));
                     }
+                }
+                if self
+                    .headers
+                    .keys()
+                    .any(|key| looks_sensitive_header_name(key))
+                {
+                    return Err(format!(
+                        "外部 MCP server `{name}` 的敏感 Header 必须放入 secret_headers。"
+                    ));
                 }
             }
             other => {
@@ -168,6 +232,16 @@ impl McpServerProfile {
             object.insert(
                 "disabled_tools".to_string(),
                 serde_json::json!(self.disabled_tools),
+            );
+        }
+        object.insert(
+            "approval_policy".to_string(),
+            Value::String(self.approval_policy.as_str().to_string()),
+        );
+        if !self.tool_approval_overrides.is_empty() {
+            object.insert(
+                "tool_approval_overrides".to_string(),
+                serde_json::json!(self.tool_approval_overrides),
             );
         }
         match self.transport.as_str() {
@@ -311,6 +385,33 @@ fn validate_environment_name(server_name: &str, name: &str) -> Result<(), String
     ))
 }
 
+fn looks_sensitive_env_name(name: &str) -> bool {
+    let normalized = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "PRIVATE_KEY",
+    ]
+    .iter()
+    .any(|marker| normalized == *marker || normalized.ends_with(&format!("_{marker}")))
+}
+
+fn looks_sensitive_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "api-key"
+            | "x-auth-token"
+    )
+}
+
 fn validate_secret_fields(
     server_name: &str,
     field: &str,
@@ -337,6 +438,8 @@ mod tests {
             request_timeout_ms: Some(30_000),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             command: Some("demo".to_string()),
             args: Some(vec!["--serve".to_string()]),
             cwd: None,
@@ -375,6 +478,8 @@ mod tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             command: None,
             args: None,
             cwd: None,
@@ -403,6 +508,58 @@ mod tests {
                 .validate("remote")
                 .expect_err("Header 名称大小写冲突必须拒绝")
                 .contains("同一 Header")
+        );
+    }
+
+    #[test]
+    fn persists_local_approval_policy_and_rejects_secrets_in_ordinary_fields() {
+        let mut profile = stdio_profile();
+        profile.approval_policy = super::McpApprovalPolicy::TrustedReadOnly;
+        profile
+            .tool_approval_overrides
+            .insert("dangerous".to_string(), super::McpApprovalPolicy::AlwaysAsk);
+        let value = profile.to_runtime_value();
+        assert_eq!(value["approval_policy"], "trusted_read_only");
+        assert_eq!(value["tool_approval_overrides"]["dangerous"], "always_ask");
+
+        profile
+            .env
+            .insert("PLAINTEXT_TOKEN".to_string(), "unsafe".to_string());
+        assert!(
+            profile
+                .validate("local")
+                .expect_err("敏感环境变量不得放入普通字段")
+                .contains("secret_env")
+        );
+
+        let mut http = McpServerProfile {
+            transport: "streamable_http".to_string(),
+            enabled: true,
+            request_timeout_ms: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
+            command: None,
+            args: None,
+            cwd: None,
+            url: Some("https://example.test/mcp".to_string()),
+            env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
+            headers: BTreeMap::from([("Authorization".to_string(), "unsafe".to_string())]),
+            secret_headers: BTreeMap::new(),
+        };
+        assert!(
+            http.validate("remote")
+                .expect_err("敏感 Header 不得放入普通字段")
+                .contains("secret_headers")
+        );
+        http.headers.clear();
+        http.url = Some("https://user:password@example.test/mcp".to_string());
+        assert!(
+            http.validate("remote")
+                .expect_err("URL 不得携带凭据")
+                .contains("用户凭据")
         );
     }
 }

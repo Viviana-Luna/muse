@@ -5,11 +5,12 @@ pub mod config;
 pub mod migration;
 mod store;
 
-pub use client::{McpClientManager, McpNegotiatedSession};
-pub use config::{McpProfileConfig, McpRuntimeSnapshot, McpServerProfile};
+pub use client::{McpClientManager, McpConnectionDiagnostic, McpNegotiatedSession};
+pub use config::{McpApprovalPolicy, McpProfileConfig, McpRuntimeSnapshot, McpServerProfile};
 
 use crate::domain::persona::{McpPolicy, ResourcePolicyMode};
 use crate::domain::tool::{ToolDef, ToolExecutionOwner, ToolRisk};
+use crate::domain::turn::RuntimeMcpToolPolicyEntry;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::Value;
@@ -41,6 +42,13 @@ impl EffectiveMcpScope {
     pub fn unrestricted() -> Self {
         Self {
             allowed_servers: None,
+        }
+    }
+
+    /// 管理端测试单个 Server 时使用的显式范围。
+    pub fn only(server: impl Into<String>) -> Self {
+        Self {
+            allowed_servers: Some(BTreeSet::from([server.into()])),
         }
     }
 
@@ -167,9 +175,39 @@ impl McpToolCatalog {
             .collect()
     }
 
+    /// 为单轮审计冻结模型实际可见的 MCP 审批事实。
+    pub fn runtime_policy_entries(
+        &self,
+        visible_tool_names: &BTreeSet<String>,
+    ) -> Vec<RuntimeMcpToolPolicyEntry> {
+        self.tools
+            .iter()
+            .filter(|tool| visible_tool_names.contains(&tool.name))
+            .map(|tool| RuntimeMcpToolPolicyEntry {
+                name: tool.name.clone(),
+                server: tool.server_name.clone(),
+                server_revision: tool.server_revision.clone(),
+                annotations_hash: tool.annotations_hash.clone(),
+                approval_policy: tool.approval_policy.as_str().to_string(),
+                approval_source: tool.approval_source.as_str().to_string(),
+                final_risk: tool.final_risk.as_str().to_string(),
+                requires_approval: tool.requires_approval,
+            })
+            .collect()
+    }
+
     /// 按完全限定工具名查找外部 MCP 工具定义。
     pub fn find_tool(&self, name: &str) -> Option<ExternalMcpToolDef> {
         self.tools.iter().find(|tool| tool.name == name).cloned()
+    }
+
+    /// 返回指定 Server 当前 lease 的脱敏连接诊断。
+    pub async fn connection_diagnostic(&self, server: &str) -> Option<McpConnectionDiagnostic> {
+        let lease = self
+            .server_leases
+            .iter()
+            .find(|lease| lease.server_name() == server)?;
+        Some(lease.diagnostic().await)
     }
 
     /// 使用本目录冻结的 server 配置调用工具。
@@ -233,24 +271,44 @@ pub struct ExternalMcpToolDef {
     pub parameters: Value,
     pub read_only: bool,
     pub annotations: Value,
+    pub server_revision: String,
+    pub annotations_hash: String,
+    pub approval_policy: McpApprovalPolicy,
+    pub approval_source: McpApprovalSource,
+    pub final_risk: ToolRisk,
+    pub requires_approval: bool,
+}
+
+/// MCP 工具最终审批策略的本地来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpApprovalSource {
+    ServerPolicy,
+    ToolOverride,
+}
+
+impl McpApprovalSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerPolicy => "server_policy",
+            Self::ToolOverride => "tool_override",
+        }
+    }
 }
 
 impl ExternalMcpToolDef {
     /// 转换为运行底座统一工具定义，保留 MCP 工具风险和参数结构。
     pub fn to_tool_def(&self) -> ToolDef {
-        // MCP annotations 来自远端服务，不能作为本地授权依据。未建立本地信任
-        // 配置前，所有外部 MCP 调用都按可产生副作用处理并要求用户确认。
-        let risk = ToolRisk::ExternalSideEffect;
         ToolDef {
             name: self.name.clone(),
             description: self.description.clone(),
             parameters: self.parameters.clone(),
             category: format!("mcp:{}", self.server_name),
-            requires_approval: true,
+            requires_approval: self.requires_approval,
             execution_owner: ToolExecutionOwner::ExternalProvider,
             available: true,
             disabled_reason: None,
-            risk,
+            risk: self.final_risk.clone(),
         }
     }
 }
@@ -261,6 +319,120 @@ pub struct ExternalMcpToolCallResult {
     pub content: String,
     pub structured: Value,
     pub is_error: bool,
+}
+
+/// MCP 失败的稳定、脱敏诊断。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpStructuredError {
+    pub code: String,
+    pub kind: String,
+    pub message: String,
+    pub retryable: bool,
+    pub alternatives: Vec<String>,
+}
+
+/// 单个已保存 Server、且只对应一个配置 revision 的最近检查状态。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpServerCheckStatus {
+    pub revision: String,
+    pub status: String,
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub checked_at: String,
+    pub last_error: Option<McpStructuredError>,
+    pub connection: Option<McpConnectionDiagnostic>,
+}
+
+/// 将内部错误收口成有界、可供管理页和模型解释的稳定结构。
+pub fn structured_mcp_error(message: impl Into<String>) -> McpStructuredError {
+    let message = message.into();
+    let (code, kind, retryable, alternatives): (&str, &str, bool, &[&str]) = if message
+        .contains("重定向")
+    {
+        (
+            "mcp_redirect_blocked",
+            "policy_blocked",
+            false,
+            &["在管理页填写 Server 的最终 URL"],
+        )
+    } else if message.contains("公网连接必须使用 HTTPS") || message.contains("未授权的特殊网络地址")
+    {
+        (
+            "mcp_url_policy_blocked",
+            "policy_blocked",
+            false,
+            &["检查 URL 是否符合本地或 HTTPS 网络策略"],
+        )
+    } else if message.contains("DNS") {
+        (
+            "mcp_dns_failed",
+            "connection",
+            true,
+            &["检查主机名和本机 DNS 配置"],
+        )
+    } else if message.contains("超时") {
+        (
+            "mcp_timeout",
+            "timeout",
+            true,
+            &["检查 Server 是否阻塞", "适当提高请求超时"],
+        )
+    } else if message.contains("协议版本") || message.contains("initialize") {
+        (
+            "mcp_protocol_incompatible",
+            "protocol",
+            false,
+            &["检查 Server 支持的 MCP 协议版本"],
+        )
+    } else if message.contains("capability") {
+        (
+            "mcp_capability_missing",
+            "protocol",
+            false,
+            &["检查 Server 声明的 capability"],
+        )
+    } else if message.contains("HTTP 401") || message.contains("HTTP 403") {
+        (
+            "mcp_auth_failed",
+            "authentication",
+            false,
+            &["更新秘密 Header 或 Bearer 凭据"],
+        )
+    } else if message.contains("已退出") || message.contains("stdout") || message.contains("stdin")
+    {
+        (
+            "mcp_server_exited",
+            "server_process",
+            true,
+            &["检查 Server 命令和本地诊断"],
+        )
+    } else if message.contains("配置") || message.contains("缺少") || message.contains("无效")
+    {
+        (
+            "mcp_config_invalid",
+            "configuration",
+            false,
+            &["修正管理页中的 Server 配置"],
+        )
+    } else {
+        (
+            "mcp_connection_failed",
+            "connection",
+            true,
+            &["检查 Server 是否已启动", "重新测试连接"],
+        )
+    };
+    McpStructuredError {
+        code: code.to_string(),
+        kind: kind.to_string(),
+        message,
+        retryable,
+        alternatives: alternatives
+            .iter()
+            .take(3)
+            .map(|value| (*value).to_string())
+            .collect(),
+    }
 }
 
 // 已加载的外部 MCP 配置，保留原始文本用于缓存失效判断。
@@ -290,6 +462,8 @@ pub(super) struct ExternalMcpServerConfig {
     request_timeout_ms: Option<u64>,
     enabled_tools: Option<Vec<String>>,
     disabled_tools: Vec<String>,
+    approval_policy: McpApprovalPolicy,
+    tool_approval_overrides: BTreeMap<String, McpApprovalPolicy>,
     transport: ExternalMcpTransport,
 }
 
@@ -344,6 +518,14 @@ impl ExternalMcpServerConfig {
         self.request_timeout_ms
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS)
             .clamp(1_000, MAX_REQUEST_TIMEOUT_MS)
+    }
+
+    fn approval_for_tool(&self, tool_name: &str) -> (McpApprovalPolicy, McpApprovalSource) {
+        self.tool_approval_overrides
+            .get(tool_name)
+            .copied()
+            .map(|policy| (policy, McpApprovalSource::ToolOverride))
+            .unwrap_or((self.approval_policy, McpApprovalSource::ServerPolicy))
     }
 
     fn diagnostic_redactions(&self) -> Vec<String> {
@@ -598,7 +780,7 @@ pub async fn discover_external_mcp_tools_for_scope_with_manager(
                 match list_all_external_mcp_tools(&lease).await {
                     Ok(result) => {
                         let (mut tools, mut errors) =
-                            normalize_tool_entries(&server_config.name, &result);
+                            normalize_tool_entries(server_config, &result);
                         tools.retain(|tool| server_config.allows_tool(&tool.original_tool_name));
                         catalog.tools.append(&mut tools);
                         catalog.errors.append(&mut errors);
@@ -753,6 +935,28 @@ fn parse_mcp_servers_entry(name: String, raw: Value) -> Result<ExternalMcpServer
         optional_string_array_field(raw_object.get("enabled_tools"), &name, "enabled_tools")?;
     let disabled_tools =
         string_array_field(raw_object.get("disabled_tools"), &name, "disabled_tools")?;
+    let approval_policy = raw_object
+        .get("approval_policy")
+        .cloned()
+        .map(serde_json::from_value::<McpApprovalPolicy>)
+        .transpose()
+        .map_err(|_| {
+            format!(
+                "外部 MCP server `{name}` 的 approval_policy 仅支持 always_ask 或 trusted_read_only。"
+            )
+        })?
+        .unwrap_or_default();
+    let tool_approval_overrides = raw_object
+        .get("tool_approval_overrides")
+        .cloned()
+        .map(serde_json::from_value::<BTreeMap<String, McpApprovalPolicy>>)
+        .transpose()
+        .map_err(|_| {
+            format!(
+                "外部 MCP server `{name}` 的 tool_approval_overrides 必须是合法的工具审批策略映射。"
+            )
+        })?
+        .unwrap_or_default();
     let transport_type = raw_object
         .get("type")
         .and_then(Value::as_str)
@@ -850,6 +1054,8 @@ fn parse_mcp_servers_entry(name: String, raw: Value) -> Result<ExternalMcpServer
         request_timeout_ms,
         enabled_tools,
         disabled_tools,
+        approval_policy,
+        tool_approval_overrides,
         transport,
     })
 }
@@ -1127,7 +1333,10 @@ fn normalize_resource_template_entry(server: &str, item: &Value) -> Value {
 }
 
 // 标准化 tools/list 返回的工具定义并收集跳过原因。
-fn normalize_tool_entries(server: &str, result: &Value) -> (Vec<ExternalMcpToolDef>, Vec<Value>) {
+fn normalize_tool_entries(
+    server: &ExternalMcpServerConfig,
+    result: &Value,
+) -> (Vec<ExternalMcpToolDef>, Vec<Value>) {
     let mut tools = Vec::new();
     let mut errors = Vec::new();
     let mut seen_names = BTreeMap::<String, ()>::new();
@@ -1143,15 +1352,15 @@ fn normalize_tool_entries(server: &str, result: &Value) -> (Vec<ExternalMcpToolD
             .filter(|value| !value.is_empty())
         else {
             errors.push(external_error_json(
-                server,
+                &server.name,
                 "tools/list 返回了缺少 name 的工具定义，已跳过。".to_string(),
             ));
             continue;
         };
-        let name = external_mcp_tool_name(server, original_name);
+        let name = external_mcp_tool_name(&server.name, original_name);
         if seen_names.insert(name.clone(), ()).is_some() {
             errors.push(external_error_json(
-                server,
+                &server.name,
                 format!("tools/list 中工具 `{original_name}` 规范化后与已有工具重名，已跳过。"),
             ));
             continue;
@@ -1163,7 +1372,10 @@ fn normalize_tool_entries(server: &str, result: &Value) -> (Vec<ExternalMcpToolD
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
-                format!("调用外部 MCP server `{server}` 的工具 `{original_name}`。")
+                format!(
+                    "调用外部 MCP server `{}` 的工具 `{original_name}`。",
+                    server.name
+                )
             });
         let parameters = item
             .get("inputSchema")
@@ -1179,14 +1391,31 @@ fn normalize_tool_entries(server: &str, result: &Value) -> (Vec<ExternalMcpToolD
             .or_else(|| annotations.get("read_only_hint"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let (approval_policy, approval_source) = server.approval_for_tool(original_name);
+        let trusted_read_only = approval_policy == McpApprovalPolicy::TrustedReadOnly && read_only;
+        let final_risk = if trusted_read_only {
+            ToolRisk::ReadOnly
+        } else {
+            ToolRisk::ExternalSideEffect
+        };
+        let annotations_hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&annotations).unwrap_or_default())
+        );
         tools.push(ExternalMcpToolDef {
             name,
-            server_name: server.to_string(),
+            server_name: server.name.clone(),
             original_tool_name: original_name.to_string(),
             description,
             parameters,
             read_only,
             annotations,
+            server_revision: server.config_revision.clone(),
+            annotations_hash,
+            approval_policy,
+            approval_source,
+            final_risk,
+            requires_approval: !trusted_read_only,
         });
     }
     (tools, errors)
@@ -1513,10 +1742,12 @@ fn mime_extension(mime_type: Option<&str>) -> &'static str {
 
 // 构造外部 MCP 错误的结构化 JSON。
 fn external_error_json(server: &str, message: String) -> Value {
-    serde_json::json!({
-        "server": server,
-        "message": message
-    })
+    let diagnostic = structured_mcp_error(message);
+    let mut value = serde_json::to_value(diagnostic).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("server".to_string(), Value::String(server.to_string()));
+    }
+    value
 }
 
 // 返回当前 UNIX 毫秒时间，用于缓存刷新和文件命名。
@@ -1564,6 +1795,8 @@ mod tests {
             request_timeout_ms: Some(1_000),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             command: Some(command.to_string()),
             args: Some(args),
             cwd: None,
@@ -1614,6 +1847,54 @@ mod tests {
         assert!(catalog.tools.is_empty());
         assert!(catalog.server_leases.is_empty());
         assert!(!marker.exists(), "禁用范围不能启动 stdio MCP 服务");
+    }
+
+    #[tokio::test]
+    async fn single_server_scope_never_spawns_other_configured_servers() {
+        let allowed_marker = std::env::temp_dir().join(format!(
+            "muse-mcp-single-allowed-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let denied_marker = std::env::temp_dir().join(format!(
+            "muse-mcp-single-denied-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let profiles = BTreeMap::from([
+            (
+                "allowed".to_string(),
+                test_profile(
+                    "/bin/sh",
+                    vec![
+                        "-c".to_string(),
+                        format!("touch '{}'; exit 1", allowed_marker.display()),
+                    ],
+                ),
+            ),
+            (
+                "denied".to_string(),
+                test_profile(
+                    "/bin/sh",
+                    vec![
+                        "-c".to_string(),
+                        format!("touch '{}'; exit 1", denied_marker.display()),
+                    ],
+                ),
+            ),
+        ]);
+        let snapshot = McpProfileConfig {
+            mcp_servers: profiles,
+        }
+        .runtime_snapshot(std::env::temp_dir().join("muse-mcp-single.toml"));
+
+        let _ =
+            discover_external_mcp_tools_for_scope(&snapshot, &EffectiveMcpScope::only("allowed"))
+                .await;
+
+        assert!(allowed_marker.exists(), "目标 Server 应被实际测试");
+        assert!(!denied_marker.exists(), "单 Server 测试不得启动其他 Server");
+        let _ = std::fs::remove_file(allowed_marker);
     }
 
     #[test]
@@ -1794,8 +2075,13 @@ mod tests {
     // 验证远端只读注解不能绕过本地审批。
     #[test]
     fn normalizes_mcp_tool_name_but_requires_local_approval() {
+        let server = parse_mcp_servers_entry(
+            "modelscope".to_string(),
+            test_profile("demo", Vec::new()).to_runtime_value(),
+        )
+        .expect("测试 Server 配置应有效");
         let (tools, errors) = normalize_tool_entries(
-            "modelscope",
+            &server,
             &serde_json::json!({
                 "tools": [
                     {
@@ -1821,5 +2107,28 @@ mod tests {
         let tool_def = tools[0].to_tool_def();
         assert_eq!(tool_def.risk, ToolRisk::ExternalSideEffect);
         assert!(tool_def.requires_approval);
+    }
+
+    #[test]
+    fn trusted_read_only_requires_both_local_policy_and_remote_hint() {
+        let mut profile = test_profile("demo", Vec::new());
+        profile.approval_policy = McpApprovalPolicy::TrustedReadOnly;
+        let server = parse_mcp_servers_entry("trusted".to_string(), profile.to_runtime_value())
+            .expect("可信只读 Server 配置应有效");
+        let (tools, errors) = normalize_tool_entries(
+            &server,
+            &serde_json::json!({
+                "tools": [
+                    { "name": "read", "annotations": { "readOnlyHint": true } },
+                    { "name": "write", "annotations": { "readOnlyHint": false } }
+                ]
+            }),
+        );
+
+        assert!(errors.is_empty());
+        assert_eq!(tools[0].to_tool_def().risk, ToolRisk::ReadOnly);
+        assert!(!tools[0].to_tool_def().requires_approval);
+        assert_eq!(tools[1].to_tool_def().risk, ToolRisk::ExternalSideEffect);
+        assert!(tools[1].to_tool_def().requires_approval);
     }
 }

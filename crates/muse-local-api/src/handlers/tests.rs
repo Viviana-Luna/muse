@@ -1780,6 +1780,27 @@ mod tests {
         );
     }
 
+    fn full_access_does_not_bypass_frozen_mcp_write_approval() {
+        let policy = muse_runtime::FrozenExecutionPolicy::new(
+            "full_access",
+            "danger_full_access",
+            Vec::new(),
+        );
+        let call = test_tool_call("mcp__docs__write", serde_json::json!({}));
+        assert!(super::should_require_tool_approval(
+            &policy,
+            &call,
+            "external_side_effect",
+            true,
+        ));
+        assert!(!super::should_require_tool_approval(
+            &policy,
+            &call,
+            "read_only",
+            false,
+        ));
+    }
+
     fn active_turn_mode_transition_uses_the_completed_tool_result() {
         let result = ToolResult::success(
             "已进入计划模式。",
@@ -3854,6 +3875,13 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
                 read_only: true,
                 annotations: serde_json::json!({}),
+                server_revision: "test-revision".to_string(),
+                annotations_hash: "test-annotations".to_string(),
+                approval_policy: Default::default(),
+                approval_source:
+                    muse_core::domain::mcp::McpApprovalSource::ServerPolicy,
+                final_risk: muse_core::domain::tool::ToolRisk::ExternalSideEffect,
+                requires_approval: true,
             });
         }
         let mut persona = Persona {
@@ -3927,6 +3955,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    async fn turn_freezes_mcp_approval_revision_and_annotations_hash() {
+        let dir = unique_temp_dir("turn-mcp-approval");
+        let state = build_test_state(&dir);
+        let mut catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
+            dir.join("config.toml"),
+        );
+        catalog.tools.push(muse_core::domain::mcp::ExternalMcpToolDef {
+            name: "mcp__docs__search".to_string(),
+            server_name: "docs".to_string(),
+            original_tool_name: "search".to_string(),
+            description: "搜索文档".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            read_only: true,
+            annotations: serde_json::json!({"readOnlyHint": true}),
+            server_revision: "server-revision-1".to_string(),
+            annotations_hash: "annotations-hash-1".to_string(),
+            approval_policy:
+                muse_core::domain::mcp::McpApprovalPolicy::TrustedReadOnly,
+            approval_source: muse_core::domain::mcp::McpApprovalSource::ServerPolicy,
+            final_risk: muse_core::domain::tool::ToolRisk::ReadOnly,
+            requires_approval: false,
+        });
+        let definitions = catalog.tool_defs();
+
+        let turn = super::build_turn_context(
+            &state,
+            "conversation-mcp-policy".to_string(),
+            "turn-mcp-policy".to_string(),
+            None,
+            false,
+            "system".to_string(),
+            super::FrozenTurnToolCatalog {
+                definitions: &definitions,
+                mcp: Some(&catalog),
+            },
+        )
+        .await;
+
+        assert_eq!(turn.runtime_policy.mcp_tool_policies.len(), 1);
+        let frozen = &turn.runtime_policy.mcp_tool_policies[0];
+        assert_eq!(frozen.server_revision, "server-revision-1");
+        assert_eq!(frozen.annotations_hash, "annotations-hash-1");
+        assert_eq!(frozen.approval_policy, "trusted_read_only");
+        assert_eq!(frozen.approval_source, "server_policy");
+        assert!(!frozen.requires_approval);
+
+        catalog.tools[0].approval_policy =
+            muse_core::domain::mcp::McpApprovalPolicy::AlwaysAsk;
+        catalog.tools[0].requires_approval = true;
+        assert!(!turn.runtime_policy.mcp_tool_policies[0].requires_approval);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     async fn runtime_policy_snapshot_contains_only_frozen_public_facts() {
         let dir = unique_temp_dir("runtime-policy-snapshot");
         let state = build_test_state(&dir);
@@ -3977,7 +4058,10 @@ mod tests {
             Some(&persona),
             false,
             "system".to_string(),
-            &tools,
+            super::FrozenTurnToolCatalog {
+                definitions: &tools,
+                mcp: None,
+            },
         )
         .await;
         let serialized = serde_json::to_string(&turn.runtime_policy).expect("策略快照应可序列化");
@@ -4040,14 +4124,17 @@ mod tests {
             Some(&persona),
             false,
             "system".to_string(),
-            &[],
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
         )
         .await;
 
-        assert_eq!(turn.runtime_policy.schema_version, 2);
+        assert_eq!(turn.runtime_policy.schema_version, 3);
         assert_eq!(
             turn.runtime_policy.policy_version,
-            "persona-resource-policy/v2"
+            "persona-resource-policy/v3"
         );
         assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
         assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
@@ -4075,7 +4162,10 @@ mod tests {
             Some(&persona),
             false,
             "system".to_string(),
-            &[],
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
         )
         .await;
         assert_ne!(next_turn.runtime_policy.skill_catalog_hash, original_hash);
@@ -4094,7 +4184,10 @@ mod tests {
             Some(&disabled_persona),
             false,
             "system".to_string(),
-            &[],
+            super::FrozenTurnToolCatalog {
+                definitions: &[],
+                mcp: None,
+            },
         )
         .await;
         assert!(disabled_turn.runtime_policy.skill_catalog.is_empty());
@@ -4504,6 +4597,11 @@ mod tests {
             }
         }
         {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(full_access_does_not_bypass_frozen_mcp_write_approval)).is_err() {
+                failures.push("full_access_does_not_bypass_frozen_mcp_write_approval");
+            }
+        }
+        {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(canonical_tool_session_preserves_semantics_but_redacts_detected_secrets)).is_err() {
                 failures.push("canonical_tool_session_preserves_semantics_but_redacts_detected_secrets");
             }
@@ -4738,6 +4836,11 @@ mod tests {
         {
             if std::panic::AssertUnwindSafe(turn_skill_catalog_is_isolated_policy_filtered_and_frozen()).catch_unwind().await.is_err() {
                 failures.push("turn_skill_catalog_is_isolated_policy_filtered_and_frozen");
+            }
+        }
+        {
+            if std::panic::AssertUnwindSafe(turn_freezes_mcp_approval_revision_and_annotations_hash()).catch_unwind().await.is_err() {
+                failures.push("turn_freezes_mcp_approval_revision_and_annotations_hash");
             }
         }
         assert!(failures.is_empty(), "聚合测试失败：{}", failures.join(", "));

@@ -10,7 +10,8 @@ use super::{
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -23,17 +24,44 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const HTTP_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 const STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const FAILED_DIAGNOSTIC_LIMIT: usize = 64;
 const STDIO_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const STDIO_TERM_GRACE: Duration = Duration::from_millis(500);
 const STDIO_KILL_GRACE: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpHttpRedirectPolicy {
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpHttpProxyPolicy {
+    DirectOnly,
+}
+
+const MCP_HTTP_REDIRECT_POLICY: McpHttpRedirectPolicy = McpHttpRedirectPolicy::Disabled;
+const MCP_HTTP_PROXY_POLICY: McpHttpProxyPolicy = McpHttpProxyPolicy::DirectOnly;
+
 /// 初始化后冻结的 MCP 协商结果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct McpNegotiatedSession {
     pub protocol_version: String,
     pub server_capabilities: Value,
     pub server_info: Value,
     pub instructions: Option<String>,
+}
+
+/// 管理页可读取的本地连接诊断；不得包含配置秘密或完整命令环境。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpConnectionDiagnostic {
+    pub transport: String,
+    pub protocol_version: Option<String>,
+    pub server_info: Option<Value>,
+    pub initialized_at: Option<String>,
+    pub healthy: bool,
+    pub stderr_summary: Option<String>,
+    pub last_error: Option<String>,
+    pub eviction_reason: Option<String>,
 }
 
 /// 进程内统一 MCP client/session manager。
@@ -45,6 +73,7 @@ pub struct McpClientManager {
 #[derive(Default)]
 struct McpClientManagerInner {
     sessions: StdMutex<BTreeMap<McpClientKey, Weak<McpClientSession>>>,
+    failed_diagnostics: StdMutex<VecDeque<(String, McpConnectionDiagnostic)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,7 +99,19 @@ impl McpClientManager {
             return Ok(McpClientLease { session });
         }
 
-        let created = McpClientSession::connect(server).await?;
+        let created = match McpClientSession::connect(server).await {
+            Ok(created) => created,
+            Err(failure) => {
+                let mut diagnostics = lock_std(&self.inner.failed_diagnostics);
+                diagnostics.retain(|(name, _)| name != &server.name);
+                diagnostics.push_back((server.name.clone(), failure.diagnostic));
+                while diagnostics.len() > FAILED_DIAGNOSTIC_LIMIT {
+                    diagnostics.pop_front();
+                }
+                return Err(failure.message);
+            }
+        };
+        lock_std(&self.inner.failed_diagnostics).retain(|(name, _)| name != &server.name);
         let mut sessions = lock_std(&self.inner.sessions);
         if let Some(existing) = sessions
             .get(&key)
@@ -83,6 +124,18 @@ impl McpClientManager {
         sessions.retain(|_, session| session.strong_count() > 0);
         sessions.insert(key, Arc::downgrade(&created));
         Ok(McpClientLease { session: created })
+    }
+
+    /// 返回指定 Server 最近一次连接失败的本地诊断。
+    ///
+    /// 管理端测试使用独立、严格单 Server 的 manager，因此这里不会混入其他
+    /// 配置 revision 的失败；运行时模型目录只消费结构化错误，不读取此诊断。
+    pub fn last_failed_diagnostic(&self, server_name: &str) -> Option<McpConnectionDiagnostic> {
+        lock_std(&self.inner.failed_diagnostics)
+            .iter()
+            .rev()
+            .find(|(name, _)| name == server_name)
+            .map(|(_, diagnostic)| diagnostic.clone())
     }
 
     /// 应用退出时请求所有仍存活的 session 开始关闭；进程树守卫负责最终兜底。
@@ -128,6 +181,10 @@ impl McpClientLease {
         self.session.is_healthy()
     }
 
+    pub(crate) async fn diagnostic(&self) -> McpConnectionDiagnostic {
+        self.session.diagnostic().await
+    }
+
     pub(crate) async fn request(
         &self,
         method: &str,
@@ -148,11 +205,34 @@ struct McpClientSession {
     transport: ManagedTransport,
 }
 
+struct McpConnectFailure {
+    message: String,
+    diagnostic: McpConnectionDiagnostic,
+}
+
+impl McpConnectFailure {
+    fn before_session(server: &ExternalMcpServerConfig, message: String) -> Self {
+        Self {
+            diagnostic: McpConnectionDiagnostic {
+                transport: server.transport.kind().to_string(),
+                protocol_version: None,
+                server_info: None,
+                initialized_at: None,
+                healthy: false,
+                stderr_summary: None,
+                last_error: Some(message.clone()),
+                eviction_reason: Some(message.clone()),
+            },
+            message,
+        }
+    }
+}
+
 impl McpClientSession {
-    async fn connect(server: &ExternalMcpServerConfig) -> Result<Arc<Self>, String> {
+    async fn connect(server: &ExternalMcpServerConfig) -> Result<Arc<Self>, McpConnectFailure> {
         let next_request_id = Arc::new(AtomicU64::new(1));
         let healthy = Arc::new(AtomicBool::new(true));
-        let events = Arc::new(McpSessionEvents::default());
+        let events = Arc::new(McpSessionEvents::new(server.diagnostic_redactions()));
         let placeholder = McpNegotiatedSession {
             protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             server_capabilities: serde_json::json!({}),
@@ -164,17 +244,20 @@ impl McpClientSession {
         let transport = match &server.transport {
             ExternalMcpTransport::Stdio { .. } => ManagedTransport::Stdio(
                 StdioClientSession::spawn(server, Arc::clone(&healthy), Arc::clone(&events))
-                    .await?,
+                    .await
+                    .map_err(|message| McpConnectFailure::before_session(server, message))?,
             ),
-            ExternalMcpTransport::StreamableHttp { .. } => {
-                ManagedTransport::Http(HttpClientSession::new(
+            ExternalMcpTransport::StreamableHttp { .. } => ManagedTransport::Http(
+                HttpClientSession::new(
                     server,
                     Arc::clone(&next_request_id),
                     Arc::clone(&healthy),
                     Arc::clone(&events),
                     Arc::clone(&negotiated),
-                )?)
-            }
+                )
+                .await
+                .map_err(|message| McpConnectFailure::before_session(server, message))?,
+            ),
         };
         let session = Arc::new(Self {
             server_name: server.name.clone(),
@@ -190,12 +273,18 @@ impl McpClientSession {
         match initialization {
             Ok(value) => {
                 *session.negotiated.write().await = value;
+                session.events.record_initialized();
                 Ok(session)
             }
             Err(error) => {
+                session.events.record_failure(&error.message, true);
                 session.healthy.store(false, Ordering::Release);
                 session.request_close();
-                Err(error.message)
+                let diagnostic = session.diagnostic().await;
+                Err(McpConnectFailure {
+                    message: error.message,
+                    diagnostic,
+                })
             }
         }
     }
@@ -220,6 +309,7 @@ impl McpClientSession {
         if let Err(error) = &result
             && error.fatal
         {
+            self.events.record_failure(&error.message, true);
             self.healthy.store(false, Ordering::Release);
             self.request_close();
         }
@@ -250,6 +340,26 @@ impl McpClientSession {
     fn request_close(&self) {
         self.transport.request_close();
     }
+
+    async fn diagnostic(&self) -> McpConnectionDiagnostic {
+        let negotiated = self.negotiated.read().await;
+        McpConnectionDiagnostic {
+            transport: self.transport.kind().to_string(),
+            protocol_version: self
+                .events
+                .initialized_at()
+                .map(|_| negotiated.protocol_version.clone()),
+            server_info: self
+                .events
+                .initialized_at()
+                .map(|_| negotiated.server_info.clone()),
+            initialized_at: self.events.initialized_at(),
+            healthy: self.is_healthy(),
+            stderr_summary: self.events.stderr_summary(),
+            last_error: self.events.last_error(),
+            eviction_reason: self.events.eviction_reason(),
+        }
+    }
 }
 
 impl Drop for McpClientSession {
@@ -258,13 +368,27 @@ impl Drop for McpClientSession {
     }
 }
 
-#[derive(Default)]
 struct McpSessionEvents {
     catalog_epoch: AtomicU64,
     notification_count: AtomicU64,
+    stderr: Arc<BoundedDiagnostic>,
+    initialized_at: StdMutex<Option<String>>,
+    last_error: StdMutex<Option<String>>,
+    eviction_reason: StdMutex<Option<String>>,
 }
 
 impl McpSessionEvents {
+    fn new(redactions: Vec<String>) -> Self {
+        Self {
+            catalog_epoch: AtomicU64::new(0),
+            notification_count: AtomicU64::new(0),
+            stderr: Arc::new(BoundedDiagnostic::new(redactions)),
+            initialized_at: StdMutex::new(None),
+            last_error: StdMutex::new(None),
+            eviction_reason: StdMutex::new(None),
+        }
+    }
+
     fn observe_notification(&self, method: &str) {
         self.notification_count.fetch_add(1, Ordering::Relaxed);
         if matches!(
@@ -276,6 +400,34 @@ impl McpSessionEvents {
             self.catalog_epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
+
+    fn record_initialized(&self) {
+        *lock_std(&self.initialized_at) = Some(chrono::Utc::now().to_rfc3339());
+    }
+
+    fn record_failure(&self, message: &str, evicted: bool) {
+        *lock_std(&self.last_error) = Some(message.to_string());
+        if evicted {
+            *lock_std(&self.eviction_reason) = Some(message.to_string());
+        }
+    }
+
+    fn initialized_at(&self) -> Option<String> {
+        lock_std(&self.initialized_at).clone()
+    }
+
+    fn stderr_summary(&self) -> Option<String> {
+        let summary = self.stderr.summary();
+        (!summary.is_empty()).then_some(summary)
+    }
+
+    fn last_error(&self) -> Option<String> {
+        lock_std(&self.last_error).clone()
+    }
+
+    fn eviction_reason(&self) -> Option<String> {
+        lock_std(&self.eviction_reason).clone()
+    }
 }
 
 enum ManagedTransport {
@@ -284,6 +436,13 @@ enum ManagedTransport {
 }
 
 impl ManagedTransport {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Stdio(_) => "stdio",
+            Self::Http(_) => "streamable_http",
+        }
+    }
+
     async fn initialize(
         &self,
         session: &McpClientSession,
@@ -441,7 +600,7 @@ impl StdioClientSession {
             .ok_or_else(|| format!("外部 MCP server `{}` 无法打开 stdout。", server.name))?;
         let stderr = child.stderr.take();
         let pending = Arc::new(StdMutex::new(BTreeMap::new()));
-        let diagnostic = Arc::new(BoundedDiagnostic::new(server.diagnostic_redactions()));
+        let diagnostic = Arc::clone(&events.stderr);
         let (writer_tx, writer_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = oneshot::channel();
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
@@ -463,7 +622,7 @@ impl StdioClientSession {
             writer_tx.clone(),
             Arc::clone(&pending),
             Arc::clone(&healthy),
-            diagnostic,
+            Arc::clone(&events),
             close_rx,
             failure_rx,
             writer_task,
@@ -680,7 +839,7 @@ async fn supervise_stdio_process(
     writer: mpsc::UnboundedSender<StdioWriterCommand>,
     pending: PendingResponses,
     healthy: Arc<AtomicBool>,
-    diagnostic: Arc<BoundedDiagnostic>,
+    events: Arc<McpSessionEvents>,
     close: oneshot::Receiver<()>,
     mut failures: mpsc::UnboundedReceiver<String>,
     writer_task: tokio::task::JoinHandle<()>,
@@ -695,7 +854,8 @@ async fn supervise_stdio_process(
                 Ok(status) => format!("外部 MCP server `{server_name}` 已退出：{status}。"),
                 Err(error) => format!("等待外部 MCP server `{server_name}` 退出失败：{error}"),
             };
-            fail_all_pending(&pending, McpSessionError::fatal(with_diagnostic(message, &diagnostic)));
+            events.record_failure(&message, true);
+            fail_all_pending(&pending, McpSessionError::fatal(message));
             healthy.store(false, Ordering::Release);
             writer_task.abort();
             reader_task.abort();
@@ -705,10 +865,8 @@ async fn supervise_stdio_process(
     };
 
     if let Some(message) = failure_message {
-        fail_all_pending(
-            &pending,
-            McpSessionError::fatal(with_diagnostic(message, &diagnostic)),
-        );
+        events.record_failure(&message, true);
+        fail_all_pending(&pending, McpSessionError::fatal(message));
     }
     healthy.store(false, Ordering::Release);
     let (acknowledge, acknowledged) = oneshot::channel();
@@ -749,12 +907,7 @@ impl BoundedDiagnostic {
     }
 
     fn push(&self, text: &str) {
-        let mut redacted = text.to_string();
-        for value in &self.redactions {
-            if !value.is_empty() {
-                redacted = redacted.replace(value, "[已脱敏]");
-            }
-        }
+        let redacted = self.redact_text(text);
         let mut content = lock_std(&self.content);
         content.push_str(&redacted);
         if content.len() > STDERR_DIAGNOSTIC_BYTES {
@@ -764,6 +917,16 @@ impl BoundedDiagnostic {
             }
             content.drain(..start);
         }
+    }
+
+    fn redact_text(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for value in &self.redactions {
+            if !value.is_empty() {
+                redacted = redacted.replace(value, "[已脱敏]");
+            }
+        }
+        redacted
     }
 
     fn summary(&self) -> String {
@@ -784,15 +947,6 @@ async fn drain_stderr(
             Ok(0) | Err(_) => break,
             Ok(read) => diagnostic.push(&String::from_utf8_lossy(&buffer[..read])),
         }
-    }
-}
-
-fn with_diagnostic(message: String, diagnostic: &BoundedDiagnostic) -> String {
-    let summary = diagnostic.summary();
-    if summary.is_empty() {
-        message
-    } else {
-        format!("{message}\nstderr 摘要：{summary}")
     }
 }
 
@@ -819,7 +973,7 @@ struct HttpConnectionState {
 }
 
 impl HttpClientSession {
-    fn new(
+    async fn new(
         server: &ExternalMcpServerConfig,
         next_request_id: Arc<AtomicU64>,
         healthy: Arc<AtomicBool>,
@@ -829,11 +983,12 @@ impl HttpClientSession {
         let ExternalMcpTransport::StreamableHttp { url, headers } = &server.transport else {
             return Err("MCP HTTP session 收到了非 HTTP 配置。".to_string());
         };
+        let client = restricted_http_client(&server.name, url).await?;
         Ok(Arc::new(Self {
             server_name: server.name.clone(),
             url: url.clone(),
             headers: build_http_headers(&server.name, headers)?,
-            client: reqwest::Client::new(),
+            client,
             timeout: Duration::from_millis(server.timeout_ms()),
             next_request_id,
             healthy,
@@ -1013,7 +1168,7 @@ impl HttpClientSession {
                 McpSessionError::fatal(if error.is_timeout() {
                     format!("外部 MCP server `{}` 请求超时。", self.server_name)
                 } else {
-                    format!("请求外部 MCP server `{}` 失败：{error}", self.server_name)
+                    format!("请求外部 MCP server `{}` 连接失败。", self.server_name)
                 })
             })?;
         let status = response.status();
@@ -1031,11 +1186,21 @@ impl HttpClientSession {
             ))
         })?;
         if !status.is_success() {
+            if status.is_redirection() {
+                return Err(McpSessionError {
+                    message: format!(
+                        "外部 MCP server `{}` 返回 HTTP 重定向 {status}；Muse 已阻止跳转，请填写最终 URL。",
+                        self.server_name
+                    ),
+                    fatal: true,
+                    status: Some(status),
+                });
+            }
             return Err(McpSessionError {
                 message: format!(
                     "外部 MCP server `{}` 返回 HTTP {status}：{}",
                     self.server_name,
-                    truncate_error_text(&text)
+                    self.events.stderr.redact_text(&truncate_error_text(&text))
                 ),
                 fatal: status == StatusCode::NOT_FOUND || status.is_server_error(),
                 status: Some(status),
@@ -1230,6 +1395,76 @@ impl HttpClientSession {
                 "关闭 MCP HTTP session 时服务返回非成功状态"
             );
         }
+    }
+}
+
+async fn restricted_http_client(
+    server_name: &str,
+    raw_url: &str,
+) -> Result<reqwest::Client, String> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|_| format!("外部 MCP server `{server_name}` 的 URL 无法解析。"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("外部 MCP server `{server_name}` 的 URL 缺少主机。"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| format!("外部 MCP server `{server_name}` 的 URL 缺少有效端口。"))?;
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| format!("外部 MCP server `{server_name}` 的主机 DNS 解析失败。"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!(
+            "外部 MCP server `{server_name}` 的主机没有可用 DNS 地址。"
+        ));
+    }
+    if addresses
+        .iter()
+        .any(|address| is_forbidden_mcp_address(address.ip()))
+    {
+        return Err(format!(
+            "外部 MCP server `{server_name}` 解析到了未授权的特殊网络地址。"
+        ));
+    }
+    let all_local = addresses
+        .iter()
+        .all(|address| is_allowed_local_mcp_address(address.ip()));
+    if url.scheme() == "http" && !all_local {
+        return Err(format!(
+            "外部 MCP server `{server_name}` 的公网连接必须使用 HTTPS；HTTP 仅允许环回或私有局域网地址。"
+        ));
+    }
+
+    let builder = reqwest::Client::builder().referer(false);
+    let builder = match MCP_HTTP_REDIRECT_POLICY {
+        McpHttpRedirectPolicy::Disabled => builder.redirect(reqwest::redirect::Policy::none()),
+    };
+    let mut builder = match MCP_HTTP_PROXY_POLICY {
+        McpHttpProxyPolicy::DirectOnly => builder.no_proxy(),
+    };
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder
+        .build()
+        .map_err(|_| format!("外部 MCP server `{server_name}` 的受限 HTTP client 创建失败。"))
+}
+
+fn is_allowed_local_mcp_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_loopback() || address.is_private(),
+        IpAddr::V6(address) => address.is_loopback() || address.is_unique_local(),
+    }
+}
+
+fn is_forbidden_mcp_address(address: IpAddr) -> bool {
+    if address.is_unspecified() || address.is_multicast() {
+        return true;
+    }
+    match address {
+        IpAddr::V4(address) => address.is_link_local() || address == Ipv4Addr::BROADCAST,
+        IpAddr::V6(address) => address.is_unicast_link_local(),
     }
 }
 
@@ -1890,11 +2125,51 @@ mod tests {
             request_timeout_ms: Some(2_000),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: ExternalMcpTransport::StreamableHttp {
                 url,
                 headers: BTreeMap::new(),
             },
         }
+    }
+
+    async fn spawn_redirect_pair() -> (String, Arc<AtomicU64>) {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能绑定重定向目标端口");
+        let target_address = target_listener.local_addr().expect("应能读取目标端口");
+        let target_hits = Arc::new(AtomicU64::new(0));
+        let target_hits_for_task = Arc::clone(&target_hits);
+        tokio::spawn(async move {
+            if let Ok(Ok((_stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), target_listener.accept()).await
+            {
+                target_hits_for_task.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能绑定重定向入口端口");
+        let redirect_address = redirect_listener
+            .local_addr()
+            .expect("应能读取重定向入口端口");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = redirect_listener.accept().await else {
+                return;
+            };
+            let _ = read_http_request(&mut stream).await;
+            write_http_response_with_headers(
+                &mut stream,
+                "302 Found",
+                "text/plain",
+                "redirect",
+                &[("Location", format!("http://{target_address}/mcp"))],
+            )
+            .await;
+        });
+        (format!("http://{redirect_address}/mcp"), target_hits)
     }
 
     async fn wait_for_counter(counter: &AtomicU64, expected: u64) {
@@ -1914,6 +2189,49 @@ mod tests {
         assert_eq!(params["capabilities"], serde_json::json!({}));
         assert!(params["capabilities"].get("tools").is_none());
         assert!(params["capabilities"].get("resources").is_none());
+    }
+
+    #[test]
+    fn restricted_http_client_structurally_disables_redirects_and_system_proxy() {
+        assert_eq!(MCP_HTTP_REDIRECT_POLICY, McpHttpRedirectPolicy::Disabled);
+        assert_eq!(MCP_HTTP_PROXY_POLICY, McpHttpProxyPolicy::DirectOnly);
+    }
+
+    #[tokio::test]
+    async fn http_redirect_is_blocked_before_target_receives_headers() {
+        let (url, target_hits) = spawn_redirect_pair().await;
+        let manager = McpClientManager::default();
+        let error = manager
+            .lease(&http_server_config(url, "redirect-policy"))
+            .await
+            .expect_err("MCP HTTP 不得自动跟随重定向");
+
+        assert!(error.contains("已阻止跳转"));
+        let diagnostic = manager
+            .last_failed_diagnostic("mock-http")
+            .expect("初始化失败必须保留本地诊断");
+        assert!(!diagnostic.healthy);
+        assert!(
+            diagnostic
+                .eviction_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("已阻止跳转"))
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(target_hits.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn plain_http_is_limited_to_loopback_or_private_addresses() {
+        let error = restricted_http_client("public", "http://8.8.8.8/mcp")
+            .await
+            .expect_err("公网 HTTP 应被策略拒绝");
+        assert!(error.contains("公网连接必须使用 HTTPS"));
+
+        let error = restricted_http_client("link-local", "http://169.254.1.2/mcp")
+            .await
+            .expect_err("链路本地地址不在允许范围");
+        assert!(error.contains("未授权的特殊网络地址"));
     }
 
     #[test]
@@ -2320,6 +2638,8 @@ done
             request_timeout_ms: Some(5_000),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: ExternalMcpTransport::Stdio {
                 command: script.display().to_string(),
                 args: vec![

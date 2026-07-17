@@ -1,6 +1,7 @@
 //! 网页接口 DTO 模块，集中定义请求体、响应体和运行时配置传输结构。
 
 use muse_core::domain::conversation::Message;
+use muse_core::domain::mcp;
 use muse_core::domain::persona::character::card::{
     PersonaCard, PersonaCardConflictStrategy, PersonaCardExportLevel,
 };
@@ -568,11 +569,9 @@ fn default_true() -> bool {
 
 /// MCP 凭据字段的变更请求。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpSecretFieldUpdate {
     pub target: String,
-    /// 兼容旧客户端的可选字段；MCP API Key 现在直接以 target 作为 env/Header 名称。
-    #[serde(default)]
-    pub environment_name: Option<String>,
     #[serde(default)]
     pub secret: SecretUpdate,
 }
@@ -615,7 +614,23 @@ pub struct McpServerCreateRequest {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub approval_policy: mcp::McpApprovalPolicy,
+    #[serde(default)]
+    pub tool_approval_overrides: BTreeMap<String, mcp::McpApprovalPolicy>,
     pub transport: McpTransportUpdate,
+}
+
+/// 不落盘的严格单 Server 草稿测试请求。
+#[derive(Debug, Deserialize)]
+pub struct McpDraftTestRequest {
+    #[serde(default)]
+    pub source_name: Option<String>,
+    #[serde(default)]
+    pub source_revision: Option<String>,
+    #[serde(default)]
+    pub include_resources: bool,
+    pub server: McpServerCreateRequest,
 }
 
 /// MCP server 更新请求。
@@ -630,7 +645,6 @@ pub struct McpServerUpdateRequest {
 #[derive(Debug, Serialize)]
 pub struct McpSecretFieldState {
     pub target: String,
-    pub environment_name: String,
     pub configured: bool,
 }
 
@@ -661,6 +675,12 @@ pub struct McpServerSummaryResponse {
     pub transport: String,
     pub revision: String,
     pub status: String,
+    pub tested_revision: Option<String>,
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub last_checked_at: Option<String>,
+    pub last_error: Option<mcp::McpStructuredError>,
+    pub policy_reason: Option<String>,
 }
 
 /// MCP server 详情。
@@ -671,6 +691,8 @@ pub struct McpServerDetailResponse {
     pub request_timeout_ms: Option<u64>,
     pub enabled_tools: Option<Vec<String>>,
     pub disabled_tools: Vec<String>,
+    pub approval_policy: mcp::McpApprovalPolicy,
+    pub tool_approval_overrides: BTreeMap<String, mcp::McpApprovalPolicy>,
     pub transport: McpTransportResponse,
     pub revision: String,
 }
@@ -679,11 +701,23 @@ pub struct McpServerDetailResponse {
 #[derive(Debug, Serialize)]
 pub struct McpCatalogResponse {
     pub server: String,
+    pub revision: String,
     pub status: String,
     pub tools: Vec<Value>,
     pub resources: Vec<Value>,
     pub errors: Vec<Value>,
     pub refreshed_at: String,
+    pub diagnostic: McpCatalogDiagnosticResponse,
+}
+
+/// MCP 测试返回的本地诊断与固定网络策略。
+#[derive(Debug, Serialize)]
+pub struct McpCatalogDiagnosticResponse {
+    pub connection: Option<mcp::McpConnectionDiagnostic>,
+    pub policy_reason: Option<String>,
+    pub redirect_policy: &'static str,
+    pub proxy_policy: &'static str,
+    pub sensitive_headers: &'static str,
 }
 
 /// 通用错误响应体。
@@ -837,6 +871,9 @@ fn public_api_error_message(message: &str) -> &str {
         "skill_revision_conflict：",
         "mcp_conflict：",
         "mcp_revision_conflict：",
+        "mcp_config_invalid：",
+        "mcp_revision_required：",
+        "mcp_source_required：",
     ] {
         if let Some(public) = message.strip_prefix(prefix) {
             return public;
@@ -876,6 +913,12 @@ fn infer_api_error_code(message: &str) -> &'static str {
         "mcp_conflict"
     } else if message.starts_with("mcp_revision_conflict") {
         "mcp_revision_conflict"
+    } else if message.starts_with("mcp_config_invalid") {
+        "mcp_config_invalid"
+    } else if message.starts_with("mcp_revision_required") {
+        "mcp_revision_required"
+    } else if message.starts_with("mcp_source_required") {
+        "mcp_source_required"
     } else if message.contains("流式聊天只接受 POST") {
         "stream_post_required"
     } else if message.contains("已以不同结果处理") {

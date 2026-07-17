@@ -3,11 +3,12 @@
 //! 该服务独占当前会话、活动会话标识和状态协调器。HTTP、桌面或命令行适配层
 //! 只能通过这里提供的窄接口读取或推进运行时状态，避免绕过状态机直接修改事实状态。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
 use muse_core::domain::conversation::Conversation;
-use muse_core::domain::mcp::{McpClientManager, McpToolCatalog};
+use muse_core::domain::mcp::{McpClientManager, McpServerCheckStatus, McpToolCatalog};
 use muse_core::domain::runtime::{RuntimeModeState, RuntimeTodoItem};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -58,6 +59,7 @@ pub struct RuntimeService {
     active_plan: Mutex<Option<serde_json::Value>>,
     mcp_client_manager: McpClientManager,
     mcp_tool_catalog: Mutex<McpToolCatalog>,
+    mcp_server_checks: Mutex<BTreeMap<String, McpServerCheckStatus>>,
     data_dir: PathBuf,
     session_repository: OnceCell<SessionRepository>,
     coordinator: RuntimeCoordinator,
@@ -95,6 +97,7 @@ impl RuntimeService {
             active_plan: Mutex::new(None),
             mcp_client_manager: McpClientManager::default(),
             mcp_tool_catalog: Mutex::new(McpToolCatalog::empty_for_config_path(mcp_config_path)),
+            mcp_server_checks: Mutex::new(BTreeMap::new()),
             data_dir,
             session_repository: OnceCell::new(),
             coordinator: RuntimeCoordinator::new(),
@@ -212,6 +215,27 @@ impl RuntimeService {
     /// 发布新的 MCP 目录快照。
     pub async fn replace_mcp_tool_catalog(&self, catalog: McpToolCatalog) -> u64 {
         *self.mcp_tool_catalog.lock().await = catalog;
+        self.coordinator.touch()
+    }
+
+    /// 发布仅与一个已保存配置 revision 对应的管理页检查状态。
+    pub async fn publish_mcp_server_check(
+        &self,
+        name: String,
+        status: McpServerCheckStatus,
+    ) -> u64 {
+        self.mcp_server_checks.lock().await.insert(name, status);
+        self.coordinator.touch()
+    }
+
+    /// 读取指定 Server 最近一次管理页检查状态。
+    pub async fn mcp_server_check(&self, name: &str) -> Option<McpServerCheckStatus> {
+        self.mcp_server_checks.lock().await.get(name).cloned()
+    }
+
+    /// 配置变化或删除后清除旧检查状态。
+    pub async fn clear_mcp_server_check(&self, name: &str) -> u64 {
+        self.mcp_server_checks.lock().await.remove(name);
         self.coordinator.touch()
     }
 

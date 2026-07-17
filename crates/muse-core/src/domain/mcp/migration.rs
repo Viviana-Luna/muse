@@ -174,6 +174,8 @@ fn profile_from_legacy<S: SecretStoreBackend>(
         request_timeout_ms,
         enabled_tools,
         disabled_tools,
+        approval_policy: Default::default(),
+        tool_approval_overrides: BTreeMap::new(),
         command: None,
         args: None,
         cwd: None,

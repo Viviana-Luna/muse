@@ -109,7 +109,6 @@ async fn load_mcp_config(
 
 fn secret_state(target: String, configured: bool) -> McpSecretFieldState {
     McpSecretFieldState {
-        environment_name: target.clone(),
         target,
         configured,
     }
@@ -158,6 +157,8 @@ fn mcp_detail_response(name: String, profile: &mcp::McpServerProfile) -> McpServ
         request_timeout_ms: profile.request_timeout_ms,
         enabled_tools: profile.enabled_tools.clone(),
         disabled_tools: profile.disabled_tools.clone(),
+        approval_policy: profile.approval_policy,
+        tool_approval_overrides: profile.tool_approval_overrides.clone(),
         transport,
         revision: mcp_server_revision(profile),
     }
@@ -169,7 +170,6 @@ fn apply_secret_update(
     next: &mut BTreeMap<String, String>,
     validate_target: fn(&str) -> McpApiResult<String>,
 ) -> McpApiResult<()> {
-    // environment_name 仅用于兼容旧客户端；新事实直接以 target 作为 env/Header 名称。
     let target = validate_target(&field.target)?;
     match field.secret.action {
         SecretUpdateAction::Keep => {
@@ -212,6 +212,8 @@ fn build_mcp_profile(
         request_timeout_ms: request.request_timeout_ms,
         enabled_tools: request.enabled_tools,
         disabled_tools: request.disabled_tools,
+        approval_policy: request.approval_policy,
+        tool_approval_overrides: request.tool_approval_overrides,
         command: None,
         args: None,
         cwd: None,
@@ -317,7 +319,9 @@ fn build_mcp_profile(
         }
     }
 
-    profile.validate(&name).map_err(|error| bad_request(&error))?;
+    profile
+        .validate(&name)
+        .map_err(|error| bad_request(&format!("mcp_config_invalid：{error}")))?;
     Ok((name, profile))
 }
 
@@ -373,6 +377,13 @@ async fn commit_mcp_config(
         (name, profile, store.storage_path().to_path_buf())
     };
     invalidate_mcp_catalog(state, config_path).await;
+    if let Some(current_name) = current_name {
+        state
+            .runtime_service
+            .clear_mcp_server_check(current_name)
+            .await;
+    }
+    state.runtime_service.clear_mcp_server_check(&name).await;
     Ok(mcp_detail_response(name, &profile))
 }
 
@@ -380,17 +391,36 @@ pub(crate) async fn handle_mcp_servers(
     State(state): State<Arc<AppState>>,
 ) -> McpApiResult<Json<Vec<McpServerSummaryResponse>>> {
     let (profiles, _) = load_mcp_config(&state).await?;
-    let output = profiles
-        .mcp_servers
-        .into_iter()
-        .map(|(name, profile)| McpServerSummaryResponse {
+    let mut output = Vec::with_capacity(profiles.mcp_servers.len());
+    for (name, profile) in profiles.mcp_servers {
+        let revision = mcp_server_revision(&profile);
+        let check = state
+            .runtime_service
+            .mcp_server_check(&name)
+            .await
+            .filter(|check| check.revision == revision);
+        let policy_reason = (!profile.enabled).then(|| "server_disabled".to_string());
+        output.push(McpServerSummaryResponse {
             name,
             enabled: profile.enabled,
-            transport: profile.transport.clone(),
-            revision: mcp_server_revision(&profile),
-            status: "not_tested".to_string(),
-        })
-        .collect();
+            transport: profile.transport,
+            revision,
+            status: if !profile.enabled {
+                "policy_blocked".to_string()
+            } else {
+                check
+                    .as_ref()
+                    .map(|value| value.status.clone())
+                    .unwrap_or_else(|| "not_tested".to_string())
+            },
+            tested_revision: check.as_ref().map(|value| value.revision.clone()),
+            tool_count: check.as_ref().map(|value| value.tool_count).unwrap_or(0),
+            resource_count: check.as_ref().map(|value| value.resource_count).unwrap_or(0),
+            last_checked_at: check.as_ref().map(|value| value.checked_at.clone()),
+            last_error: check.and_then(|value| value.last_error),
+            policy_reason,
+        });
+    }
     Ok(Json(output))
 }
 
@@ -464,30 +494,27 @@ pub(crate) async fn handle_delete_mcp_server(
         store.storage_path().to_path_buf()
     };
     invalidate_mcp_catalog(&state, config_path).await;
+    state.runtime_service.clear_mcp_server_check(&name).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn refresh_single_mcp_catalog(
-    state: &Arc<AppState>,
+async fn inspect_single_mcp_profile(
     name: &str,
+    profile: &mcp::McpServerProfile,
+    config_path: PathBuf,
     include_resources: bool,
-) -> McpApiResult<McpCatalogResponse> {
-    let (profiles, snapshot) = load_mcp_config(state).await?;
-    let profile = profiles.mcp_servers.get(name).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("MCP 连接 `{name}` 不存在。"),
-            }),
-        )
-    })?;
-    if !profile.enabled {
-        return Err(bad_request("请先启用 MCP 连接再测试。"));
+) -> McpCatalogResponse {
+    let mut test_profile = profile.clone();
+    test_profile.enabled = true;
+    let snapshot = mcp::McpProfileConfig {
+        mcp_servers: BTreeMap::from([(name.to_string(), test_profile)]),
     }
+    .runtime_snapshot(config_path);
+    let manager = mcp::McpClientManager::default();
     let catalog = mcp::discover_external_mcp_tools_for_scope_with_manager(
         &snapshot,
-        &mcp::EffectiveMcpScope::unrestricted(),
-        state.runtime_service.mcp_client_manager(),
+        &mcp::EffectiveMcpScope::only(name),
+        &manager,
     )
     .await;
     let tools = catalog
@@ -501,6 +528,13 @@ async fn refresh_single_mcp_catalog(
                 "description": tool.description,
                 "read_only": tool.read_only,
                 "annotations": tool.annotations,
+                "annotations_hash": tool.annotations_hash,
+                "local_approval": {
+                    "policy": tool.approval_policy,
+                    "source": tool.approval_source,
+                    "final_risk": tool.final_risk,
+                    "requires_approval": tool.requires_approval,
+                },
             })
         })
         .collect::<Vec<_>>();
@@ -522,19 +556,28 @@ async fn refresh_single_mcp_catalog(
                 result.resources
             }
             Err(error) => {
-                errors.push(serde_json::json!({ "server": name, "message": error }));
+                let diagnostic = mcp::structured_mcp_error(error);
+                errors.push(serde_json::json!({
+                    "server": name,
+                    "code": diagnostic.code,
+                    "kind": diagnostic.kind,
+                    "message": diagnostic.message,
+                    "retryable": diagnostic.retryable,
+                    "alternatives": diagnostic.alternatives,
+                }));
                 Vec::new()
             }
         }
     } else {
         Vec::new()
     };
-    state
-        .runtime_service
-        .replace_mcp_tool_catalog(catalog.clone())
-        .await;
-    Ok(McpCatalogResponse {
+    let connection = match catalog.connection_diagnostic(name).await {
+        Some(diagnostic) => Some(diagnostic),
+        None => manager.last_failed_diagnostic(name),
+    };
+    McpCatalogResponse {
         server: name.to_string(),
+        revision: mcp_server_revision(profile),
         status: if errors.is_empty() {
             "connected".to_string()
         } else {
@@ -544,7 +587,116 @@ async fn refresh_single_mcp_catalog(
         resources,
         errors,
         refreshed_at: catalog.refreshed_at,
-    })
+        diagnostic: McpCatalogDiagnosticResponse {
+            connection,
+            policy_reason: None,
+            redirect_policy: "disabled",
+            proxy_policy: "direct_only",
+            sensitive_headers: "exact_configured_origin_only",
+        },
+    }
+}
+
+async fn refresh_single_mcp_catalog(
+    state: &Arc<AppState>,
+    name: &str,
+    include_resources: bool,
+) -> McpApiResult<McpCatalogResponse> {
+    let (profiles, snapshot) = load_mcp_config(state).await?;
+    let profile = profiles.mcp_servers.get(name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("MCP 连接 `{name}` 不存在。"),
+            }),
+        )
+    })?;
+    let result = inspect_single_mcp_profile(
+        name,
+        profile,
+        snapshot.config_path().clone(),
+        include_resources,
+    )
+    .await;
+    let last_error = result
+        .errors
+        .first()
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(mcp::structured_mcp_error);
+    state
+        .runtime_service
+        .publish_mcp_server_check(
+            name.to_string(),
+            mcp::McpServerCheckStatus {
+                revision: result.revision.clone(),
+                status: result.status.clone(),
+                tool_count: result.tools.len(),
+                resource_count: result.resources.len(),
+                checked_at: result.refreshed_at.clone(),
+                last_error,
+                connection: result.diagnostic.connection.clone(),
+            },
+        )
+        .await;
+    Ok(result)
+}
+
+pub(crate) async fn handle_test_mcp_draft(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpDraftTestRequest>,
+) -> McpApiResult<Json<McpCatalogResponse>> {
+    let (name, profile, config_path) = {
+        let mut store = state.user_config.lock().await;
+        store.refresh_from_disk().map_err(mcp_config_error)?;
+        if !store.mcp_profiles_are_valid() {
+            return Err(bad_request(
+                "config_mcp_profiles_invalid：config.toml 中的 mcp_servers 无法解析，请修正后重试。",
+            ));
+        }
+        let existing = match request.source_name.as_deref() {
+            Some(source_name) => {
+                let profile = store
+                    .mcp_profiles()
+                    .mcp_servers
+                    .get(source_name)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(ErrorResponse {
+                                error: format!("MCP 连接 `{source_name}` 不存在。"),
+                            }),
+                        )
+                    })?;
+                let expected = request.source_revision.as_deref().ok_or_else(|| {
+                    bad_request("mcp_revision_required：测试已保存草稿时必须提供 revision。")
+                })?;
+                if mcp_server_revision(profile) != expected {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(ErrorResponse {
+                            error: "mcp_revision_conflict：MCP 连接已在其他窗口中变更，请刷新后重试。"
+                                .to_string(),
+                        }),
+                    ));
+                }
+                Some(profile)
+            }
+            None => {
+                if request.source_revision.is_some() {
+                    return Err(bad_request(
+                        "mcp_source_required：提供 source_revision 时必须同时提供 source_name。",
+                    ));
+                }
+                None
+            }
+        };
+        let (name, profile) = build_mcp_profile(request.server, existing)?;
+        (name, profile, store.storage_path().to_path_buf())
+    };
+    Ok(Json(
+        inspect_single_mcp_profile(&name, &profile, config_path, request.include_resources).await,
+    ))
 }
 
 pub(crate) async fn handle_test_mcp_server(
@@ -590,7 +742,6 @@ mod mcp_management_tests {
     fn replacement_secret(target: &str, value: &str) -> McpSecretFieldUpdate {
         McpSecretFieldUpdate {
             target: target.to_string(),
-            environment_name: Some("LEGACY_NAME_MUST_NOT_BE_STORED".to_string()),
             secret: SecretUpdate {
                 action: SecretUpdateAction::Replace,
                 value: Some(value.to_string()),
@@ -606,6 +757,8 @@ mod mcp_management_tests {
             request_timeout_ms: Some(30_000),
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: McpTransportUpdate::Stdio {
                 command: "npx".to_string(),
                 args: vec!["-y".to_string(), "github-mcp".to_string()],
@@ -620,7 +773,6 @@ mod mcp_management_tests {
         let response = mcp_detail_response(name, &profile);
         let serialized = serde_json::to_string(&response).expect("响应应可序列化");
         assert!(!serialized.contains("top-secret"));
-        assert!(!serialized.contains("LEGACY_NAME_MUST_NOT_BE_STORED"));
         assert!(serialized.contains("GITHUB_TOKEN"));
         assert!(serialized.contains("\"configured\":true"));
     }
@@ -633,6 +785,8 @@ mod mcp_management_tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             command: Some("demo".to_string()),
             args: Some(Vec::new()),
             cwd: None,
@@ -648,6 +802,8 @@ mod mcp_management_tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: McpTransportUpdate::Stdio {
                 command: "demo".to_string(),
                 args: Vec::new(),
@@ -655,7 +811,6 @@ mod mcp_management_tests {
                 env: BTreeMap::new(),
                 secrets: vec![McpSecretFieldUpdate {
                     target: "TOKEN".to_string(),
-                    environment_name: None,
                     secret: SecretUpdate {
                         action: SecretUpdateAction::Keep,
                         value: None,
@@ -672,6 +827,8 @@ mod mcp_management_tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: McpTransportUpdate::Stdio {
                 command: "demo".to_string(),
                 args: Vec::new(),
@@ -690,6 +847,8 @@ mod mcp_management_tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: McpTransportUpdate::Stdio {
                 command: "demo".to_string(),
                 args: Vec::new(),
@@ -697,7 +856,6 @@ mod mcp_management_tests {
                 env: BTreeMap::new(),
                 secrets: vec![McpSecretFieldUpdate {
                     target: "TOKEN".to_string(),
-                    environment_name: Some("IGNORED".to_string()),
                     secret: SecretUpdate {
                         action: SecretUpdateAction::Delete,
                         value: None,
@@ -718,6 +876,8 @@ mod mcp_management_tests {
             request_timeout_ms: None,
             enabled_tools: None,
             disabled_tools: Vec::new(),
+            approval_policy: Default::default(),
+            tool_approval_overrides: BTreeMap::new(),
             transport: McpTransportUpdate::StreamableHttp {
                 url: "https://example.test/mcp".to_string(),
                 headers: BTreeMap::from([("Accept".to_string(), "application/json".to_string())]),
@@ -734,7 +894,7 @@ mod mcp_management_tests {
     }
 
     #[test]
-    fn legacy_environment_name_is_optional_in_requests() {
+    fn target_is_the_only_secret_name_field() {
         let request: McpServerCreateRequest = serde_json::from_value(serde_json::json!({
             "name": "demo",
             "transport": {
@@ -749,5 +909,19 @@ mod mcp_management_tests {
         .expect("缺少 environment_name 的新请求应可解析");
         let (_, profile) = build_mcp_profile(request, None).expect("新请求应可构造 Profile");
         assert_eq!(profile.secret_env["TOKEN"], "api-key");
+
+        let legacy = serde_json::from_value::<McpServerCreateRequest>(serde_json::json!({
+            "name": "demo",
+            "transport": {
+                "type": "stdio",
+                "command": "demo",
+                "secrets": [{
+                    "target": "TOKEN",
+                    "environment_name": "LEGACY_TOKEN",
+                    "secret": {"action": "replace", "value": "api-key"}
+                }]
+            }
+        }));
+        assert!(legacy.is_err(), "废弃字段不得被静默忽略");
     }
 }

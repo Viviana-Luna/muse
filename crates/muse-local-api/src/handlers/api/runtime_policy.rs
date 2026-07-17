@@ -79,6 +79,11 @@ fn append_frozen_skill_catalog(
 }
 
 /// 在回合入口冻结角色、模型、工具、Skill 与 MCP 的公共运行事实。
+struct FrozenTurnToolCatalog<'a> {
+    definitions: &'a [ToolDef],
+    mcp: Option<&'a mcp::McpToolCatalog>,
+}
+
 async fn build_turn_context(
     state: &Arc<AppState>,
     conversation_id: String,
@@ -86,7 +91,7 @@ async fn build_turn_context(
     active_persona: Option<&Persona>,
     voice_enabled: bool,
     mut system_prompt: String,
-    tool_definitions: &[ToolDef],
+    tools: FrozenTurnToolCatalog<'_>,
 ) -> TurnContext {
     let mode_state = current_runtime_mode_state(state);
     let (chat, active_voice_id) = {
@@ -165,16 +170,22 @@ async fn build_turn_context(
         .map(|skill| format!("{}={}", skill.name, skill.revision))
         .collect::<Vec<_>>()
         .join(":");
-    let mut tool_ids = tool_definitions
+    let mut tool_ids = tools
+        .definitions
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
     tool_ids.sort();
     tool_ids.dedup();
+    let visible_mcp_tools = tool_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mcp_tool_policies = tools
+        .mcp
+        .map(|catalog| catalog.runtime_policy_entries(&visible_mcp_tools))
+        .unwrap_or_default();
 
     let runtime_policy = muse_core::domain::turn::RuntimePolicySnapshot {
-        schema_version: 2,
-        policy_version: "persona-resource-policy/v2".to_string(),
+        schema_version: 3,
+        policy_version: "persona-resource-policy/v3".to_string(),
         persona_version: active_persona.map(|persona| persona.version.clone()),
         provider: chat.provider.clone(),
         model: chat.model.clone(),
@@ -189,6 +200,7 @@ async fn build_turn_context(
         omitted_skill_count,
         mcp_revision,
         mcp_catalog_hash,
+        mcp_tool_policies,
     };
     TurnContext {
         conversation_id,
@@ -207,6 +219,6 @@ async fn build_turn_context(
         active_voice_id,
         created_at,
         runtime_policy,
-        tool_definitions: tool_definitions.to_vec(),
+        tool_definitions: tools.definitions.to_vec(),
     }
 }

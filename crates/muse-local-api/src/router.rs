@@ -179,6 +179,10 @@ fn api_routes() -> Router<Arc<AppState>> {
             get(handlers::handle_mcp_servers).post(handlers::handle_create_mcp_server),
         )
         .route(
+            "/mcp/servers/test-draft",
+            post(handlers::handle_test_mcp_draft),
+        )
+        .route(
             "/mcp/servers/{name}",
             get(handlers::handle_get_mcp_server)
                 .put(handlers::handle_update_mcp_server)
@@ -917,6 +921,7 @@ check_on_startup = true
         assert!(!response_json.to_string().contains("router-mcp-secret"));
 
         let get_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/mcp/servers/docs")
@@ -930,6 +935,73 @@ check_on_startup = true
             .await
             .expect("应读取 MCP 详情响应");
         assert!(!String::from_utf8_lossy(&get_body).contains("router-mcp-secret"));
+
+        let draft_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp/servers/test-draft")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "include_resources": false,
+                            "server": {
+                                "name": "draft-only",
+                                "request_timeout_ms": 1000,
+                                "transport": {
+                                    "type": "stdio",
+                                    "command": "/usr/bin/false",
+                                    "args": [],
+                                    "env": {},
+                                    "secrets": []
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应构造 MCP 草稿测试请求"),
+            )
+            .await
+            .expect("MCP 草稿测试应返回响应");
+        assert_eq!(draft_response.status(), StatusCode::OK);
+        let draft_body = to_bytes(draft_response.into_body(), usize::MAX)
+            .await
+            .expect("应读取 MCP 草稿测试响应");
+        let draft_json: serde_json::Value =
+            serde_json::from_slice(&draft_body).expect("草稿测试响应应为 JSON");
+        assert_eq!(draft_json["server"], "draft-only");
+        assert_eq!(draft_json["status"], "failed");
+
+        let saved_test = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp/servers/docs/test")
+                    .body(Body::empty())
+                    .expect("应构造已保存 MCP 测试请求"),
+            )
+            .await
+            .expect("已保存 MCP 测试应返回响应");
+        assert_eq!(saved_test.status(), StatusCode::OK);
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp/servers")
+                    .body(Body::empty())
+                    .expect("应构造 MCP 列表请求"),
+            )
+            .await
+            .expect("MCP 列表应返回响应");
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("应读取 MCP 列表响应");
+        let list_json: serde_json::Value =
+            serde_json::from_slice(&list_body).expect("MCP 列表响应应为 JSON");
+        assert_eq!(list_json[0]["status"], "failed");
+        assert_eq!(list_json[0]["tested_revision"], list_json[0]["revision"]);
+        assert!(list_json[0]["last_error"]["code"].as_str().is_some());
         assert!(
             state
                 .model_config
@@ -942,6 +1014,12 @@ check_on_startup = true
         );
         let config_store = state.user_config.lock().await;
         assert!(config_store.mcp_profiles().mcp_servers.contains_key("docs"));
+        assert!(
+            !config_store
+                .mcp_profiles()
+                .mcp_servers
+                .contains_key("draft-only")
+        );
         let persisted = std::fs::read_to_string(config_dir.join("config.toml"))
             .expect("config.toml MCP 配置应已落盘");
         assert!(persisted.contains("[mcp_servers.docs]"));

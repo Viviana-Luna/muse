@@ -12,6 +12,19 @@ pub struct RuntimeSkillCatalogEntry {
     pub revision: String,
 }
 
+/// 单轮冻结的 MCP 工具审批事实；不包含远端描述、参数或本机秘密。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimeMcpToolPolicyEntry {
+    pub name: String,
+    pub server: String,
+    pub server_revision: String,
+    pub annotations_hash: String,
+    pub approval_policy: String,
+    pub approval_source: String,
+    pub final_risk: String,
+    pub requires_approval: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RuntimePolicySnapshot {
     pub schema_version: u32,
@@ -34,6 +47,8 @@ pub struct RuntimePolicySnapshot {
     pub omitted_skill_count: usize,
     pub mcp_revision: u64,
     pub mcp_catalog_hash: String,
+    #[serde(default)]
+    pub mcp_tool_policies: Vec<RuntimeMcpToolPolicyEntry>,
 }
 
 /// 单轮运行时上下文快照。

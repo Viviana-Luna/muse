@@ -18,6 +18,7 @@ import {
   listMcpServers,
   refreshMcpServer,
   testMcpServer,
+  testMcpServerDraft,
   updateMcpServer
 } from '@/api';
 import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
@@ -44,6 +45,8 @@ function emptyDraft(type: 'stdio' | 'streamable_http' = 'stdio'): McpServerDraft
     request_timeout_ms: 30_000,
     enabled_tools: null,
     disabled_tools: [],
+    approval_policy: 'always_ask',
+    tool_approval_overrides: {},
     transport:
       type === 'stdio'
         ? { type: 'stdio', command: '', args: [], cwd: '', env: {}, secrets: [] }
@@ -54,7 +57,6 @@ function emptyDraft(type: 'stdio' | 'streamable_http' = 'stdio'): McpServerDraft
 function secretStateToUpdate(secret: McpSecretFieldState): McpSecretFieldUpdate {
   return {
     target: secret.target,
-    environment_name: secret.environment_name,
     secret: { action: 'keep' }
   };
 }
@@ -84,6 +86,8 @@ function detailToDraft(detail: McpServerDetail): McpServerDraft {
     request_timeout_ms: detail.request_timeout_ms ?? 30_000,
     enabled_tools: detail.enabled_tools,
     disabled_tools: detail.disabled_tools,
+    approval_policy: detail.approval_policy,
+    tool_approval_overrides: detail.tool_approval_overrides,
     transport
   };
 }
@@ -250,18 +254,31 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
   }
 
   async function runTest(refresh: boolean) {
-    if (!record || dirty) {
-      notify({ title: '请先保存连接', description: '测试只使用已经保存的 MCP 配置。', tone: 'warning' });
+    const normalizedName = draft.name.trim();
+    if (!MCP_SERVER_NAME_PATTERN.test(normalizedName)) {
+      setNameError(MCP_SERVER_NAME_HINT);
+      notify({ title: 'MCP 名称不符合要求', description: MCP_SERVER_NAME_HINT, tone: 'warning' });
       return;
     }
     setTesting(true);
     try {
-      const result = refresh ? await refreshMcpServer(record.name) : await testMcpServer(record.name);
+      const testDraft = { ...draft, name: normalizedName };
+      const result = !creating && record && !dirty
+        ? refresh
+          ? await refreshMcpServer(record.name)
+          : await testMcpServer(record.name)
+        : await testMcpServerDraft(testDraft, {
+            sourceName: record?.name,
+            sourceRevision: record?.revision,
+            includeResources: refresh
+          });
       setCatalog(result);
-      await reloadList();
+      if (!creating && record && !dirty) await reloadList();
       notify({
         title: result.status === 'connected' ? 'MCP 连接成功' : 'MCP 连接异常',
-        description: result.errors[0] ? JSON.stringify(result.errors[0]) : `${result.tools.length} 个工具`,
+        description: result.errors[0]
+          ? String(result.errors[0].message ?? '请查看结构化诊断')
+          : `${result.tools.length} 个工具`,
         tone: result.status === 'connected' ? 'success' : 'error'
       });
     } catch (error) {
@@ -305,6 +322,13 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
     setDraft({ ...draft, transport: { ...draft.transport, ...patch } });
   }
 
+  function updateToolApproval(toolName: string, policy: '' | 'always_ask' | 'trusted_read_only') {
+    const overrides = { ...draft.tool_approval_overrides };
+    if (policy) overrides[toolName] = policy;
+    else delete overrides[toolName];
+    setDraft({ ...draft, tool_approval_overrides: overrides });
+  }
+
   const catalogItems = catalogTab === 'tools' ? catalog?.tools ?? [] : catalog?.resources ?? [];
 
   return (
@@ -322,8 +346,18 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
           {filteredServers.map((server) => (
             <button type="button" key={server.name} role="listitem" className={!creating && selectedName === server.name ? 'active' : ''} onClick={() => requestSelection(server.name)}>
               <Cable aria-hidden="true" />
-              <span><strong>{server.name}</strong><small>{server.transport === 'stdio' ? '本地命令 · stdio' : '远程连接 · HTTP'}</small></span>
-              <i className={server.enabled ? 'enabled' : ''}>{server.enabled ? '启用' : '停用'}</i>
+              <span>
+                <strong>{server.name}</strong>
+                <small>{server.transport === 'stdio' ? '本地命令 · stdio' : '远程连接 · HTTP'}</small>
+                <small>{server.status === 'connected'
+                  ? `${server.tool_count} 工具 · ${server.resource_count} 资源`
+                  : server.status === 'failed'
+                    ? server.last_error?.message ?? '最近检查失败'
+                    : server.status === 'policy_blocked'
+                      ? '已停用，策略未连接'
+                      : '当前 revision 尚未测试'}</small>
+              </span>
+              <i className={server.status === 'connected' ? 'enabled' : ''}>{server.status === 'connected' ? '正常' : server.enabled ? '待检查' : '停用'}</i>
             </button>
           ))}
           {!listLoading && filteredServers.length === 0 && (
@@ -371,7 +405,7 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
                       {nameError || MCP_SERVER_NAME_HINT}
                     </small>
                   </label>
-                  <label><span>传输方式</span><select disabled={!creating} value={draft.transport.type} onChange={(event) => { const next = emptyDraft(event.target.value as 'stdio' | 'streamable_http'); setDraft({ ...next, name: draft.name, enabled: draft.enabled, request_timeout_ms: draft.request_timeout_ms, enabled_tools: draft.enabled_tools, disabled_tools: draft.disabled_tools }); }}><option value="stdio">stdio</option><option value="streamable_http">streamable_http</option></select></label>
+                  <label><span>传输方式</span><select disabled={!creating} value={draft.transport.type} onChange={(event) => { const next = emptyDraft(event.target.value as 'stdio' | 'streamable_http'); setDraft({ ...next, name: draft.name, enabled: draft.enabled, request_timeout_ms: draft.request_timeout_ms, enabled_tools: draft.enabled_tools, disabled_tools: draft.disabled_tools, approval_policy: draft.approval_policy, tool_approval_overrides: draft.tool_approval_overrides }); }}><option value="stdio">stdio</option><option value="streamable_http">streamable_http</option></select></label>
                 </div>
               </section>
 
@@ -403,6 +437,42 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
                 </section>
               )}
 
+              <section className="mcp-form-section mcp-trust-section">
+                <h2>本地授权</h2>
+                <div className="mcp-form-grid">
+                  <label>
+                    <span>默认审批策略</span>
+                    <select
+                      value={draft.approval_policy}
+                      onChange={(event) => setDraft({
+                        ...draft,
+                        approval_policy: event.target.value as McpServerDraft['approval_policy']
+                      })}
+                    >
+                      <option value="always_ask">每次询问</option>
+                      <option value="trusted_read_only">信任远端只读声明</option>
+                    </select>
+                  </label>
+                  <div className="mcp-trust-explanation">
+                    <strong>远端声明不等于本地授权</strong>
+                    <small>只有你明确启用信任，且工具声明 readOnlyHint=true 时才免审批；写操作始终询问。</small>
+                    <button
+                      type="button"
+                      onClick={() => setDraft({
+                        ...draft,
+                        approval_policy: 'always_ask',
+                        tool_approval_overrides: Object.fromEntries(
+                          Object.entries(draft.tool_approval_overrides)
+                            .filter(([, policy]) => policy === 'always_ask')
+                        )
+                      })}
+                    >
+                      撤销全部只读信任
+                    </button>
+                  </div>
+                </div>
+              </section>
+
               <details className="mcp-advanced">
                 <summary>高级设置</summary>
                 <div className="mcp-form-grid">
@@ -412,25 +482,81 @@ export function McpPage({ selectedName, onSelectedNameChange, notify }: McpPageP
                 </div>
               </details>
 
-              {!creating && (
-                <section className="mcp-catalog-section">
-                  <header>
-                    <div role="tablist" aria-label="MCP 目录">
-                      <button type="button" role="tab" aria-selected={catalogTab === 'tools'} className={catalogTab === 'tools' ? 'active' : ''} onClick={() => setCatalogTab('tools')}>工具 {catalog ? catalog.tools.length : ''}</button>
-                      <button type="button" role="tab" aria-selected={catalogTab === 'resources'} className={catalogTab === 'resources' ? 'active' : ''} onClick={() => setCatalogTab('resources')}>资源 {catalog ? catalog.resources.length : ''}</button>
+              <section className="mcp-catalog-section">
+                <header>
+                  <div role="tablist" aria-label="MCP 目录">
+                    <button type="button" role="tab" aria-selected={catalogTab === 'tools'} className={catalogTab === 'tools' ? 'active' : ''} onClick={() => setCatalogTab('tools')}>工具 {catalog ? catalog.tools.length : ''}</button>
+                    <button type="button" role="tab" aria-selected={catalogTab === 'resources'} className={catalogTab === 'resources' ? 'active' : ''} onClick={() => setCatalogTab('resources')}>资源 {catalog ? catalog.resources.length : ''}</button>
+                  </div>
+                  <button type="button" disabled={testing} onClick={() => void runTest(true)}><RefreshCw aria-hidden="true" />刷新目录</button>
+                </header>
+                {catalog ? (
+                  <>
+                    <div className="mcp-diagnostic-summary">
+                      <span><strong>状态</strong>{catalog.status === 'connected' ? '连接成功' : '连接异常'}</span>
+                      <span><strong>协议</strong>{catalog.diagnostic.connection?.protocol_version ?? '未协商'}</span>
+                      <span><strong>初始化</strong>{catalog.diagnostic.connection?.initialized_at ?? '未完成'}</span>
+                      <span><strong>网络</strong>禁止重定向 · 不使用系统代理</span>
                     </div>
-                    <button type="button" disabled={testing || dirty} onClick={() => void runTest(true)}><RefreshCw aria-hidden="true" />刷新目录</button>
-                  </header>
-                  {catalog ? (
-                    catalogItems.length > 0 ? <div className="mcp-catalog-list">{catalogItems.map((item, index) => <article key={`${String(item.name ?? item.uri ?? index)}`}><strong>{String(item.name ?? item.uri ?? '未命名')}</strong><small>{String(item.description ?? item.mime_type ?? '')}</small></article>)}</div> : <p>{catalogTab === 'tools' ? '该连接没有返回工具。' : '该连接没有返回资源。'}</p>
-                  ) : <p>保存后点击“测试连接”或“刷新目录”，这里会显示服务器真实返回的内容。</p>}
-                </section>
-              )}
+                    {catalog.errors[0] && (
+                      <div className="mcp-diagnostic-error" role="alert">
+                        <strong>{String(catalog.errors[0].code ?? 'mcp_connection_failed')}</strong>
+                        <span>{String(catalog.errors[0].message ?? '连接失败')}</span>
+                      </div>
+                    )}
+                    {(catalog.diagnostic.connection?.stderr_summary || catalog.diagnostic.connection?.eviction_reason) && (
+                      <details className="mcp-local-diagnostic">
+                        <summary>本地诊断详情</summary>
+                        {catalog.diagnostic.connection.stderr_summary && (
+                          <pre>{catalog.diagnostic.connection.stderr_summary}</pre>
+                        )}
+                        {catalog.diagnostic.connection.eviction_reason && (
+                          <small>连接移除原因：{catalog.diagnostic.connection.eviction_reason}</small>
+                        )}
+                      </details>
+                    )}
+                    {catalogItems.length > 0 ? (
+                      <div className="mcp-catalog-list">
+                        {catalogItems.map((item, index) => {
+                          const itemName = String(item.name ?? item.uri ?? index);
+                          const local = (item.local_approval ?? {}) as Record<string, unknown>;
+                          return (
+                            <article key={itemName}>
+                              <strong>{String(item.name ?? item.uri ?? '未命名')}</strong>
+                              <small>{String(item.description ?? item.mime_type ?? '')}</small>
+                              {catalogTab === 'tools' && (
+                                <>
+                                  <small>{item.read_only === true ? '远端声明：只读' : '远端声明：可能产生副作用'}</small>
+                                  <small>本地判定：{String(local.final_risk ?? 'external_side_effect')} · {local.requires_approval === false ? '免审批' : '需要审批'}</small>
+                                  <label>
+                                    <span>单工具覆盖</span>
+                                    <select
+                                      value={draft.tool_approval_overrides[itemName] ?? ''}
+                                      onChange={(event) => updateToolApproval(
+                                        itemName,
+                                        event.target.value as '' | 'always_ask' | 'trusted_read_only'
+                                      )}
+                                    >
+                                      <option value="">继承 Server 策略</option>
+                                      <option value="always_ask">始终询问</option>
+                                      <option value="trusted_read_only">信任只读声明</option>
+                                    </select>
+                                  </label>
+                                </>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    ) : <p>{catalogTab === 'tools' ? '该连接没有返回工具。' : '该连接没有返回资源。'}</p>}
+                  </>
+                ) : <p>无需保存即可测试当前草稿；测试只会连接这个 Server，也不会写入配置。</p>}
+              </section>
             </div>
             <footer className="detail-actions mcp-detail-actions">
               {!creating && record && <ConfirmDialog title="删除这个 MCP 连接？" description={`“${record.name}”及其凭据绑定将被永久删除。`} confirmLabel="删除" tone="danger" onConfirm={() => void remove()}><button type="button" className="danger-ghost"><Trash2 aria-hidden="true" />删除</button></ConfirmDialog>}
               <span />
-              {!creating && <button type="button" disabled={testing || dirty || !record?.enabled} onClick={() => void runTest(false)}><FlaskConical aria-hidden="true" />{testing ? '测试中…' : '测试连接'}</button>}
+              <button type="button" disabled={testing} onClick={() => void runTest(false)}><FlaskConical aria-hidden="true" />{testing ? '测试中…' : '测试连接'}</button>
               <button type="button" className="primary" disabled={saving || (!creating && !dirty)} onClick={() => void save()}><Save aria-hidden="true" />{saving ? '保存中…' : '保存更改'}</button>
             </footer>
           </>
@@ -460,11 +586,10 @@ function SecretRows({
   }
   return (
     <section className="mcp-secret-fields">
-      <header><strong>{label}</strong>{(!limit || values.length < limit) && <button type="button" onClick={() => onChange([...values, { target: defaultTarget, environment_name: '', secret: { action: 'replace', value: '' } }])}><Plus aria-hidden="true" />添加</button>}</header>
+      <header><strong>{label}</strong>{(!limit || values.length < limit) && <button type="button" onClick={() => onChange([...values, { target: defaultTarget, secret: { action: 'replace', value: '' } }])}><Plus aria-hidden="true" />添加</button>}</header>
       {values.map((field, index) => (
         <div className="mcp-secret-row" key={`${field.target}-${index}`}>
-          <label><span>使用位置</span><input value={field.target} onChange={(event) => update(index, { target: event.target.value })} /></label>
-          <label><span>变量名</span><input value={field.environment_name} placeholder="例如 GITHUB_TOKEN" onChange={(event) => update(index, { environment_name: event.target.value })} /></label>
+          <label><span>名称</span><input value={field.target} placeholder="例如 GITHUB_TOKEN" onChange={(event) => update(index, { target: event.target.value })} /></label>
           <label>
             <span>凭据值</span>
             <input
@@ -477,7 +602,7 @@ function SecretRows({
               }
             />
           </label>
-          <button type="button" aria-label={`删除 ${field.environment_name || label}`} onClick={() => { if (field.secret.action === 'keep') update(index, { secret: { action: 'delete' } }); else onChange(values.filter((_, itemIndex) => itemIndex !== index)); }}><Trash2 aria-hidden="true" /></button>
+          <button type="button" aria-label={`删除 ${field.target || label}`} onClick={() => { if (field.secret.action === 'keep') update(index, { secret: { action: 'delete' } }); else onChange(values.filter((_, itemIndex) => itemIndex !== index)); }}><Trash2 aria-hidden="true" /></button>
           {field.secret.action === 'delete' && <small>保存后删除</small>}
         </div>
       ))}

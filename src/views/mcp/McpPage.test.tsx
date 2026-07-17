@@ -8,6 +8,7 @@ const api = vi.hoisted(() => ({
   updateMcpServer: vi.fn(),
   deleteMcpServer: vi.fn(),
   testMcpServer: vi.fn(),
+  testMcpServerDraft: vi.fn(),
   refreshMcpServer: vi.fn()
 }));
 vi.mock('@/api', () => api);
@@ -19,6 +20,21 @@ describe('McpPage', () => {
     vi.clearAllMocks();
     api.listMcpServers.mockResolvedValue([]);
     api.createMcpServer.mockImplementation(async (draft) => ({ ...draft, revision: 'm1' }));
+    api.testMcpServerDraft.mockResolvedValue({
+      server: 'docs',
+      revision: 'draft-1',
+      status: 'connected',
+      tools: [],
+      resources: [],
+      errors: [],
+      refreshed_at: '2026-07-17T00:00:00Z',
+      diagnostic: {
+        connection: { transport: 'streamable_http', healthy: true, protocol_version: '2025-11-25' },
+        redirect_policy: 'disabled',
+        proxy_policy: 'direct_only',
+        sensitive_headers: 'exact_configured_origin_only'
+      }
+    });
   });
   afterEach(cleanup);
 
@@ -64,5 +80,25 @@ describe('McpPage', () => {
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'MCP 名称不符合要求', tone: 'warning' })
     );
+  });
+
+  it('未保存草稿只测试目标 Server 且不会触发保存', async () => {
+    render(<McpPage onSelectedNameChange={vi.fn()} notify={vi.fn()} />);
+    await screen.findByText('还没有 MCP 连接');
+    fireEvent.click(screen.getAllByRole('button', { name: /添加 MCP/u })[0]);
+    fireEvent.change(screen.getByLabelText('传输方式'), { target: { value: 'streamable_http' } });
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'docs' } });
+    fireEvent.change(screen.getByLabelText('URL'), { target: { value: 'https://example.test/mcp' } });
+
+    fireEvent.click(screen.getByRole('button', { name: '测试连接' }));
+
+    await waitFor(() => expect(api.testMcpServerDraft).toHaveBeenCalledOnce());
+    expect(api.testMcpServerDraft).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'docs' }),
+      expect.objectContaining({ includeResources: false })
+    );
+    expect(api.createMcpServer).not.toHaveBeenCalled();
+    expect(await screen.findByText('远端声明不等于本地授权')).toBeInTheDocument();
+    expect(screen.getByText(/禁止重定向/u)).toBeInTheDocument();
   });
 });

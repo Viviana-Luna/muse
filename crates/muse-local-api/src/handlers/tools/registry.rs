@@ -1903,15 +1903,24 @@ async fn dispatch_runtime_tool(
                 content: result.content,
                 structured: Some(result.structured),
             },
-            Err(err) => ToolResult {
-                status: ToolResultStatus::Failed,
-                content: format!("外部 MCP 工具 `{}` 执行失败：{err}", call.name),
-                structured: Some(serde_json::json!({
-                    "reason": "external_mcp_call_failed",
-                    "tool": call.name,
-                    "message": err
-                })),
-            },
+            Err(err) => {
+                let diagnostic = mcp::structured_mcp_error(err);
+                ToolResult {
+                    status: ToolResultStatus::Failed,
+                    content: format!(
+                        "外部 MCP 工具 `{}` 执行失败：{}",
+                        call.name, diagnostic.message
+                    ),
+                    structured: Some(serde_json::json!({
+                        "reason": diagnostic.code,
+                        "kind": diagnostic.kind,
+                        "tool": call.name,
+                        "message": diagnostic.message,
+                        "retryable": diagnostic.retryable,
+                        "alternatives": diagnostic.alternatives
+                    })),
+                }
+            }
         };
     }
 

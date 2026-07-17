@@ -1459,6 +1459,8 @@ mod tests {
                     request_timeout_ms: Some(30_000),
                     enabled_tools: Some(vec!["search".to_string()]),
                     disabled_tools: Vec::new(),
+                    approval_policy: Default::default(),
+                    tool_approval_overrides: BTreeMap::new(),
                     command: Some("npx".to_string()),
                     args: Some(vec!["-y".to_string(), "github-mcp".to_string()]),
                     cwd: None,
