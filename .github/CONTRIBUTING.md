@@ -21,7 +21,7 @@
 - **Rust stable** 工具链，并安装 `rustfmt` 与 `clippy`（用于后端服务与本地工具运行时编译）。
 - **Node.js 22** 与 **npm**（用于前端 UI 开发与构建）。
 - 对应平台的 **Tauri 2 前置依赖**（用于原生桌面构建与调试）。
-- 桌面目标环境为 **macOS 13.1+** 或 **Windows 10 22H2 / Windows 11**；Windows 使用 **WebView2 111+** 的 Evergreen Runtime。修改前端能力、构建目标或安装配置时必须同步维护 [`docs/webview-compatibility.md`](../docs/webview-compatibility.md) 与 CI 契约。
+- 当前主要开发和真实桌面验证环境为 **macOS**；代码仍保留 **macOS 13.1 / Safari 16.2** 技术基线。**Windows 10 22H2 / Windows 11、WebView2 111+** 是未来适配目标，当前不属于已支持平台。修改前端能力、构建目标或安装配置时必须同步维护 [`docs/webview-compatibility.md`](../docs/webview-compatibility.md) 与 CI 契约。
 
 ### 仓库克隆与依赖安装
 
@@ -93,14 +93,18 @@ bash scripts/clean-build-artifacts.sh
 
 ## 🔁 CI 与发布流程
 
-`.github/workflows/ci.yml` 是实际执行契约。触发矩阵固定如下：
+Muse 当前处于功能与架构开发阶段，尚未进入 Alpha、Beta、RC、发布候选或正式发布准备阶段。当前不创建 `v*` 标签、公开安装包或 GitHub Release，也不接受以“准备发布”为理由降低质量门禁。
 
-| 事件 | quality | macOS DMG | Windows NSIS | GitHub Release |
-|---|---:|---:|---:|---:|
-| 面向 `master` 的 Pull Request | 是 | 否 | 否 | 否 |
-| `master` push | 是 | 否 | 否 | 否 |
-| 手动 `workflow_dispatch` | 是 | 否 | 否 | 否 |
-| 当前仓库的 `v*` 标签 | 是 | 是 | 是 | 是 |
+`.github/workflows/ci.yml` 是自动化实际执行契约。当前日常协作只把 quality 作为有效门禁：
+
+| 事件 | quality | 测试安装包 | GitHub Release |
+|---|---:|---:|---:|
+| 面向 `dev` 或 `master` 的 Pull Request | 是 | 否 | 否 |
+| `dev` 或 `master` push | 是 | 否 | 否 |
+| 普通手动 `workflow_dispatch` | 是 | 默认不构建 | 否 |
+| `v*` 标签 | 当前禁止创建 | 当前禁止 | 当前禁止 |
+
+工作流中仍存在历史双平台标签打包路径，但它不是当前支持或发布授权。未来只有维护者明确启动版本阶段评估后，才能根据当时批准的平台范围重写并启用安装包、签名、公证、Release asset 和校验和契约。
 
 贡献者开发时先运行受影响模块的 focused 测试；提交前运行默认门禁：
 
@@ -118,12 +122,9 @@ npm run build
 cargo test --workspace --all-targets --locked --features live-tests
 ```
 
-维护者发布版本时还必须遵守以下规则：
+当前平台策略：macOS 是主要开发、长期自用和真实桌面验证环境，但并未达到发布质量；Windows 条件编译和适配基础保留，等待以后有固定 Windows 主机时重新立项。自动化 Windows 结果不能代替 Windows 实机，也不阻塞当前 macOS 开发。
 
-1. 先确认 `master` quality 全绿，并核对桌面、前端和全部 Rust crate 的版本一致。
-2. 确认待标记提交已经属于 `master`，再创建新的不可变 `v*` 标签；不得从 `dev`、临时分支或未合入 `master` 的提交创建正式版本。
-3. 等待 macOS/Windows 安装包校验、任意 CWD 启动、单实例和退出清理冒烟全部通过。
-4. Release 必须包含唯一 DMG、唯一 NSIS 和 `SHA256SUMS`，发布后下载复核校验和。
+未来若维护者明确启动版本阶段评估，必须新建独立计划，重新确认目标平台、版本一致性、最低系统、签名、公证、安装升级、资产数量和 `SHA256SUMS`，不能沿用当前遗留双平台发布假设。
 
 修改 Actions 时必须使用完整提交 SHA，不得改回浮动标签。默认 workflow 权限保持只读，只有 Release job 可以请求 `contents: write`。Pull Request 不得接触真实供应商密钥；测试使用 mock、fixture 或显式测试值。
 
@@ -145,4 +146,4 @@ Muse 使用 `master`、`dev` 和临时功能分支三级流转：`master` 只承
 3. **收口分支**：提交前把临时分支 rebase 到最新 `dev`；多个相互依赖的临时分支先按依赖顺序收口到一个临时集成分支，并在 rebase 后重新运行质量门禁。
 4. **提交 Commit**：Commit 信息保持清晰简明，推荐使用 conventional commits 规范（如 `feat: add quick brief tool`，`fix: resolve UI overlay issue on mobile`）。
 5. **发起 PR 到 `dev`**：在 PR 描述中写明改动动机、实现思路和验证结果。功能分支不得直接向 `master` 发起常规合并。
-6. **测试与提升**：改动进入 `dev` 后，由维护者构建短期测试版本并完成真实环境验收；达到验收口径后，才将 `dev` 提升到 `master` 并从 `master` 创建正式版本。
+6. **测试与提升**：改动进入 `dev` 后，由维护者在 macOS 主环境持续真实使用和验证；是否进入版本阶段必须以后单独决策，不能因一次门禁或测试包通过自动提升到 `master` 或创建正式版本。

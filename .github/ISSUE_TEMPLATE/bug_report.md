@@ -27,6 +27,9 @@ assignees: []
 
 
 ## 💻 运行环境
+
+当前主要开发与验证环境为 macOS；Windows 10 22H2、Windows 11 和 WebView2 111 属于未来适配目标。欢迎记录 Windows 源码调试问题，但这不表示当前已有 Windows 安装包或支持承诺。
+
 - **操作系统及完整版本**：[例如：macOS 13.1 / Windows 10 22H2 / Windows 11 24H2]
 - **WebView 版本**：[macOS 填 Safari 版本；Windows 填 WebView2 版本]
 - **显示缩放**：[例如：100% / 125% / 150% / 200%]

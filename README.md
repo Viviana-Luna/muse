@@ -6,6 +6,12 @@
 
 Muse 面向希望在本机创建、演绎和陪伴角色的用户。角色设定、世界观、场景、演绎风格与角色卡共同决定每轮互动；模型、角色、语音、会话和工具执行统一运行在本地桌面宿主中。
 
+## 当前开发状态
+
+Muse 仍处于功能与架构开发阶段，尚未进入 Alpha、Beta、RC、发布候选或正式发布准备阶段。目前没有公开安装包、正式版本标签或发布日期。
+
+macOS 是当前主要开发、长期自用和真实桌面验证环境，但这不表示 macOS 已达到发布质量。Windows 相关条件编译和适配基础仍保留，计划在 macOS 主链稳定、具备固定 Windows 测试主机并重新立项后独立适配；当前不宣称 Windows 已受支持。
+
 ## 主要能力
 
 - 模型供应商：聊天只支持 DeepSeek 与火山方舟 Agent Plan。两者共用 OpenAI-compatible Chat Completions 传输层，但能力和验证策略由独立 profile 声明；不把协议兼容等同于对 OpenAI、Azure、Ollama、普通方舟在线推理、Coding Plan 或任意自定义服务的支持。
@@ -25,7 +31,7 @@ Muse 面向希望在本机创建、演绎和陪伴角色的用户。角色设定
 - 运行时：`crates/muse-runtime` 负责状态协调、回合快照和 v3 会话存储。
 - 本地 API：`crates/muse-local-api` 负责 Axum 路由、安全边界和运行时装配。
 - 前端：React 19、Vite 7、TypeScript、Zustand、Radix UI、react-markdown。
-- 桌面：Tauri 2，正式构建支持 macOS DMG 和 Windows NSIS。
+- 桌面：Tauri 2；当前以 macOS WKWebView 桌面开发为主，保留未来 Windows WebView2/NSIS 适配基础。
 - 存储：平台应用数据目录中的用户级 `config.toml`、版本化 SQLite、Session JSONL 和文件资源；旧 JSON 只作为一次性迁移来源原样保留。
 
 ## 快速开始
@@ -37,7 +43,7 @@ Muse 面向希望在本机创建、演绎和陪伴角色的用户。角色设定
 - 对应平台的 [Tauri 2 前置依赖](https://v2.tauri.app/start/prerequisites/)。
 - 打包安装包时使用 `tauri-cli 2.10.1`。
 
-桌面安装包的能力基线为 macOS 13.1 或更高版本，以及 Windows 10 22H2、Windows 11。Windows 使用 Evergreen WebView2，安装器会在缺失或低于 WebView2 111 时联网更新运行时；当前不内嵌离线 WebView2 Runtime，也不支持 Windows 7/8/8.1 或 Linux。完整边界与验收状态见 [WebView 兼容基线](docs/webview-compatibility.md)。
+当前开发技术基线仍保留 macOS 13.1 / Safari 16.2，以及未来 Windows 10 22H2、Windows 11 / WebView2 111 的兼容目标，但这些目标不等于已完成公开支持验收。日常真实桌面工作只以 macOS 为主；Windows 适配整体延后。完整边界见 [WebView 兼容基线](docs/webview-compatibility.md)。
 
 ### 安装依赖
 
@@ -56,7 +62,9 @@ npm run tauri dev
 
 Tauri 开发模式会启动根目录 Vite 前端和 `src-tauri/` 桌面宿主。后端只监听本进程分配的 `127.0.0.1` 随机端口；主窗口通过受控的 `runtime_bootstrap` 命令取得 API 地址、内存 Bearer、协议版本和实例 ID，不需要另行启动浏览器后端或暴露固定端口。
 
-### 构建安装包
+### 构建本地测试包
+
+以下命令只用于开发和内部验证，不构成发布说明。
 
 macOS：
 
@@ -65,16 +73,14 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm run tauri build -- --bundles dmg --target universal-apple-darwin
 ```
 
-Windows：
+Windows（未来适配或 CI 诊断使用，当前不属于支持范围）：
 
 ```bash
 npm run tauri build -- --bundles nsis
 ```
 
-Windows 安装包输出到 `target/release/bundle/`；macOS Universal 安装包输出到
-`target/universal-apple-darwin/release/bundle/`。当前开发流程生成的 macOS 社区构建不使用 Apple Developer ID
-签名或公证，分发时文件名必须标记为 `unsigned`。首次启动被 macOS 阻止时，请在尝试打开应用后进入
-“系统设置 → 隐私与安全性”，仅在确认下载来源和 SHA-256 无误后点击“仍要打开”。
+Windows 测试包输出到 `target/release/bundle/`；macOS Universal 测试包输出到
+`target/universal-apple-darwin/release/bundle/`。当前 macOS 构建不使用 Apple Developer ID 签名或公证，只能作为本地或受控测试产物，不能据此创建公开 Release。未来进入版本阶段时必须重新制定签名、公证、最低系统和分发策略。
 
 ## 数据目录
 
