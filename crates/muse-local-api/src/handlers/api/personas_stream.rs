@@ -974,7 +974,12 @@ async fn refresh_mcp_tool_catalog_if_needed(
         }
     }
 
-    let catalog = mcp::discover_external_mcp_tools_for_scope(&snapshot, &scope).await;
+    let catalog = mcp::discover_external_mcp_tools_for_scope_with_manager(
+        &snapshot,
+        &scope,
+        state.runtime_service.mcp_client_manager(),
+    )
+    .await;
     state
         .runtime_service
         .replace_mcp_tool_catalog(catalog.clone())

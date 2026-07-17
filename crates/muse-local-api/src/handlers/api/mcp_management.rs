@@ -484,7 +484,12 @@ async fn refresh_single_mcp_catalog(
     if !profile.enabled {
         return Err(bad_request("请先启用 MCP 连接再测试。"));
     }
-    let catalog = mcp::discover_external_mcp_tools(&snapshot).await;
+    let catalog = mcp::discover_external_mcp_tools_for_scope_with_manager(
+        &snapshot,
+        &mcp::EffectiveMcpScope::unrestricted(),
+        state.runtime_service.mcp_client_manager(),
+    )
+    .await;
     let tools = catalog
         .tools
         .iter()

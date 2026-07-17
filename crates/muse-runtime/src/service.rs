@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
 use muse_core::domain::conversation::Conversation;
-use muse_core::domain::mcp::McpToolCatalog;
+use muse_core::domain::mcp::{McpClientManager, McpToolCatalog};
 use muse_core::domain::runtime::{RuntimeModeState, RuntimeTodoItem};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -56,6 +56,7 @@ pub struct RuntimeService {
     runtime_mode: StdMutex<RuntimeModeState>,
     active_todos: Mutex<Vec<RuntimeTodoItem>>,
     active_plan: Mutex<Option<serde_json::Value>>,
+    mcp_client_manager: McpClientManager,
     mcp_tool_catalog: Mutex<McpToolCatalog>,
     data_dir: PathBuf,
     session_repository: OnceCell<SessionRepository>,
@@ -92,6 +93,7 @@ impl RuntimeService {
             runtime_mode: StdMutex::new(RuntimeModeState::default()),
             active_todos: Mutex::new(Vec::new()),
             active_plan: Mutex::new(None),
+            mcp_client_manager: McpClientManager::default(),
             mcp_tool_catalog: Mutex::new(McpToolCatalog::empty_for_config_path(mcp_config_path)),
             data_dir,
             session_repository: OnceCell::new(),
@@ -211,6 +213,11 @@ impl RuntimeService {
     pub async fn replace_mcp_tool_catalog(&self, catalog: McpToolCatalog) -> u64 {
         *self.mcp_tool_catalog.lock().await = catalog;
         self.coordinator.touch()
+    }
+
+    /// 返回由运行时独占的 MCP client/session manager。
+    pub fn mcp_client_manager(&self) -> &McpClientManager {
+        &self.mcp_client_manager
     }
 
     /// 读取当前活动逻辑会话标识。
@@ -523,6 +530,12 @@ impl RuntimeService {
     /// 标记协调器外、但属于运行时事实状态的变更。
     pub fn touch(&self) -> u64 {
         self.coordinator.touch()
+    }
+}
+
+impl Drop for RuntimeService {
+    fn drop(&mut self) {
+        self.mcp_client_manager.request_close_all();
     }
 }
 

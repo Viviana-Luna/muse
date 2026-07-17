@@ -1,33 +1,32 @@
 //! MCP 客户端与动态工具目录模块，负责外部 MCP 服务发现、资源读取和工具调用。
 
+mod client;
 pub mod config;
 pub mod migration;
 mod store;
 
+pub use client::{McpClientManager, McpNegotiatedSession};
 pub use config::{McpProfileConfig, McpRuntimeSnapshot, McpServerProfile};
 
 use crate::domain::persona::{McpPolicy, ResourcePolicyMode};
 use crate::domain::tool::{ToolDef, ToolExecutionOwner, ToolRisk};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 120_000;
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
-const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_COMPATIBLE_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_MAX_CATALOG_PAGES: usize = 64;
+const MCP_MAX_CATALOG_TOOLS: usize = 1_024;
 const MCP_RESOURCE_TEXT_PREVIEW_CHARS: usize = 40_000;
 const MCP_TOOL_TEXT_PREVIEW_CHARS: usize = 40_000;
 
@@ -119,9 +118,10 @@ pub struct McpToolCatalog {
     pub refreshed_at_millis: u128,
     pub config_path: PathBuf,
     pub config_hash: String,
-    // 与工具定义同时发现的不可变执行目标。当前回合调用 MCP 时只能使用这里的
-    // server 配置，不能重新读取磁盘后把同名工具切换到未经审批的新 URL/命令。
-    server_configs: Vec<ExternalMcpServerConfig>,
+    // 与工具定义同时冻结的连接 lease。当前回合只能使用这里的配置 revision；
+    // 配置变更只影响新 lease，最后一个旧 Turn 释放后再关闭旧 session。
+    server_leases: Vec<client::McpClientLease>,
+    lease_catalog_epochs: BTreeMap<String, u64>,
 }
 
 impl McpToolCatalog {
@@ -139,7 +139,8 @@ impl McpToolCatalog {
             refreshed_at_millis: current_millis(),
             config_path,
             config_hash: String::new(),
-            server_configs: Vec::new(),
+            server_leases: Vec::new(),
+            lease_catalog_epochs: BTreeMap::new(),
         }
     }
 
@@ -149,6 +150,13 @@ impl McpToolCatalog {
             return false;
         }
         current_millis().saturating_sub(self.refreshed_at_millis) <= ttl.as_millis()
+            && self.server_leases.iter().all(|lease| {
+                lease.is_healthy()
+                    && self
+                        .lease_catalog_epochs
+                        .get(lease.server_name())
+                        .is_some_and(|epoch| *epoch == lease.catalog_epoch())
+            })
     }
 
     /// 将外部 MCP 工具目录转换为本轮可暴露给模型的工具定义。
@@ -170,8 +178,8 @@ impl McpToolCatalog {
         tool: &ExternalMcpToolDef,
         arguments: Value,
     ) -> Result<ExternalMcpToolCallResult, String> {
-        let server_config = select_single_server(&self.server_configs, &tool.server_name)?;
-        call_external_mcp_tool_with_server(server_config, tool, arguments).await
+        let lease = select_single_lease(&self.server_leases, &tool.server_name)?;
+        call_external_mcp_tool_with_lease(lease, tool, arguments).await
     }
 
     /// 使用本目录冻结的 server 配置列出资源。
@@ -180,8 +188,8 @@ impl McpToolCatalog {
         server: Option<String>,
         cursor: Option<String>,
     ) -> Result<ExternalMcpResources, String> {
-        list_external_mcp_resources_with_servers(
-            &self.server_configs,
+        list_external_mcp_resources_with_leases(
+            &self.server_leases,
             self.config_path.clone(),
             server,
             cursor,
@@ -195,8 +203,8 @@ impl McpToolCatalog {
         server: Option<String>,
         cursor: Option<String>,
     ) -> Result<ExternalMcpResourceTemplates, String> {
-        list_external_mcp_resource_templates_with_servers(
-            &self.server_configs,
+        list_external_mcp_resource_templates_with_leases(
+            &self.server_leases,
             self.config_path.clone(),
             server,
             cursor,
@@ -210,8 +218,8 @@ impl McpToolCatalog {
         server: String,
         uri: String,
     ) -> Result<ExternalMcpReadResource, String> {
-        let server_config = select_single_server(&self.server_configs, &server)?;
-        read_external_mcp_resource_with_server(server_config, uri).await
+        let lease = select_single_lease(&self.server_leases, &server)?;
+        read_external_mcp_resource_with_lease(lease, uri).await
     }
 }
 
@@ -274,14 +282,27 @@ impl LoadedExternalMcpConfig {
 }
 
 // 单个外部 MCP server 的标准化配置。
-#[derive(Debug, Clone)]
-struct ExternalMcpServerConfig {
+#[derive(Clone)]
+pub(super) struct ExternalMcpServerConfig {
     name: String,
+    config_revision: String,
     enabled: bool,
     request_timeout_ms: Option<u64>,
     enabled_tools: Option<Vec<String>>,
     disabled_tools: Vec<String>,
     transport: ExternalMcpTransport,
+}
+
+impl std::fmt::Debug for ExternalMcpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalMcpServerConfig")
+            .field("name", &self.name)
+            .field("config_revision", &self.config_revision)
+            .field("enabled", &self.enabled)
+            .field("transport", &self.transport.kind())
+            .finish_non_exhaustive()
+    }
 }
 
 // v1 支持的外部 MCP 传输类型。
@@ -299,28 +320,13 @@ enum ExternalMcpTransport {
     },
 }
 
-// JSON-RPC 响应的最小解析结构。
-#[derive(Debug, Deserialize)]
-struct JsonRpcResponse {
-    #[serde(default)]
-    id: Option<Value>,
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
-    error: Option<JsonRpcError>,
-}
-
-// JSON-RPC 错误对象。
-#[derive(Debug, Deserialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-// HTTP 调用后保留响应体和可选 MCP session id。
-struct HttpJsonRpcResponse {
-    text: String,
-    session_id: Option<String>,
+impl ExternalMcpTransport {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::StreamableHttp { .. } => "streamable_http",
+            Self::Stdio { .. } => "stdio",
+        }
+    }
 }
 
 impl ExternalMcpServerConfig {
@@ -332,6 +338,21 @@ impl ExternalMcpServerConfig {
             return false;
         }
         !self.disabled_tools.iter().any(|item| item == tool_name)
+    }
+
+    fn timeout_ms(&self) -> u64 {
+        self.request_timeout_ms
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS)
+            .clamp(1_000, MAX_REQUEST_TIMEOUT_MS)
+    }
+
+    fn diagnostic_redactions(&self) -> Vec<String> {
+        match &self.transport {
+            ExternalMcpTransport::Stdio { env, .. } => env.values().cloned().collect(),
+            ExternalMcpTransport::StreamableHttp { headers, .. } => {
+                headers.values().cloned().collect()
+            }
+        }
     }
 }
 
@@ -347,12 +368,13 @@ pub async fn list_external_mcp_resources(
     cursor: Option<String>,
 ) -> Result<ExternalMcpResources, String> {
     let loaded = load_enabled_servers(snapshot)?;
-    list_external_mcp_resources_with_servers(&loaded.servers, loaded.config_path, server, cursor)
-        .await
+    let manager = McpClientManager::default();
+    let leases = lease_servers(&manager, &loaded.servers).await?;
+    list_external_mcp_resources_with_leases(&leases, loaded.config_path, server, cursor).await
 }
 
-async fn list_external_mcp_resources_with_servers(
-    servers: &[ExternalMcpServerConfig],
+async fn list_external_mcp_resources_with_leases(
+    leases: &[client::McpClientLease],
     config_path: PathBuf,
     server: Option<String>,
     cursor: Option<String>,
@@ -362,7 +384,7 @@ async fn list_external_mcp_resources_with_servers(
     let mut errors = Vec::new();
     let mut next_cursor = None;
 
-    let targets = select_servers(servers, server.as_deref())?;
+    let targets = select_leases(leases, server.as_deref())?;
     if targets.is_empty() {
         return Ok(ExternalMcpResources {
             resources,
@@ -378,12 +400,12 @@ async fn list_external_mcp_resources_with_servers(
     }
 
     let target_count = targets.len();
-    for server_config in targets {
+    for lease in targets {
         let params = match cursor.as_ref() {
             Some(value) => serde_json::json!({ "cursor": value }),
             None => serde_json::json!({}),
         };
-        match call_external_mcp_method(server_config, "resources/list", Some(params)).await {
+        match lease.request("resources/list", Some(params)).await {
             Ok(result) => {
                 if target_count == 1 {
                     next_cursor = result
@@ -392,9 +414,9 @@ async fn list_external_mcp_resources_with_servers(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
                 }
-                resources.extend(normalize_resource_entries(&server_config.name, &result));
+                resources.extend(normalize_resource_entries(lease.server_name(), &result));
             }
-            Err(err) => errors.push(external_error_json(&server_config.name, err)),
+            Err(err) => errors.push(external_error_json(lease.server_name(), err)),
         }
     }
 
@@ -414,17 +436,14 @@ pub async fn list_external_mcp_resource_templates(
     cursor: Option<String>,
 ) -> Result<ExternalMcpResourceTemplates, String> {
     let loaded = load_enabled_servers(snapshot)?;
-    list_external_mcp_resource_templates_with_servers(
-        &loaded.servers,
-        loaded.config_path,
-        server,
-        cursor,
-    )
-    .await
+    let manager = McpClientManager::default();
+    let leases = lease_servers(&manager, &loaded.servers).await?;
+    list_external_mcp_resource_templates_with_leases(&leases, loaded.config_path, server, cursor)
+        .await
 }
 
-async fn list_external_mcp_resource_templates_with_servers(
-    servers: &[ExternalMcpServerConfig],
+async fn list_external_mcp_resource_templates_with_leases(
+    leases: &[client::McpClientLease],
     config_path: PathBuf,
     server: Option<String>,
     cursor: Option<String>,
@@ -434,7 +453,7 @@ async fn list_external_mcp_resource_templates_with_servers(
     let mut errors = Vec::new();
     let mut next_cursor = None;
 
-    let targets = select_servers(servers, server.as_deref())?;
+    let targets = select_leases(leases, server.as_deref())?;
     if targets.is_empty() {
         return Ok(ExternalMcpResourceTemplates {
             resource_templates,
@@ -450,12 +469,13 @@ async fn list_external_mcp_resource_templates_with_servers(
     }
 
     let target_count = targets.len();
-    for server_config in targets {
+    for lease in targets {
         let params = match cursor.as_ref() {
             Some(value) => serde_json::json!({ "cursor": value }),
             None => serde_json::json!({}),
         };
-        match call_external_mcp_method(server_config, "resources/templates/list", Some(params))
+        match lease
+            .request("resources/templates/list", Some(params))
             .await
         {
             Ok(result) => {
@@ -467,11 +487,11 @@ async fn list_external_mcp_resource_templates_with_servers(
                         .map(ToOwned::to_owned);
                 }
                 resource_templates.extend(normalize_resource_template_entries(
-                    &server_config.name,
+                    lease.server_name(),
                     &result,
                 ));
             }
-            Err(err) => errors.push(external_error_json(&server_config.name, err)),
+            Err(err) => errors.push(external_error_json(lease.server_name(), err)),
         }
     }
 
@@ -491,32 +511,47 @@ pub async fn read_external_mcp_resource(
     uri: String,
 ) -> Result<ExternalMcpReadResource, String> {
     let loaded = load_enabled_servers(snapshot)?;
-    let server_config = select_single_server(&loaded.servers, &server)?;
-    read_external_mcp_resource_with_server(server_config, uri).await
+    let manager = McpClientManager::default();
+    let leases = lease_servers(&manager, &loaded.servers).await?;
+    let lease = select_single_lease(&leases, &server)?;
+    read_external_mcp_resource_with_lease(lease, uri).await
 }
 
-async fn read_external_mcp_resource_with_server(
-    server_config: &ExternalMcpServerConfig,
+async fn read_external_mcp_resource_with_lease(
+    lease: &client::McpClientLease,
     uri: String,
 ) -> Result<ExternalMcpReadResource, String> {
-    let result = call_external_mcp_method(
-        server_config,
-        "resources/read",
-        Some(serde_json::json!({ "uri": uri })),
-    )
-    .await?;
-    normalize_read_resource(&server_config.name, &uri, result).await
+    let result = lease
+        .request("resources/read", Some(serde_json::json!({ "uri": uri })))
+        .await?;
+    normalize_read_resource(lease.server_name(), &uri, result).await
 }
 
 /// 发现所有启用 MCP 服务暴露的工具，并隔离单个服务失败。
 pub async fn discover_external_mcp_tools(snapshot: &McpRuntimeSnapshot) -> McpToolCatalog {
-    discover_external_mcp_tools_for_scope(snapshot, &EffectiveMcpScope::unrestricted()).await
+    let manager = McpClientManager::default();
+    discover_external_mcp_tools_for_scope_with_manager(
+        snapshot,
+        &EffectiveMcpScope::unrestricted(),
+        &manager,
+    )
+    .await
 }
 
 /// 仅发现当前 Turn 允许的 MCP 服务；过滤发生在任何网络请求或进程启动之前。
 pub async fn discover_external_mcp_tools_for_scope(
     snapshot: &McpRuntimeSnapshot,
     scope: &EffectiveMcpScope,
+) -> McpToolCatalog {
+    let manager = McpClientManager::default();
+    discover_external_mcp_tools_for_scope_with_manager(snapshot, scope, &manager).await
+}
+
+/// 使用运行时拥有的 manager 发现工具；返回目录持有对应配置 revision 的 lease。
+pub async fn discover_external_mcp_tools_for_scope_with_manager(
+    snapshot: &McpRuntimeSnapshot,
+    scope: &EffectiveMcpScope,
+    manager: &McpClientManager,
 ) -> McpToolCatalog {
     let refreshed_at = chrono::Local::now().to_rfc3339();
     let refreshed_at_millis = current_millis();
@@ -530,7 +565,8 @@ pub async fn discover_external_mcp_tools_for_scope(
                 refreshed_at_millis,
                 config_path: snapshot.config_path().clone(),
                 config_hash: format!("error:{err}"),
-                server_configs: Vec::new(),
+                server_leases: Vec::new(),
+                lease_catalog_epochs: BTreeMap::new(),
             };
             catalog.tools.sort_by(|a, b| a.name.cmp(&b.name));
             return catalog;
@@ -549,22 +585,36 @@ pub async fn discover_external_mcp_tools_for_scope(
         refreshed_at_millis,
         config_path: loaded.config_path.clone(),
         config_hash,
-        server_configs: scoped_servers.clone(),
+        server_leases: Vec::new(),
+        lease_catalog_epochs: BTreeMap::new(),
     };
 
     for server_config in &scoped_servers {
-        match call_external_mcp_method(server_config, "tools/list", Some(serde_json::json!({})))
-            .await
-        {
-            Ok(result) => {
-                let (mut tools, mut errors) = normalize_tool_entries(&server_config.name, &result);
-                tools.retain(|tool| server_config.allows_tool(&tool.original_tool_name));
-                catalog.tools.append(&mut tools);
-                catalog.errors.append(&mut errors);
+        match manager.lease(server_config).await {
+            Ok(lease) => {
+                // 目录拉取开始前冻结 epoch。若 listChanged 在分页期间或完成后到达，
+                // 实际 epoch 会推进，当前目录会立即判定为过期，而不是吞掉通知。
+                let catalog_epoch = lease.catalog_epoch();
+                match list_all_external_mcp_tools(&lease).await {
+                    Ok(result) => {
+                        let (mut tools, mut errors) =
+                            normalize_tool_entries(&server_config.name, &result);
+                        tools.retain(|tool| server_config.allows_tool(&tool.original_tool_name));
+                        catalog.tools.append(&mut tools);
+                        catalog.errors.append(&mut errors);
+                    }
+                    Err(error) => catalog
+                        .errors
+                        .push(external_error_json(&server_config.name, error)),
+                }
+                catalog
+                    .lease_catalog_epochs
+                    .insert(server_config.name.clone(), catalog_epoch);
+                catalog.server_leases.push(lease);
             }
-            Err(err) => catalog
+            Err(error) => catalog
                 .errors
-                .push(external_error_json(&server_config.name, err)),
+                .push(external_error_json(&server_config.name, error)),
         }
     }
     catalog.tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -578,25 +628,77 @@ pub async fn call_external_mcp_tool(
     arguments: Value,
 ) -> Result<ExternalMcpToolCallResult, String> {
     let loaded = load_enabled_servers(snapshot)?;
-    let server_config = select_single_server(&loaded.servers, &tool.server_name)?;
-    call_external_mcp_tool_with_server(server_config, tool, arguments).await
+    let manager = McpClientManager::default();
+    let leases = lease_servers(&manager, &loaded.servers).await?;
+    let lease = select_single_lease(&leases, &tool.server_name)?;
+    call_external_mcp_tool_with_lease(lease, tool, arguments).await
 }
 
-async fn call_external_mcp_tool_with_server(
-    server_config: &ExternalMcpServerConfig,
+async fn call_external_mcp_tool_with_lease(
+    lease: &client::McpClientLease,
     tool: &ExternalMcpToolDef,
     arguments: Value,
 ) -> Result<ExternalMcpToolCallResult, String> {
-    let result = call_external_mcp_method(
-        server_config,
-        "tools/call",
-        Some(serde_json::json!({
+    let result = lease
+        .request(
+            "tools/call",
+            Some(serde_json::json!({
             "name": tool.original_tool_name,
             "arguments": arguments
-        })),
-    )
-    .await?;
+            })),
+        )
+        .await?;
     normalize_tool_call_result(tool, result).await
+}
+
+async fn list_all_external_mcp_tools(lease: &client::McpClientLease) -> Result<Value, String> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut tools = Vec::new();
+    for _ in 0..MCP_MAX_CATALOG_PAGES {
+        let params = cursor
+            .as_ref()
+            .map(|cursor| serde_json::json!({ "cursor": cursor }))
+            .unwrap_or_else(|| serde_json::json!({}));
+        let result = lease.request("tools/list", Some(params)).await?;
+        let page = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "外部 MCP server `{}` 的 tools/list 响应缺少 tools 数组。",
+                    lease.server_name()
+                )
+            })?;
+        if tools.len().saturating_add(page.len()) > MCP_MAX_CATALOG_TOOLS {
+            return Err(format!(
+                "外部 MCP server `{}` 的工具目录超过 {} 项安全上限。",
+                lease.server_name(),
+                MCP_MAX_CATALOG_TOOLS
+            ));
+        }
+        tools.extend(page.iter().cloned());
+        let next_cursor = result
+            .get("nextCursor")
+            .or_else(|| result.get("next_cursor"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let Some(next_cursor) = next_cursor else {
+            return Ok(serde_json::json!({ "tools": tools }));
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(format!(
+                "外部 MCP server `{}` 的 tools/list 出现 cursor 循环。",
+                lease.server_name()
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+    Err(format!(
+        "外部 MCP server `{}` 的 tools/list 超过 {} 页安全上限。",
+        lease.server_name(),
+        MCP_MAX_CATALOG_PAGES
+    ))
 }
 
 // 只从共享配置 Store 冻结的不可变快照加载；运行时不得重新读取磁盘或旧 JSON。
@@ -625,6 +727,7 @@ fn parse_mcp_servers_map(
 
 // 解析单个 server 配置对象并区分 transport。
 fn parse_mcp_servers_entry(name: String, raw: Value) -> Result<ExternalMcpServerConfig, String> {
+    let config_revision = external_server_config_revision(&name, &raw);
     let raw_object = raw
         .as_object()
         .ok_or_else(|| format!("外部 MCP server `{name}` 配置必须是对象。"))?;
@@ -742,12 +845,21 @@ fn parse_mcp_servers_entry(name: String, raw: Value) -> Result<ExternalMcpServer
 
     Ok(ExternalMcpServerConfig {
         name,
+        config_revision,
         enabled,
         request_timeout_ms,
         enabled_tools,
         disabled_tools,
         transport,
     })
+}
+
+fn external_server_config_revision(name: &str, raw: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(raw).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
 }
 
 // 拒绝当前 transport 不应该出现的配置字段。
@@ -861,29 +973,40 @@ fn string_map_field(
     Ok(output)
 }
 
-// 按可选 server 名称选择本次要调用的 server 集合。
-fn select_servers<'a>(
-    servers: &'a [ExternalMcpServerConfig],
-    server: Option<&str>,
-) -> Result<Vec<&'a ExternalMcpServerConfig>, String> {
-    if let Some(server_name) = server {
-        return Ok(vec![select_single_server(servers, server_name)?]);
+async fn lease_servers(
+    manager: &McpClientManager,
+    servers: &[ExternalMcpServerConfig],
+) -> Result<Vec<client::McpClientLease>, String> {
+    let mut leases = Vec::with_capacity(servers.len());
+    for server in servers {
+        leases.push(manager.lease(server).await?);
     }
-    Ok(servers.iter().collect())
+    Ok(leases)
 }
 
-// 选择单个 server，并在失败时给出当前可用列表。
-fn select_single_server<'a>(
-    servers: &'a [ExternalMcpServerConfig],
+// 按可选 server 名称选择本次要调用的连接 lease 集合。
+fn select_leases<'a>(
+    leases: &'a [client::McpClientLease],
+    server: Option<&str>,
+) -> Result<Vec<&'a client::McpClientLease>, String> {
+    if let Some(server_name) = server {
+        return Ok(vec![select_single_lease(leases, server_name)?]);
+    }
+    Ok(leases.iter().collect())
+}
+
+// 选择单个 lease，并在失败时给出当前可用列表。
+fn select_single_lease<'a>(
+    leases: &'a [client::McpClientLease],
     server: &str,
-) -> Result<&'a ExternalMcpServerConfig, String> {
-    servers
+) -> Result<&'a client::McpClientLease, String> {
+    leases
         .iter()
-        .find(|item| item.name == server)
+        .find(|item| item.server_name() == server)
         .ok_or_else(|| {
-            let available = servers
+            let available = leases
                 .iter()
-                .map(|item| item.name.as_str())
+                .map(client::McpClientLease::server_name)
                 .collect::<Vec<_>>()
                 .join(", ");
             if available.is_empty() {
@@ -939,454 +1062,6 @@ fn sanitize_tool_name_segment(value: &str) -> String {
         "tool".to_string()
     } else {
         output
-    }
-}
-
-// 根据 server transport 分发一次完整 MCP JSON-RPC 调用。
-async fn call_external_mcp_method(
-    server: &ExternalMcpServerConfig,
-    method: &str,
-    params: Option<Value>,
-) -> Result<Value, String> {
-    let timeout_ms = server
-        .request_timeout_ms
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS)
-        .clamp(1_000, MAX_REQUEST_TIMEOUT_MS);
-    match &server.transport {
-        ExternalMcpTransport::StreamableHttp { url, headers } => {
-            call_http_json_rpc(HttpJsonRpcRequest {
-                server_name: &server.name,
-                url,
-                headers,
-                method,
-                params,
-                timeout_ms,
-            })
-            .await
-        }
-        ExternalMcpTransport::Stdio {
-            command,
-            args,
-            env,
-            cwd,
-        } => {
-            call_stdio_json_rpc(StdioJsonRpcRequest {
-                server_name: &server.name,
-                command,
-                args,
-                env,
-                cwd: cwd.as_deref(),
-                method,
-                params,
-                timeout_ms,
-            })
-            .await
-        }
-    }
-}
-
-struct HttpJsonRpcRequest<'a> {
-    server_name: &'a str,
-    url: &'a str,
-    headers: &'a BTreeMap<String, String>,
-    method: &'a str,
-    params: Option<Value>,
-    timeout_ms: u64,
-}
-
-// 通过 streamable HTTP 完成 initialize、initialized 和目标方法调用。
-async fn call_http_json_rpc(request: HttpJsonRpcRequest<'_>) -> Result<Value, String> {
-    let HttpJsonRpcRequest {
-        server_name,
-        url,
-        headers,
-        method,
-        params,
-        timeout_ms,
-    } = request;
-    let client = reqwest::Client::new();
-    let header_map = build_http_header_map(server_name, headers)?;
-    let initialize_response = post_http_json_rpc(
-        &client,
-        server_name,
-        url,
-        header_map.clone(),
-        None,
-        json_rpc_request(1, "initialize", Some(mcp_initialize_params())),
-        timeout_ms,
-    )
-    .await?;
-    parse_json_rpc_result(&initialize_response.text, 1)?;
-
-    let session_id = initialize_response.session_id;
-    post_http_json_rpc(
-        &client,
-        server_name,
-        url,
-        header_map.clone(),
-        session_id.as_deref(),
-        json_rpc_notification("notifications/initialized", Some(serde_json::json!({}))),
-        timeout_ms,
-    )
-    .await?;
-    let response = post_http_json_rpc(
-        &client,
-        server_name,
-        url,
-        header_map,
-        session_id.as_deref(),
-        json_rpc_request(2, method, params),
-        timeout_ms,
-    )
-    .await?;
-
-    parse_json_rpc_result(&response.text, 2)
-}
-
-// 构造 HTTP transport 所需请求头。秘密值已由不可变配置快照合并进来。
-fn build_http_header_map(
-    server_name: &str,
-    headers: &BTreeMap<String, String>,
-) -> Result<HeaderMap, String> {
-    let mut header_map = HeaderMap::new();
-    header_map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    header_map.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/json, text/event-stream"),
-    );
-    for (key, value) in headers {
-        let name = HeaderName::from_bytes(key.as_bytes())
-            .map_err(|err| format!("外部 MCP server `{server_name}` 的 header 名称无效：{err}"))?;
-        let value = HeaderValue::from_str(value).map_err(|err| {
-            format!("外部 MCP server `{server_name}` 的 header `{key}` 值无效：{err}")
-        })?;
-        header_map.insert(name, value);
-    }
-    header_map.insert(
-        HeaderName::from_static(MCP_PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(MCP_PROTOCOL_VERSION),
-    );
-    Ok(header_map)
-}
-
-// 发送单次 HTTP JSON-RPC 请求并保留响应 session id。
-async fn post_http_json_rpc(
-    client: &reqwest::Client,
-    server_name: &str,
-    url: &str,
-    mut header_map: HeaderMap,
-    session_id: Option<&str>,
-    payload: Value,
-    timeout_ms: u64,
-) -> Result<HttpJsonRpcResponse, String> {
-    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
-        let value = HeaderValue::from_str(session_id).map_err(|err| {
-            format!("外部 MCP server `{server_name}` 的 session id 无法写入 header：{err}")
-        })?;
-        header_map.insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), value);
-    }
-
-    let response = client
-        .post(url)
-        .headers(header_map)
-        .json(&payload)
-        .timeout(Duration::from_millis(timeout_ms))
-        .send()
-        .await
-        .map_err(|err| format!("请求外部 MCP server `{server_name}` 失败：{err}"))?;
-
-    let status = response.status();
-    let session_id = response
-        .headers()
-        .get(HeaderName::from_static(MCP_SESSION_ID_HEADER))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let text = response
-        .text()
-        .await
-        .map_err(|err| format!("读取外部 MCP server `{server_name}` 响应失败：{err}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "外部 MCP server `{server_name}` 返回 HTTP {status}：{}",
-            truncate_for_error(&text)
-        ));
-    }
-
-    Ok(HttpJsonRpcResponse { text, session_id })
-}
-
-struct StdioJsonRpcRequest<'a> {
-    server_name: &'a str,
-    command: &'a str,
-    args: &'a [String],
-    env: &'a BTreeMap<String, String>,
-    cwd: Option<&'a str>,
-    method: &'a str,
-    params: Option<Value>,
-    timeout_ms: u64,
-}
-
-// 通过 stdio 子进程完成 initialize、initialized 和目标方法调用。
-async fn call_stdio_json_rpc(request: StdioJsonRpcRequest<'_>) -> Result<Value, String> {
-    let StdioJsonRpcRequest {
-        server_name,
-        command,
-        args,
-        env,
-        cwd,
-        method,
-        params,
-        timeout_ms,
-    } = request;
-    let mut cmd = Command::new(command);
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    crate::process_supervision::configure_process_tree(&mut cmd);
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("启动外部 MCP server `{server_name}` 失败：{err}"))?;
-    let process_tree_guard = match crate::process_supervision::ProcessTreeGuard::attach(&child) {
-        Ok(guard) => guard,
-        Err(error) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(format!(
-                "外部 MCP server `{server_name}` 进程树隔离失败：{error}"
-            ));
-        }
-    };
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("外部 MCP server `{server_name}` 无法打开 stdin。"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("外部 MCP server `{server_name}` 无法打开 stdout。"))?;
-    let stderr_reader = tokio::spawn(read_stderr_bounded(child.stderr.take()));
-
-    let mut lines = BufReader::new(stdout).lines();
-    let read_result = async {
-        write_json_rpc_line(
-            &mut stdin,
-            json_rpc_request(1, "initialize", Some(mcp_initialize_params())),
-        )
-        .await?;
-        read_stdio_json_rpc_result(&mut lines, server_name, "initialize", 1, timeout_ms).await?;
-        write_json_rpc_line(
-            &mut stdin,
-            json_rpc_notification("notifications/initialized", Some(serde_json::json!({}))),
-        )
-        .await?;
-        write_json_rpc_line(&mut stdin, json_rpc_request(2, method, params)).await?;
-        read_stdio_json_rpc_result(&mut lines, server_name, method, 2, timeout_ms).await
-    }
-    .await;
-    drop(stdin);
-
-    let _ = process_tree_guard.terminate(false);
-    if tokio::time::timeout(Duration::from_millis(250), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = process_tree_guard.terminate(true);
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-    }
-    let stderr_text = join_stderr_reader(stderr_reader).await;
-
-    match read_result {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            if stderr_text.trim().is_empty() {
-                Err(err)
-            } else {
-                Err(format!(
-                    "{err}\nstderr：{}",
-                    truncate_for_error(&stderr_text)
-                ))
-            }
-        }
-    }
-}
-
-// 从 stdio stdout 中读取指定 JSON-RPC id 的结果。
-async fn read_stdio_json_rpc_result(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    server_name: &str,
-    method: &str,
-    expected_id: u64,
-    timeout_ms: u64,
-) -> Result<Value, String> {
-    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|err| format!("读取外部 MCP server `{server_name}` stdout 失败：{err}"))?
-        {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(result) = parse_json_rpc_result_value(&line, expected_id)? {
-                return Ok(result);
-            }
-        }
-        Err(format!(
-            "外部 MCP server `{server_name}` 未返回请求 `{method}` 的 JSON-RPC 结果。"
-        ))
-    })
-    .await
-    .map_err(|_| format!("外部 MCP server `{server_name}` 请求 `{method}` 超时。"))?
-}
-
-// 向 stdio server 写入一行 JSON-RPC 消息。
-async fn write_json_rpc_line(
-    stdin: &mut tokio::process::ChildStdin,
-    value: Value,
-) -> Result<(), String> {
-    let line =
-        serde_json::to_string(&value).map_err(|err| format!("序列化 JSON-RPC 请求失败：{err}"))?;
-    stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|err| format!("写入外部 MCP stdin 失败：{err}"))?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|err| format!("写入外部 MCP stdin 失败：{err}"))
-}
-
-// 持续排空 stderr，避免服务写满管道后阻塞；只保留有界诊断内容。
-async fn read_stderr_bounded(stderr: Option<tokio::process::ChildStderr>) -> String {
-    let Some(stderr) = stderr else {
-        return String::new();
-    };
-    let reader = BufReader::new(stderr);
-    let mut output = Vec::new();
-    let _ = reader.take(16 * 1024).read_to_end(&mut output).await;
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-async fn join_stderr_reader(mut reader: tokio::task::JoinHandle<String>) -> String {
-    match tokio::time::timeout(Duration::from_millis(500), &mut reader).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => String::new(),
-        Err(_) => {
-            reader.abort();
-            let _ = reader.await;
-            String::new()
-        }
-    }
-}
-
-// 构造带 id 的 JSON-RPC 请求对象。
-fn json_rpc_request(id: u64, method: &str, params: Option<Value>) -> Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params.unwrap_or_else(|| serde_json::json!({}))
-    })
-}
-
-// 构造无需响应的 JSON-RPC 通知对象。
-fn json_rpc_notification(method: &str, params: Option<Value>) -> Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params.unwrap_or_else(|| serde_json::json!({}))
-    })
-}
-
-// 构造 MCP initialize 生命周期参数。
-fn mcp_initialize_params() -> Value {
-    serde_json::json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": { "resources": {}, "tools": {} },
-        "clientInfo": {
-            "name": "muse-mcp-client",
-            "version": env!("CARGO_PKG_VERSION"),
-            "title": "muse"
-        }
-    })
-}
-
-// 解析普通 JSON 或 SSE 包裹的 JSON-RPC result。
-fn parse_json_rpc_result(text: &str, expected_id: u64) -> Result<Value, String> {
-    if let Some(result) = parse_sse_json_rpc_result(text, expected_id)? {
-        return Ok(result);
-    }
-    parse_json_rpc_result_value(text, expected_id)?
-        .ok_or_else(|| "JSON-RPC 响应中没有匹配请求 id 的 result。".to_string())
-}
-
-// 从 text/event-stream 响应中提取匹配 id 的 JSON-RPC result。
-fn parse_sse_json_rpc_result(text: &str, expected_id: u64) -> Result<Option<Value>, String> {
-    let mut saw_sse = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(data) = trimmed.strip_prefix("data:") else {
-            continue;
-        };
-        saw_sse = true;
-        let payload = data.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        if let Some(result) = parse_json_rpc_result_value(payload, expected_id)? {
-            return Ok(Some(result));
-        }
-    }
-    if saw_sse {
-        return Err("SSE 响应中没有匹配请求 id 的 JSON-RPC result。".to_string());
-    }
-    Ok(None)
-}
-
-// 从 JSON 文本中解析单个或批量 JSON-RPC 响应。
-fn parse_json_rpc_result_value(text: &str, expected_id: u64) -> Result<Option<Value>, String> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|err| format!("解析外部 MCP JSON-RPC 响应失败：{err}"))?;
-    if let Some(items) = value.as_array() {
-        for item in items {
-            if let Some(result) = extract_json_rpc_result(item.clone(), expected_id)? {
-                return Ok(Some(result));
-            }
-        }
-        return Ok(None);
-    }
-    extract_json_rpc_result(value, expected_id)
-}
-
-// 从已解析 JSON 中提取匹配 id 的 result 或错误。
-fn extract_json_rpc_result(value: Value, expected_id: u64) -> Result<Option<Value>, String> {
-    let response: JsonRpcResponse = serde_json::from_value(value)
-        .map_err(|err| format!("解析外部 MCP JSON-RPC 响应结构失败：{err}"))?;
-    if !json_rpc_id_matches(response.id.as_ref(), expected_id) {
-        return Ok(None);
-    }
-    if let Some(error) = response.error {
-        return Err(format!("JSON-RPC 错误 {}：{}", error.code, error.message));
-    }
-    Ok(response.result)
-}
-
-// 判断 JSON-RPC 响应 id 是否匹配请求 id。
-fn json_rpc_id_matches(id: Option<&Value>, expected_id: u64) -> bool {
-    match id {
-        Some(Value::Number(number)) => number.as_u64() == Some(expected_id),
-        Some(Value::String(value)) => value == &expected_id.to_string(),
-        _ => false,
     }
 }
 
@@ -1878,16 +1553,6 @@ fn truncate_tool_text(text: &str) -> (String, bool) {
     (format!("{preview}\n...（MCP 工具结果内容已截断）"), true)
 }
 
-// 截断错误消息中的外部响应体，避免日志和前端被大块内容淹没。
-fn truncate_for_error(text: &str) -> String {
-    const MAX: usize = 2_000;
-    if text.chars().count() <= MAX {
-        return text.to_string();
-    }
-    let preview = text.chars().take(MAX).collect::<String>();
-    format!("{preview}\n...（已截断）")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1914,18 +1579,6 @@ mod tests {
         let entries = serde_json::from_value(entries)
             .map_err(|error| format!("构造 MCP 测试配置失败：{error}"))?;
         parse_mcp_servers_map(entries)
-    }
-
-    // 验证普通 JSON-RPC 响应能够解析出 result。
-    #[test]
-    fn parses_plain_json_rpc_result() {
-        let result = parse_json_rpc_result(
-            r#"{"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"demo://a","name":"A"}]}}"#,
-            1,
-        )
-        .expect("应能解析普通 JSON-RPC 响应");
-
-        assert_eq!(result["resources"][0]["uri"], "demo://a");
     }
 
     #[tokio::test]
@@ -1959,68 +1612,8 @@ mod tests {
         .await;
 
         assert!(catalog.tools.is_empty());
-        assert!(catalog.server_configs.is_empty());
+        assert!(catalog.server_leases.is_empty());
         assert!(!marker.exists(), "禁用范围不能启动 stdio MCP 服务");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_stdio_request_kills_spawned_process_group() {
-        let marker = std::env::temp_dir().join(format!(
-            "muse-mcp-child-{}-{}",
-            std::process::id(),
-            current_millis()
-        ));
-        let marker_for_task = marker.clone();
-        let request_task = tokio::spawn(async move {
-            let command = "/bin/sh".to_string();
-            let args = vec![
-                "-c".to_string(),
-                format!(
-                    "sleep 30 & echo $! > '{}'; while :; do sleep 1; done",
-                    marker_for_task.display()
-                ),
-            ];
-            let env = BTreeMap::new();
-            call_stdio_json_rpc(StdioJsonRpcRequest {
-                server_name: "drop-test",
-                command: &command,
-                args: &args,
-                env: &env,
-                cwd: None,
-                method: "tools/list",
-                params: Some(serde_json::json!({})),
-                timeout_ms: 30_000,
-            })
-            .await
-        });
-
-        for _ in 0..100 {
-            if marker.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let child_pid = std::fs::read_to_string(&marker)
-            .expect("MCP 测试服务应写出子进程 PID")
-            .trim()
-            .parse::<libc::pid_t>()
-            .expect("子进程 PID 应合法");
-
-        request_task.abort();
-        let _ = request_task.await;
-        for _ in 0..100 {
-            if unsafe { libc::kill(child_pid, 0) } != 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_ne!(
-            unsafe { libc::kill(child_pid, 0) },
-            0,
-            "丢弃 MCP 请求 Future 后不能遗留后代进程"
-        );
-        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
@@ -2037,18 +1630,6 @@ mod tests {
             EffectiveMcpScope::from_policy(Some(&first)).cache_key(),
             EffectiveMcpScope::from_policy(Some(&second)).cache_key()
         );
-    }
-
-    // 验证 SSE data 行中的 JSON-RPC 响应能够解析出 result。
-    #[test]
-    fn parses_sse_json_rpc_result() {
-        let result = parse_json_rpc_result(
-            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contents\":[{\"uri\":\"demo://a\",\"text\":\"ok\"}]}}\n\n",
-            1,
-        )
-        .expect("应能解析 SSE data 中的 JSON-RPC 响应");
-
-        assert_eq!(result["contents"][0]["text"], "ok");
     }
 
     // 验证 MCP resource template 的驼峰字段会归一化成底座字段。
@@ -2143,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_keeps_the_discovered_server_target_after_config_changes() {
+    fn config_revision_changes_with_transport_or_secret_content() {
         let first = parse_test_servers(serde_json::json!({
             "docs": {
                 "type": "streamable_http",
@@ -2151,33 +1732,17 @@ mod tests {
             }
         }))
         .expect("首次 MCP 配置应可解析");
-        let catalog = super::McpToolCatalog {
-            tools: Vec::new(),
-            errors: Vec::new(),
-            refreshed_at: "now".to_string(),
-            refreshed_at_millis: 0,
-            config_path: std::path::PathBuf::from("config.toml"),
-            config_hash: "first".to_string(),
-            server_configs: first,
-        };
         let changed = parse_test_servers(serde_json::json!({
             "docs": {
                 "type": "streamable_http",
-                "url": "https://second.example.test/mcp"
+                "url": "https://second.example.test/mcp",
+                "headers": { "Authorization": "Bearer changed-secret" }
             }
         }))
         .expect("变更后的 MCP 配置应可解析");
-
-        let frozen_url = match &catalog.server_configs[0].transport {
-            super::ExternalMcpTransport::StreamableHttp { url, .. } => url,
-            _ => panic!("测试 server 应为 HTTP transport"),
-        };
-        let changed_url = match &changed[0].transport {
-            super::ExternalMcpTransport::StreamableHttp { url, .. } => url,
-            _ => panic!("测试 server 应为 HTTP transport"),
-        };
-        assert_eq!(frozen_url, "https://first.example.test/mcp");
-        assert_eq!(changed_url, "https://second.example.test/mcp");
+        assert_ne!(first[0].config_revision, changed[0].config_revision);
+        assert!(!first[0].config_revision.contains("first.example"));
+        assert!(!changed[0].config_revision.contains("changed-secret"));
     }
 
     // 验证运行时快照拒绝旧 bearer 字段，Bearer 应先合并进 Authorization header。
