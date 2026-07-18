@@ -74,4 +74,11 @@ describe('GalgameDialogueBox', () => {
     expect(screen.getByText('尾消息流式更新')).toBeVisible();
     expect(screen.getAllByTestId('story-message').length).toBeLessThan(40);
   });
+
+  it('为聊天富文本挂载受约束的 Markdown 容器', async () => {
+    render(<GalgameDialogueBox messages={buildMessages(1)} />);
+
+    await waitFor(() => expect(screen.getByText('第 0 条消息')).toBeVisible());
+    expect(screen.getByText('第 0 条消息').closest('.message-markdown')).not.toBeNull();
+  });
 });

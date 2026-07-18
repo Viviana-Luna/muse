@@ -1444,6 +1444,8 @@ textarea {
 }
 
 .message-markdown {
+  min-width: 0;
+  max-width: 100%;
   color: #fff;
   font-size: 13px;
   line-height: 1.58;
@@ -1473,10 +1475,22 @@ textarea {
 }
 
 .message-markdown pre {
+  max-width: 100%;
   overflow-x: auto;
   padding: 10px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.28);
+}
+
+.message-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.message-markdown img {
+  max-width: 100%;
+  height: auto;
 }
 
 .message-placeholder {
@@ -6370,7 +6384,9 @@ button.muse-runtime-model svg {
 }
 
 .story-scroll-region {
+  min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   padding: clamp(20px, 3vw, 36px);
   scroll-behavior: smooth;
@@ -6378,11 +6394,13 @@ button.muse-runtime-model svg {
 
 .story-timeline {
   display: grid;
+  min-width: 0;
   gap: 14px;
 }
 
 .story-message {
   display: grid;
+  min-width: 0;
   gap: 5px;
   max-width: 82%;
 }
@@ -6415,6 +6433,8 @@ button.muse-runtime-model svg {
 }
 
 .story-message-content {
+  min-width: 0;
+  max-width: 100%;
   padding: 10px 13px;
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 4px 13px 13px;
@@ -6422,6 +6442,7 @@ button.muse-runtime-model svg {
   color: rgba(255, 255, 255, 0.92);
   font-size: 13px;
   line-height: 1.65;
+  overflow-wrap: anywhere;
 }
 
 .story-message.user .story-message-content {
