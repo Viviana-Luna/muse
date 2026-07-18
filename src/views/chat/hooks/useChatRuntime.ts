@@ -35,7 +35,7 @@ import type {
   RuntimeStateResponse,
   RuntimeTokenUsage
 } from '@/types';
-import type { RuntimeModeChoice } from '@/views/chat/components/RuntimeModeSelector';
+import type { PlanModeChoice } from '@/views/chat/components/PlanModeToggle';
 import {
   normalizeConversationId,
   readConversationIdFromUrl,
@@ -122,9 +122,9 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     inputRevisionRef.current += 1;
     setInputValueState(value);
   }, []);
-  const [runtimeMode, setRuntimeMode] = useState('daily');
-  const [runtimeFocusPhase, setRuntimeFocusPhase] = useState('plan');
-  const [runtimeToolPreset, setRuntimeToolPreset] = useState('daily');
+  const [runtimeMode, setRuntimeMode] = useState('focus');
+  const [runtimeFocusPhase, setRuntimeFocusPhase] = useState('build');
+  const [runtimeToolPreset, setRuntimeToolPreset] = useState('focus_build');
   const [runtimeModeSwitching, setRuntimeModeSwitching] = useState(false);
 
   const session = useSessionState();
@@ -427,9 +427,9 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     }
   }
 
-  async function handleRuntimeModeChange(nextPreset: RuntimeModeChoice): Promise<void> {
+  async function handleRuntimeModeChange(nextPreset: PlanModeChoice): Promise<void> {
     if (stream.busy || runtimeModeSwitching || nextPreset === runtimeToolPreset) return;
-    if (rejectBlockedMutation('切换运行模式')) return;
+    if (rejectBlockedMutation('切换计划状态')) return;
     if (session.selectedConversationReadOnly) {
       optionsRef.current.notify({
         title: '当前会话为只读历史',
@@ -438,23 +438,22 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       });
       return;
     }
-    const target = {
-      daily: { mode: 'daily' as const, phase: undefined, label: '日常' },
-      focus_build: { mode: 'focus' as const, phase: 'build' as const, label: '工作' },
-      focus_plan: { mode: 'focus' as const, phase: 'plan' as const, label: '计划' }
-    }[nextPreset];
+    const target =
+      nextPreset === 'focus_plan'
+        ? { mode: 'focus' as const, phase: 'plan' as const, label: '已进入计划模式' }
+        : { mode: 'focus' as const, phase: 'build' as const, label: '已退出计划模式' };
     setRuntimeModeSwitching(true);
     try {
       const response = await updateRuntimeMode(target.mode, target.phase);
       applyRuntimeMode(response.mode, response.focus_phase, response.tool_preset);
       optionsRef.current.notify({
-        title: `已切换为${target.label}模式`,
+        title: target.label,
         description: '后续新回合将使用对应的工具范围。',
         tone: 'success'
       });
     } catch (error) {
       optionsRef.current.notify({
-        title: '切换运行模式失败',
+        title: '切换计划状态失败',
         description: error instanceof Error ? error.message : '运行时未接受本次模式切换。',
         tone: 'error'
       });

@@ -581,27 +581,14 @@ fn disabled_tool_result(tool: &Tool) -> ToolResult {
 // 判断工具定义是否允许被当前角色策略暴露或执行。
 fn is_tool_definition_allowed(policy: Option<&ToolPolicy>, name: &str) -> bool {
     match policy.map(|value| &value.mode) {
-        // 默认角色只暴露陪伴、澄清、语音和网页搜索能力。开发者工具必须由
-        // 用户在角色的显式白名单中开启，避免模型在普通对话中获得文件或命令权限。
-        None | Some(ToolPolicyMode::Inherit) => is_default_assistant_tool(name),
+        // 默认工作态继承完整通用工具池。写入、命令和外部副作用仍由风险审批、
+        // 沙箱与工作区边界约束；角色显式禁用或白名单继续作为更窄的安全上限。
+        None | Some(ToolPolicyMode::Inherit) => true,
         Some(ToolPolicyMode::Disabled) => false,
         Some(ToolPolicyMode::AllowList) => policy
             .map(|value| value.allowed_tools.iter().any(|item| item == name))
             .unwrap_or(false),
     }
-}
-
-// 默认角色助手能力，不包含文件、命令、MCP、技能和任务编排等开发者扩展。
-fn is_default_assistant_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "ask_user_question"
-            | "send_user_message"
-            | "brief"
-            | "tts_speak"
-            | "voice_current"
-            | "web_search"
-    )
 }
 
 // 判断工具是否属于当前运行模式预设。
@@ -617,7 +604,7 @@ fn is_tool_allowed_for_preset(definition: &ToolDef, preset: ToolPreset) -> bool 
     }
 }
 
-// 日常模式仅保留角色助手默认能力；开发者扩展需要显式白名单后才会通过权限过滤。
+// 旧 daily 预设仅用于读取历史 Turn，不再作为新运行时默认能力。
 fn is_daily_tool(name: &str) -> bool {
     matches!(
         name,
@@ -864,9 +851,9 @@ mod tests {
         assert!(result.content.contains("未被授权"));
     }
 
-    // 验证日常模式只暴露低打扰工具，不把命令执行交给模型。
+    // 旧 daily 预设仅为历史协议读取保留，仍不得暴露命令工具。
     #[test]
-    fn daily_preset_hides_command_tools() {
+    fn legacy_daily_preset_hides_command_tools() {
         let mut registry = ToolRegistry::new();
         builtin::register_all(&mut registry);
 
@@ -951,6 +938,33 @@ mod tests {
         assert!(names.contains(&"mcp_list_resources"));
         assert!(names.contains(&"agent"));
         assert!(names.contains(&"create_skill"));
+    }
+
+    #[test]
+    fn inherited_work_preset_exposes_all_general_tools() {
+        let mut registry = ToolRegistry::new();
+        builtin::register_all(&mut registry);
+
+        let names = registry
+            .list_definitions_for_preset_and_policy(ToolPreset::FocusBuild, None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        for required in [
+            "load_skill",
+            "create_skill",
+            "file_read",
+            "file_write",
+            "file_edit",
+            "command_run",
+            "agent",
+        ] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "缺少通用工具 {required}"
+            );
+        }
     }
 
     #[test]

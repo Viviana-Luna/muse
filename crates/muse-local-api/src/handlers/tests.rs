@@ -1484,12 +1484,16 @@ mod tests {
             None,
             &mcp_catalog,
         );
-        assert!(!full_tool_defs.iter().any(|tool| tool.name == "create_skill"));
+        assert!(
+            full_tool_defs.iter().any(|tool| tool.name == "create_skill"),
+            "默认工作态应直接包含通用 create_skill 工具"
+        );
         let skill_tool_ids = super::grant_selected_skill_required_tools(
             &state,
             None,
             &mut full_tool_defs,
             &required_tools,
+            muse_core::domain::runtime::ToolPreset::FocusBuild,
         )
         .expect("默认角色应允许已选内置 Skill 的最小工具依赖");
         let restricted_persona: Persona = serde_json::from_value(serde_json::json!({
@@ -1508,12 +1512,34 @@ mod tests {
             Some(&restricted_persona),
             &mut Vec::new(),
             &required_tools,
+            muse_core::domain::runtime::ToolPreset::FocusBuild,
         )
         .expect_err("显式白名单缺少必需工具时必须拒绝 Turn");
         assert!(policy_error.contains("当前角色工具策略未允许"));
+        let mut plan_tool_defs = full_tool_defs.clone();
+        let plan_error = super::grant_selected_skill_required_tools(
+            &state,
+            None,
+            &mut plan_tool_defs,
+            &required_tools,
+            muse_core::domain::runtime::ToolPreset::FocusPlan,
+        )
+        .expect_err("计划态不得注入需要写入的 Skill 工具");
+        assert!(plan_error.contains("计划态只允许只读工具"));
+        let plan_visible_tool_defs = super::visible_tool_definitions_for_turn(
+            &full_tool_defs,
+            muse_core::domain::runtime::ToolPreset::FocusPlan,
+            &skill_tool_ids,
+        );
+        assert!(
+            plan_visible_tool_defs
+                .iter()
+                .all(|tool| tool.name != "create_skill"),
+            "切入计划态后不得重新暴露写入型 Skill 工具"
+        );
         let visible_tool_defs = super::visible_tool_definitions_for_turn(
             &full_tool_defs,
-            muse_core::domain::runtime::ToolPreset::Daily,
+            muse_core::domain::runtime::ToolPreset::FocusBuild,
             &skill_tool_ids,
         );
         assert!(visible_tool_defs.iter().any(|tool| tool.name == "create_skill"));
@@ -1536,6 +1562,20 @@ mod tests {
         .context;
         turn.runtime_policy.skill_tool_ids = skill_tool_ids;
         assert!(super::runtime_tool_allowed(&turn, "create_skill"));
+        let create_call = test_tool_call(
+            "create_skill",
+            serde_json::json!({
+                "name": "permission-probe",
+                "description": "验证冻结 Skill 工具授权",
+                "content": "# 验证\n\n执行授权必须与冻结目录一致。"
+            }),
+        );
+        let handler = super::runtime_tool_handler("create_skill")
+            .expect("运行时应注册 create_skill handler");
+        assert!(
+            handler.check_permissions(&state, &turn, &create_call).is_ok(),
+            "显式 Skill 工具授权必须穿过实际 handler 权限门禁"
+        );
 
         let (prompt, activated) =
             super::activate_selected_skill(&state, &turn, "skill-creator")
@@ -2336,6 +2376,17 @@ mod tests {
         assert_eq!(
             mode,
             muse_core::domain::runtime::RuntimeModeState::focus_plan()
+        );
+    }
+
+    #[test]
+    fn legacy_daily_mode_request_migrates_to_default_work_state() {
+        let state = super::parse_runtime_mode_state("daily", None)
+            .expect("旧 daily 请求应平滑迁移");
+
+        assert_eq!(
+            state,
+            muse_core::domain::runtime::RuntimeModeState::focus_build()
         );
     }
 

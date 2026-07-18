@@ -1,13 +1,14 @@
-//! 运行模式模块，定义日常/专注模式和可选计划工具预设的稳定协议。
+//! 运行模式模块，定义默认工作态与可选计划工具预设；旧日常值仅用于历史兼容。
 
 use serde::{Deserialize, Serialize};
 
-/// 对用户可见的运行模式。
+/// 运行时模式协议。新状态固定使用 `Focus`，`Daily` 只读取旧记录。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeMode {
-    #[default]
+    /// 仅用于读取旧协议；新运行时不再进入日常模式。
     Daily,
+    #[default]
     Focus,
 }
 
@@ -90,12 +91,9 @@ impl RuntimeModeState {
         }
     }
 
-    /// 进入日常模式，专注档位回到默认工作档位，避免残留计划态。
+    /// 旧调用兼容别名；日常模式已移除，统一回到默认工作态。
     pub fn daily() -> Self {
-        Self {
-            mode: RuntimeMode::Daily,
-            focus_phase: FocusPhase::Build,
-        }
+        Self::focus_build()
     }
 
     /// 进入默认专注工作档位。
@@ -142,6 +140,11 @@ mod tests {
         assert_eq!(state.mode, RuntimeMode::Focus);
         assert_eq!(state.focus_phase, FocusPhase::Build);
         assert_eq!(state.tool_preset(), ToolPreset::FocusBuild);
+    }
+
+    #[test]
+    fn runtime_defaults_to_work_preset() {
+        assert_eq!(RuntimeModeState::default(), RuntimeModeState::focus_build());
     }
 
     // 验证计划预设是专注模式下的显式可选档位。

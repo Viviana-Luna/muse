@@ -5,7 +5,7 @@ import { Mic, MicOff, Sparkles, Square, Volume2, VolumeX, X } from 'lucide-react
 import type { VoiceRuntime } from '@/hooks/useVoiceRuntime';
 import type { RuntimeToolPreset } from '@/types';
 import type { SkillPickerController } from '@/views/chat/hooks/useSkillPicker';
-import { RuntimeModeSelector, type RuntimeModeChoice } from './RuntimeModeSelector';
+import { PlanModeToggle, type PlanModeChoice } from './PlanModeToggle';
 import { SkillPickerDrawer } from './SkillPickerDrawer';
 
 interface ComposerBarProps {
@@ -22,7 +22,7 @@ interface ComposerBarProps {
   visualizerCanvasRef?: RefObject<HTMLCanvasElement | null>;
   placeholder?: string;
   onInputValueChange: (value: string) => void;
-  onRuntimeModeChange: (value: RuntimeModeChoice) => void | Promise<void>;
+  onRuntimeModeChange: (value: PlanModeChoice) => void | Promise<void>;
   onSend: () => void | Promise<void>;
   onStartVoiceInput: () => void | Promise<void>;
   onToggleVoice: () => void;
@@ -151,7 +151,7 @@ export function ComposerBar({
               <Sparkles aria-hidden="true" />
               <span>Skill</span>
             </button>
-            <RuntimeModeSelector
+            <PlanModeToggle
               value={runtimeToolPreset}
               switching={runtimeModeSwitching}
               disabled={busy || writeLocked}

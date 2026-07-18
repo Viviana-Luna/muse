@@ -199,6 +199,7 @@ fn grant_selected_skill_required_tools(
     active_persona: Option<&Persona>,
     definitions: &mut Vec<ToolDef>,
     required_tools: &[String],
+    preset: ToolPreset,
 ) -> Result<Vec<String>, String> {
     if required_tools.is_empty() {
         return Ok(Vec::new());
@@ -225,6 +226,11 @@ fn grant_selected_skill_required_tools(
             .tool_def(name)
             .filter(|definition| definition.available)
             .ok_or_else(|| format!("已选择的内置 Skill 需要工具 `{name}`，但工具当前不可用。"))?;
+        if !ToolRegistry::is_tool_definition_allowed_for_preset(&definition, preset) {
+            return Err(format!(
+                "已选择的内置 Skill 需要工具 `{name}`，但当前计划态只允许只读工具。请先退出计划态。"
+            ));
+        }
         if !definitions.iter().any(|current| current.name == *name) {
             definitions.push(definition);
         }
@@ -253,6 +259,9 @@ fn visible_tool_definitions_for_turn(
         if let Some(definition) = full_definitions
             .iter()
             .find(|definition| definition.name == *name)
+            .filter(|definition| {
+                ToolRegistry::is_tool_definition_allowed_for_preset(definition, preset)
+            })
         {
             visible.push(definition.clone());
         }
@@ -262,18 +271,25 @@ fn visible_tool_definitions_for_turn(
 }
 
 fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
+    let preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::FocusBuild);
+    let Some(definition) = turn
+        .tool_definitions
+        .iter()
+        .find(|definition| definition.available && definition.name == name)
+    else {
+        return false;
+    };
+    if !ToolRegistry::is_tool_definition_allowed_for_preset(definition, preset) {
+        return false;
+    }
     if turn
         .runtime_policy
         .skill_tool_ids
         .iter()
         .any(|granted| granted == name)
     {
-        return turn
-            .tool_definitions
-            .iter()
-            .any(|definition| definition.available && definition.name == name);
+        return true;
     }
-    let preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::Daily);
     ToolRegistry::filter_definitions_for_preset_and_policy(
         turn.tool_definitions.clone(),
         preset,

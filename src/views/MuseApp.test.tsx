@@ -46,8 +46,8 @@ describe('MuseApp 角色导入意图', () => {
       state_revision: 1,
       active_persona_id: null,
       active_conversation_id: 'default',
-      mode: 'daily',
-      focus_phase: 'plan',
+      mode: 'focus',
+      focus_phase: 'build',
       busy_turn: null,
       exclusive_operation: null,
       usage_summary: {},
@@ -93,9 +93,9 @@ describe('MuseApp 角色导入意图', () => {
     });
     api.fetchModelInfo.mockResolvedValue({ provider: 'mock', model: 'model' });
     api.fetchRuntimeMode.mockResolvedValue({
-      mode: 'daily',
-      focus_phase: 'plan',
-      tool_preset: 'daily',
+      mode: 'focus',
+      focus_phase: 'build',
+      tool_preset: 'focus_build',
       status: 'ok'
     });
     api.fetchVoiceCapabilities.mockResolvedValue({

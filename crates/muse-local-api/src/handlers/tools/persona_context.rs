@@ -403,7 +403,11 @@ fn split_system_prompt_for_segments(turn: &TurnContext) -> (Option<String>, Stri
     if turn.persona_id.is_none() {
         return (None, prompt.to_string());
     }
-    if let Some(index) = prompt.find("\n\n【运行模式】") {
+    let runtime_boundary = ["\n\n【运行状态】", "\n\n【运行模式】"]
+        .into_iter()
+        .filter_map(|marker| prompt.find(marker))
+        .min();
+    if let Some(index) = runtime_boundary {
         let persona = prompt[..index].trim().to_string();
         let system = prompt[index..].trim().to_string();
         return (Some(persona).filter(|value| !value.is_empty()), system);

@@ -447,34 +447,11 @@ fn set_runtime_mode_state(
     Ok(next)
 }
 
-fn runtime_mode_switch_from_message(message: &str) -> Option<RuntimeModeState> {
-    let text = message.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    if ["下班吧", "回到日常", "不用继续工作模式"]
-        .iter()
-        .any(|trigger| text.contains(trigger))
-    {
-        return Some(RuntimeModeState::daily());
-    }
-
-    if ["加班吧", "进入专注模式", "进入工作模式", "认真处理这个"]
-        .iter()
-        .any(|trigger| text.contains(trigger))
-    {
-        return Some(RuntimeModeState::focus());
-    }
-
-    None
-}
-
 fn runtime_mode_notice(mode_state: RuntimeModeState) -> &'static str {
     match mode_state.tool_preset() {
-        ToolPreset::Daily => "已回到日常模式。",
-        ToolPreset::FocusPlan => "已进入专注模式，当前使用计划工具预设。",
-        ToolPreset::FocusBuild => "已进入专注模式。",
+        ToolPreset::Daily => "已进入默认工作态。",
+        ToolPreset::FocusPlan => "已进入计划态。",
+        ToolPreset::FocusBuild => "已恢复默认工作态。",
     }
 }
 
@@ -483,7 +460,8 @@ fn parse_runtime_mode_state(
     focus_phase: Option<&str>,
 ) -> Result<RuntimeModeState, String> {
     match mode.trim() {
-        "daily" => Ok(RuntimeModeState::daily()),
+        // 旧客户端的 daily 请求迁移到默认工作态，不再恢复已移除的产品模式。
+        "daily" => Ok(RuntimeModeState::focus_build()),
         "focus" => match focus_phase.unwrap_or("build").trim() {
             "plan" => Ok(RuntimeModeState::focus_plan()),
             "build" | "" => Ok(RuntimeModeState::focus_build()),
@@ -812,13 +790,6 @@ impl ConversationRuntime {
             register_active_turn(&self.state, &turn_id, runtime_lease)?;
         let _client_disconnect_guard =
             bind_client_disconnect_to_turn(self.state.clone(), turn_id.clone(), emitter.clone());
-        let mode_switch_notice = if let Some(next_mode) = runtime_mode_switch_from_message(&message)
-        {
-            let mode_state = set_runtime_mode_state(&self.state, next_mode)?;
-            Some(runtime_mode_notice(mode_state).to_string())
-        } else {
-            None
-        };
         let mode_state = current_runtime_mode_state(&self.state);
         let binding_result = async {
             let repository = self
@@ -888,6 +859,7 @@ impl ConversationRuntime {
             Some(&active_persona),
             &mut full_tool_defs,
             &required_skill_tools,
+            mode_state.tool_preset(),
         ) {
             Ok(tool_ids) => tool_ids,
             Err(message) => {
@@ -1056,17 +1028,6 @@ impl ConversationRuntime {
             })
             .await
             .map_err(|_| "客户端连接已断开。".to_string())?;
-        if let Some(notice) = mode_switch_notice {
-            emitter
-                .emit(RuntimeEvent::Status {
-                    phase: "mode_switched".to_string(),
-                    message: notice,
-                    detail: Some(format!("工具预设：{}。", mode_state.tool_preset().as_str())),
-                    state: "completed".to_string(),
-                })
-                .await
-                .map_err(|_| "客户端连接已断开。".to_string())?;
-        }
         emitter
             .emit(RuntimeEvent::Status {
                 phase: "queued".to_string(),

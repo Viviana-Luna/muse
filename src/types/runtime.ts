@@ -347,13 +347,13 @@ export interface RuntimeWorkspacesResponse {
 }
 
 // 运行模式。
-export type RuntimeMode = 'daily' | 'focus' | string;
+export type RuntimeMode = 'focus' | string;
 
-// 专注模式阶段。
+// 默认工作态下的可选计划阶段。
 export type RuntimeFocusPhase = 'plan' | 'build' | string;
 
 // 工具预设。
-export type RuntimeToolPreset = 'daily' | 'focus_plan' | 'focus_build' | string;
+export type RuntimeToolPreset = 'focus_plan' | 'focus_build' | string;
 
 // 当前运行模式响应。
 export interface RuntimeModeResponse {

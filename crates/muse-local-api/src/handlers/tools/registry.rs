@@ -89,7 +89,8 @@ async fn execute_runtime_tool(
         let recorded_result = emit_and_record_tool_result(state, tx, turn, &call, &result).await?;
         return Ok(recorded_result);
     }
-    let active_preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::Daily);
+    let active_preset =
+        ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::FocusBuild);
     if !ToolRegistry::is_tool_definition_allowed_for_preset(&def, active_preset) {
         let result = ToolResult {
             status: ToolResultStatus::Failed,
@@ -571,14 +572,11 @@ trait RuntimeToolHandler: Send + Sync {
 
     fn check_permissions(
         &self,
-        state: &Arc<AppState>,
+        _state: &Arc<AppState>,
         turn: &TurnContext,
         call: &ToolCall,
     ) -> Result<(), ToolResult> {
-        if state
-            .tools
-            .is_tool_allowed(Some(&turn.tool_policy), &call.name)
-        {
+        if runtime_tool_allowed(turn, &call.name) {
             Ok(())
         } else {
             Err(ToolResult {
@@ -731,7 +729,7 @@ impl RuntimeToolHandler for EnterPlanModeHandler {
         }
         Some(RuntimeToolContextEffect::Append {
             title: "运行模式",
-            content: "当前已进入专注计划预设；只能读、查、问和写计划，不能直接执行写入或命令。"
+            content: "当前已进入计划态；只能读、查、问和写计划，不能直接执行写入或命令。"
                 .to_string(),
         })
     }

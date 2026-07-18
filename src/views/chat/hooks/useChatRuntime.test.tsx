@@ -86,8 +86,8 @@ describe('useChatRuntime', () => {
         state_revision: stateRevision,
         active_persona_id: persona.id,
         active_conversation_id: activeConversationId,
-        mode: 'daily',
-        focus_phase: 'plan',
+        mode: 'focus',
+        focus_phase: 'build',
         busy_turn: null,
         exclusive_operation: null,
         usage_summary: {},
@@ -117,9 +117,9 @@ describe('useChatRuntime', () => {
       state_revision: stateRevision
     }));
     api.fetchRuntimeMode.mockResolvedValue({
-      mode: 'daily',
-      focus_phase: 'plan',
-      tool_preset: 'daily',
+      mode: 'focus',
+      focus_phase: 'build',
+      tool_preset: 'focus_build',
       status: 'ok'
     });
     api.fetchRuntimeTodos.mockResolvedValue({ todos: [], status: 'ok' });
@@ -154,9 +154,9 @@ describe('useChatRuntime', () => {
       omitted_skill_count: 0
     });
     api.updateRuntimeMode.mockResolvedValue({
-      mode: 'daily',
-      focus_phase: 'plan',
-      tool_preset: 'daily',
+      mode: 'focus',
+      focus_phase: 'build',
+      tool_preset: 'focus_build',
       status: 'ok'
     });
   });
@@ -218,25 +218,25 @@ describe('useChatRuntime', () => {
     expect(result.current.modelLabel).toBe('火山方舟 Agent Plan / GLM 5.2');
   });
 
-  it('通过后端事实切换日常、工作和计划模式', async () => {
+  it('通过后端事实进入计划模式', async () => {
     api.updateRuntimeMode.mockResolvedValue({
       mode: 'focus',
-      focus_phase: 'build',
-      tool_preset: 'focus_build',
+      focus_phase: 'plan',
+      tool_preset: 'focus_plan',
       status: '已切换'
     });
     const { result, notify } = setup();
     await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
 
     await act(async () => {
-      await result.current.handleRuntimeModeChange('focus_build');
+      await result.current.handleRuntimeModeChange('focus_plan');
     });
 
-    expect(api.updateRuntimeMode).toHaveBeenCalledWith('focus', 'build');
-    expect(result.current.runtimeToolPreset).toBe('focus_build');
+    expect(api.updateRuntimeMode).toHaveBeenCalledWith('focus', 'plan');
+    expect(result.current.runtimeToolPreset).toBe('focus_plan');
     expect(result.current.runtimeModeSwitching).toBe(false);
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ title: '已切换为工作模式', tone: 'success' })
+      expect.objectContaining({ title: '已进入计划模式', tone: 'success' })
     );
   });
 
@@ -249,10 +249,10 @@ describe('useChatRuntime', () => {
       await result.current.handleRuntimeModeChange('focus_plan');
     });
 
-    expect(result.current.runtimeToolPreset).toBe('daily');
+    expect(result.current.runtimeToolPreset).toBe('focus_build');
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({
-        title: '切换运行模式失败',
+        title: '切换计划状态失败',
         description: '运行时忙碌',
         tone: 'error'
       })
@@ -356,8 +356,8 @@ describe('useChatRuntime', () => {
         state_revision: stateRevision,
         active_persona_id: stateRevision === 1 ? persona.id : nextPersona.id,
         active_conversation_id: stateRevision === 1 ? 'active' : 'history-b',
-        mode: 'daily',
-        focus_phase: 'plan',
+        mode: 'focus',
+        focus_phase: 'build',
         busy_turn: null,
         exclusive_operation: null,
         usage_summary: {},

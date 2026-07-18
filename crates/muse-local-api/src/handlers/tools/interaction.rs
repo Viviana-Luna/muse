@@ -957,7 +957,7 @@ async fn tool_enter_plan_mode(
             "plan_mode_entered",
             reason
                 .clone()
-                .unwrap_or_else(|| "已进入专注计划预设。".to_string()),
+                .unwrap_or_else(|| "已进入计划态。".to_string()),
             Some(&call.name),
         )
         .await,
@@ -966,8 +966,8 @@ async fn tool_enter_plan_mode(
     ToolResult {
         status: ToolResultStatus::Success,
         content: reason
-            .map(|reason| format!("已进入专注计划预设：{reason}"))
-            .unwrap_or_else(|| "已进入专注计划预设。".to_string()),
+            .map(|reason| format!("已进入计划态：{reason}"))
+            .unwrap_or_else(|| "已进入计划态。".to_string()),
         structured: Some(serde_json::json!({
             "runtime_mode_state": mode_state_json(mode_state),
         })),
@@ -1020,7 +1020,7 @@ async fn tool_exit_plan_mode(
             Ok(decision) => decision,
             Err(_) => {
                 return tool_failed(
-                    "计划确认等待被中断，仍保持专注计划预设。",
+                    "计划确认等待被中断，仍保持计划态。",
                     "plan_confirmation_interrupted",
                 );
             }
@@ -1062,7 +1062,7 @@ async fn tool_exit_plan_mode(
         );
         return ToolResult {
             status: ToolResultStatus::Failed,
-            content: "计划未获得确认，已保持在专注计划预设。".to_string(),
+            content: "计划未获得确认，已保持在计划态。".to_string(),
             structured: Some(serde_json::json!({
                 "confirmed": false,
                 "reason": reason,
@@ -1134,9 +1134,9 @@ async fn tool_exit_plan_mode(
             if confirmed {
                 "计划已确认，已回到专注工作预设。"
             } else if cancelled {
-                "用户取消计划，已保持在专注计划预设。"
+                "用户取消计划，已保持在计划态。"
             } else {
-                "用户要求继续调整计划，已保持在专注计划预设。"
+                "用户要求继续调整计划，已保持在计划态。"
             },
             Some(&call.name),
         )
@@ -1148,10 +1148,10 @@ async fn tool_exit_plan_mode(
         content: if confirmed {
             "用户已确认计划，已回到专注工作预设。请按计划继续执行。".to_string()
         } else if cancelled {
-            "用户取消了计划，已保持在专注计划预设。请停止执行该计划，等待用户下一步指示。"
+            "用户取消了计划，已保持在计划态。请停止执行该计划，等待用户下一步指示。"
                 .to_string()
         } else {
-            "用户要求继续调整计划，已保持在专注计划预设。请根据反馈修改计划后再提交确认。"
+            "用户要求继续调整计划，已保持在计划态。请根据反馈修改计划后再提交确认。"
                 .to_string()
         },
         structured: Some(serde_json::json!({

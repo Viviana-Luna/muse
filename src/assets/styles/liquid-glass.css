@@ -352,7 +352,7 @@
 }
 
 .story-reading-column .skill-picker-trigger,
-.story-reading-column .runtime-mode-trigger {
+.story-reading-column .plan-mode-trigger {
   display: inline-flex;
   min-height: 32px;
   align-items: center;
@@ -368,138 +368,25 @@
 
 .story-reading-column .skill-picker-trigger:hover:not(:disabled),
 .story-reading-column .skill-picker-trigger.is-selected,
-.story-reading-column .runtime-mode-trigger:hover:not(:disabled),
-.story-reading-column .runtime-mode-trigger.is-open {
+.story-reading-column .plan-mode-trigger:hover:not(:disabled),
+.story-reading-column .plan-mode-trigger.is-selected {
   border-color: var(--accent-edge);
   background: color-mix(in srgb, var(--theme-color), transparent 90%);
   color: var(--text-primary);
 }
 
 .story-reading-column .skill-picker-trigger svg,
-.story-reading-column .runtime-mode-trigger svg {
+.story-reading-column .plan-mode-trigger svg {
   width: 15px;
   height: 15px;
 }
 
-.story-reading-column .runtime-mode-control {
-  position: relative;
-}
-
-.story-reading-column .runtime-mode-trigger {
+.story-reading-column .plan-mode-trigger {
   white-space: nowrap;
 }
 
-.story-reading-column .runtime-mode-trigger .runtime-mode-chevron {
-  width: 12px;
-  height: 12px;
-  transition: transform 160ms ease;
-}
-
-.story-reading-column .runtime-mode-trigger.is-open .runtime-mode-chevron {
-  transform: rotate(180deg);
-}
-
-.story-reading-column .runtime-mode-trigger .is-spinning {
+.story-reading-column .plan-mode-trigger .is-spinning {
   animation: runtime-mode-spin 800ms linear infinite;
-}
-
-.story-reading-column .runtime-mode-menu {
-  position: absolute;
-  z-index: 32;
-  bottom: calc(100% + 10px);
-  left: 0;
-  display: grid;
-  width: min(286px, calc(100vw - 48px));
-  gap: 5px;
-  padding: 9px;
-  border: 1px solid var(--glass-edge);
-  border-radius: 16px;
-  background: color-mix(in srgb, var(--glass-surface-strong), transparent 2%);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 28%),
-    0 20px 48px rgba(0, 0, 0, 0.24);
-  backdrop-filter: blur(28px) saturate(1.25);
-  -webkit-backdrop-filter: blur(28px) saturate(1.25);
-}
-
-.story-reading-column .runtime-mode-menu-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 4px 6px 7px;
-  color: var(--text-primary);
-}
-
-.story-reading-column .runtime-mode-menu-heading strong {
-  font-size: 12px;
-}
-
-.story-reading-column .runtime-mode-menu-heading span {
-  color: var(--text-muted);
-  font-size: 10px;
-}
-
-.story-reading-column .runtime-mode-menu > button {
-  display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 18px;
-  min-height: 50px;
-  align-items: center;
-  gap: 9px;
-  padding: 7px 9px;
-  border: 1px solid transparent;
-  border-radius: 12px;
-  background: transparent;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.story-reading-column .runtime-mode-menu > button:hover,
-.story-reading-column .runtime-mode-menu > button:focus-visible,
-.story-reading-column .runtime-mode-menu > button.is-selected {
-  border-color: var(--accent-edge);
-  background: color-mix(in srgb, var(--theme-color), transparent 90%);
-  color: var(--text-primary);
-}
-
-.story-reading-column .runtime-mode-option-icon {
-  display: inline-flex;
-  width: 32px;
-  height: 32px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid color-mix(in srgb, var(--glass-edge), transparent 8%);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--glass-surface-soft), transparent 12%);
-}
-
-.story-reading-column .runtime-mode-option-icon svg,
-.story-reading-column .runtime-mode-check {
-  width: 15px;
-  height: 15px;
-}
-
-.story-reading-column .runtime-mode-option-copy {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.story-reading-column .runtime-mode-option-copy strong {
-  color: inherit;
-  font-size: 12px;
-}
-
-.story-reading-column .runtime-mode-option-copy small {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.story-reading-column .runtime-mode-check {
-  color: var(--theme-color);
 }
 
 @keyframes runtime-mode-spin {
@@ -2232,8 +2119,7 @@
   }
 
   .skill-picker-drawer,
-  .runtime-mode-menu,
-  .runtime-mode-trigger .is-spinning,
+  .plan-mode-trigger .is-spinning,
   .skill-picker-layer .is-spinning {
     animation: none;
     transition-duration: 1ms !important;
@@ -2247,11 +2133,6 @@
 
   .story-reading-column .composer-insertions {
     grid-column: 1;
-  }
-
-  .story-reading-column .runtime-mode-menu {
-    left: auto;
-    right: 0;
   }
 
   .story-reading-column .composer-status {

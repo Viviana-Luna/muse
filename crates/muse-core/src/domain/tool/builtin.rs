@@ -240,7 +240,7 @@ fn register_harness_tools(registry: &mut ToolRegistry) {
     register_web_runtime_tool(
         registry,
         "enter_plan_mode",
-        "进入专注模式下的计划工具预设。计划预设只允许读、查、问和写计划，不直接执行写入或命令。",
+        "进入临时计划态。计划态只允许读、查、问和写计划，不直接执行写入或命令。",
         "planning",
         ToolRisk::ExternalSideEffect,
         false,

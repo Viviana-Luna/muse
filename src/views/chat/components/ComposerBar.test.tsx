@@ -31,7 +31,7 @@ describe('ComposerBar', () => {
       <ComposerBar
         busy={false}
         inputValue=""
-        runtimeToolPreset="daily"
+        runtimeToolPreset="focus_build"
         skillPicker={createSkillPicker()}
         voice={{
           status: '语音未启用',
@@ -92,7 +92,7 @@ describe('ComposerBar', () => {
     expect(onStopVoice).toHaveBeenCalledTimes(1);
     expect(composer.getByRole('button', { name: '发送' })).toBeDisabled();
     expect(composer.getByRole('button', { name: 'Skill' })).toBeDisabled();
-    expect(composer.getByRole('button', { name: '运行模式：计划' })).toBeDisabled();
+    expect(composer.getByRole('button', { name: '退出计划模式' })).toBeDisabled();
   });
 
   it('展示已选择的 Skill 附件并允许在空闲时移除', () => {
@@ -102,7 +102,7 @@ describe('ComposerBar', () => {
       <ComposerBar
         busy={false}
         inputValue="生成一份报告"
-        runtimeToolPreset="daily"
+        runtimeToolPreset="focus_build"
         skillPicker={createSkillPicker({
           selectedSkill: {
             name: 'pdf',
