@@ -82,6 +82,34 @@ function formatVoiceError(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function microphoneAccessError(error: unknown) {
+  const name = error instanceof DOMException || error instanceof Error ? error.name : '';
+  switch (name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return {
+        status: '麦克风权限被拒绝',
+        description: '请在系统设置的麦克风隐私权限中允许 Muse 访问，然后返回应用重试。'
+      };
+    case 'NotFoundError':
+      return {
+        status: '未检测到可用麦克风',
+        description: '请连接或启用麦克风设备，然后重试语音输入。'
+      };
+    case 'NotReadableError':
+    case 'AbortError':
+      return {
+        status: '麦克风暂时无法使用',
+        description: '麦克风可能正被其他应用占用，请关闭占用后重试。'
+      };
+    default:
+      return {
+        status: '无法访问麦克风',
+        description: '当前环境无法访问麦克风，请检查系统权限或音频设备后重试。'
+      };
+  }
+}
+
 function mergePcmChunks(chunks: Float32Array[]): Float32Array {
   const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
   const merged = new Float32Array(length);
@@ -652,11 +680,11 @@ export function useVoiceRuntime({
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
+    } catch (error) {
       if (recordingRequestIdRef.current !== requestId) return;
-      const message = '麦克风权限被拒绝';
-      setVoicePhase('error', { status: message });
-      notifyVoiceError('语音输入失败', message);
+      const diagnostic = microphoneAccessError(error);
+      setVoicePhase('error', { status: diagnostic.status });
+      notifyVoiceError('语音输入失败', diagnostic.description);
       return;
     }
     if (!mountedRef.current || recordingRequestIdRef.current !== requestId) {

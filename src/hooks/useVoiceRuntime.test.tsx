@@ -127,6 +127,44 @@ describe('useVoiceRuntime', () => {
     expect(result.current.voice.listening).toBe(true);
   });
 
+  it.each([
+    [
+      'NotAllowedError',
+      '麦克风权限被拒绝',
+      '请在系统设置的麦克风隐私权限中允许 Muse 访问，然后返回应用重试。'
+    ],
+    ['NotFoundError', '未检测到可用麦克风', '请连接或启用麦克风设备，然后重试语音输入。'],
+    ['NotReadableError', '麦克风暂时无法使用', '麦克风可能正被其他应用占用，请关闭占用后重试。']
+  ])('麦克风访问失败 %s 会返回可操作诊断', async (name, status, description) => {
+    const getUserMedia = vi.fn(() => Promise.reject(new DOMException('test', name)));
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      mediaDevices: { getUserMedia }
+    });
+    const onNotify = vi.fn();
+    const { result } = renderHook(() =>
+      useVoiceRuntime({
+        onTranscript: vi.fn(),
+        getTranscriptContext: transcriptContext,
+        onNotify
+      })
+    );
+    await waitFor(() => expect(result.current.voice.speechRecognitionAvailable).toBe(true));
+
+    await act(async () => {
+      await result.current.startVoiceInput();
+    });
+
+    expect(result.current.voice.phase).toBe('error');
+    expect(result.current.voice.status).toBe(status);
+    expect(onNotify).toHaveBeenCalledWith({
+      title: '语音输入失败',
+      description,
+      tone: 'error',
+      duration: 7200
+    });
+  });
+
   it('停止语音会使尚未完成的麦克风权限请求失效', async () => {
     const permission = deferred<MediaStream>();
     const stopTrack = vi.fn();

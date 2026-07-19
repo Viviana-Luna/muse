@@ -26,7 +26,9 @@
     "category": "Utility",
     "shortDescription": "本地优先的角色扮演 Agent",
     "macOS": {
-      "minimumSystemVersion": "13.1"
+      "minimumSystemVersion": "13.1",
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist"
     },
     "windows": {
       "webviewInstallMode": {

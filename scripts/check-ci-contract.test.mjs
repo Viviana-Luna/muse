@@ -218,6 +218,17 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
     'icons/muse-logo.ico',
   ]);
   assert.equal(tauriConfig.bundle.macOS.minimumSystemVersion, '13.1');
+  assert.equal(tauriConfig.bundle.macOS.infoPlist, 'Info.plist');
+  assert.equal(tauriConfig.bundle.macOS.entitlements, 'Entitlements.plist');
+  const macInfoPlist = read('src-tauri/Info.plist');
+  assert.match(macInfoPlist, /<key>NSMicrophoneUsageDescription<\/key>/);
+  assert.match(
+    macInfoPlist,
+    /<string>[^<]*语音识别服务[^<]*<\/string>/,
+    '麦克风用途说明必须解释录音会发送到用户配置的语音识别服务。'
+  );
+  const macEntitlements = read('src-tauri/Entitlements.plist');
+  assert.match(macEntitlements, /<key>com\.apple\.security\.device\.audio-input<\/key>\s*<true\/>/);
   assert.equal(
     tauriConfig.bundle.windows.webviewInstallMode.type,
     'downloadBootstrapper',
