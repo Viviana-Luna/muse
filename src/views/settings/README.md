@@ -13,7 +13,7 @@
 - `tts`：语音合成配置，负责外接语音服务、音色、语速、输出格式和测试播报。
 - `speech_recognition`：OpenAI-compatible 语音识别配置，负责服务地址、密钥、模型、语言和返回格式。
 - `workspace`：工具工作区策略，负责权限模式、沙箱模式和风险提示。
-- `web_search`：联网搜索密钥草稿，只显示是否已配置，保存时使用 `keep | replace | delete` 动作。
+- `web_search`：Exa 联网搜索后端与密钥草稿。默认使用免费 MCP；切换 API 方案后，密钥按 `keep | replace | delete` 动作保存到系统凭据库。
 - `appearance`：客户端外观配置，当前负责动效强度；旧版背景模糊与可见度字段继续由本地 API 兼容读取，但不再出现在产品界面。草稿随“保存全部更改”通过本地 API 原子写入用户级 `config.toml`，不进入模型配置或浏览器持久状态。
 - `diagnostics`：系统诊断摘要，负责展示当前端点配置、运行状态和真实连通性检测结果。
 

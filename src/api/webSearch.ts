@@ -7,7 +7,7 @@ export async function fetchWebSearchConfig(): Promise<WebSearchConfig> {
   return readJson<WebSearchConfig>(await apiFetch('/api/web-search/config'));
 }
 
-/// 更新 Brave Search 密钥；后端只操作系统凭据库，不会回传明文。
+/// 更新 Exa 搜索后端与密钥；后端不会回传明文。
 export async function saveWebSearchConfig(payload: WebSearchConfigUpdate): Promise<WebSearchConfig> {
   return readJson<WebSearchConfig>(
     await apiFetch('/api/web-search/config', {

@@ -144,12 +144,16 @@ export function useSettingsController(options: UseSettingsControllerOptions) {
       const webSearch =
         webSearchResult.status === 'fulfilled'
           ? webSearchResult.value
-          : { api_key_configured: draft.webSearchConfigured };
+          : {
+              provider: draft.webSearchProvider,
+              api_key_configured: draft.webSearchConfigured
+            };
       draft.applyLoadedSettings({
         config: normalizeSettingsConfig(configResult.value, catalog),
         catalog,
         permissionMode: workspaces.permission_mode,
         sandboxMode: workspaces.sandbox_mode,
+        webSearchProvider: webSearch.provider,
         webSearchConfigured: webSearch.api_key_configured,
         panel
       });
@@ -329,13 +333,26 @@ export function useSettingsController(options: UseSettingsControllerOptions) {
         try {
           const update =
             draft.webSearchAction === 'replace'
-              ? ({ action: 'replace', value: draft.webSearchKeyDraft.trim() } as const)
-              : ({ action: 'delete' } as const);
+              ? ({
+                  provider: draft.webSearchProvider,
+                  action: 'replace',
+                  value: draft.webSearchKeyDraft.trim()
+                } as const)
+              : draft.webSearchAction === 'delete'
+                ? ({ provider: draft.webSearchProvider, action: 'delete' } as const)
+                : ({ provider: draft.webSearchProvider, action: 'keep' } as const);
           if (update.action === 'replace' && !update.value) {
-            throw new Error('请输入有效的 Brave Search API Key。');
+            throw new Error('请输入有效的 Exa API Key。');
+          }
+          if (
+            update.provider === 'exa_api' &&
+            update.action !== 'replace' &&
+            !draft.webSearchConfigured
+          ) {
+            throw new Error('Exa API Key 模式需要先配置有效密钥。');
           }
           const webSearch = await saveWebSearchConfig(update);
-          draft.applyWebSearchState(webSearch.api_key_configured);
+          draft.applyWebSearchState(webSearch.provider, webSearch.api_key_configured);
         } catch (err) {
           const message = formatApiErrorMessage(err, '保存失败');
           failures.push(`联网搜索：${message}`);

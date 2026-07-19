@@ -8,7 +8,7 @@ import type {
   ModelConfigSection,
   ModelsConfig
 } from '@/types';
-import type { SecretUpdate } from '@/types';
+import type { SecretUpdate, WebSearchProvider } from '@/types';
 import {
   DEFAULT_APPEARANCE_SETTINGS,
   type AppearanceSettings,
@@ -40,6 +40,7 @@ export interface LoadedSettingsDraft {
   catalog: ModelCatalog;
   permissionMode: string;
   sandboxMode: string;
+  webSearchProvider: WebSearchProvider;
   webSearchConfigured: boolean;
   panel: SettingsPanel;
 }
@@ -57,6 +58,8 @@ export interface UseSettingsDraftResult {
   setWorkspaceSandboxMode: Dispatch<SetStateAction<string>>;
   webSearchConfigured: boolean;
   setWebSearchConfigured: Dispatch<SetStateAction<boolean>>;
+  webSearchProvider: WebSearchProvider;
+  stageWebSearchProvider: (provider: WebSearchProvider) => void;
   webSearchKeyDraft: string;
   stageWebSearchKey: (value: string) => void;
   stageWebSearchDelete: () => void;
@@ -75,7 +78,7 @@ export interface UseSettingsDraftResult {
   maskedKeys: SettingsMaskedKeys;
   setMaskedKeys: Dispatch<SetStateAction<SettingsMaskedKeys>>;
   applyLoadedSettings: (draft: LoadedSettingsDraft) => void;
-  applyWebSearchState: (configured: boolean) => void;
+  applyWebSearchState: (provider: WebSearchProvider, configured: boolean) => void;
   dirtyDomains: SettingsDirtyDomain[];
   markModelsSaved: (config: ModelsConfig) => void;
   markWorkspaceSaved: (permissionMode: string, sandboxMode: string) => void;
@@ -136,6 +139,10 @@ export function useSettingsDraft(): UseSettingsDraftResult {
   const [workspacePermissionMode, setWorkspacePermissionMode] = useState('request_approval');
   const [workspaceSandboxMode, setWorkspaceSandboxMode] = useState('workspace_write');
   const [webSearchConfigured, setWebSearchConfigured] = useState(false);
+  const [webSearchProvider, setWebSearchProvider] =
+    useState<WebSearchProvider>('exa_free_mcp');
+  const [savedWebSearchProvider, setSavedWebSearchProvider] =
+    useState<WebSearchProvider>('exa_free_mcp');
   const [webSearchKeyDraft, setWebSearchKeyDraft] = useState('');
   const [webSearchAction, setWebSearchAction] = useState<SecretUpdate['action']>('keep');
   const [appearanceSettings, setAppearanceSettings] =
@@ -169,7 +176,9 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     ) {
       dirty.push('workspace');
     }
-    if (webSearchAction !== 'keep') dirty.push('web_search');
+    if (webSearchAction !== 'keep' || webSearchProvider !== savedWebSearchProvider) {
+      dirty.push('web_search');
+    }
     if (JSON.stringify(appearanceSettings) !== savedAppearanceSnapshot) dirty.push('appearance');
     return dirty;
   }, [
@@ -178,6 +187,8 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     savedModelsSnapshot,
     savedWorkspaceSnapshot,
     settingsConfig,
+    webSearchProvider,
+    savedWebSearchProvider,
     webSearchAction,
     workspacePermissionMode,
     workspaceSandboxMode
@@ -198,6 +209,8 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     setWorkspacePermissionMode(draft.permissionMode);
     setWorkspaceSandboxMode(draft.sandboxMode);
     setSavedWorkspaceSnapshot(JSON.stringify([draft.permissionMode, draft.sandboxMode]));
+    setWebSearchProvider(draft.webSearchProvider);
+    setSavedWebSearchProvider(draft.webSearchProvider);
     setWebSearchConfigured(draft.webSearchConfigured);
     setWebSearchKeyDraft('');
     setWebSearchAction('keep');
@@ -205,10 +218,19 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     setSettingsOpen(true);
   }
 
-  function applyWebSearchState(configured: boolean) {
+  function applyWebSearchState(provider: WebSearchProvider, configured: boolean) {
+    setWebSearchProvider(provider);
+    setSavedWebSearchProvider(provider);
     setWebSearchConfigured(configured);
     setWebSearchKeyDraft('');
     setWebSearchAction('keep');
+  }
+
+  function stageWebSearchProvider(provider: WebSearchProvider) {
+    setWebSearchProvider(provider);
+    if (provider === 'exa_api' && webSearchAction === 'delete') {
+      setWebSearchAction('keep');
+    }
   }
 
   function stageWebSearchKey(value: string) {
@@ -219,6 +241,7 @@ export function useSettingsDraft(): UseSettingsDraftResult {
   function stageWebSearchDelete() {
     setWebSearchKeyDraft('');
     setWebSearchAction('delete');
+    setWebSearchProvider('exa_free_mcp');
   }
 
   function stageWorkspacePolicy(permissionMode: string, sandboxMode: string) {
@@ -259,6 +282,7 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     }
     setWebSearchKeyDraft('');
     setWebSearchAction('keep');
+    setWebSearchProvider(savedWebSearchProvider);
     setAppearanceSettings(JSON.parse(savedAppearanceSnapshot) as AppearanceSettings);
   }
 
@@ -311,6 +335,8 @@ export function useSettingsDraft(): UseSettingsDraftResult {
     setWorkspaceSandboxMode,
     webSearchConfigured,
     setWebSearchConfigured,
+    webSearchProvider,
+    stageWebSearchProvider,
     webSearchKeyDraft,
     stageWebSearchKey,
     stageWebSearchDelete,

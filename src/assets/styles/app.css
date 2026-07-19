@@ -8045,9 +8045,15 @@ button.muse-runtime-model svg {
   }
 }
 
-/* 联网搜索密钥只呈现状态与安全边界，避免把凭据管理做成模型表单。 */
+/* 联网搜索只暴露后端选择与凭据状态，避免把调用细节混入模型表单。 */
 .web-search-settings-card {
   align-content: start;
+}
+
+.web-search-provider-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .web-search-provider,
@@ -8060,6 +8066,40 @@ button.muse-runtime-model svg {
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.035);
+}
+
+.web-search-provider {
+  width: 100%;
+  appearance: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.web-search-provider:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--theme-color), transparent 58%);
+  background: color-mix(in srgb, var(--theme-color), transparent 91%);
+}
+
+.web-search-provider.active {
+  border-color: color-mix(in srgb, var(--theme-color), transparent 38%);
+  background: color-mix(in srgb, var(--theme-color), transparent 86%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-color), transparent 76%);
+}
+
+.web-search-provider:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--theme-color), #fff 18%);
+  outline-offset: 2px;
+}
+
+.web-search-provider:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .web-search-provider-icon {
@@ -8319,6 +8359,10 @@ button.muse-runtime-model svg {
 }
 
 @media (max-width: 680px) {
+  .web-search-provider-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .web-search-provider {
     grid-template-columns: auto minmax(0, 1fr);
   }

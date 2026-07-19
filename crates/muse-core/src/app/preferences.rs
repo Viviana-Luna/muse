@@ -114,6 +114,32 @@ impl Default for UpdatePreferences {
     }
 }
 
+/// 联网搜索执行后端。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchProvider {
+    /// Exa 托管的匿名免费 MCP。
+    #[default]
+    ExaFreeMcp,
+    /// 使用用户 Exa API Key 的正式 Search API。
+    ExaApi,
+}
+
+impl WebSearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExaFreeMcp => "exa_free_mcp",
+            Self::ExaApi => "exa_api",
+        }
+    }
+}
+
+/// 联网搜索非敏感偏好；API Key 始终由系统凭据库承载。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchPreferences {
+    pub provider: WebSearchProvider,
+}
+
 /// 当前已实现的用户级声明式配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MuseConfig {
@@ -122,6 +148,7 @@ pub struct MuseConfig {
     pub conversation: ConversationPreferences,
     pub voice: VoicePreferences,
     pub updates: UpdatePreferences,
+    pub web_search: WebSearchPreferences,
     /// Provider Profile 与活动模型选择。API 响应不得直接序列化这个字段。
     #[serde(skip_serializing)]
     pub model_profiles: ModelProfileConfig,
@@ -141,6 +168,7 @@ impl Default for MuseConfig {
             conversation: ConversationPreferences::default(),
             voice: VoicePreferences::default(),
             updates: UpdatePreferences::default(),
+            web_search: WebSearchPreferences::default(),
             model_profiles: ModelProfileConfig::default(),
             mcp_profiles: McpProfileConfig::default(),
             skill_preferences: SkillPreferences::default(),
@@ -328,6 +356,19 @@ impl MuseConfigStore {
 
     pub fn skill_preferences(&self) -> &SkillPreferences {
         &self.config.skill_preferences
+    }
+
+    pub fn web_search_preferences(&self) -> &WebSearchPreferences {
+        &self.config.web_search
+    }
+
+    /// 原子发布联网搜索非敏感偏好；API Key 由调用方单独写入系统凭据库。
+    pub fn update_web_search_preferences(
+        &mut self,
+        preferences: WebSearchPreferences,
+    ) -> Result<(), MuseConfigStoreError> {
+        self.reject_external_modification()?;
+        self.commit_web_search_preferences(preferences)
     }
 
     /// Skill 管理与迁移共用的原子启停配置发布入口。
@@ -604,6 +645,23 @@ impl MuseConfigStore {
         Ok(())
     }
 
+    fn commit_web_search_preferences(
+        &mut self,
+        preferences: WebSearchPreferences,
+    ) -> Result<(), MuseConfigStoreError> {
+        let mut next_document = self.document.clone();
+        write_web_search_preferences(&mut next_document, preferences)?;
+        let (config, diagnostics) = decode_document(&next_document)?;
+        let content = next_document.to_string();
+        atomic_write_sensitive_synced(&self.storage_path, content.as_bytes())?;
+        self.document = next_document;
+        self.runtime_models = config.model_profiles.resolve_runtime();
+        self.config = config;
+        self.diagnostics = diagnostics;
+        self.content_digest = content_digest(content.as_bytes());
+        Ok(())
+    }
+
     /// 跨 `SKILL.md` 与 `config.toml` 事务失败时恢复已发布前的配置快照。
     pub(crate) fn restore_snapshot(&mut self, previous: &Self) -> Result<(), MuseConfigStoreError> {
         let current = std::fs::read(&self.storage_path)?;
@@ -698,6 +756,9 @@ input_language = "zh"
 
 [updates]
 check_on_startup = true
+
+[web_search]
+provider = "exa_free_mcp"
 "#
     .parse()
     .expect("内置 config.toml 模板必须有效")
@@ -824,6 +885,30 @@ fn decode_document(
             &mut diagnostics,
         );
     }
+    if let Some(table) = document.get("web_search").and_then(Item::as_table) {
+        let provider = read_enum_string(
+            table,
+            "provider",
+            "web_search.provider",
+            config.web_search.provider.as_str(),
+            &["exa_free_mcp", "exa_api"],
+            &mut diagnostics,
+        );
+        config.web_search.provider = if provider == "exa_api" {
+            WebSearchProvider::ExaApi
+        } else {
+            WebSearchProvider::ExaFreeMcp
+        };
+    } else if document
+        .get("web_search")
+        .is_some_and(|item| !item.is_table())
+    {
+        diagnostics.push(diagnostic(
+            "config_type_invalid",
+            "web_search",
+            "配置段 `web_search` 必须是 TOML 表，当前使用免费搜索默认值。",
+        ));
+    }
     config.model_profiles = decode_model_profiles(document, &mut diagnostics);
     config.mcp_profiles = decode_mcp_profiles(document, &mut diagnostics);
     config.skill_preferences = decode_skill_preferences(document, &mut diagnostics);
@@ -837,6 +922,7 @@ fn collect_unknown_fields(document: &DocumentMut, diagnostics: &mut Vec<ConfigDi
         "conversation",
         "voice",
         "updates",
+        "web_search",
         "providers",
         "active_models",
         "mcp_servers",
@@ -865,6 +951,7 @@ fn collect_unknown_fields(document: &DocumentMut, diagnostics: &mut Vec<ConfigDi
         ("conversation", &["send_key", "restore_last_session"][..]),
         ("voice", &["auto_play", "input_language"][..]),
         ("updates", &["check_on_startup"][..]),
+        ("web_search", &["provider"][..]),
         ("skills", &["config"][..]),
     ] {
         let Some(table) = document.get(section).and_then(Item::as_table) else {
@@ -1386,6 +1473,34 @@ fn write_appearance(
     Ok(())
 }
 
+fn write_web_search_preferences(
+    document: &mut DocumentMut,
+    preferences: WebSearchPreferences,
+) -> Result<(), MuseConfigStoreError> {
+    if document
+        .get("web_search")
+        .is_some_and(|item| !item.is_table())
+    {
+        return Err(validation(
+            "config_type_invalid",
+            "web_search",
+            "配置段 `web_search` 必须是 TOML 表；为避免覆盖未知内容，本次保存已取消。",
+        ));
+    }
+    if document.get("web_search").is_none() {
+        document["web_search"] = Item::Table(Table::new());
+    }
+    let table = document["web_search"]
+        .as_table_mut()
+        .expect("web_search 已转换为表");
+    set_value_preserving_decor(
+        table,
+        "provider",
+        Value::from(preferences.provider.as_str()),
+    );
+    Ok(())
+}
+
 fn set_value_preserving_decor(table: &mut Table, key: &str, new_value: Value) {
     if let Some(item) = table.get_mut(key) {
         let decor = item.as_value().map(|current| current.decor().clone());
@@ -1413,7 +1528,10 @@ fn reject_non_regular_config_path(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppearancePreferences, MotionLevel, MuseConfigStore};
+    use super::{
+        AppearancePreferences, MotionLevel, MuseConfigStore, WebSearchPreferences,
+        WebSearchProvider,
+    };
     use crate::domain::mcp::{McpProfileConfig, McpServerProfile};
     use crate::domain::skill::SkillPreferences;
     use std::collections::BTreeMap;
@@ -1437,7 +1555,69 @@ mod tests {
         assert!(content.contains("schema_version = 1"));
         assert!(!store.has_published_model_profiles());
         assert_eq!(store.snapshot().config.appearance.background_blur, 18);
+        assert_eq!(
+            store.web_search_preferences().provider,
+            WebSearchProvider::ExaFreeMcp
+        );
         assert!(store.snapshot().diagnostics.is_empty());
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn web_search_defaults_to_free_and_persists_api_choice_without_losing_extensions() {
+        let root = unique_root("web-search-provider");
+        std::fs::create_dir_all(&root).expect("应创建测试目录");
+        std::fs::write(
+            root.join("config.toml"),
+            r#"schema_version = 1
+
+[appearance]
+theme = "system"
+language = "zh-CN"
+background_blur = 18
+background_opacity = 1.0
+motion_level = "full"
+
+[conversation]
+send_key = "enter"
+restore_last_session = true
+
+[voice]
+auto_play = false
+input_language = "zh"
+
+[updates]
+check_on_startup = true
+"#,
+        )
+        .expect("应写入旧版配置");
+        let mut store = MuseConfigStore::load_from_dir(&root).expect("应加载旧版配置");
+        assert_eq!(
+            store.web_search_preferences().provider,
+            WebSearchProvider::ExaFreeMcp
+        );
+        assert!(
+            store
+                .snapshot()
+                .diagnostics
+                .iter()
+                .all(|item| item.field_path != "web_search")
+        );
+
+        store
+            .update_web_search_preferences(WebSearchPreferences {
+                provider: WebSearchProvider::ExaApi,
+            })
+            .expect("应保存 API 模式");
+        let content = std::fs::read_to_string(root.join("config.toml")).expect("应读取配置");
+        assert!(content.contains("[web_search]"));
+        assert!(content.contains("provider = \"exa_api\""));
+
+        let reloaded = MuseConfigStore::load_from_dir(&root).expect("应重新加载配置");
+        assert_eq!(
+            reloaded.web_search_preferences().provider,
+            WebSearchProvider::ExaApi
+        );
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
 

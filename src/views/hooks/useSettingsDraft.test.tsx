@@ -72,6 +72,7 @@ describe('useSettingsDraft', () => {
         catalog,
         permissionMode: 'deny',
         sandboxMode: 'read_only',
+        webSearchProvider: 'exa_api',
         webSearchConfigured: true,
         panel: 'web_search'
       })
@@ -82,6 +83,7 @@ describe('useSettingsDraft', () => {
     expect(result.current.settingsConfig?.chat.model).toBe('deepseek-chat');
     expect(result.current.maskedKeys.chat).toBe('••••••••');
     expect(result.current.workspacePermissionMode).toBe('deny');
+    expect(result.current.webSearchProvider).toBe('exa_api');
     expect(result.current.webSearchConfigured).toBe(true);
   });
 
@@ -93,6 +95,7 @@ describe('useSettingsDraft', () => {
         catalog,
         permissionMode: 'request_approval',
         sandboxMode: 'workspace_write',
+        webSearchProvider: 'exa_free_mcp',
         webSearchConfigured: false,
         panel: 'chat'
       })
@@ -102,7 +105,8 @@ describe('useSettingsDraft', () => {
       result.current.updateSection('chat', 'model', 'deepseek-reasoner');
       result.current.updateSpeechRecognition('model', 'gpt-4o-mini-transcribe');
       result.current.updateSpeechRecognition('language', 'ja');
-      result.current.stageWebSearchKey('brv-draft');
+      result.current.stageWebSearchProvider('exa_api');
+      result.current.stageWebSearchKey('exa-draft');
     });
 
     expect(result.current.settingsConfig?.chat.model).toBe('deepseek-reasoner');
@@ -110,7 +114,8 @@ describe('useSettingsDraft', () => {
     expect(result.current.settingsConfig?.speech_recognition.language).toBe('ja');
     expect(result.current.settingsConfig?.voice_input.mode).toBe('speech_text');
     expect(result.current.webSearchConfigured).toBe(false);
-    expect(result.current.webSearchKeyDraft).toBe('brv-draft');
+    expect(result.current.webSearchProvider).toBe('exa_api');
+    expect(result.current.webSearchKeyDraft).toBe('exa-draft');
     expect(result.current.dirtyDomains).toEqual(expect.arrayContaining(['models', 'web_search']));
   });
 
@@ -155,6 +160,7 @@ describe('useSettingsDraft', () => {
         catalog,
         permissionMode: 'request_approval',
         sandboxMode: 'workspace_write',
+        webSearchProvider: 'exa_api',
         webSearchConfigured: true,
         panel: 'chat'
       })
@@ -169,10 +175,34 @@ describe('useSettingsDraft', () => {
     expect(result.current.dirtyDomains).not.toContain('models');
     expect(result.current.dirtyDomains).toContain('web_search');
     expect(result.current.webSearchAction).toBe('delete');
+    expect(result.current.webSearchProvider).toBe('exa_free_mcp');
 
     act(() => result.current.discardSettingsChanges());
     expect(result.current.dirtyDomains).toEqual([]);
     expect(result.current.settingsConfig?.chat.model).toBe('next-model');
+    expect(result.current.webSearchAction).toBe('keep');
+  });
+
+  it('删除 Exa 密钥时回退免费方案，重新选择 API 会取消待删除动作', () => {
+    const { result } = renderHook(() => useSettingsDraft());
+    act(() =>
+      result.current.applyLoadedSettings({
+        config,
+        catalog,
+        permissionMode: 'request_approval',
+        sandboxMode: 'workspace_write',
+        webSearchProvider: 'exa_api',
+        webSearchConfigured: true,
+        panel: 'web_search'
+      })
+    );
+
+    act(() => result.current.stageWebSearchDelete());
+    expect(result.current.webSearchProvider).toBe('exa_free_mcp');
+    expect(result.current.webSearchAction).toBe('delete');
+
+    act(() => result.current.stageWebSearchProvider('exa_api'));
+    expect(result.current.webSearchProvider).toBe('exa_api');
     expect(result.current.webSearchAction).toBe('keep');
   });
 });

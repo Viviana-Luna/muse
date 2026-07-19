@@ -1,5 +1,6 @@
 //! 网页接口 DTO 模块，集中定义请求体、响应体和运行时配置传输结构。
 
+use muse_core::app::preferences::WebSearchProvider;
 use muse_core::domain::conversation::Message;
 use muse_core::domain::mcp;
 use muse_core::domain::persona::character::card::{
@@ -1086,11 +1087,11 @@ pub struct ProviderBalanceResponse {
     pub status: String,
 }
 
-/// `GET /api/web-search/config` 响应：联网搜索提供器与凭据配置状态。
-/// 仅返回是否已配置，绝不返回 Brave API 密钥或其掩码。
+/// `GET /api/web-search/config` 响应：联网搜索后端与凭据配置状态。
+/// 仅返回是否已配置，绝不返回 Exa API Key 或其掩码。
 #[derive(Serialize)]
 pub struct WebSearchConfigResponse {
-    pub provider: String,
+    pub provider: WebSearchProvider,
     pub api_key_configured: bool,
 }
 
@@ -1116,40 +1117,52 @@ pub struct SecretUpdate {
     pub value: Option<String>,
 }
 
-/// `PUT /api/web-search/config` 请求体。
-pub type WebSearchConfigUpdate = SecretUpdate;
+/// `PUT /api/web-search/config` 请求体：非敏感后端选择与密钥动作一次提交。
+#[derive(Debug, Default, Deserialize)]
+pub struct WebSearchConfigUpdate {
+    #[serde(default)]
+    pub provider: WebSearchProvider,
+    #[serde(default)]
+    pub action: SecretUpdateAction,
+    #[serde(default)]
+    pub value: Option<String>,
+}
 
 #[cfg(test)]
 mod web_search_config_tests {
     use super::{SecretUpdateAction, WebSearchConfigResponse, WebSearchConfigUpdate};
+    use muse_core::app::preferences::WebSearchProvider;
 
     #[test]
     fn web_search_config_response_never_contains_secret_value() {
         let response = WebSearchConfigResponse {
-            provider: "brave_search_api".to_string(),
+            provider: WebSearchProvider::ExaApi,
             api_key_configured: true,
         };
         let json = serde_json::to_value(response).expect("配置状态应能序列化");
 
-        assert_eq!(json["provider"], "brave_search_api");
+        assert_eq!(json["provider"], "exa_api");
         assert_eq!(json["api_key_configured"], true);
         assert!(json.get("api_key").is_none());
     }
 
     #[test]
     fn web_search_config_update_accepts_explicit_replace() {
-        let request: WebSearchConfigUpdate =
-            serde_json::from_str(r#"{"action":"replace","value":"brv-secret-value"}"#)
-                .expect("请求体应能解析");
+        let request: WebSearchConfigUpdate = serde_json::from_str(
+            r#"{"provider":"exa_api","action":"replace","value":"exa-secret-value"}"#,
+        )
+        .expect("请求体应能解析");
 
+        assert_eq!(request.provider, WebSearchProvider::ExaApi);
         assert_eq!(request.action, SecretUpdateAction::Replace);
-        assert_eq!(request.value.as_deref(), Some("brv-secret-value"));
+        assert_eq!(request.value.as_deref(), Some("exa-secret-value"));
     }
 
     #[test]
     fn web_search_config_update_defaults_to_keep() {
         let request: WebSearchConfigUpdate = serde_json::from_str(r#"{}"#).expect("请求体应能解析");
 
+        assert_eq!(request.provider, WebSearchProvider::ExaFreeMcp);
         assert_eq!(request.action, SecretUpdateAction::Keep);
         assert!(request.value.is_none());
     }

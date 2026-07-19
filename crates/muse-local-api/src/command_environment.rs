@@ -264,7 +264,7 @@ mod tests {
             "HOME",
             "MUSE_API_TOKEN",
             "LLM_API_KEY",
-            "BRAVE_SEARCH_API_KEY",
+            "EXA_API_KEY",
             "DEPLOY_TOKEN",
             "SSH_AUTH_SOCK",
             "AWS_ACCESS_KEY_ID",
@@ -278,7 +278,7 @@ mod tests {
         assert!(names.contains(&OsString::from("PATH")));
         assert!(!names.contains(&OsString::from("MUSE_API_TOKEN")));
         assert!(!names.contains(&OsString::from("LLM_API_KEY")));
-        assert!(!names.contains(&OsString::from("BRAVE_SEARCH_API_KEY")));
+        assert!(!names.contains(&OsString::from("EXA_API_KEY")));
         assert!(!names.contains(&OsString::from("DEPLOY_TOKEN")));
         assert!(!names.contains(&OsString::from("SSH_AUTH_SOCK")));
         assert!(!names.contains(&OsString::from("AWS_ACCESS_KEY_ID")));
@@ -329,7 +329,7 @@ mod tests {
         let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
         let mut process = Command::new("/bin/sh");
         process.arg("-c").arg(
-            r#"printf 'PATH=%s\nMUSE=%s\nLLM=%s\nBRAVE=%s\nCUSTOM=%s\n' "$PATH" "${MUSE_API_TOKEN-unset}" "${LLM_API_KEY-unset}" "${BRAVE_SEARCH_API_KEY-unset}" "${CUSTOM_DEPLOY_TOKEN-unset}"; command -v sh"#,
+            r#"printf 'PATH=%s\nMUSE=%s\nLLM=%s\nEXA=%s\nCUSTOM=%s\n' "$PATH" "${MUSE_API_TOKEN-unset}" "${LLM_API_KEY-unset}" "${EXA_API_KEY-unset}" "${CUSTOM_DEPLOY_TOKEN-unset}"; command -v sh"#,
         );
         apply_command_environment_from(
             &mut process,
@@ -340,10 +340,7 @@ mod tests {
                     OsString::from("muse-secret"),
                 ),
                 (OsString::from("LLM_API_KEY"), OsString::from("llm-secret")),
-                (
-                    OsString::from("BRAVE_SEARCH_API_KEY"),
-                    OsString::from("brave-secret"),
-                ),
+                (OsString::from("EXA_API_KEY"), OsString::from("exa-secret")),
                 (
                     OsString::from("CUSTOM_DEPLOY_TOKEN"),
                     OsString::from("custom-secret"),
@@ -362,7 +359,7 @@ mod tests {
         );
         assert!(stdout.contains("MUSE=unset\n"));
         assert!(stdout.contains("LLM=unset\n"));
-        assert!(stdout.contains("BRAVE=unset\n"));
+        assert!(stdout.contains("EXA=unset\n"));
         assert!(stdout.contains("CUSTOM=unset\n"));
         assert!(stdout.lines().any(|line| line.ends_with("/sh")));
     }

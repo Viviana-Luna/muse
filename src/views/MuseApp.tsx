@@ -97,9 +97,11 @@ export function App() {
     setSettingsConfig,
     workspacePermissionMode,
     workspaceSandboxMode,
+    webSearchProvider,
     webSearchConfigured,
     webSearchKeyDraft,
     stageWebSearchKey,
+    stageWebSearchProvider,
     stageWebSearchDelete,
     webSearchAction,
     appearanceSettings,
@@ -640,6 +642,7 @@ export function App() {
             modelFetchStatus={modelFetchStatus}
             workspacePermissionMode={workspacePermissionMode}
             workspaceSandboxMode={workspaceSandboxMode}
+            webSearchProvider={webSearchProvider}
             webSearchConfigured={webSearchConfigured}
             webSearchKeyDraft={webSearchKeyDraft}
             webSearchAction={webSearchAction}
@@ -652,6 +655,7 @@ export function App() {
             setSettingsConfig={setSettingsConfig}
             setModelCatalog={setModelCatalog}
             setAppearanceSettings={setAppearanceSettings}
+            setWebSearchProvider={stageWebSearchProvider}
             setWebSearchKeyDraft={stageWebSearchKey}
             onClose={() => navigateMuseSection('chat')}
             onDiscard={discardSettingsChanges}

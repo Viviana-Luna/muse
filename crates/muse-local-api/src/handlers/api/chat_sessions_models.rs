@@ -1739,72 +1739,143 @@ fn config_has_api_key(value: Option<&str>) -> bool {
     value.is_some_and(|key| !key.trim().is_empty())
 }
 
-/// 读取 Brave Search 凭据的配置状态，不向界面泄漏密钥内容或掩码。
+/// 读取 Exa 搜索后端与凭据状态，不向界面泄漏密钥内容或掩码。
 pub(crate) async fn handle_get_web_search_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<WebSearchConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _transition = state.model_configuration_transition_gate.lock().await;
+    let provider = state
+        .user_config
+        .lock()
+        .await
+        .web_search_preferences()
+        .provider;
     let api_key_configured = state
         .secrets
-        .get_optional("web-search.brave")
+        .get_optional("web-search.exa")
         .map_err(|err| internal_error(err.to_string()))?
         .is_some();
     Ok(Json(WebSearchConfigResponse {
-        provider: "brave_search_api".to_string(),
+        provider,
         api_key_configured,
     }))
 }
 
-/// 更新 Brave Search 密钥。密钥只进入系统凭据库，配置文件与响应体都不保留明文。
+/// 原子更新 Exa 搜索后端与密钥；配置发布失败时恢复原凭据。
 pub(crate) async fn handle_put_web_search_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WebSearchConfigUpdate>,
 ) -> Result<Json<WebSearchConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match request.action {
+    use muse_core::app::preferences::{WebSearchPreferences, WebSearchProvider};
+
+    let _transition = state.model_configuration_transition_gate.lock().await;
+    let previous = state
+        .secrets
+        .get_optional("web-search.exa")
+        .map_err(|err| internal_error(err.to_string()))?;
+    let replacement = match request.action {
         SecretUpdateAction::Keep => {
             if request.value.is_some() {
                 return Err(bad_request("action 为 keep 时不得提交 value"));
             }
+            previous.clone()
         }
-        SecretUpdateAction::Replace => {
-            let api_key = request
+        SecretUpdateAction::Replace => Some(
+            request
                 .value
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| bad_request("action 为 replace 时必须提交非空 value"))?;
-            let previous = state
-                .secrets
-                .get_optional("web-search.brave")
-                .map_err(|err| internal_error(err.to_string()))?;
-            if let Err(error) = state.secrets.set_verified("web-search.brave", api_key) {
-                let rollback = match previous {
-                    Some(previous) => state
-                        .secrets
-                        .set_verified("web-search.brave", &previous),
-                    None => state.secrets.delete("web-search.brave"),
-                };
-                if let Err(rollback_error) = rollback {
-                    return Err(internal_error(format!(
-                        "替换联网搜索凭据失败，且原凭据回滚失败：{error}；{rollback_error}"
-                    )));
-                }
-                return Err(internal_error(format!(
-                    "替换联网搜索凭据失败，原凭据保持不变：{error}"
-                )));
-            }
-        }
+                .ok_or_else(|| bad_request("action 为 replace 时必须提交非空 value"))?
+                .to_string(),
+        ),
         SecretUpdateAction::Delete => {
             if request.value.is_some() {
                 return Err(bad_request("action 为 delete 时不得提交 value"));
             }
-            state
+            None
+        }
+    };
+    if request.provider == WebSearchProvider::ExaApi && replacement.is_none() {
+        return Err(bad_request(
+            "Exa API Key 模式需要先配置有效密钥；也可以改用默认的免费搜索。",
+        ));
+    }
+
+    match request.action {
+        SecretUpdateAction::Keep => {}
+        SecretUpdateAction::Replace => {
+            if let Err(error) = state
                 .secrets
-                .delete("web-search.brave")
-                .map_err(|err| internal_error(err.to_string()))?;
+                .set_verified(
+                    "web-search.exa",
+                    replacement.as_deref().expect("replace 已解析非空密钥"),
+                )
+            {
+                return Err(web_search_secret_update_error(
+                    &state,
+                    previous.as_deref(),
+                    format!("替换联网搜索凭据失败：{error}"),
+                ));
+            }
+        }
+        SecretUpdateAction::Delete => {
+            if let Err(error) = state.secrets.delete("web-search.exa") {
+                return Err(web_search_secret_update_error(
+                    &state,
+                    previous.as_deref(),
+                    format!("删除联网搜索凭据失败：{error}"),
+                ));
+            }
         }
     }
 
-    handle_get_web_search_config(State(state)).await
+    let update_result = state
+        .user_config
+        .lock()
+        .await
+        .update_web_search_preferences(WebSearchPreferences {
+            provider: request.provider,
+        });
+    if let Err(error) = update_result {
+        let rollback = restore_web_search_secret(&state, previous.as_deref());
+        if let Err(rollback_error) = rollback {
+            return Err(internal_error(format!(
+                "保存联网搜索后端失败，且原凭据回滚失败：{error}；{rollback_error}"
+            )));
+        }
+        return Err(internal_error(format!(
+            "保存联网搜索后端失败，原凭据已恢复：{error}"
+        )));
+    }
+
+    Ok(Json(WebSearchConfigResponse {
+        provider: request.provider,
+        api_key_configured: replacement.is_some(),
+    }))
+}
+
+fn restore_web_search_secret(
+    state: &AppState,
+    previous: Option<&str>,
+) -> Result<(), muse_core::app::secret::SecretStoreError> {
+    match previous {
+        Some(previous) => state.secrets.set_verified("web-search.exa", previous),
+        None => state.secrets.delete("web-search.exa"),
+    }
+}
+
+fn web_search_secret_update_error(
+    state: &AppState,
+    previous: Option<&str>,
+    message: String,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match restore_web_search_secret(state, previous) {
+        Ok(()) => internal_error(format!("{message}，原凭据状态已恢复。")),
+        Err(rollback_error) => internal_error(format!(
+            "{message}，且原凭据状态恢复失败：{rollback_error}"
+        )),
+    }
 }
 
 struct ResolvedSettingSecretUpdate {

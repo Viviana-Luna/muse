@@ -740,7 +740,7 @@ mod tests {
         }
     }
 
-    fn unconfigured_web_search_stays_visible_and_returns_actionable_error() {
+    fn exa_web_search_stays_visible_and_normalizes_free_and_api_failures() {
         let data_dir = unique_temp_dir("web-search-unconfigured");
         let mut state = build_test_state(&data_dir);
         muse_core::domain::tool::builtin::register_all(
@@ -759,7 +759,7 @@ mod tests {
         );
         assert!(
             defs.iter().any(|definition| definition.name == "web_search"),
-            "未配置凭据只能让调用失败，不能从冻结工具目录隐藏 web_search"
+            "Exa 后端选择不得从冻结工具目录隐藏 web_search"
         );
 
         let result = super::web_search_not_configured_result();
@@ -769,7 +769,59 @@ mod tests {
             Some("search_not_configured")
         );
         assert!(result.content.contains("设置中心"));
-        assert!(result.content.contains("联网搜索"));
+        assert!(result.content.contains("免费搜索"));
+
+        let sse = r#"event: message
+data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.ai"}]},"jsonrpc":"2.0","id":1}
+
+"#;
+        let content = super::parse_exa_mcp_search_response(sse).expect("应解析 Exa SSE 搜索结果");
+        assert!(content.contains("Title: Exa"));
+        assert!(content.contains("https://exa.ai"));
+
+        let free_request = super::exa_free_mcp_request("Muse roadmap", 4);
+        assert_eq!(free_request["method"], "tools/call");
+        assert_eq!(free_request["params"]["name"], "web_search_exa");
+        assert_eq!(
+            free_request["params"]["arguments"]["numResults"],
+            serde_json::json!(4)
+        );
+        let api_request = super::exa_api_search_request("Muse roadmap", 3);
+        assert_eq!(api_request["query"], "Muse roadmap");
+        assert_eq!(api_request["numResults"], serde_json::json!(3));
+        assert_eq!(api_request["contents"]["highlights"], true);
+
+        let api_results = super::normalize_exa_api_results(
+            &serde_json::json!({
+                "results": [
+                    {
+                        "title": "Muse",
+                        "url": "https://example.com/muse",
+                        "highlights": ["第一个摘要", "第二个摘要"],
+                        "publishedDate": "2026-07-19",
+                        "author": "Luna"
+                    }
+                ]
+            }),
+            5,
+        );
+        assert_eq!(api_results.len(), 1);
+        assert_eq!(api_results[0]["title"], "Muse");
+        assert_eq!(api_results[0]["snippet"], "第一个摘要 … 第二个摘要");
+        assert_eq!(api_results[0]["published_date"], "2026-07-19");
+
+        let limited = super::exa_search_http_failure(429, true);
+        assert_eq!(
+            super::tool_result_reason(&limited),
+            Some("search_free_rate_limited")
+        );
+        assert!(limited.content.contains("API Key"));
+
+        let auth_failed = super::exa_search_http_failure(401, false);
+        assert_eq!(
+            super::tool_result_reason(&auth_failed),
+            Some("search_auth_failed")
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -3913,7 +3965,7 @@ mod tests {
             "网页搜索 `private roadmap query` 返回 1 条结果。",
             Some(serde_json::json!({
                 "query": "private roadmap query",
-                "provider": "brave_search_api",
+                "provider": "exa_api",
                 "results": [{ "title": "private body", "url": "https://example.com" }],
             })),
         );
@@ -5193,8 +5245,8 @@ mod tests {
             }
         }
         {
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(unconfigured_web_search_stays_visible_and_returns_actionable_error)).is_err() {
-                failures.push("unconfigured_web_search_stays_visible_and_returns_actionable_error");
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(exa_web_search_stays_visible_and_normalizes_free_and_api_failures)).is_err() {
+                failures.push("exa_web_search_stays_visible_and_normalizes_free_and_api_failures");
             }
         }
         {

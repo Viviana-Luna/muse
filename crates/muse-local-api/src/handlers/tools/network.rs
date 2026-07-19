@@ -76,50 +76,80 @@ async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
     }
     tool_failed("网页跳转处理异常结束。", "redirect_failed")
 }
-/// 构造未配置搜索凭据时的稳定、可操作失败结果。
+const EXA_FREE_MCP_URL: &str = "https://mcp.exa.ai/mcp";
+const EXA_API_SEARCH_URL: &str = "https://api.exa.ai/search";
+
+/// 构造 API 模式未配置凭据时的稳定、可操作失败结果。
 fn web_search_not_configured_result() -> ToolResult {
     tool_failed(
-        "网页搜索尚未配置 Brave Search API 密钥。请在 Muse 设置中心的“联网搜索”中配置，或在首次启动前设置 BRAVE_SEARCH_API_KEY。",
+        "当前选择了 Exa API Key 搜索，但尚未配置密钥。请在 Muse 设置中心的“联网搜索”中配置，或切换回默认的免费搜索。",
         "search_not_configured",
     )
 }
 
-/// 使用 Brave Search API 执行结构化公开网页搜索。
+/// 按用户配置选择 Exa 免费 MCP 或正式 Search API。
 async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
+    use muse_core::app::preferences::WebSearchProvider;
+
     let Some(query) = tool_arg_string(&call.arguments, "query") else {
         return tool_failed("web_search 缺少 query 参数。", "missing_query");
     };
-    let api_key = match state.secrets.get_optional("web-search.brave") {
-        Ok(Some(key)) => key,
-        Ok(None) => return web_search_not_configured_result(),
-        Err(err) => {
-            return tool_failed(
-                format!("无法读取网页搜索凭据：{err}"),
-                "secret_store_failed",
-            );
-        }
+    let (provider, api_key) = {
+        // 配置切换和凭据发布共用同一 transition gate，单次调用只观察完整快照。
+        let _transition = state.model_configuration_transition_gate.lock().await;
+        let provider = state
+            .user_config
+            .lock()
+            .await
+            .web_search_preferences()
+            .provider;
+        let api_key = if provider == WebSearchProvider::ExaApi {
+            match state.secrets.get_optional("web-search.exa") {
+                Ok(value) => value,
+                Err(err) => {
+                    return tool_failed(
+                        format!("无法读取网页搜索凭据：{err}"),
+                        "secret_store_failed",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        (provider, api_key)
     };
     let limit = tool_arg_limit(&call.arguments, 5, 10);
-    let target =
-        match validate_public_https_url("https://api.search.brave.com/res/v1/web/search").await {
-            Ok(target) => target,
-            Err(err) => return tool_failed(format!("搜索服务地址校验失败：{err}"), "blocked_url"),
-        };
+
+    match provider {
+        WebSearchProvider::ExaFreeMcp => exa_free_mcp_search(&query, limit).await,
+        WebSearchProvider::ExaApi => {
+            let Some(api_key) = api_key else {
+                return web_search_not_configured_result();
+            };
+            exa_api_search(&query, limit, &api_key).await
+        }
+    }
+}
+
+async fn exa_free_mcp_search(query: &str, limit: usize) -> ToolResult {
+    let target = match validate_public_https_url(EXA_FREE_MCP_URL).await {
+        Ok(target) => target,
+        Err(err) => return tool_failed(format!("搜索服务地址校验失败：{err}"), "blocked_url"),
+    };
     let client =
         match build_pinned_https_client(&target, Duration::from_secs(WEB_FETCH_TIMEOUT_SECS)) {
             Ok(client) => client,
             Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
         };
     let response = match client
-        .get(target.url)
-        .header("Accept", "application/json")
-        .header("X-Subscription-Token", api_key)
-        .query(&[("q", query.as_str()), ("count", &limit.to_string())])
+        .post(target.url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&exa_free_mcp_request(query, limit))
         .send()
         .await
     {
         Ok(response) => response,
-        Err(err) => return tool_failed(format!("网页搜索请求失败：{err}"), "request_failed"),
+        Err(err) => return tool_failed(format!("免费搜索请求失败：{err}"), "request_failed"),
     };
     let status = response.status().as_u16();
     let body = match read_bounded_web_response(response).await {
@@ -127,14 +157,132 @@ async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
         Err(err) => return tool_failed(err, "read_failed"),
     };
     if !(200..300).contains(&status) {
-        return tool_failed(format!("网页搜索请求失败，HTTP {status}。"), "http_failed");
+        return exa_search_http_failure(status, true);
+    }
+    let content = match parse_exa_mcp_search_response(&body) {
+        Ok(content) => content,
+        Err(err) => {
+            let normalized = err.to_ascii_lowercase();
+            if normalized.contains("rate limit")
+                || normalized.contains("rate-limit")
+                || normalized.contains("429")
+            {
+                return exa_search_http_failure(429, true);
+            }
+            return tool_failed(err, "invalid_mcp_response");
+        }
+    };
+    ToolResult::success(
+        format!(
+            "【不可信外部搜索结果】\n{}",
+            truncate_text(&content, 40_000)
+        ),
+        Some(serde_json::json!({
+            "query": query,
+            "provider": "exa_free_mcp",
+            "trust_boundary": "untrusted_external_content",
+        })),
+    )
+}
+
+async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult {
+    let target = match validate_public_https_url(EXA_API_SEARCH_URL).await {
+        Ok(target) => target,
+        Err(err) => return tool_failed(format!("搜索服务地址校验失败：{err}"), "blocked_url"),
+    };
+    let client =
+        match build_pinned_https_client(&target, Duration::from_secs(WEB_FETCH_TIMEOUT_SECS)) {
+            Ok(client) => client,
+            Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
+        };
+    let response = match client
+        .post(target.url)
+        .header("Accept", "application/json")
+        .header("x-api-key", api_key)
+        .json(&exa_api_search_request(query, limit))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return tool_failed(format!("Exa API 请求失败：{err}"), "request_failed"),
+    };
+    let status = response.status().as_u16();
+    let body = match read_bounded_web_response(response).await {
+        Ok(body) => body,
+        Err(err) => return tool_failed(err, "read_failed"),
+    };
+    if !(200..300).contains(&status) {
+        return exa_search_http_failure(status, false);
     }
     let payload: serde_json::Value = match serde_json::from_str(&body) {
         Ok(payload) => payload,
-        Err(err) => return tool_failed(format!("搜索响应不是有效 JSON：{err}"), "invalid_json"),
+        Err(err) => return tool_failed(format!("Exa API 响应不是有效 JSON：{err}"), "invalid_json"),
     };
-    let results = payload
-        .pointer("/web/results")
+    let results = normalize_exa_api_results(&payload, limit);
+    let readable = results
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            format!(
+                "{}. {}\nURL: {}\n摘要: {}",
+                index + 1,
+                item.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
+                item.get("url").and_then(serde_json::Value::as_str).unwrap_or(""),
+                item.get("snippet").and_then(serde_json::Value::as_str).unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    ToolResult::success(
+        format!(
+            "【不可信外部搜索结果】\n网页搜索 `{query}` 返回 {} 条结果。\n\n{}",
+            results.len(),
+            truncate_text(&readable, 40_000)
+        ),
+        Some(serde_json::json!({
+            "query": query,
+            "provider": "exa_api",
+            "results": results,
+            "request_id": payload.get("requestId").cloned(),
+            "cost_dollars": payload.get("costDollars").cloned(),
+            "trust_boundary": "untrusted_external_content",
+        })),
+    )
+}
+
+fn exa_free_mcp_request(query: &str, limit: usize) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search_exa",
+            "arguments": {
+                "query": query,
+                "type": "auto",
+                "numResults": limit,
+                "livecrawl": "fallback",
+                "contextMaxCharacters": 20_000
+            }
+        }
+    })
+}
+
+fn exa_api_search_request(query: &str, limit: usize) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "numResults": limit,
+        "type": "auto",
+        "contents": { "highlights": true }
+    })
+}
+
+fn normalize_exa_api_results(
+    payload: &serde_json::Value,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    payload
+        .get("results")
         .and_then(serde_json::Value::as_array)
         .map(|items| {
             items
@@ -144,22 +292,117 @@ async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
                     serde_json::json!({
                         "title": item.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
                         "url": item.get("url").and_then(serde_json::Value::as_str).unwrap_or(""),
-                        "snippet": item.get("description").and_then(serde_json::Value::as_str).unwrap_or(""),
-                        "age": item.get("age").and_then(serde_json::Value::as_str),
+                        "snippet": exa_api_result_snippet(item),
+                        "published_date": item.get("publishedDate").and_then(serde_json::Value::as_str),
+                        "author": item.get("author").and_then(serde_json::Value::as_str),
                     })
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    ToolResult::success(
-        format!("网页搜索 `{query}` 返回 {} 条结果。", results.len()),
-        Some(serde_json::json!({
-            "query": query,
-            "provider": "brave_search_api",
-            "results": results,
-            "trust_boundary": "untrusted_external_content",
-        })),
-    )
+        .unwrap_or_default()
+}
+
+fn exa_api_result_snippet(item: &serde_json::Value) -> String {
+    if let Some(highlights) = item.get("highlights").and_then(serde_json::Value::as_array) {
+        let joined = highlights
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" … ");
+        if !joined.is_empty() {
+            return truncate_text(&joined, 1_500).to_string();
+        }
+    }
+    item.get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| truncate_text(text, 1_500).to_string())
+        .unwrap_or_default()
+}
+
+fn exa_search_http_failure(status: u16, free_mcp: bool) -> ToolResult {
+    match status {
+        401 | 403 if !free_mcp => tool_failed(
+            "Exa API Key 无效或无权执行搜索，请在设置中心更新密钥。",
+            "search_auth_failed",
+        ),
+        402 if !free_mcp => tool_failed(
+            "Exa API 账户额度不足或需要完成付款设置，请检查 Exa 控制台。",
+            "search_quota_exhausted",
+        ),
+        429 if free_mcp => tool_failed(
+            "Exa 免费搜索当前已达到公共限流，请稍后重试，或在设置中心切换到自己的 API Key。",
+            "search_free_rate_limited",
+        ),
+        429 => tool_failed(
+            "Exa API 当前已达到账号限流，请稍后重试并检查 Exa 控制台额度。",
+            "search_rate_limited",
+        ),
+        500..=599 => tool_failed(
+            format!("Exa 搜索服务暂时不可用，HTTP {status}。"),
+            "search_service_unavailable",
+        ),
+        _ => tool_failed(format!("Exa 搜索请求失败，HTTP {status}。"), "http_failed"),
+    }
+}
+
+fn parse_exa_mcp_search_response(body: &str) -> Result<String, String> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        let value = serde_json::from_str::<serde_json::Value>(trimmed)
+            .map_err(|err| format!("Exa MCP 响应不是有效 JSON：{err}"))?;
+        if let Some(content) = exa_mcp_payload_text(&value)? {
+            return Ok(content);
+        }
+    }
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(payload.trim())
+            .map_err(|err| format!("Exa MCP 的 SSE 数据不是有效 JSON：{err}"))?;
+        if let Some(content) = exa_mcp_payload_text(&value)? {
+            return Ok(content);
+        }
+    }
+    Err("Exa MCP 响应中没有可读取的搜索结果。".to_string())
+}
+
+fn exa_mcp_payload_text(value: &serde_json::Value) -> Result<Option<String>, String> {
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Exa MCP 返回协议错误。");
+        return Err(truncate_text(message, 1_000).to_string());
+    }
+    let Some(result) = value.get("result") else {
+        return Ok(None);
+    };
+    let text = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(if text.is_empty() {
+            "Exa MCP 搜索执行失败。".to_string()
+        } else {
+            truncate_text(&text, 1_000).to_string()
+        });
+    }
+    Ok((!text.is_empty()).then_some(text))
 }
 
 const LOCAL_MCP_SERVER_NAME: &str = "muse-local";

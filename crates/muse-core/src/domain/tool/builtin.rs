@@ -14,13 +14,12 @@ pub fn register_all(registry: &mut ToolRegistry) {
 
 /// 注册由网页运行时执行的真实搜索入口。
 ///
-/// 搜索服务的凭据由运行时安全存储提供，因此核心注册表不读取密钥；未配置时
-/// 运行时会给出可操作诊断，而不会把 DuckDuckGo 摘要占位当成完整搜索能力。
+/// 搜索后端与凭据由网页运行时解析，因此核心注册表不读取配置或密钥。
 fn register_web_runtime_search_tool(registry: &mut ToolRegistry) {
     register_web_runtime_tool(
         registry,
         "web_search",
-        "使用已配置的 Brave Search API 搜索公开网页。联网查询会先请求用户审批。",
+        "使用 Exa 搜索公开网页；默认走免费托管搜索，也可使用用户配置的 Exa API Key。联网查询会先经过当前会话审批策略。",
         "network",
         ToolRisk::Network,
         true,

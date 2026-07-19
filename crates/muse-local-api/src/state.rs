@@ -586,14 +586,6 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
     migrate_legacy_skill_enabled(&data_dir, &mut user_config)?;
     // Provider Profile 已发布后才允许数据库 migration 删除旧 providers/models 表。
     let _ = muse_core::app::storage::open_runtime_database(&data_dir)?;
-    if secrets.get_optional("web-search.brave")?.is_none()
-        && let Ok(key) = std::env::var("BRAVE_SEARCH_API_KEY")
-        && !key.trim().is_empty()
-        && let Err(error) = secrets.set_verified("web-search.brave", &key)
-    {
-        let _ = secrets.delete("web-search.brave");
-        return Err(Box::new(error));
-    }
     let provider = build_chat_provider(user_config.chat())?;
     let tts_provider = build_tts_provider(user_config.tts());
     let speech_recognition_provider =

@@ -103,7 +103,7 @@ describe('useRuntimeStream 交互恢复', () => {
         call_id: 'call-search',
         name: 'web_search',
         success: false,
-        content: '网页搜索尚未配置 Brave Search API 密钥。请在 Muse 设置中心的“联网搜索”中配置。'
+        content: '当前已选择 Exa API 搜索，但尚未配置 API Key。请在 Muse 设置中心的“联网搜索”中配置。'
       });
     });
 

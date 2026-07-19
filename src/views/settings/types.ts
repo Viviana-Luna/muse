@@ -9,7 +9,7 @@ import type {
   ModelsConfig,
   DiagnosticsConnectivityItem
 } from '@/types';
-import type { SecretUpdate } from '@/types';
+import type { SecretUpdate, WebSearchProvider } from '@/types';
 
 export type SettingsPanel =
   | 'chat'
@@ -59,6 +59,7 @@ export interface SettingsDialogProps {
   modelFetchStatus: Record<ModelPurpose, string>;
   workspacePermissionMode: string;
   workspaceSandboxMode: string;
+  webSearchProvider: WebSearchProvider;
   webSearchConfigured: boolean;
   webSearchKeyDraft: string;
   webSearchAction: SecretUpdate['action'];
@@ -71,6 +72,7 @@ export interface SettingsDialogProps {
   setSettingsConfig: Dispatch<SetStateAction<ModelsConfig | null>>;
   setModelCatalog: Dispatch<SetStateAction<ModelCatalog | null>>;
   setAppearanceSettings: Dispatch<SetStateAction<AppearanceSettings>>;
+  setWebSearchProvider: (provider: WebSearchProvider) => void;
   setWebSearchKeyDraft: (value: string) => void;
   onClose: () => void;
   onDiscard: () => void;
