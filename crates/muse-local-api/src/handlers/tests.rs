@@ -822,6 +822,28 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             super::tool_result_reason(&auth_failed),
             Some("search_auth_failed")
         );
+
+        assert_eq!(
+            super::TrustedSearchEndpoint::ExaFreeMcp.url(),
+            "https://mcp.exa.ai/mcp"
+        );
+        assert_eq!(
+            super::TrustedSearchEndpoint::ExaApi.url(),
+            "https://api.exa.ai/search"
+        );
+        for endpoint in [
+            super::TrustedSearchEndpoint::ExaFreeMcp,
+            super::TrustedSearchEndpoint::ExaApi,
+        ] {
+            assert!(
+                super::build_trusted_search_client(
+                    endpoint,
+                    std::time::Duration::from_secs(1),
+                )
+                .is_ok(),
+                "固定搜索端点客户端构建不得依赖 DNS 公网地址或 DNS pin"
+            );
+        }
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -3878,6 +3900,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             "10.0.0.8",
             "169.254.169.254",
             "192.0.2.10",
+            "198.18.17.115",
             "198.51.100.10",
             "203.0.113.10",
             "240.0.0.1",

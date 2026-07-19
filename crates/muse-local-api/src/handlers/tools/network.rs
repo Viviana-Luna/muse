@@ -76,8 +76,58 @@ async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
     }
     tool_failed("网页跳转处理异常结束。", "redirect_failed")
 }
-const EXA_FREE_MCP_URL: &str = "https://mcp.exa.ai/mcp";
-const EXA_API_SEARCH_URL: &str = "https://api.exa.ai/search";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustedSearchEndpoint {
+    ExaFreeMcp,
+    ExaApi,
+}
+
+impl TrustedSearchEndpoint {
+    fn url(self) -> &'static str {
+        match self {
+            Self::ExaFreeMcp => "https://mcp.exa.ai/mcp",
+            Self::ExaApi => "https://api.exa.ai/search",
+        }
+    }
+
+    fn expected_host(self) -> &'static str {
+        match self {
+            Self::ExaFreeMcp => "mcp.exa.ai",
+            Self::ExaApi => "api.exa.ai",
+        }
+    }
+}
+
+/// 为代码内固定的搜索供应商建立客户端，不把模型输入或用户 URL 接入此路径。
+///
+/// 可信端点仍由 HTTPS/TLS 校验域名，并禁用环境代理与自动重定向；这里只是不预解析
+/// 和固定 IP，让 macOS VPN/TUN 能处理 Fake-IP 映射。任意网页仍必须走
+/// `validate_public_https_url` 与 `build_pinned_https_client`。
+fn build_trusted_search_client(
+    endpoint: TrustedSearchEndpoint,
+    timeout: Duration,
+) -> Result<(reqwest::Client, reqwest::Url), String> {
+    let url = reqwest::Url::parse(endpoint.url())
+        .map_err(|err| format!("可信搜索服务地址无效：{err}"))?;
+    if url.scheme() != "https"
+        || url.host_str() != Some(endpoint.expected_host())
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("可信搜索服务地址不符合固定 HTTPS 端点约束。".to_string());
+    }
+    let builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = match RESTRICTED_HTTPS_PROXY_POLICY {
+        RestrictedHttpsProxyPolicy::Disabled => builder.no_proxy(),
+    };
+    let client = builder
+        .build()
+        .map_err(|err| format!("无法创建可信搜索客户端：{err}"))?;
+    Ok((client, url))
+}
 
 /// 构造 API 模式未配置凭据时的稳定、可操作失败结果。
 fn web_search_not_configured_result() -> ToolResult {
@@ -132,17 +182,15 @@ async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
 }
 
 async fn exa_free_mcp_search(query: &str, limit: usize) -> ToolResult {
-    let target = match validate_public_https_url(EXA_FREE_MCP_URL).await {
+    let (client, url) = match build_trusted_search_client(
+        TrustedSearchEndpoint::ExaFreeMcp,
+        Duration::from_secs(WEB_FETCH_TIMEOUT_SECS),
+    ) {
         Ok(target) => target,
-        Err(err) => return tool_failed(format!("搜索服务地址校验失败：{err}"), "blocked_url"),
+        Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
     };
-    let client =
-        match build_pinned_https_client(&target, Duration::from_secs(WEB_FETCH_TIMEOUT_SECS)) {
-            Ok(client) => client,
-            Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
-        };
     let response = match client
-        .post(target.url)
+        .post(url)
         .header("Accept", "application/json, text/event-stream")
         .json(&exa_free_mcp_request(query, limit))
         .send()
@@ -186,17 +234,15 @@ async fn exa_free_mcp_search(query: &str, limit: usize) -> ToolResult {
 }
 
 async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult {
-    let target = match validate_public_https_url(EXA_API_SEARCH_URL).await {
+    let (client, url) = match build_trusted_search_client(
+        TrustedSearchEndpoint::ExaApi,
+        Duration::from_secs(WEB_FETCH_TIMEOUT_SECS),
+    ) {
         Ok(target) => target,
-        Err(err) => return tool_failed(format!("搜索服务地址校验失败：{err}"), "blocked_url"),
+        Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
     };
-    let client =
-        match build_pinned_https_client(&target, Duration::from_secs(WEB_FETCH_TIMEOUT_SECS)) {
-            Ok(client) => client,
-            Err(err) => return tool_failed(format!("无法创建搜索客户端：{err}"), "client_failed"),
-        };
     let response = match client
-        .post(target.url)
+        .post(url)
         .header("Accept", "application/json")
         .header("x-api-key", api_key)
         .json(&exa_api_search_request(query, limit))
