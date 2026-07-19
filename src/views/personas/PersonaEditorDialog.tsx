@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { Dispatch, DragEvent, FormEvent, SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 
-import { uploadPersonaImage } from '@/api';
+import { discardUnreferencedPersonaImage, uploadPersonaImage } from '@/api';
 import { ApiError } from '@/api/client';
 import type { AppToastInput } from '@/hooks/useAppToast';
 import { useAuthenticatedAssetUrl } from '@/hooks/useAuthenticatedAsset';
@@ -287,8 +287,10 @@ export function PersonaEditorDialog({
     files: Record<PersonaCropTargetKey, File>
   ): Promise<boolean> {
     setImageUploading(true);
+    let uploadedPortraitUrl: string | null = null;
     try {
       const portrait = await uploadPersonaImage(files.portrait);
+      uploadedPortraitUrl = portrait.url;
       const avatar = await uploadPersonaImage(files.avatar);
       const detectedTheme = await detectImageTheme(portrait.url).catch(() => undefined);
       setEditor((state) => ({
@@ -318,9 +320,23 @@ export function PersonaEditorDialog({
       });
       return true;
     } catch (err) {
+      let rollbackError: unknown;
+      if (uploadedPortraitUrl) {
+        try {
+          await discardUnreferencedPersonaImage(uploadedPortraitUrl);
+        } catch (error) {
+          rollbackError = error;
+        }
+      }
+      const uploadErrorMessage = err instanceof Error ? err.message : '上传角色图片时遇到错误。';
+      const rollbackErrorMessage = rollbackError instanceof Error
+        ? `首张图片回滚失败：${rollbackError.message}`
+        : rollbackError
+          ? '首张图片回滚失败。'
+          : '';
       notify({
         title: '上传图片失败',
-        description: err instanceof Error ? err.message : '上传角色图片时遇到错误。',
+        description: [uploadErrorMessage, rollbackErrorMessage].filter(Boolean).join('；'),
         tone: 'error'
       });
       return false;

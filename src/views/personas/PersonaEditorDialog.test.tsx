@@ -7,7 +7,10 @@ import type { ModelCatalog, Persona } from '@/types';
 import type { PersonaEditorState } from '@/views/personas/hooks/usePersonaState';
 import { PersonaEditorDialog } from './PersonaEditorDialog';
 
-const api = vi.hoisted(() => ({ uploadPersonaImage: vi.fn() }));
+const api = vi.hoisted(() => ({
+  discardUnreferencedPersonaImage: vi.fn(),
+  uploadPersonaImage: vi.fn()
+}));
 const theme = vi.hoisted(() => ({
   detectImageTheme: vi.fn().mockResolvedValue({
     themeColor: '#a84f63',
@@ -260,6 +263,55 @@ describe('PersonaEditorDialog', () => {
       portrait_scale: 100
     });
     expect(next.visualDirty).toBe(true);
+  });
+
+  it('头像上传失败时回滚已上传但尚未引用的立绘', async () => {
+    api.uploadPersonaImage
+      .mockResolvedValueOnce({ url: '/api/assets/uploaded/portrait-new.webp' })
+      .mockRejectedValueOnce(new Error('头像上传失败'));
+    api.discardUnreferencedPersonaImage.mockResolvedValue(undefined);
+    const setEditor = vi.fn();
+    const notify = vi.fn();
+    renderEditor({}, { setEditor, notify });
+
+    fireEvent.change(screen.getByLabelText('选择角色原图'), {
+      target: { files: [new File(['source'], 'source.png', { type: 'image/png' })] }
+    });
+    fireEvent.click(screen.getByRole('button', { name: '确认裁剪' }));
+
+    await waitFor(() => {
+      expect(api.discardUnreferencedPersonaImage).toHaveBeenCalledWith(
+        '/api/assets/uploaded/portrait-new.webp'
+      );
+    });
+    expect(setEditor).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith({
+      title: '上传图片失败',
+      description: '头像上传失败',
+      tone: 'error'
+    });
+  });
+
+  it('首张图片回滚失败时同时呈现原始错误与补偿错误', async () => {
+    api.uploadPersonaImage
+      .mockResolvedValueOnce({ url: '/api/assets/uploaded/portrait-new.webp' })
+      .mockRejectedValueOnce(new Error('头像上传失败'));
+    api.discardUnreferencedPersonaImage.mockRejectedValue(new Error('磁盘拒绝删除'));
+    const notify = vi.fn();
+    renderEditor({}, { notify });
+
+    fireEvent.change(screen.getByLabelText('选择角色原图'), {
+      target: { files: [new File(['source'], 'source.png', { type: 'image/png' })] }
+    });
+    fireEvent.click(screen.getByRole('button', { name: '确认裁剪' }));
+
+    await waitFor(() => {
+      expect(notify).toHaveBeenCalledWith({
+        title: '上传图片失败',
+        description: '头像上传失败；首张图片回滚失败：磁盘拒绝删除',
+        tone: 'error'
+      });
+    });
   });
 
   it('无图角色也会保存显式主题设置', async () => {

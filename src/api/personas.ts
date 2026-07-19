@@ -57,6 +57,22 @@ export async function uploadPersonaImage(file: File): Promise<AssetUploadRespons
   );
 }
 
+export async function discardUnreferencedPersonaImage(url: string): Promise<void> {
+  const prefix = '/api/assets/uploaded/';
+  if (!url.startsWith(prefix)) {
+    throw new Error('只能回滚由 Muse 上传的角色图片。');
+  }
+  const filename = url.slice(prefix.length);
+  if (!filename || filename.includes('/')) {
+    throw new Error('待回滚的角色图片地址无效。');
+  }
+  const response = await apiFetch(
+    `/api/assets/uploaded/${encodeURIComponent(filename)}`,
+    { method: 'DELETE' }
+  );
+  if (!response.ok) await readJson(response);
+}
+
 export async function deletePersona(id: string): Promise<PersonaMutationResponse> {
   return readJson<PersonaMutationResponse>(
     await apiFetch(`/api/personas/${encodeURIComponent(id)}`, { method: 'DELETE' })

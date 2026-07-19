@@ -863,6 +863,23 @@ pub(crate) async fn handle_uploaded_asset(
         .map_err(|error| internal_error(format!("构造上传资源响应失败：{error}")))
 }
 
+/// 回滚尚未被任何角色展示包引用的上传图片。
+///
+/// 内容哈希文件可能已经被其他角色复用，因此“仍被引用”和“文件已不存在”都视为
+/// 回滚目标已经满足；只有确认无引用时才删除磁盘文件。
+pub(crate) async fn handle_discard_uploaded_asset(
+    Path(filename): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    validated_uploaded_asset_name(&filename)
+        .ok_or_else(|| bad_request("上传资源文件名无效。"))?;
+    let url = format!("/api/assets/uploaded/{filename}");
+    discard_unreferenced_uploaded_asset(&state, &url)
+        .await
+        .map_err(|error| internal_error(format!("回滚无引用上传资源失败：{error}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn read_uploaded_asset_file(path: &StdPath) -> std::io::Result<Vec<u8>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);

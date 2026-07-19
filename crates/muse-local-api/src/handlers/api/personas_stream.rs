@@ -440,47 +440,61 @@ fn visual_pack_paths(visual_pack: &VisualPack) -> Vec<String> {
     .into_iter()
     .filter(|path| !path.trim().is_empty())
     .cloned()
-    .collect()
+        .collect()
+}
+
+enum UploadedAssetDiscardOutcome {
+    Deleted,
+    RetainedReference,
+    Missing,
+}
+
+async fn discard_unreferenced_uploaded_asset(
+    state: &Arc<AppState>,
+    url: &str,
+) -> Result<UploadedAssetDiscardOutcome, String> {
+    let filename = url
+        .strip_prefix("/api/assets/uploaded/")
+        .filter(|filename| validated_uploaded_asset_name(filename).is_some())
+        .ok_or_else(|| "上传资源地址格式无效。".to_string())?;
+    let visual_packs = state.visual_packs.lock().await;
+    if visual_packs
+        .visual_packs()
+        .iter()
+        .flat_map(visual_pack_paths)
+        .any(|path| path == url)
+    {
+        return Ok(UploadedAssetDiscardOutcome::RetainedReference);
+    }
+
+    let path = uploaded_assets_dir().join(filename);
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(UploadedAssetDiscardOutcome::Deleted),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(UploadedAssetDiscardOutcome::Missing)
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn cleanup_unreferenced_uploaded_assets(state: &Arc<AppState>, candidates: Vec<String>) {
     if candidates.is_empty() {
         return;
     }
-    let referenced = {
-        let visual_packs = state.visual_packs.lock().await;
-        visual_packs
-            .visual_packs()
-            .iter()
-            .flat_map(visual_pack_paths)
-            .collect::<HashSet<_>>()
-    };
     for url in candidates.into_iter().collect::<HashSet<_>>() {
-        if referenced.contains(&url) {
-            continue;
-        }
-        let Some(filename) = url.strip_prefix("/api/assets/uploaded/") else {
-            continue;
-        };
-        if validated_uploaded_asset_name(filename).is_none() {
-            tracing::warn!(
+        match discard_unreferenced_uploaded_asset(state, &url).await {
+            Ok(UploadedAssetDiscardOutcome::Deleted) => tracing::info!(
                 target: "muse::persona_assets",
                 asset_url = %url,
-                "跳过格式异常的上传资源清理候选"
-            );
-            continue;
-        }
-        let path = uploaded_assets_dir().join(filename);
-        match fs::remove_file(&path).await {
-            Ok(()) => tracing::info!(
-                target: "muse::persona_assets",
-                asset = %filename,
                 "已清理无角色展示包引用的上传资源"
             ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(
+                UploadedAssetDiscardOutcome::RetainedReference
+                | UploadedAssetDiscardOutcome::Missing,
+            ) => {}
             Err(error) => tracing::warn!(
                 target: "muse::persona_assets",
-                asset = %filename,
+                asset_url = %url,
                 error = %error,
                 "角色已保存，但无引用上传资源清理失败；保留文件等待后续诊断"
             ),

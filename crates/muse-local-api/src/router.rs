@@ -113,7 +113,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/assets/uploaded/{filename}",
-            get(handlers::handle_uploaded_asset),
+            get(handlers::handle_uploaded_asset).delete(handlers::handle_discard_uploaded_asset),
         )
         .route("/runtime/sessions", get(handlers::handle_runtime_sessions))
         .route(
@@ -1003,6 +1003,75 @@ check_on_startup = true
             .expect("角色删除应返回响应");
         assert_eq!(delete_response.status(), StatusCode::OK);
         assert!(!uploaded_dir.join(&kept_portrait_name).exists());
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn asset_rollback_deletes_only_unreferenced_uploaded_asset() {
+        let config_dir = unique_temp_dir("asset-upload-rollback");
+        let _env_guard = ENV_LOCK.lock().await;
+        let _data_dir_guard = MuseDataDirEnvGuard {
+            previous: std::env::var_os("MUSE_DATA_DIR"),
+        };
+        unsafe {
+            std::env::set_var("MUSE_DATA_DIR", &config_dir);
+        }
+        let state = build_test_state(&config_dir);
+        let referenced_name = format!("{}.webp", "a".repeat(64));
+        let orphan_name = format!("{}.webp", "b".repeat(64));
+        let referenced_url = format!("/api/assets/uploaded/{referenced_name}");
+        {
+            let mut visual_packs = state.visual_packs.lock().await;
+            let mut pack = test_visual_pack("visual-router-test-persona", "#d8596f");
+            pack.portrait_path = referenced_url;
+            visual_packs.upsert(pack).expect("应写入测试展示包");
+        }
+        let uploaded_dir = config_dir.join("assets").join("uploaded");
+        std::fs::create_dir_all(&uploaded_dir).expect("应创建上传资源目录");
+        std::fs::write(uploaded_dir.join(&referenced_name), b"referenced")
+            .expect("应写入已引用资源");
+        std::fs::write(uploaded_dir.join(&orphan_name), b"orphan").expect("应写入无引用资源");
+        let app = api_routes().with_state(state);
+
+        let orphan_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assets/uploaded/{orphan_name}"))
+                    .body(Body::empty())
+                    .expect("应能构造无引用资源回滚请求"),
+            )
+            .await
+            .expect("无引用资源回滚应返回响应");
+        assert_eq!(orphan_response.status(), StatusCode::NO_CONTENT);
+        assert!(!uploaded_dir.join(&orphan_name).exists());
+
+        let referenced_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assets/uploaded/{referenced_name}"))
+                    .body(Body::empty())
+                    .expect("应能构造已引用资源回滚请求"),
+            )
+            .await
+            .expect("已引用资源回滚应返回响应");
+        assert_eq!(referenced_response.status(), StatusCode::NO_CONTENT);
+        assert!(uploaded_dir.join(&referenced_name).exists());
+
+        let invalid_response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/assets/uploaded/invalid.webp")
+                    .body(Body::empty())
+                    .expect("应能构造非法资源回滚请求"),
+            )
+            .await
+            .expect("非法资源回滚应返回响应");
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
         let _ = std::fs::remove_dir_all(config_dir);
     }
 
