@@ -76,6 +76,14 @@ async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
     }
     tool_failed("网页跳转处理异常结束。", "redirect_failed")
 }
+/// 构造未配置搜索凭据时的稳定、可操作失败结果。
+fn web_search_not_configured_result() -> ToolResult {
+    tool_failed(
+        "网页搜索尚未配置 Brave Search API 密钥。请在 Muse 设置中心的“联网搜索”中配置，或在首次启动前设置 BRAVE_SEARCH_API_KEY。",
+        "search_not_configured",
+    )
+}
+
 /// 使用 Brave Search API 执行结构化公开网页搜索。
 async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
     let Some(query) = tool_arg_string(&call.arguments, "query") else {
@@ -83,12 +91,7 @@ async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
     };
     let api_key = match state.secrets.get_optional("web-search.brave") {
         Ok(Some(key)) => key,
-        Ok(None) => {
-            return tool_failed(
-                "网页搜索尚未配置 Brave Search API 密钥。请在 Muse 设置中心的“联网搜索”中配置，或在首次启动前设置 BRAVE_SEARCH_API_KEY。",
-                "search_not_configured",
-            );
-        }
+        Ok(None) => return web_search_not_configured_result(),
         Err(err) => {
             return tool_failed(
                 format!("无法读取网页搜索凭据：{err}"),

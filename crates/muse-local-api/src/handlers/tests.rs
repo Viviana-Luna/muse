@@ -740,6 +740,39 @@ mod tests {
         }
     }
 
+    fn unconfigured_web_search_stays_visible_and_returns_actionable_error() {
+        let data_dir = unique_temp_dir("web-search-unconfigured");
+        let mut state = build_test_state(&data_dir);
+        muse_core::domain::tool::builtin::register_all(
+            &mut Arc::get_mut(&mut state)
+                .expect("测试状态尚未共享")
+                .tools,
+        );
+        let mcp_catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
+            data_dir.join("mcp").join("servers.json"),
+        );
+
+        let defs = super::runtime_frozen_tool_defs_for_policy_with_catalog(
+            &state,
+            None,
+            &mcp_catalog,
+        );
+        assert!(
+            defs.iter().any(|definition| definition.name == "web_search"),
+            "未配置凭据只能让调用失败，不能从冻结工具目录隐藏 web_search"
+        );
+
+        let result = super::web_search_not_configured_result();
+        assert!(!result.is_success());
+        assert_eq!(
+            super::tool_result_reason(&result),
+            Some("search_not_configured")
+        );
+        assert!(result.content.contains("设置中心"));
+        assert!(result.content.contains("联网搜索"));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     fn command_run_schema_matches_runtime_timeout_and_audit_contract() {
         let mut registry = ToolRegistry::new();
         builtin::register_all(&mut registry);
@@ -5157,6 +5190,11 @@ mod tests {
         {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(runtime_tool_registry_contains_migrated_handlers)).is_err() {
                 failures.push("runtime_tool_registry_contains_migrated_handlers");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(unconfigured_web_search_stays_visible_and_returns_actionable_error)).is_err() {
+                failures.push("unconfigured_web_search_stays_visible_and_returns_actionable_error");
             }
         }
         {

@@ -1042,13 +1042,6 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
             });
         }
     }
-    let web_search_configured = matches!(
-        state.secrets.get_optional("web-search.brave"),
-        Ok(Some(ref value)) if !value.trim().is_empty()
-    );
-    if !web_search_configured {
-        defs.retain(|definition| definition.name != "web_search");
-    }
     let mut defs = ToolRegistry::filter_definitions_for_policy(
         defs,
         active_persona.map(|persona| &persona.tool_policy),

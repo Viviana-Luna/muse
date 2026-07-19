@@ -87,6 +87,34 @@ describe('useRuntimeStream 交互恢复', () => {
     expect(step?.interactionError).toContain('网络不可用');
   });
 
+  it('工具执行失败时保留后端返回的可操作配置提示', async () => {
+    const { current, emit } = setup();
+    await act(async () => {
+      await current.value?.sendMessage('搜索最新赛程');
+      emit({ type: 'turn_started', turn_id: 'turn-search' });
+      emit({
+        type: 'tool_call',
+        call_id: 'call-search',
+        name: 'web_search',
+        phase: 'tool_running'
+      });
+      emit({
+        type: 'tool_result',
+        call_id: 'call-search',
+        name: 'web_search',
+        success: false,
+        content: '网页搜索尚未配置 Brave Search API 密钥。请在 Muse 设置中心的“联网搜索”中配置。'
+      });
+    });
+
+    const step = current.value?.messages[1].process
+      .filter((item) => item.callId === 'call-search')
+      .at(-1);
+    expect(step?.state).toBe('error');
+    expect(step?.message).toBe('工具调用失败，请查看回复。');
+    expect(step?.detail).toContain('设置中心的“联网搜索”');
+  });
+
   it('成功提交取消后等待后端终态，再将本地流标记为已停止', async () => {
     api.cancelRuntimeTurn.mockResolvedValue({ status: 'ok' });
     const { current, emit } = setup();
