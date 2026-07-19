@@ -57,6 +57,7 @@ describe('AppTitleBar', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
   });
 
@@ -100,7 +101,19 @@ describe('AppTitleBar', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent('余额CNY 66.23');
     expect(screen.getByRole('tooltip')).toHaveTextContent('使用率1%');
     expect(screen.getByRole('tooltip')).toHaveTextContent('Token1,200');
-    expect(screen.getByLabelText('当前时间').textContent).toMatch(/^\d{2}:\d{2}$/);
+    expect(screen.getByLabelText(/当前日期和时间/)).toHaveTextContent(/\d{2}:\d{2}/);
+  });
+
+  it('按本地格式展示日期、星期和时间', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 6, 19, 10, 24));
+
+    render(<AppTitleBar {...titleBarProps()} />);
+
+    const clock = screen.getByLabelText(/当前日期和时间/);
+    expect(clock).toHaveTextContent('07/19 周日');
+    expect(clock).toHaveTextContent('10:24');
+    expect(clock).toHaveAccessibleName(/2026年7月19日星期日.*10:24/);
   });
 
   it('未提供余额时不在上下文详情中渲染余额行', () => {

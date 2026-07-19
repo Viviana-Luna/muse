@@ -106,8 +106,7 @@
   -webkit-backdrop-filter: blur(34px) saturate(1.35);
 }
 
-.app-rail button,
-.app-rail-build {
+.app-rail button {
   min-height: 52px;
   border-radius: 16px;
   color: var(--text-tertiary);
@@ -1757,7 +1756,7 @@
     z-index: 60;
     grid-row: 2;
     display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 3px;
     margin: 0 8px 8px;
     padding: 5px 5px calc(5px + env(safe-area-inset-bottom));
@@ -1769,8 +1768,7 @@
   }
 
   .app-rail > .app-rail-brand,
-  .app-rail-spacer,
-  .app-rail-build {
+  .app-rail-spacer {
     display: none !important;
   }
 

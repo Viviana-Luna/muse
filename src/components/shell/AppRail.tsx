@@ -1,6 +1,5 @@
 import {
   Bot,
-  Boxes,
   Cable,
   MessagesSquare,
   Settings,
@@ -71,9 +70,6 @@ export function AppRail({
         <Settings aria-hidden="true" />
         <span>设置</span>
       </button>
-      <span className="app-rail-build" title="本地 Agent 工作台">
-        <Boxes aria-hidden="true" />
-      </span>
     </aside>
   );
 }

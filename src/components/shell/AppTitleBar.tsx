@@ -41,9 +41,27 @@ const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
   hour12: false
 });
+const dateFormatter = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit'
+});
+const weekdayFormatter = new Intl.DateTimeFormat('zh-CN', { weekday: 'short' });
+const accessibleDateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: 'long',
+  day: 'numeric',
+  weekday: 'long',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false
+});
 
 // 分钟对齐的整点刷新，避免固定间隔造成的分钟漂移。
-function useCurrentTime(): string {
+function useCurrentDateTime(): {
+  dateLabel: string;
+  timeLabel: string;
+  accessibleLabel: string;
+} {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     let timer = 0;
@@ -56,7 +74,11 @@ function useCurrentTime(): string {
     scheduleNext();
     return () => window.clearTimeout(timer);
   }, []);
-  return timeFormatter.format(now);
+  return {
+    dateLabel: `${dateFormatter.format(now)} ${weekdayFormatter.format(now)}`,
+    timeLabel: timeFormatter.format(now),
+    accessibleLabel: accessibleDateTimeFormatter.format(now)
+  };
 }
 
 export function AppTitleBar({
@@ -106,7 +128,7 @@ export function AppTitleBar({
   const personaLabel = activePersonaName || '未选择角色';
   const nativeMacWindowControls = usesNativeMacWindowControls();
   const contextProgress = Math.max(0, Math.min(100, conversationContext.contextProgress ?? 0));
-  const timeLabel = useCurrentTime();
+  const currentDateTime = useCurrentDateTime();
 
   useEffect(() => {
     if (!sessionSelectorOpen && !personaSelectorOpen && !modelSelectorOpen) return;
@@ -314,8 +336,12 @@ export function AppTitleBar({
           </div>
         </section>
 
-        <span className="titlebar-clock" aria-label="当前时间">
-          {timeLabel}
+        <span
+          className="titlebar-clock"
+          aria-label={`当前日期和时间：${currentDateTime.accessibleLabel}`}
+        >
+          <small>{currentDateTime.dateLabel}</small>
+          <strong>{currentDateTime.timeLabel}</strong>
         </span>
       </div>
     </header>

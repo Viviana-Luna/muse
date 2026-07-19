@@ -133,14 +133,34 @@
 
 .titlebar-clock {
   display: grid;
-  min-width: 64px;
-  place-items: center;
+  min-width: 88px;
+  place-content: center;
+  gap: 2px;
   padding: 0 14px 0 12px;
   border-left: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 0 9px 9px 0;
   color: rgba(255, 255, 255, 0.6);
-  font-size: 13px;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.titlebar-clock small,
+.titlebar-clock strong {
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.titlebar-clock small {
+  color: currentColor;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  opacity: 0.68;
+}
+
+.titlebar-clock strong {
+  color: currentColor;
+  font-size: 13px;
   font-weight: 560;
   letter-spacing: 0.04em;
 }
@@ -617,8 +637,7 @@
   backdrop-filter: blur(26px);
 }
 
-.app-rail button,
-.app-rail-build {
+.app-rail button {
   display: grid;
   min-height: 58px;
   place-items: center;
@@ -673,8 +692,6 @@
 }
 
 .app-rail-spacer { flex: 1 1 auto; }
-.app-rail-build { min-height: 34px; opacity: 0.28; }
-.app-rail-build svg { width: 14px; height: 14px; }
 
 .app-main-surface {
   position: relative;
@@ -1091,6 +1108,7 @@
   }
   .titlebar-context-bar { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) 44px auto; }
   .titlebar-persona-segment { display: none; }
+  .titlebar-clock { min-width: 82px; padding-inline: 8px; }
   .window-controls { margin-right: 2px; }
   .app-rail { padding-inline: 6px; }
   .app-rail button { min-height: 54px; }
