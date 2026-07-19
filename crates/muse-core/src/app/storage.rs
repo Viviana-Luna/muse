@@ -155,25 +155,33 @@ pub fn open_runtime_database(
     base_dir: impl AsRef<Path>,
 ) -> Result<(PathBuf, Connection), RuntimeStorageError> {
     let path = runtime_database_path(base_dir);
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("运行时数据库路径缺少父目录"))?;
-    ensure_regular_directory(parent)?;
     let connection = open_runtime_database_at_path(&path)?;
     Ok((path, connection))
 }
 
 /// 打开已知运行时数据库路径；所有读写连接必须经过同一参数入口。
 pub fn open_runtime_database_at_path(path: &Path) -> Result<Connection, RuntimeStorageError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("运行时数据库路径缺少父目录"))?;
-    ensure_regular_directory(parent)?;
-    reject_non_regular_file_path(path)?;
+    prepare_runtime_database_path(path)?;
     let mut connection = Connection::open(path)?;
+    // 数据库可能由旧版本以默认 umask 创建；必须在启用 WAL 前修复主文件权限，
+    // 让随后生成的辅助文件继承同等级的私有访问边界。
+    restrict_sensitive_file_permissions(path)?;
     configure_runtime_connection(&connection)?;
     run_runtime_migrations(&mut connection)?;
     Ok(connection)
+}
+
+/// 在 SQLite 打开数据库前建立统一的私有目录与文件边界。
+///
+/// 旧模型目录迁移需要先读取已退场的业务表，不能提前运行统一 migration；该入口让它
+/// 仍与正式运行时连接共享相同的路径和权限检查。
+pub fn prepare_runtime_database_path(path: &Path) -> Result<(), std::io::Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("运行时数据库路径缺少父目录"))?;
+    ensure_private_runtime_directory(parent)?;
+    reject_non_regular_file_path(path)?;
+    restrict_sensitive_file_permissions(path)
 }
 
 fn configure_runtime_connection(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -291,6 +299,23 @@ fn ensure_regular_directory(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+fn ensure_private_runtime_directory(path: &Path) -> Result<(), std::io::Error> {
+    ensure_regular_directory(path)?;
+    set_sensitive_directory_permissions(path)
+}
+
+#[cfg(unix)]
+fn set_sensitive_directory_permissions(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_sensitive_directory_permissions(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 fn reject_non_regular_file_path(path: &Path) -> Result<(), std::io::Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
@@ -346,7 +371,7 @@ fn atomic_write_synced_with_permissions(
     result
 }
 
-/// 确保已存在的敏感配置不会继续沿用过宽的 Unix 文件权限。
+/// 确保已存在的敏感配置或数据库不会继续沿用过宽的 Unix 文件权限。
 ///
 /// Windows 文件继承用户数据目录 ACL；其当前用户专属 ACL 由 Windows 实机门禁验证。
 pub fn restrict_sensitive_file_permissions(path: &Path) -> Result<(), std::io::Error> {
@@ -394,6 +419,7 @@ pub fn backup_runtime_database(
     let temporary = create_unique_temporary_path(destination)?;
 
     let result = (|| {
+        restrict_sensitive_file_permissions(&temporary)?;
         let source = open_runtime_database_at_path(&source_path)?;
         let mut target = Connection::open(&temporary)?;
         Backup::new(&source, &mut target)?.run_to_completion(
@@ -585,42 +611,61 @@ fn copy_legacy_database(legacy: &Path, current: &Path) -> Result<(), String> {
     let parent = current
         .parent()
         .ok_or_else(|| "运行时数据库缺少父目录".to_string())?;
-    fs::create_dir_all(parent).map_err(|error| format!("创建运行时目录失败：{error}"))?;
-    let temporary = parent.join(format!(
-        ".{RUNTIME_DATABASE_FILE}.migrating-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_file(&temporary);
-    let source = Connection::open_with_flags(legacy, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| format!("打开 legacy 数据库失败：{error}"))?;
-    let mut target = Connection::open(&temporary)
+    ensure_private_runtime_directory(parent)
+        .map_err(|error| format!("创建或修复运行时目录失败：{error}"))?;
+    restrict_sensitive_file_permissions(legacy)
+        .map_err(|error| format!("修复 legacy 数据库权限失败：{error}"))?;
+    let temporary = create_unique_temporary_path(current)
         .map_err(|error| format!("创建临时 Muse 数据库失败：{error}"))?;
-    Backup::new(&source, &mut target)
-        .and_then(|backup| backup.run_to_completion(64, Duration::from_millis(10), None))
-        .map_err(|error| format!("备份 legacy 数据库失败：{error}"))?;
-    drop(target);
-    drop(source);
-    match fs::rename(&temporary, current) {
-        Ok(()) => {
-            if let Err(error) = fs::remove_file(legacy) {
-                tracing::warn!(%error, legacy = %legacy.display(), "新数据库已发布，但清理旧数据库失败");
-            }
-            Ok(())
-        }
-        Err(_error) if current.is_file() => {
-            let _ = fs::remove_file(&temporary);
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(format!("原子发布 Muse 数据库失败：{error}"))
-        }
+    let result = (|| {
+        restrict_sensitive_file_permissions(&temporary)
+            .map_err(|error| format!("修复临时 Muse 数据库权限失败：{error}"))?;
+        let source = Connection::open_with_flags(legacy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("打开 legacy 数据库失败：{error}"))?;
+        let mut target = Connection::open(&temporary)
+            .map_err(|error| format!("创建临时 Muse 数据库失败：{error}"))?;
+        Backup::new(&source, &mut target)
+            .and_then(|backup| backup.run_to_completion(64, Duration::from_millis(10), None))
+            .map_err(|error| format!("备份 legacy 数据库失败：{error}"))?;
+        drop(target);
+        drop(source);
+        validate_database(&temporary)
+            .map_err(|error| format!("临时 Muse 数据库校验失败：{error}"))?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("同步临时 Muse 数据库失败：{error}"))?;
+        replace_file(&temporary, current)
+            .map_err(|error| format!("原子发布 Muse 数据库失败：{error}"))?;
+        sync_parent_directory(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return result;
     }
+    if let Err(error) = fs::remove_file(legacy) {
+        tracing::warn!(%error, legacy = %legacy.display(), "新数据库已发布，但清理旧数据库失败");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+
+    #[cfg(unix)]
+    fn unix_mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .expect("应读取文件权限")
+            .permissions()
+            .mode()
+            & 0o777
+    }
 
     fn unique_root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -689,6 +734,48 @@ mod tests {
             .expect("应检查会话可恢复投影列");
         assert_eq!(recoverable_column, 1);
         drop(reopened);
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repairs_existing_runtime_directory_and_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_root("private-permissions");
+        let runtime = root.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("应创建运行时目录");
+        let database = runtime.join("muse.sqlite");
+        drop(Connection::open(&database).expect("应创建旧版运行时数据库"));
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+            .expect("应放宽测试目录权限");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644))
+            .expect("应放宽测试数据库权限");
+
+        let (opened_path, connection) =
+            super::open_runtime_database(&root).expect("启动应修复旧版存储权限");
+
+        assert_eq!(opened_path, database);
+        assert_eq!(unix_mode(&runtime), 0o700);
+        assert_eq!(unix_mode(&database), 0o600);
+        connection
+            .execute_batch(
+                "CREATE TABLE permission_probe(value TEXT NOT NULL);
+                 INSERT INTO permission_probe VALUES('private');",
+            )
+            .expect("应写入 WAL 权限探针");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("应读取日志模式");
+        assert_eq!(journal_mode, "wal");
+        let wal = runtime.join("muse.sqlite-wal");
+        assert!(wal.is_file(), "测试期间应保留 WAL 文件");
+        assert_eq!(unix_mode(&wal), 0o600);
+        let shared_memory = runtime.join("muse.sqlite-shm");
+        if shared_memory.is_file() {
+            assert_eq!(unix_mode(&shared_memory), 0o600);
+        }
+        drop(connection);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
 
@@ -875,7 +962,16 @@ mod tests {
         let wal_path = root.join("runtime/muse.sqlite-wal");
         assert!(wal_path.is_file(), "测试必须保留活跃 WAL 文件");
 
-        let backup = root.join("backups/runtime.sqlite");
+        let backup_directory = root.join("backups");
+        std::fs::create_dir_all(&backup_directory).expect("应创建用户选择的备份目录");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&backup_directory, std::fs::Permissions::from_mode(0o755))
+                .expect("应设置备份目录测试权限");
+        }
+        let backup = backup_directory.join("runtime.sqlite");
         let published = super::backup_runtime_database(&root, &backup).expect("应创建一致性备份");
         assert_eq!(published, backup);
         let restored = Connection::open(&backup).expect("应打开备份数据库");
@@ -887,8 +983,54 @@ mod tests {
             .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
             .expect("应检查备份完整性");
         assert_eq!(integrity, "ok");
+        #[cfg(unix)]
+        {
+            assert_eq!(unix_mode(&backup), 0o600, "核心库备份必须保持私有权限");
+            assert_eq!(
+                unix_mode(&backup_directory),
+                0o755,
+                "不得修改用户选择的备份父目录权限"
+            );
+        }
         drop(restored);
         drop(source);
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn failed_backup_preserves_last_good_destination_and_cleans_temporary_file() {
+        let root = unique_root("backup-failure");
+        let runtime = root.join("runtime");
+        let backups = root.join("backups");
+        std::fs::create_dir_all(&runtime).expect("应创建运行时目录");
+        std::fs::create_dir_all(&backups).expect("应创建备份目录");
+        std::fs::write(runtime.join("muse.sqlite"), b"not a sqlite database")
+            .expect("应写入损坏的源数据库");
+        let destination = backups.join("runtime.sqlite");
+        std::fs::write(&destination, b"last-good-backup").expect("应写入上一份有效备份占位");
+
+        let error = super::backup_runtime_database(&root, &destination)
+            .expect_err("损坏源库不得覆盖上一份备份");
+
+        assert!(
+            error.to_string().contains("SQLite"),
+            "应返回可诊断的 SQLite 错误：{error}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("应读取上一份备份"),
+            b"last-good-backup"
+        );
+        let temporary_files = std::fs::read_dir(&backups)
+            .expect("应读取备份目录")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".runtime.sqlite.")
+            })
+            .count();
+        assert_eq!(temporary_files, 0, "失败后不应遗留临时数据库");
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
 
@@ -912,7 +1054,47 @@ mod tests {
             .expect("应读取迁移数据");
         assert_eq!(value, "legacy");
         assert!(!legacy.exists(), "当前数据目录不应继续保留旧数据库名");
+        #[cfg(unix)]
+        {
+            assert_eq!(unix_mode(&runtime), 0o700);
+            assert_eq!(unix_mode(&current), 0o600);
+        }
         drop(migrated);
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn failed_legacy_migration_keeps_source_and_cleans_temporary_database() {
+        let root = unique_root("migration-failure");
+        let runtime = root.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("应创建运行时目录");
+        let legacy = runtime.join("agent-vp.sqlite");
+        std::fs::write(&legacy, b"not a sqlite database").expect("应写入损坏的 legacy 数据库");
+
+        let selected = super::runtime_database_path(&root);
+
+        assert_eq!(selected, legacy);
+        assert!(legacy.is_file(), "迁移失败时必须保留 legacy 数据库");
+        assert!(
+            !runtime.join("muse.sqlite").exists(),
+            "迁移失败时不得发布不完整的新数据库"
+        );
+        let temporary_files = std::fs::read_dir(&runtime)
+            .expect("应读取运行时目录")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".muse.sqlite.")
+            })
+            .count();
+        assert_eq!(temporary_files, 0, "迁移失败后不应遗留临时数据库");
+        #[cfg(unix)]
+        {
+            assert_eq!(unix_mode(&runtime), 0o700);
+            assert_eq!(unix_mode(&legacy), 0o600);
+        }
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
 

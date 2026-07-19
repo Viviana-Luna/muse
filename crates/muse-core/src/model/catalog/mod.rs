@@ -211,10 +211,9 @@ impl LegacyModelCatalogStore {
     /// 旧表并发布 TOML，随后才能触发删除旧表的 schema migration。
     pub fn load_from_dir(base_dir: impl AsRef<Path>) -> Result<Self, ModelCatalogError> {
         let db_path = Self::db_path(base_dir.as_ref());
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        storage::prepare_runtime_database_path(&db_path)?;
         let mut conn = Connection::open(&db_path)?;
+        storage::restrict_sensitive_file_permissions(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -408,8 +407,10 @@ impl LegacyModelCatalogStore {
     }
 }
 
-fn open_legacy_catalog_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+fn open_legacy_catalog_connection(path: &Path) -> Result<Connection, ModelCatalogError> {
+    storage::prepare_runtime_database_path(path)?;
     let connection = Connection::open(path)?;
+    storage::restrict_sensitive_file_permissions(path)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1124,6 +1125,29 @@ mod tests {
             )
             .expect("统计旧表");
         assert_eq!(legacy_count, 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let runtime = dir.join("runtime");
+            let database = runtime.join("muse.sqlite");
+            assert_eq!(
+                std::fs::metadata(&runtime)
+                    .expect("应读取旧目录迁移运行目录权限")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&database)
+                    .expect("应读取旧目录迁移数据库权限")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
