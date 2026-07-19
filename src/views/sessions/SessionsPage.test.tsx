@@ -137,6 +137,17 @@ describe('SessionsPage', () => {
     await waitFor(() => expect(runtime.handleForkSession).toHaveBeenCalledWith('history'));
 
     fireEvent.click(screen.getByRole('button', { name: '删除会话' }));
+    const deleteDialog = screen.getByRole('alertdialog');
+    expect(within(deleteDialog).getByText('删除这个会话？')).toBeVisible();
+    expect(within(deleteDialog).getByText(/“雨夜散步”及其本地记录将被永久删除/)).toBeVisible();
+    expect(runtime.handleDeleteRuntimeSession).not.toHaveBeenCalled();
+    fireEvent.click(within(deleteDialog).getByRole('button', { name: '取消' }));
+    expect(runtime.handleDeleteRuntimeSession).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '删除会话' }));
+    fireEvent.click(
+      within(screen.getByRole('alertdialog')).getByRole('button', { name: '删除会话' })
+    );
     expect(runtime.handleDeleteRuntimeSession).toHaveBeenCalledWith('history');
 
     fireEvent.click(screen.getByRole('button', { name: '开始新对话' }));

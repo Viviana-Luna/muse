@@ -599,4 +599,62 @@ describe('useChatRuntime', () => {
       expect.objectContaining({ description: '角色状态正在同步，请稍候。' })
     );
   });
+
+  it('删除当前会话后使用服务端返回的新会话刷新完整运行时事实', async () => {
+    let deleted = false;
+    api.deleteRuntimeSession.mockImplementation(async (conversationId) => {
+      deleted = true;
+      stateRevision += 1;
+      activeConversationId = 'replacement';
+      return {
+        conversation_id: conversationId,
+        active_conversation_id: activeConversationId,
+        deleted_records: 3,
+        deleted_files: 1,
+        status: '会话已删除。'
+      };
+    });
+    api.fetchRuntimeSessions.mockImplementation(() =>
+      Promise.resolve({
+        sessions: deleted
+          ? sessions.filter((session) => session.conversation_id !== 'active')
+          : sessions,
+        active_conversation_id: activeConversationId,
+        status: 'ok'
+      })
+    );
+    const { result, notify } = setup();
+    await waitFor(() => expect(result.current.runtimeSessions).toHaveLength(3));
+
+    await act(async () => {
+      await result.current.handleDeleteRuntimeSession('active');
+    });
+
+    expect(api.deleteRuntimeSession).toHaveBeenCalledWith('active');
+    expect(result.current.activeConversationId).toBe('replacement');
+    expect(result.current.selectedConversationId).toBe('replacement');
+    expect(result.current.messages[0].content).toBe('replacement-消息');
+    expect(notify).toHaveBeenCalledWith({
+      title: '会话已删除',
+      description: '已清理 3 条 transcript 记录。',
+      tone: 'success'
+    });
+  });
+
+  it('会话删除请求失败时解除忙碌状态并展示明确错误', async () => {
+    api.deleteRuntimeSession.mockRejectedValue(new Error('删除会话 transcript 失败：磁盘只读'));
+    const { result, notify } = setup();
+    await waitFor(() => expect(result.current.runtimeSessions).toHaveLength(3));
+
+    await act(async () => {
+      await result.current.handleDeleteRuntimeSession('history-a');
+    });
+
+    expect(result.current.busy).toBe(false);
+    expect(notify).toHaveBeenCalledWith({
+      title: '删除会话失败',
+      description: '删除会话 transcript 失败：磁盘只读',
+      tone: 'error'
+    });
+  });
 });

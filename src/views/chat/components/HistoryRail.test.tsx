@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -77,6 +77,10 @@ describe('HistoryRail', () => {
 
     fireEvent.click(screen.getByLabelText('更多会话操作'));
     fireEvent.click(screen.getByRole('button', { name: '删除会话' }));
+    const deleteDialog = screen.getByRole('alertdialog');
+    expect(within(deleteDialog).getByText('删除这个会话？')).toBeVisible();
+    expect(onDeleteSession).not.toHaveBeenCalled();
+    fireEvent.click(within(deleteDialog).getByRole('button', { name: '删除会话' }));
     expect(onDeleteSession).toHaveBeenCalledWith('history-1');
   });
 

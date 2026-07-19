@@ -21,6 +21,7 @@ import {
   fetchRuntimeSessions,
   updateRuntimeSessionMetadata
 } from '@/api';
+import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
 import { SectionLoading } from '@/components/feedback/LoadingState';
 import { GalgameDialogueBox } from '@/views/chat/components/GalgameDialogueBox';
 import { sessionMeta, sessionTitle } from '@/views/chat/components/HistoryRail';
@@ -370,18 +371,33 @@ export function SessionsPage({
                     )}
                     {selectedSession.archived ? '取消归档' : '归档'}
                   </button>
-                  <button
-                    type="button"
-                    className="sessions-delete-action"
-                    disabled={runtime.busy}
-                    onClick={() =>
+                  <ConfirmDialog
+                    title={
+                      selectedSession.conversation_id === runtime.activeConversationId
+                        ? '删除当前会话？'
+                        : '删除这个会话？'
+                    }
+                    description={
+                      selectedSession.conversation_id === runtime.activeConversationId
+                        ? `“${sessionTitle(selectedSession)}”及其本地记录将被永久删除，随后会自动切换到新对话。`
+                        : `“${sessionTitle(selectedSession)}”及其本地记录将被永久删除，此操作无法撤销。`
+                    }
+                    confirmLabel="删除会话"
+                    tone="danger"
+                    onConfirm={() =>
                       void runtime.handleDeleteRuntimeSession(selectedSession.conversation_id)
                     }
-                    aria-label="删除会话"
-                    title="删除会话"
                   >
-                    <Trash2 aria-hidden="true" />
-                  </button>
+                    <button
+                      type="button"
+                      className="sessions-delete-action"
+                      disabled={runtime.busy}
+                      aria-label="删除会话"
+                      title="删除会话"
+                    >
+                      <Trash2 aria-hidden="true" />
+                    </button>
+                  </ConfirmDialog>
                 </div>
               </header>
               {inspectorOpen && (

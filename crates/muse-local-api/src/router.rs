@@ -1367,6 +1367,7 @@ check_on_startup = true
             "deepseek"
         );
         let profile = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/runtime/sessions/chapter-1/runtime-profile")
@@ -1394,6 +1395,41 @@ check_on_startup = true
         assert_eq!(
             events.last().map(|event| event.kind.as_str()),
             Some("session_metadata_updated")
+        );
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/runtime/sessions/chapter-1")
+                    .body(Body::empty())
+                    .expect("应能构造会话删除请求"),
+            )
+            .await
+            .expect("会话删除接口应返回响应");
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted_payload = response_json(deleted).await;
+        assert_eq!(deleted_payload["conversation_id"], "chapter-1");
+        assert_eq!(deleted_payload["deleted_records"], 6);
+
+        let list_after_delete = app
+            .oneshot(
+                Request::builder()
+                    .uri("/runtime/sessions")
+                    .body(Body::empty())
+                    .expect("应能构造删除后的会话列表请求"),
+            )
+            .await
+            .expect("删除后的会话列表接口应返回响应");
+        let list_after_delete_payload = response_json(list_after_delete).await;
+        assert!(
+            list_after_delete_payload["sessions"]
+                .as_array()
+                .is_some_and(|sessions| sessions
+                    .iter()
+                    .all(|session| session["conversation_id"] != "chapter-1")),
+            "删除后会话不得残留在列表索引中"
         );
         let _ = std::fs::remove_dir_all(config_dir);
     }

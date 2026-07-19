@@ -1,5 +1,6 @@
 import { GitFork, MoreHorizontal, RotateCcw, X } from 'lucide-react';
 
+import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
 import type { RuntimeSessionItem } from '@/types';
 
 interface HistoryRailProps {
@@ -171,13 +172,19 @@ export function HistoryRail({
               <MoreHorizontal aria-hidden="true" />
             </summary>
             <div>
-              <button
-                type="button"
-                disabled={deleteDisabled}
-                onClick={() => void onDeleteSession(selectedSession.conversation_id)}
+              <ConfirmDialog
+                title={selectedIsActive ? '删除当前会话？' : '删除这个会话？'}
+                description={
+                  selectedIsActive
+                    ? `“${sessionTitle(selectedSession)}”及其本地记录将被永久删除，随后会自动切换到新对话。`
+                    : `“${sessionTitle(selectedSession)}”及其本地记录将被永久删除，此操作无法撤销。`
+                }
+                confirmLabel="删除会话"
+                tone="danger"
+                onConfirm={() => void onDeleteSession(selectedSession.conversation_id)}
               >
-                删除会话
-              </button>
+                <button type="button" disabled={deleteDisabled}>删除会话</button>
+              </ConfirmDialog>
             </div>
           </details>
         </footer>

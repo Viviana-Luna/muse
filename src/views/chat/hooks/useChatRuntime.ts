@@ -580,17 +580,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       });
       return;
     }
-    const title =
-      targetSession.summary?.trim() ||
-      targetSession.first_prompt?.trim() ||
-      conversationId;
     const deletingActive = conversationId === session.activeConversationId;
-    const confirmed = window.confirm(
-      deletingActive
-        ? `确定删除当前会话“${title}”吗？删除后会自动切换到新对话。`
-        : `确定删除会话“${title}”吗？这会删除本地 transcript。`
-    );
-    if (!confirmed) return;
     stream.setBusy(true);
     try {
       if (deletingActive) {
