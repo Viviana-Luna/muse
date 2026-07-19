@@ -1,5 +1,6 @@
-import { useEffect, useId, useState } from 'react';
-import { Bot, ChevronDown, ShieldCheck, TriangleAlert, UserRoundCheck } from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Bot, Check, ChevronDown, Hand, ShieldAlert } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
 import type { RuntimeApprovalModePreset } from '@/types';
@@ -26,7 +27,16 @@ export function ApprovalModePicker({
   onChange
 }: ApprovalModePickerProps) {
   const [open, setOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState<{
+    bottom: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
   const titleId = useId();
+  const menuId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const blocked = disabled || switching;
 
   useEffect(() => {
@@ -35,12 +45,54 @@ export function ApprovalModePicker({
 
   useEffect(() => {
     if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false);
+    const syncPosition = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const horizontalInset = 12;
+      const width = Math.min(374, window.innerWidth - horizontalInset * 2);
+      setMenuStyle({
+        bottom: window.innerHeight - rect.top + 8,
+        left: Math.min(
+          Math.max(horizontalInset, rect.left),
+          window.innerWidth - width - horizontalInset
+        ),
+        width,
+        maxHeight: Math.max(180, rect.top - 20)
+      });
     };
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      if (target instanceof Element && target.closest('[role="alertdialog"]')) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    syncPosition();
+    window.addEventListener('resize', syncPosition);
+    window.addEventListener('scroll', syncPosition, true);
+    window.addEventListener('pointerdown', closeOnOutsidePointer);
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('resize', syncPosition);
+      window.removeEventListener('scroll', syncPosition, true);
+      window.removeEventListener('pointerdown', closeOnOutsidePointer);
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !menuStyle) return;
+    menuRef.current
+      ?.querySelector<HTMLButtonElement>('[role="menuitemradio"][aria-checked="true"]')
+      ?.focus();
+  }, [menuStyle, open]);
 
   const select = async (preset: RuntimeApprovalModePreset) => {
     if (preset === value || switching) {
@@ -51,74 +103,71 @@ export function ApprovalModePicker({
     setOpen(false);
   };
 
-  return (
-    <>
-      <button
-        type="button"
-        className={`approval-mode-trigger is-${value}`}
-        disabled={blocked}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-controls="approval-mode-picker"
-        title={disabledReason || '切换当前会话的审批模式'}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {value === 'manual' ? (
-          <UserRoundCheck aria-hidden="true" />
-        ) : value === 'auto' ? (
-          <Bot aria-hidden="true" />
-        ) : (
-          <TriangleAlert aria-hidden="true" />
-        )}
-        <span>{switching ? '切换中…' : MODE_LABELS[value]}</span>
-        <ChevronDown aria-hidden="true" />
-      </button>
+  const onMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') ?? []
+    ).filter((item) => !item.disabled);
+    if (items.length === 0) return;
+    event.preventDefault();
+    const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? items.length - 1
+          : event.key === 'ArrowDown'
+            ? (currentIndex + 1 + items.length) % items.length
+            : (currentIndex - 1 + items.length) % items.length;
+    items[nextIndex]?.focus();
+  };
 
-      {open && (
-        <div className="approval-mode-layer">
-          <button
-            type="button"
-            className="approval-mode-scrim"
-            aria-label="关闭审批模式选择器"
-            onClick={() => setOpen(false)}
-          />
-          <section
-            id="approval-mode-picker"
-            className="approval-mode-drawer"
-            role="dialog"
-            aria-modal="true"
+  const menu =
+    open && menuStyle
+      ? createPortal(
+          <div
+            ref={menuRef}
+            id={menuId}
+            className="approval-mode-popover"
+            role="menu"
             aria-labelledby={titleId}
+            style={menuStyle}
+            onKeyDown={onMenuKeyDown}
           >
             <header>
-              <div>
-                <span>当前会话</span>
-                <h2 id={titleId}>选择审批模式</h2>
-                <p>切换只影响后续新回合；MCP 继续遵守独立安全策略。</p>
-              </div>
-              <button type="button" onClick={() => setOpen(false)} aria-label="关闭审批模式选择器">
-                关闭
-              </button>
+              <span id={titleId}>应如何批准 Muse 操作？</span>
+              <small>当前会话</small>
             </header>
-            <div className="approval-mode-options">
+            <div className="approval-mode-menu-options">
               <button
                 type="button"
+                role="menuitemradio"
+                aria-checked={value === 'manual'}
                 className={value === 'manual' ? 'is-active' : ''}
                 disabled={switching}
                 onClick={() => void select('manual')}
               >
-                <UserRoundCheck aria-hidden="true" />
-                <strong>手动审批</strong>
-                <small>需要审批的动作由你确认，权限限制在当前工作区。</small>
+                <Hand aria-hidden="true" />
+                <span>
+                  <strong>手动审批</strong>
+                  <small>需要审批的动作始终由你确认</small>
+                </span>
+                {value === 'manual' && <Check className="approval-mode-check" aria-hidden="true" />}
               </button>
               <button
                 type="button"
-                className={value === 'auto' ? 'is-active is-auto' : 'is-auto'}
+                role="menuitemradio"
+                aria-checked={value === 'auto'}
+                className={value === 'auto' ? 'is-active' : ''}
                 disabled={switching}
                 onClick={() => void select('auto')}
               >
                 <Bot aria-hidden="true" />
-                <strong>AUTO 模式</strong>
-                <small>由无工具、无角色、无 Skill 的独立审查器按风险决定；异常时转人工。</small>
+                <span>
+                  <strong>AUTO 模式</strong>
+                  <small>由隔离审查器判断需审批的风险操作</small>
+                </span>
+                {value === 'auto' && <Check className="approval-mode-check" aria-hidden="true" />}
               </button>
               <ConfirmDialog
                 title="开启当前会话的 YOLO 模式？"
@@ -130,22 +179,50 @@ export function ApprovalModePicker({
               >
                 <button
                   type="button"
+                  role="menuitemradio"
+                  aria-checked={value === 'yolo'}
                   className={value === 'yolo' ? 'is-active is-yolo' : 'is-yolo'}
                   disabled={switching}
                 >
-                  <TriangleAlert aria-hidden="true" />
-                  <strong>YOLO 模式</strong>
-                  <small>跳过普通审批并启用完全访问；可能造成不可逆的数据或系统变更。</small>
+                  <ShieldAlert aria-hidden="true" />
+                  <span>
+                    <strong>YOLO 模式</strong>
+                    <small>跳过普通审批并启用完全访问</small>
+                  </span>
+                  {value === 'yolo' && <Check className="approval-mode-check" aria-hidden="true" />}
                 </button>
               </ConfirmDialog>
             </div>
-            <footer>
-              <ShieldCheck aria-hidden="true" />
-              <span>AUTO 不是免审；只有 YOLO 会关闭普通审批边界。</span>
-            </footer>
-          </section>
-        </div>
-      )}
-    </>
+            <footer>MCP 仍遵守独立安全策略</footer>
+          </div>,
+          triggerRef.current?.closest<HTMLElement>('.app-shell') ?? document.body
+        )
+      : null;
+
+  return (
+    <div className="approval-mode-picker">
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`approval-mode-trigger is-${value}`}
+        disabled={blocked}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={menuId}
+        title={disabledReason || '切换当前会话的审批模式'}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {value === 'manual' ? (
+          <Hand aria-hidden="true" />
+        ) : value === 'auto' ? (
+          <Bot aria-hidden="true" />
+        ) : (
+          <ShieldAlert aria-hidden="true" />
+        )}
+        <span>{switching ? '切换中…' : MODE_LABELS[value]}</span>
+        <ChevronDown aria-hidden="true" />
+      </button>
+      {menu}
+    </div>
   );
 }

@@ -11,12 +11,29 @@ describe('ApprovalModePicker', () => {
     render(<ApprovalModePicker value="manual" onChange={onChange} />);
 
     fireEvent.click(screen.getByRole('button', { name: /手动审批/ }));
-    const dialog = screen.getByRole('dialog', { name: '选择审批模式' });
-    expect(within(dialog).getByText('手动审批')).toBeVisible();
-    expect(within(dialog).getByText('AUTO 模式')).toBeVisible();
-    expect(within(dialog).getByText('YOLO 模式')).toBeVisible();
-    fireEvent.click(within(dialog).getByRole('button', { name: /AUTO 模式/ }));
+    const menu = screen.getByRole('menu', { name: '应如何批准 Muse 操作？' });
+    expect(within(menu).getByText('手动审批')).toBeVisible();
+    expect(within(menu).getByText('AUTO 模式')).toBeVisible();
+    expect(within(menu).getByText('YOLO 模式')).toBeVisible();
+    expect(within(menu).getByRole('menuitemradio', { name: /手动审批/ })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+    fireEvent.click(within(menu).getByRole('menuitemradio', { name: /AUTO 模式/ }));
     expect(onChange).toHaveBeenCalledWith('auto');
+  });
+
+  it('将浮层渲染在应用主题作用域内', () => {
+    render(
+      <div className="app-shell">
+        <ApprovalModePicker value="auto" onChange={vi.fn()} />
+      </div>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /AUTO 模式/ }));
+    expect(
+      screen.getByRole('menu', { name: '应如何批准 Muse 操作？' }).closest('.app-shell')
+    ).not.toBeNull();
   });
 
   it('YOLO 必须经过危险确认', () => {
@@ -24,7 +41,7 @@ describe('ApprovalModePicker', () => {
     render(<ApprovalModePicker value="manual" onChange={onChange} />);
 
     fireEvent.click(screen.getByRole('button', { name: /手动审批/ }));
-    fireEvent.click(screen.getByRole('button', { name: /YOLO 模式/ }));
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /YOLO 模式/ }));
     expect(onChange).not.toHaveBeenCalled();
     expect(screen.getByRole('alertdialog', { name: '开启当前会话的 YOLO 模式？' })).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: '开启 YOLO' }));

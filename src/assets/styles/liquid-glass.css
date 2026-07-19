@@ -390,6 +390,11 @@
   white-space: nowrap;
 }
 
+.story-reading-column .approval-mode-picker {
+  display: inline-flex;
+  min-width: 0;
+}
+
 .story-reading-column .approval-mode-trigger.is-auto {
   color: color-mix(in srgb, var(--theme-color), white 24%);
 }
@@ -412,148 +417,121 @@
   to { transform: rotate(360deg); }
 }
 
-/* 当前会话审批模式选择器：使用固定层，避免被输入框 overflow 裁切。 */
-.approval-mode-layer {
+/* 当前会话审批模式菜单：通过 Portal 固定到触发按钮上方，避免被对话区域裁切。 */
+.approval-mode-popover {
   position: fixed;
-  inset: 0;
   z-index: calc(var(--layer-modal) + 24);
   display: grid;
-  place-items: end center;
-  padding: 20px;
-}
-
-.approval-mode-scrim {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: rgba(6, 7, 10, 0.5);
-  backdrop-filter: blur(5px);
-  -webkit-backdrop-filter: blur(5px);
-}
-
-.approval-mode-drawer {
-  position: relative;
-  z-index: 1;
-  display: grid;
-  width: min(760px, calc(100vw - 40px));
-  gap: 14px;
-  margin-bottom: clamp(84px, 13vh, 126px);
-  padding: 18px;
-  border: 1px solid var(--glass-edge);
-  border-radius: 22px;
-  background: color-mix(in srgb, var(--glass-surface-strong), transparent 3%);
+  overflow-y: auto;
+  border: 1px solid color-mix(in srgb, var(--glass-edge), white 8%);
+  border-radius: 17px;
+  background: color-mix(in srgb, var(--glass-surface-strong), #3a3b40 24%);
   box-shadow:
-    inset 0 1px 0 var(--glass-highlight),
-    0 26px 70px rgba(0, 0, 0, 0.36);
-  backdrop-filter: blur(32px) saturate(1.24);
-  -webkit-backdrop-filter: blur(32px) saturate(1.24);
+    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight), transparent 48%),
+    0 18px 48px rgba(0, 0, 0, 0.38);
+  backdrop-filter: blur(28px) saturate(1.16);
+  -webkit-backdrop-filter: blur(28px) saturate(1.16);
   color: var(--text-primary);
 }
 
-.approval-mode-drawer > header {
+.approval-mode-popover > header {
   display: flex;
-  align-items: flex-start;
+  min-height: 44px;
+  align-items: center;
   justify-content: space-between;
-  gap: 18px;
+  gap: 12px;
+  padding: 0 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--glass-edge), transparent 20%);
 }
 
-.approval-mode-drawer > header span {
-  color: var(--theme-color);
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0.12em;
-}
-
-.approval-mode-drawer h2 {
-  margin: 3px 0 4px;
-  font-size: 19px;
-}
-
-.approval-mode-drawer p {
-  margin: 0;
-  color: var(--text-tertiary);
-  font-size: 12px;
-}
-
-.approval-mode-drawer > header > button {
-  min-height: 34px;
-  padding: 6px 11px;
-  border: 1px solid var(--glass-edge);
-  border-radius: 10px;
-  background: var(--glass-surface-soft);
+.approval-mode-popover > header span {
   color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
 }
 
-.approval-mode-options {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+.approval-mode-popover > header small {
+  color: var(--text-tertiary);
+  font-size: 10px;
 }
 
-.approval-mode-options > button {
+.approval-mode-menu-options {
   display: grid;
+  gap: 2px;
+  padding: 7px;
+}
+
+.approval-mode-menu-options > button {
+  display: grid;
+  position: relative;
   min-width: 0;
-  min-height: 144px;
-  grid-template-columns: 24px minmax(0, 1fr);
-  grid-template-rows: auto 1fr;
-  align-content: start;
-  gap: 7px 9px;
-  padding: 16px;
-  border: 1px solid var(--glass-edge);
-  border-radius: 16px;
-  background: var(--glass-surface-soft);
+  min-height: 62px;
+  grid-template-columns: 28px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
   color: var(--text-primary);
   text-align: left;
 }
 
-.approval-mode-options > button:hover:not(:disabled),
-.approval-mode-options > button.is-active {
-  border-color: var(--accent-edge);
-  background: color-mix(in srgb, var(--theme-color), transparent 90%);
+.approval-mode-menu-options > button:hover:not(:disabled),
+.approval-mode-menu-options > button:focus-visible,
+.approval-mode-menu-options > button.is-active {
+  background: color-mix(in srgb, var(--glass-surface-soft), white 4%);
 }
 
-.approval-mode-options > button.is-yolo {
-  border-color: color-mix(in srgb, #e55c4f, transparent 52%);
+.approval-mode-menu-options > button:focus-visible {
+  outline: 1px solid var(--accent-edge);
+  outline-offset: -1px;
 }
 
-.approval-mode-options > button > svg {
-  width: 20px;
-  height: 20px;
-  color: var(--theme-color);
+.approval-mode-menu-options > button > svg:first-child {
+  width: 19px;
+  height: 19px;
+  color: var(--text-secondary);
 }
 
-.approval-mode-options > button.is-yolo > svg {
-  color: #ef806e;
+.approval-mode-menu-options > button > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
 }
 
-.approval-mode-options strong {
-  align-self: center;
-  font-size: 14px;
+.approval-mode-menu-options strong {
+  font-size: 13px;
+  line-height: 1.2;
 }
 
-.approval-mode-options small {
-  grid-column: 1 / -1;
+.approval-mode-menu-options small {
+  overflow: hidden;
   color: var(--text-tertiary);
   font-size: 11px;
-  line-height: 1.55;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.approval-mode-drawer > footer {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.approval-mode-menu-options > button.is-yolo,
+.approval-mode-menu-options > button.is-yolo > svg:first-child,
+.approval-mode-menu-options > button.is-yolo small {
+  color: #f08a4b;
+}
+
+.approval-mode-menu-options .approval-mode-check {
+  width: 17px;
+  height: 17px;
+  color: var(--text-secondary);
+}
+
+.approval-mode-popover > footer {
+  min-height: 31px;
+  padding: 8px 16px 9px;
+  border-top: 1px solid color-mix(in srgb, var(--glass-edge), transparent 20%);
   color: var(--text-tertiary);
-  font-size: 11px;
-}
-
-.approval-mode-drawer > footer svg {
-  width: 14px;
-  height: 14px;
-  color: var(--theme-color);
+  font-size: 10px;
 }
 
 .story-reading-column .composer-skill-attachment {
@@ -1888,18 +1866,8 @@
     object-position: var(--portrait-object-x) 22%;
   }
 
-  .approval-mode-options {
-    grid-template-columns: 1fr;
-  }
-
-  .approval-mode-options > button {
-    min-height: 104px;
-  }
-
-  .approval-mode-drawer {
-    max-height: min(70dvh, 620px);
-    margin-bottom: 0;
-    overflow-y: auto;
+  .approval-mode-popover {
+    border-radius: 15px;
   }
 }
 
