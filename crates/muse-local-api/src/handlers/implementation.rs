@@ -71,6 +71,9 @@ use muse_runtime::interactions::{
     ApprovalDecision, InteractionResolveError, PendingApproval, PendingUserQuestion,
     UserQuestionDecision,
 };
+use muse_runtime::persona_state::{
+    PERSONA_EFFECTS_SCHEMA_VERSION, PersonaEffectsPayload, PersonaEmotionEffect,
+};
 use muse_runtime::{
     ApprovalModePreset, ApprovalPolicy, ApprovalsReviewer, FrozenExecutionPolicy,
     PermissionProfile, TurnBudget, TurnSnapshot,
@@ -881,12 +884,48 @@ impl ConversationRuntime {
             mode_state.tool_preset(),
             &skill_tool_ids,
         );
-        let system_prompt = build_runtime_system_prompt_with_mode_state(
+        let mut system_prompt = build_runtime_system_prompt_with_mode_state(
             &self.state.config,
             Some(&active_persona),
             &tool_defs,
             mode_state,
         );
+        let persona_state_result = self
+            .state
+            .runtime_service
+            .session_repository()
+            .await
+            .map_err(|error| error.to_string());
+        let persona_state = match persona_state_result {
+            Ok(repository) => repository
+                .persona_state(&active_persona.id)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let persona_state = match persona_state {
+            Ok(state) => state,
+            Err(message) => {
+                return Err(abort_preparing_turn(
+                    &self.state,
+                    &emitter,
+                    &conversation_id,
+                    &turn_id,
+                    format!("读取 Persona 长期状态失败：{message}"),
+                )
+                .await);
+            }
+        };
+        if let Some(persona_state) = persona_state {
+            let effective = persona_state.effective_at(chrono::Utc::now());
+            system_prompt.push_str(&format!(
+                "\n\n【角色长期情绪状态】\n上次已提交情绪：{}，当前纯计算强度：{}/100，原因：{}，来源回合：{}。该状态仅用于轻量语气与视觉连续性，不得改变模型、工具、Skill、MCP、审批或权限。读取与衰减不会写数据库。",
+                effective.effective_emotion,
+                effective.effective_intensity,
+                effective.persisted.reason_code,
+                effective.persisted.source_turn_id,
+            ));
+        }
         let frozen_runtime = match build_turn_context(
             &self.state,
             conversation_id.clone(),
@@ -1137,6 +1176,7 @@ impl ConversationRuntime {
                 );
             }
             let mut produced_tool_output = false;
+            let final_emotion_candidate = current_turn.emotion_candidate.clone();
             for item in current_turn.items {
                 match item {
                     RuntimeModelItem::AssistantMessage {
@@ -1357,6 +1397,7 @@ impl ConversationRuntime {
                                 switched_conversation,
                                 "角色切换已完成，本轮状态已经提交。",
                                 "角色已切换，本轮已结束。",
+                                None,
                             )
                             .await
                             {
@@ -1371,7 +1412,8 @@ impl ConversationRuntime {
                                         )
                                         .await
                                     }
-                                    PublishCommittedTurnError::MemoryPublish(_) => {
+                                    PublishCommittedTurnError::StateProjection(_)
+                                    | PublishCommittedTurnError::MemoryPublish(_) => {
                                         emit_committed_memory_publish_failure(&emitter, &message)
                                             .await;
                                         message
@@ -1459,6 +1501,7 @@ impl ConversationRuntime {
                     working_conversation.clone(),
                     "模型回复与工具结果已经提交。",
                     "回复已完成。",
+                    final_emotion_candidate,
                 )
                 .await
                 {
@@ -1473,7 +1516,8 @@ impl ConversationRuntime {
                             )
                             .await
                         }
-                        PublishCommittedTurnError::MemoryPublish(_) => {
+                        PublishCommittedTurnError::StateProjection(_)
+                        | PublishCommittedTurnError::MemoryPublish(_) => {
                             emit_committed_memory_publish_failure(&emitter, &message).await;
                             message
                         }
@@ -1602,15 +1646,16 @@ where
 #[derive(Debug)]
 enum PublishCommittedTurnError {
     CommitPersistence(String),
+    StateProjection(String),
     MemoryPublish(String),
 }
 
 impl std::fmt::Display for PublishCommittedTurnError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CommitPersistence(message) | Self::MemoryPublish(message) => {
-                formatter.write_str(message)
-            }
+            Self::CommitPersistence(message)
+            | Self::StateProjection(message)
+            | Self::MemoryPublish(message) => formatter.write_str(message),
         }
     }
 }
@@ -1633,10 +1678,18 @@ async fn publish_committed_turn(
     conversation: Conversation,
     summary: &str,
     status_message: &str,
+    emotion_candidate: Option<PersonaEmotionEffect>,
 ) -> Result<(), PublishCommittedTurnError> {
-    append_turn_committed(state, turn, summary)
+    let committed = append_turn_committed(state, turn, summary, emotion_candidate)
         .await
         .map_err(PublishCommittedTurnError::CommitPersistence)?;
+    state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| PublishCommittedTurnError::StateProjection(error.to_string()))?
+        .project_committed_persona_state(&committed)
+        .map_err(|error| PublishCommittedTurnError::StateProjection(error.to_string()))?;
     state
         .runtime_service
         .publish_turn_conversation(&turn.turn_id, conversation)
@@ -1658,18 +1711,46 @@ async fn append_turn_committed(
     state: &Arc<AppState>,
     turn: &TurnContext,
     summary: &str,
-) -> Result<(), String> {
-    append_required_turn_event(
-        state,
-        "turn_committed",
-        serde_json::json!({
-            "conversation_id": turn.conversation_id,
-            "turn_id": turn.turn_id,
-            "outcome": "committed",
-            "summary": summary,
-        }),
-    )
-    .await
+    emotion_candidate: Option<PersonaEmotionEffect>,
+) -> Result<muse_runtime::session::SessionEventV3, String> {
+    let persona_effects = persona_effects_for_committed_turn(turn, emotion_candidate);
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| error.to_string())?;
+    repository
+        .append_event(
+            turn.conversation_id.clone(),
+            Some(turn.turn_id.clone()),
+            "turn_committed",
+            serde_json::json!({
+                "conversation_id": turn.conversation_id,
+                "turn_id": turn.turn_id,
+                "outcome": "committed",
+                "summary": summary,
+                "persona_effects": persona_effects,
+            }),
+        )
+        .await
+        .map_err(|error| format!("写入 v3 会话事件 `turn_committed` 失败：{error}"))
+}
+
+fn persona_effects_for_committed_turn(
+    turn: &TurnContext,
+    emotion_candidate: Option<PersonaEmotionEffect>,
+) -> Option<PersonaEffectsPayload> {
+    turn.persona_id
+        .as_ref()
+        .map(|persona_id| PersonaEffectsPayload {
+            schema_version: PERSONA_EFFECTS_SCHEMA_VERSION.to_string(),
+            persona_id: persona_id.clone(),
+            emotion: turn
+                .persona_feature_policy
+                .emotion_persistence_enabled
+                .then_some(emotion_candidate)
+                .flatten(),
+        })
 }
 
 fn report_transcript_failure(result: Result<(), String>) {

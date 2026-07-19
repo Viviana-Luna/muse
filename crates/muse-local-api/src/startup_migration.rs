@@ -202,6 +202,7 @@ fn historical_default_persona() -> Persona {
         mcp_policy: Default::default(),
         preferred_model_ref: None,
         preferred_voice_id: None,
+        feature_policy: Default::default(),
         default_visual_pack_id: "default-visual-pack".to_string(),
         author: "system".to_string(),
         version: "1.0.0".to_string(),
@@ -274,6 +275,7 @@ fn raw_store_matches_historical_template(content: &[u8]) -> bool {
     // 不能把当前结构重新序列化后冒充旧模板。
     expected.remove("skill_policy");
     expected.remove("mcp_policy");
+    expected.remove("feature_policy");
     personas[0] == serde_json::Value::Object(expected.clone())
 }
 
@@ -507,6 +509,7 @@ mod tests {
         let persona = persona.as_object_mut().expect("历史默认角色应为对象");
         persona.remove("skill_policy");
         persona.remove("mcp_policy");
+        persona.remove("feature_policy");
         serde_json::json!({
             "personas": [persona],
             "active_persona_id": LEGACY_DEFAULT_PERSONA_ID

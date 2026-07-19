@@ -405,6 +405,7 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            persona_feature_policy: Default::default(),
             runtime_mode: "focus".to_string(),
             focus_phase: "build".to_string(),
             tool_preset: "focus_build".to_string(),
@@ -417,6 +418,27 @@ mod tests {
             runtime_policy: Default::default(),
             tool_definitions: Vec::new(),
         }
+    }
+
+    fn persona_emotion_persistence_policy_is_frozen_at_commit() {
+        let candidate = muse_runtime::persona_state::PersonaEmotionEffect {
+            emotion: "happy".to_string(),
+            intensity: 70,
+            reason_code: "positive_interaction".to_string(),
+        };
+        let mut turn = test_turn_context("turn-emotion-policy");
+
+        let enabled = super::persona_effects_for_committed_turn(&turn, Some(candidate.clone()))
+            .expect("有 Persona 时应生成 canonical effects payload");
+        assert_eq!(enabled.emotion, Some(candidate.clone()));
+
+        turn.persona_feature_policy.emotion_persistence_enabled = false;
+        let disabled = super::persona_effects_for_committed_turn(&turn, Some(candidate))
+            .expect("关闭持久化仍应保留可审计的 Persona effects envelope");
+        assert!(
+            disabled.emotion.is_none(),
+            "关闭持久化后最终候选不得进入 canonical commit"
+        );
     }
 
     fn runtime_context_snapshot_splits_context_segments() {
@@ -579,13 +601,13 @@ mod tests {
         let mut state = EmotionPrefixState::default();
 
         assert!(matches!(
-            state.push_chunk("{\"emotion\":\"happy\""),
+            state.push_chunk("{\"emotion\":\"happy\",\"intensity\":70,\"reason_code\":\"positive_interaction\""),
             PrefixParseResult::Pending
         ));
 
         match state.push_chunk("}\n你好") {
             PrefixParseResult::Resolved { emotion, text } => {
-                assert_eq!(emotion.as_deref(), Some("happy"));
+                assert_eq!(emotion.as_ref().map(|value| value.emotion.as_str()), Some("happy"));
                 assert_eq!(text, "你好");
             }
             PrefixParseResult::Pending => panic!("应当已经完成情绪前缀解析"),
@@ -606,7 +628,7 @@ mod tests {
 
     fn strips_reasoning_block_before_emotion_prefix() {
         let reply = super::sanitize_assistant_reply(
-            "<think>内部推理不应显示</think> {\"emotion\":\"neutral\"}诶，你的问题好像没打完。",
+            "<think>内部推理不应显示</think> {\"emotion\":\"neutral\",\"intensity\":0,\"reason_code\":\"neutral\"}诶，你的问题好像没打完。",
         );
 
         assert_eq!(reply.content, "诶，你的问题好像没打完。");
@@ -620,9 +642,9 @@ mod tests {
             PrefixParseResult::Pending
         ));
 
-        match state.push_chunk("推理</think> {\"emotion\":\"neutral\"}你好") {
+        match state.push_chunk("推理</think> {\"emotion\":\"neutral\",\"intensity\":0,\"reason_code\":\"neutral\"}你好") {
             PrefixParseResult::Resolved { emotion, text } => {
-                assert_eq!(emotion.as_deref(), Some("neutral"));
+                assert_eq!(emotion.as_ref().map(|value| value.emotion.as_str()), Some("neutral"));
                 assert_eq!(text, "你好");
             }
             PrefixParseResult::Pending => panic!("推理块结束后应当继续解析情绪前缀"),
@@ -3780,6 +3802,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4475,6 +4498,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
                 mcp_policy: Default::default(),
                 preferred_model_ref: None,
                 preferred_voice_id: None,
+                feature_policy: Default::default(),
                 default_visual_pack_id: "default-visual-pack".to_string(),
                 author: String::new(),
                 version: "1.0.0".to_string(),
@@ -4546,6 +4570,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "visual-persona-slots".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4625,6 +4650,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4718,6 +4744,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             },
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -4849,6 +4876,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             },
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "2.0.0".to_string(),
@@ -4918,6 +4946,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
                 model_id: "deepseek-v4-flash".to_string(),
             }),
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -5022,6 +5051,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -5045,10 +5075,10 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
         .expect("应冻结 Turn 运行时")
         .context;
 
-        assert_eq!(turn.runtime_policy.schema_version, 6);
+        assert_eq!(turn.runtime_policy.schema_version, 7);
         assert_eq!(
             turn.runtime_policy.policy_version,
-            "persona-runtime-policy/v6"
+            "persona-runtime-policy/v7"
         );
         assert_eq!(turn.runtime_policy.skill_catalog.len(), 1);
         assert_eq!(turn.runtime_policy.skill_catalog[0].name, "calendar");
@@ -5136,6 +5166,7 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "visual-a".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -5207,6 +5238,11 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
     #[test]
     fn aggregated_sync_test_cases() {
         let mut failures = Vec::new();
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(persona_emotion_persistence_policy_is_frozen_at_commit)).is_err() {
+                failures.push("persona_emotion_persistence_policy_is_frozen_at_commit");
+            }
+        }
         {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(runtime_context_snapshot_splits_context_segments)).is_err() {
                 failures.push("runtime_context_snapshot_splits_context_segments");

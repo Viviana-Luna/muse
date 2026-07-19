@@ -101,9 +101,20 @@ pub(crate) async fn handle_get_persona(
             }),
         ));
     };
+    drop(personas);
+    let runtime_state = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+        .persona_state(&persona.id)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+        .map(|projection| projection.effective_at(chrono::Utc::now()));
 
     Ok(Json(PersonaDetailResponse {
         visual_pack: resolve_persona_visual_pack(&state, &persona).await,
+        runtime_state,
         persona,
     }))
 }
@@ -613,7 +624,7 @@ struct EmotionPrefixState {
 enum PrefixParseResult {
     Pending,
     Resolved {
-        emotion: Option<String>,
+        emotion: Option<PersonaEmotionEffect>,
         text: String,
     },
 }
@@ -638,6 +649,7 @@ enum RuntimeModelItem {
 struct StreamedTurn {
     items: Vec<RuntimeModelItem>,
     usage: Option<ProviderTokenUsage>,
+    emotion_candidate: Option<PersonaEmotionEffect>,
 }
 
 impl EmotionPrefixState {
@@ -679,7 +691,7 @@ impl EmotionPrefixState {
                 .to_string();
             self.buffer.clear();
             return PrefixParseResult::Resolved {
-                emotion: Some(emotion),
+                emotion,
                 text,
             };
         }
@@ -792,19 +804,22 @@ impl ToolCallPrefixState {
     }
 }
 
-fn parse_emotion_json(text: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(text)
-        .ok()?
-        .get("emotion")?
-        .as_str()
-        .map(|emotion| emotion.to_string())
+fn parse_emotion_json(text: &str) -> Option<PersonaEmotionEffect> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    parse_emotion_candidate(value)
 }
 
-fn parse_emotion_json_prefix(text: &str) -> Option<(String, usize)> {
+fn parse_emotion_json_prefix(text: &str) -> Option<(Option<PersonaEmotionEffect>, usize)> {
     let consumed = json_object_prefix_len(text)?;
     let value = serde_json::from_str::<serde_json::Value>(&text[..consumed]).ok()?;
-    let emotion = value.get("emotion")?.as_str()?.to_string();
-    Some((emotion, consumed))
+    value.get("emotion")?;
+    Some((parse_emotion_candidate(value), consumed))
+}
+
+fn parse_emotion_candidate(value: serde_json::Value) -> Option<PersonaEmotionEffect> {
+    let candidate = serde_json::from_value::<PersonaEmotionEffect>(value).ok()?;
+    candidate.validate().ok()?;
+    Some(candidate)
 }
 
 fn parse_tool_call_json_prefix(text: &str) -> Option<(ToolCall, usize)> {

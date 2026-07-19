@@ -5,6 +5,7 @@ import type {
   ActivePersonaResponse,
   Persona,
   PersonaLibraryItem,
+  PersonaRuntimeState,
   PersonaVisualPackPatch,
   VisualPack
 } from '@/types';
@@ -19,6 +20,7 @@ export interface PersonaEditorState {
   persona: Persona;
   visualPackDraft: PersonaVisualPackPatch;
   visualDirty: boolean;
+  runtimeState?: PersonaRuntimeState | null;
 }
 
 export interface UsePersonaStateOptions {
@@ -53,6 +55,9 @@ export const DEFAULT_PERSONA: Persona = {
   },
   preferred_model_ref: null,
   preferred_voice_id: null,
+  feature_policy: {
+    emotion_persistence_enabled: true
+  },
   default_visual_pack_id: 'default-visual-pack',
   author: '',
   version: '1.0.0',

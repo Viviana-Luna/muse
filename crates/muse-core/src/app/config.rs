@@ -154,7 +154,7 @@ impl AgentConfig {
 
         if !emotion_disabled {
             prompt.push_str("\n\n");
-            prompt.push_str("【情绪输出规则】在每条回复的最开头，用一行 JSON 标明你的情绪，格式为 {\"emotion\":\"happy|sad|surprised|thinking|neutral|angry\"}，然后换行再写正常回复。示例：\n{\"emotion\":\"happy\"}\n你好呀！");
+            prompt.push_str("【情绪输出规则】在每条回复的最开头，用一行严格 JSON 标明本轮情绪，格式为 {\"emotion\":\"happy|sad|surprised|thinking|neutral|angry\",\"intensity\":0到100的整数,\"reason_code\":\"positive_interaction|negative_interaction|surprise|deliberation|conflict|neutral\"}，然后换行再写正常回复。不要增加其他字段。示例：\n{\"emotion\":\"happy\",\"intensity\":65,\"reason_code\":\"positive_interaction\"}\n你好呀！");
         }
 
         prompt
@@ -1051,6 +1051,7 @@ mod tests {
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default-visual-pack".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),

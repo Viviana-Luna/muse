@@ -1,6 +1,6 @@
 //! 单轮上下文模块，定义工具执行和运行时事件共享的轮次快照。
 
-use crate::domain::persona::{McpPolicy, SkillPolicy, ToolPolicy};
+use crate::domain::persona::{McpPolicy, PersonaFeaturePolicy, SkillPolicy, ToolPolicy};
 use crate::domain::tool::ToolDef;
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,8 @@ pub struct RuntimePolicySnapshot {
     pub skill_policy: SkillPolicy,
     #[serde(default)]
     pub mcp_policy: McpPolicy,
+    #[serde(default)]
+    pub persona_feature_policy: PersonaFeaturePolicy,
     pub skill_revision: String,
     pub skill_catalog_hash: String,
     #[serde(default)]
@@ -111,6 +113,8 @@ pub struct TurnContext {
     pub tool_policy: ToolPolicy,
     pub skill_policy: SkillPolicy,
     pub mcp_policy: McpPolicy,
+    #[serde(default)]
+    pub persona_feature_policy: PersonaFeaturePolicy,
     pub runtime_mode: String,
     pub focus_phase: String,
     pub tool_preset: String,
@@ -133,7 +137,7 @@ pub struct TurnContext {
 #[cfg(test)]
 mod tests {
     use super::{RuntimePolicySnapshot, RuntimeSkillCatalogEntry, TurnContext};
-    use crate::domain::persona::{McpPolicy, SkillPolicy, ToolPolicy};
+    use crate::domain::persona::{McpPolicy, PersonaFeaturePolicy, SkillPolicy, ToolPolicy};
 
     #[test]
     fn legacy_turn_context_defaults_new_model_and_voice_fields() {
@@ -153,6 +157,7 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: SkillPolicy::default(),
             mcp_policy: McpPolicy::default(),
+            persona_feature_policy: PersonaFeaturePolicy::default(),
             runtime_mode: "daily".to_string(),
             focus_phase: "plan".to_string(),
             tool_preset: "daily".to_string(),

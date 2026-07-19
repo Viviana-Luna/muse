@@ -527,6 +527,7 @@ pub struct ActivePersonaResponse {
 pub struct PersonaDetailResponse {
     pub persona: Persona,
     pub visual_pack: Option<VisualPack>,
+    pub runtime_state: Option<muse_runtime::persona_state::EffectivePersonaState>,
 }
 
 #[derive(Serialize)]

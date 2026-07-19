@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::ApprovalModePreset;
+use crate::persona_state::{PersonaStateError, PersonaStateProjection, PersonaStateStore};
 use crate::session::{
     SessionEventV3, SessionIndexIdentity, SessionMigrationReport, SessionStore, SessionStoreError,
     conversation_file_name,
@@ -27,6 +28,7 @@ pub enum SessionRepositoryError {
     Session(SessionStoreError),
     Storage(RuntimeStorageError),
     Sqlite(rusqlite::Error),
+    PersonaState(PersonaStateError),
     InvalidInput(String),
     InvalidData(String),
 }
@@ -37,6 +39,7 @@ impl std::fmt::Display for SessionRepositoryError {
             Self::Session(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Sqlite(error) => write!(formatter, "会话 SQLite 索引操作失败：{error}"),
+            Self::PersonaState(error) => error.fmt(formatter),
             Self::InvalidInput(message) => formatter.write_str(message),
             Self::InvalidData(message) => formatter.write_str(message),
         }
@@ -60,6 +63,12 @@ impl From<RuntimeStorageError> for SessionRepositoryError {
 impl From<rusqlite::Error> for SessionRepositoryError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
+    }
+}
+
+impl From<PersonaStateError> for SessionRepositoryError {
+    fn from(value: PersonaStateError) -> Self {
+        Self::PersonaState(value)
     }
 }
 
@@ -216,11 +225,40 @@ impl SessionRepository {
         if let Err(error) = repository.ensure_index_current().await {
             tracing::warn!(%error, "会话仓储已打开，SQLite 索引将在列表访问时重试重建");
         }
+        if let Err(error) = repository.recover_persona_state().await {
+            tracing::warn!(%error, "Persona 状态补投影失败，将在下次读取时重试");
+        }
         Ok((repository, report))
     }
 
     pub fn session_store(&self) -> &SessionStore {
         &self.store
+    }
+
+    /// 从 canonical Session v3 committed payload 幂等补齐 Persona 状态。
+    pub async fn recover_persona_state(&self) -> Result<usize, SessionRepositoryError> {
+        let _guard = self.index_gate.lock().await;
+        Ok(PersonaStateStore::new(&self.data_dir)
+            .recover_from_session_store(&self.store)
+            .await?)
+    }
+
+    /// 投影刚刚可靠写入的 committed event。失败时 canonical commit 已经成立，
+    /// 调用方不得追加冲突的 aborted 终态。
+    pub fn project_committed_persona_state(
+        &self,
+        event: &SessionEventV3,
+    ) -> Result<bool, SessionRepositoryError> {
+        Ok(PersonaStateStore::new(&self.data_dir).project_committed_event(event)?)
+    }
+
+    /// 读取前先执行幂等补偿，避免上次进程在 JSONL commit 与 SQLite 投影之间退出。
+    pub async fn persona_state(
+        &self,
+        persona_id: &str,
+    ) -> Result<Option<PersonaStateProjection>, SessionRepositoryError> {
+        self.recover_persona_state().await?;
+        Ok(PersonaStateStore::new(&self.data_dir).projection(persona_id)?)
     }
 
     pub async fn append_event(

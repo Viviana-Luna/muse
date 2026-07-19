@@ -11,7 +11,7 @@ const RUNTIME_DATABASE_FILE: &str = "muse.sqlite";
 const LEGACY_RUNTIME_DATABASE_FILE: &str = "agent-vp.sqlite";
 const RUNTIME_DATABASE_DIR: &str = "runtime";
 const RUNTIME_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 6;
+const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 7;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 统一运行时数据库初始化、连接或迁移错误。
@@ -146,6 +146,51 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
             );
             DELETE FROM session_index;
             DELETE FROM session_index_state;
+        "#,
+    },
+    RuntimeMigration {
+        version: 7,
+        name: "persona_emotion_state_mvp",
+        // Session v3 的 turn_committed payload 仍是人格状态的 canonical 事实。
+        // event 表提供按 turn_id 幂等的结构化审计，projection 只保存当前状态，
+        // 两者均不承载记忆、关系、成长或任何权限事实。
+        sql: r#"
+            CREATE TABLE persona_state_event (
+                turn_id TEXT PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                source_commit_seq INTEGER NOT NULL UNIQUE CHECK (source_commit_seq > 0),
+                emotion TEXT NOT NULL CHECK (
+                    emotion IN ('happy', 'sad', 'surprised', 'thinking', 'neutral', 'angry')
+                ),
+                intensity INTEGER NOT NULL CHECK (intensity BETWEEN 0 AND 100),
+                reason_code TEXT NOT NULL CHECK (
+                    reason_code IN (
+                        'positive_interaction', 'negative_interaction', 'surprise',
+                        'deliberation', 'conflict', 'neutral'
+                    )
+                ),
+                committed_at TEXT NOT NULL
+            );
+            CREATE INDEX persona_state_event_persona_revision
+                ON persona_state_event(persona_id, source_commit_seq DESC);
+            CREATE TABLE persona_state_projection (
+                persona_id TEXT PRIMARY KEY,
+                emotion TEXT NOT NULL CHECK (
+                    emotion IN ('happy', 'sad', 'surprised', 'thinking', 'neutral', 'angry')
+                ),
+                intensity INTEGER NOT NULL CHECK (intensity BETWEEN 0 AND 100),
+                reason_code TEXT NOT NULL CHECK (
+                    reason_code IN (
+                        'positive_interaction', 'negative_interaction', 'surprise',
+                        'deliberation', 'conflict', 'neutral'
+                    )
+                ),
+                source_conversation_id TEXT NOT NULL,
+                source_turn_id TEXT NOT NULL,
+                last_interaction_at TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0)
+            );
         "#,
     },
 ];
@@ -690,7 +735,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("应记录最新 migration");
-        assert_eq!(migration, (6, "persona_session_ownership_v2".to_string()));
+        assert_eq!(migration, (7, "persona_emotion_state_mvp".to_string()));
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -724,7 +769,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 6);
+        assert_eq!(migration_count, 7);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",
@@ -810,7 +855,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取最新 migration");
-        assert_eq!(latest, 6);
+        assert_eq!(latest, 7);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
@@ -903,6 +948,43 @@ mod tests {
         assert_eq!(indexed_rows, 0);
         assert_eq!(persona_columns, 3);
         assert!(workspace_table);
+        drop(migrated);
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn migration_seven_creates_bounded_persona_emotion_event_and_projection() {
+        let root = unique_root("persona-emotion-state");
+        let (_, connection) = super::open_runtime_database(&root).expect("应初始化核心库");
+        connection
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version = 7;
+                 DROP TABLE persona_state_projection;
+                 DROP INDEX persona_state_event_persona_revision;
+                 DROP TABLE persona_state_event;",
+            )
+            .expect("应模拟 migration v6 的运行时库");
+        drop(connection);
+
+        let (_, migrated) = super::open_runtime_database(&root).expect("应执行情绪状态迁移");
+        for table in ["persona_state_event", "persona_state_projection"] {
+            let exists: bool = migrated
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("应检查情绪状态表");
+            assert!(exists, "应创建 `{table}`");
+        }
+        let invalid = migrated.execute(
+            "INSERT INTO persona_state_event(
+                turn_id, persona_id, conversation_id, source_commit_seq,
+                emotion, intensity, reason_code, committed_at
+             ) VALUES('turn', 'persona', 'conversation', 1, 'unknown', 101, 'other', 'now')",
+            [],
+        );
+        assert!(invalid.is_err(), "数据库必须拒绝越界或未知情绪状态");
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }

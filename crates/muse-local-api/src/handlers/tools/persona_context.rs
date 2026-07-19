@@ -111,6 +111,7 @@ async fn stream_provider_reply(
     let mut usage = None::<ProviderTokenUsage>;
     let mut prefix_state = EmotionPrefixState::default();
     let mut tool_prefix_state = ToolCallPrefixState::default();
+    let mut emotion_candidate = None;
 
     loop {
         if cancel_token.is_cancelled() {
@@ -142,10 +143,13 @@ async fn stream_provider_reply(
                 PrefixParseResult::Pending => {}
                 PrefixParseResult::Resolved { emotion, text } => {
                     if let Some(emotion) = emotion {
-                        let _ = state.emotion_tx.send(emotion.clone());
+                        let _ = state.emotion_tx.send(emotion.emotion.clone());
                         emitter
-                            .emit_or_die(RuntimeEvent::Emotion { emotion })
+                            .emit_or_die(RuntimeEvent::Emotion {
+                                emotion: emotion.emotion.clone(),
+                            })
                             .await?;
+                        emotion_candidate = Some(emotion);
                     }
 
                     if !text.is_empty() {
@@ -273,7 +277,12 @@ async fn stream_provider_reply(
                     }
                 }
                 push_assistant_model_item(&mut items, &mut full_reply);
-                return Ok(streamed_turn_with_reasoning(items, full_reasoning, usage));
+                return Ok(streamed_turn_with_reasoning(
+                    items,
+                    full_reasoning,
+                    usage,
+                    emotion_candidate,
+                ));
             }
             Err(err) => {
                 return Err(err);
@@ -282,7 +291,12 @@ async fn stream_provider_reply(
     }
 
     push_assistant_model_item(&mut items, &mut full_reply);
-    Ok(streamed_turn_with_reasoning(items, full_reasoning, usage))
+    Ok(streamed_turn_with_reasoning(
+        items,
+        full_reasoning,
+        usage,
+        emotion_candidate,
+    ))
 }
 
 fn push_assistant_model_item(items: &mut Vec<RuntimeModelItem>, content: &mut String) {
@@ -299,9 +313,14 @@ fn streamed_turn_with_reasoning(
     mut items: Vec<RuntimeModelItem>,
     reasoning_content: String,
     usage: Option<ProviderTokenUsage>,
+    emotion_candidate: Option<PersonaEmotionEffect>,
 ) -> StreamedTurn {
     if reasoning_content.trim().is_empty() {
-        return StreamedTurn { items, usage };
+        return StreamedTurn {
+            items,
+            usage,
+            emotion_candidate,
+        };
     }
 
     let has_tool_call = items
@@ -325,7 +344,11 @@ fn streamed_turn_with_reasoning(
         *item_reasoning = Some(reasoning_content);
     }
 
-    StreamedTurn { items, usage }
+    StreamedTurn {
+        items,
+        usage,
+        emotion_candidate,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

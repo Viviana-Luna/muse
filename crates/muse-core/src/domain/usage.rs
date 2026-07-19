@@ -417,6 +417,8 @@ fn inspect_history_database(
                         | "session_index"
                         | "session_index_state"
                         | "persona_workspace_state"
+                        | "persona_state_event"
+                        | "persona_state_projection"
                 ))
             || table.starts_with("sqlite_");
         if !known {

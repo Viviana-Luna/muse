@@ -415,7 +415,10 @@ mod tests {
                 ]
             } else {
                 vec![
-                    Ok(ChatStreamEvent::Text("当前测试回复。".to_string())),
+                    Ok(ChatStreamEvent::Text(
+                        "{\"emotion\":\"happy\",\"intensity\":70,\"reason_code\":\"positive_interaction\"}\n当前测试回复。"
+                            .to_string(),
+                    )),
                     Ok(ChatStreamEvent::Done),
                 ]
             };
@@ -501,6 +504,7 @@ mod tests {
             mcp_policy: Default::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: Default::default(),
             default_visual_pack_id: "default-visual-pack".to_string(),
             author: "test".to_string(),
             version: "1.0.0".to_string(),
@@ -2574,7 +2578,8 @@ check_on_startup = true
         unsafe {
             std::env::set_var("MUSE_DATA_DIR", &config_dir);
         }
-        let app = api_routes().with_state(build_test_state(&config_dir));
+        let state = build_test_state(&config_dir);
+        let app = api_routes().with_state(state.clone());
         let response = app
             .oneshot(
                 Request::builder()
@@ -2637,6 +2642,18 @@ check_on_startup = true
             payloads.last().map(|payload| &payload["type"]),
             Some(&serde_json::json!("done"))
         );
+        let projection = state
+            .runtime_service
+            .session_repository()
+            .await
+            .expect("应打开会话仓储")
+            .persona_state("router-test-persona")
+            .await
+            .expect("应读取已提交情绪")
+            .expect("最终 assistant 的严格候选应产生长期状态");
+        assert_eq!(projection.emotion, "happy");
+        assert_eq!(projection.intensity, 70);
+        assert_eq!(projection.reason_code, "positive_interaction");
     }
 
     #[tokio::test]

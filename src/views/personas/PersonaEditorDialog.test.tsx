@@ -68,6 +68,7 @@ const persona: Persona = {
   mcp_policy: { mode: 'inherit', allowed_servers: [] },
   preferred_model_ref: null,
   preferred_voice_id: null,
+  feature_policy: { emotion_persistence_enabled: true },
   default_visual_pack_id: 'default',
   author: '',
   version: '1.0.0',
@@ -361,6 +362,39 @@ describe('PersonaEditorDialog', () => {
     expect(updateEditor).toHaveBeenCalledWith('mcp_policy', {
       mode: 'inherit',
       allowed_servers: ['docs', 'search']
+    });
+  });
+
+  it('可以暂停长期情绪持久化并查看纯计算状态', () => {
+    const updateEditor = vi.fn();
+    renderEditor(
+      {
+        mode: 'edit',
+        runtimeState: {
+          persona_id: 'muse',
+          emotion: 'happy',
+          intensity: 70,
+          reason_code: 'positive_interaction',
+          source_conversation_id: 'conversation-1',
+          source_turn_id: 'turn-1',
+          last_interaction_at: '2026-07-19T01:00:00Z',
+          revision: 7,
+          effective_emotion: 'happy',
+          effective_intensity: 55,
+          evaluated_at: '2026-07-19T04:00:00Z'
+        }
+      },
+      { updateEditor }
+    );
+
+    expect(screen.getByText('当前有效情绪：happy')).toBeInTheDocument();
+    expect(screen.getByText(/强度 55\/100/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('长期情绪持久化'), {
+      target: { value: 'disabled' }
+    });
+
+    expect(updateEditor).toHaveBeenCalledWith('feature_policy', {
+      emotion_persistence_enabled: false
     });
   });
 

@@ -246,7 +246,8 @@ export function usePersonaController(options: UsePersonaControllerOptions) {
           name: '新角色'
         },
         visualPackDraft: createPersonaVisualDraft(null),
-        visualDirty: false
+        visualDirty: false,
+        runtimeState: null
       });
       return;
     }
@@ -265,7 +266,8 @@ export function usePersonaController(options: UsePersonaControllerOptions) {
             }
           : source,
       visualPackDraft: createPersonaVisualDraft(detail.visual_pack),
-      visualDirty: false
+      visualDirty: false,
+      runtimeState: detail.runtime_state ?? null
     });
   }
 

@@ -84,6 +84,26 @@ pub struct PersonaModelReference {
     pub model_id: String,
 }
 
+/// Persona 可选长期能力的用户控制面。当前阶段只开放情绪持久化，
+/// 瞬时 Emotion 事件不受该开关影响。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaFeaturePolicy {
+    #[serde(default = "default_true")]
+    pub emotion_persistence_enabled: bool,
+}
+
+impl Default for PersonaFeaturePolicy {
+    fn default() -> Self {
+        Self {
+            emotion_persistence_enabled: true,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 /// 角色资产主体。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Persona {
@@ -118,6 +138,8 @@ pub struct Persona {
     pub preferred_model_ref: Option<PersonaModelReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_voice_id: Option<String>,
+    #[serde(default)]
+    pub feature_policy: PersonaFeaturePolicy,
     pub default_visual_pack_id: String,
     #[serde(default)]
     pub author: String,
@@ -239,7 +261,8 @@ fn default_persona_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        McpPolicy, Persona, PersonaValidationError, RoleplayStyle, SkillPolicy, ToolPolicy,
+        McpPolicy, Persona, PersonaFeaturePolicy, PersonaValidationError, RoleplayStyle,
+        SkillPolicy, ToolPolicy,
     };
 
     fn valid_persona() -> Persona {
@@ -261,6 +284,7 @@ mod tests {
             mcp_policy: McpPolicy::default(),
             preferred_model_ref: None,
             preferred_voice_id: None,
+            feature_policy: PersonaFeaturePolicy::default(),
             default_visual_pack_id: "default-room".to_string(),
             author: String::new(),
             version: "1.0.0".to_string(),
@@ -272,6 +296,16 @@ mod tests {
     fn validates_required_fields() {
         let persona = valid_persona();
         assert!(persona.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_persona_defaults_emotion_persistence_to_enabled() {
+        let mut value = serde_json::to_value(valid_persona()).unwrap();
+        value.as_object_mut().unwrap().remove("feature_policy");
+
+        let restored: Persona = serde_json::from_value(value).unwrap();
+
+        assert!(restored.feature_policy.emotion_persistence_enabled);
     }
 
     #[test]

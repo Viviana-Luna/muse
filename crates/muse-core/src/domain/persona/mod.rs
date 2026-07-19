@@ -5,7 +5,8 @@ pub mod character;
 pub mod visual;
 
 pub use character::{
-    McpPolicy, Persona, PersonaModelReference, PersonaSummary, PersonaValidationError,
-    ResourcePolicyMode, RoleplayStyle, SkillPolicy, ToolPolicy, ToolPolicyMode,
+    McpPolicy, Persona, PersonaFeaturePolicy, PersonaModelReference, PersonaSummary,
+    PersonaValidationError, ResourcePolicyMode, RoleplayStyle, SkillPolicy, ToolPolicy,
+    ToolPolicyMode,
 };
 pub use visual::{VisualPack, VisualPackValidationError};

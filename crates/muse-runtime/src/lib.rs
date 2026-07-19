@@ -5,6 +5,7 @@
 
 pub mod coordinator;
 pub mod interactions;
+pub mod persona_state;
 pub mod service;
 pub mod session;
 pub mod session_metadata;
@@ -709,6 +710,7 @@ mod tests {
             tool_policy: ToolPolicy::default(),
             skill_policy: Default::default(),
             mcp_policy: Default::default(),
+            persona_feature_policy: Default::default(),
             runtime_mode: "chat".to_string(),
             focus_phase: "idle".to_string(),
             tool_preset: "default".to_string(),

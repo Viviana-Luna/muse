@@ -3256,6 +3256,24 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.persona-runtime-state {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--theme-color), transparent 68%);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--theme-color), transparent 90%);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.persona-runtime-state strong {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.persona-runtime-state small {
+  color: rgba(255, 255, 255, 0.52);
+}
+
 .field-hint {
   color: rgba(255, 255, 255, 0.48);
   font-size: 12px;
@@ -8784,6 +8802,20 @@ button.muse-runtime-model svg {
 .story-shell.theme-light .role-editor-modal :is(.persona-image-result, .persona-image-source) span,
 .story-shell.theme-light .role-editor-modal .persona-image-hint {
   color: rgba(54, 42, 50, 0.72);
+}
+
+.story-shell.theme-light .role-editor-modal .persona-runtime-state {
+  border-color: rgba(54, 42, 50, 0.14);
+  background: rgba(255, 255, 255, 0.66);
+  color: rgba(54, 42, 50, 0.72);
+}
+
+.story-shell.theme-light .role-editor-modal .persona-runtime-state strong {
+  color: rgba(39, 31, 38, 0.92);
+}
+
+.story-shell.theme-light .role-editor-modal .persona-runtime-state small {
+  color: rgba(54, 42, 50, 0.56);
 }
 
 .story-shell.theme-light .persona-crop-dialog {

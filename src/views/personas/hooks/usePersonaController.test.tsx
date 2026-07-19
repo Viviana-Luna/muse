@@ -46,6 +46,7 @@ const persona: Persona = {
   mcp_policy: { mode: 'inherit', allowed_servers: [] },
   preferred_model_ref: null,
   preferred_voice_id: null,
+  feature_policy: { emotion_persistence_enabled: true },
   default_visual_pack_id: 'visual-alice',
   author: 'Muse',
   version: '1.0.0',

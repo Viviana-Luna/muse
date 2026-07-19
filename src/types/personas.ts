@@ -23,6 +23,10 @@ export interface PersonaModelReference {
   model_id: string;
 }
 
+export interface PersonaFeaturePolicy {
+  emotion_persistence_enabled: boolean;
+}
+
 export interface Persona {
   id: string;
   name: string;
@@ -41,6 +45,7 @@ export interface Persona {
   mcp_policy: McpPolicy;
   preferred_model_ref: PersonaModelReference | null;
   preferred_voice_id: string | null;
+  feature_policy: PersonaFeaturePolicy;
   default_visual_pack_id: string;
   author: string;
   version: string;
@@ -104,6 +109,27 @@ export interface AssetUploadResponse {
 export interface ActivePersonaResponse {
   persona: Persona;
   visual_pack: VisualPack | null;
+  runtime_state?: PersonaRuntimeState | null;
+}
+
+export interface PersonaRuntimeState {
+  persona_id: string;
+  emotion: 'happy' | 'sad' | 'surprised' | 'thinking' | 'neutral' | 'angry';
+  intensity: number;
+  reason_code:
+    | 'positive_interaction'
+    | 'negative_interaction'
+    | 'surprise'
+    | 'deliberation'
+    | 'conflict'
+    | 'neutral';
+  source_conversation_id: string;
+  source_turn_id: string;
+  last_interaction_at: string;
+  revision: number;
+  effective_emotion: string;
+  effective_intensity: number;
+  evaluated_at: string;
 }
 
 /**

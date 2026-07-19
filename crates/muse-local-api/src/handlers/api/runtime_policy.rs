@@ -515,6 +515,9 @@ async fn build_turn_context(
     let mcp_policy = active_persona
         .map(|persona| persona.mcp_policy.clone())
         .unwrap_or_default();
+    let persona_feature_policy = active_persona
+        .map(|persona| persona.feature_policy.clone())
+        .unwrap_or_default();
 
     let (mcp_revision, mcp_catalog_hash, skill_preferences) = {
         let mut store = state.user_config.lock().await;
@@ -562,8 +565,8 @@ async fn build_turn_context(
         .unwrap_or_default();
 
     let runtime_policy = muse_core::domain::turn::RuntimePolicySnapshot {
-        schema_version: 6,
-        policy_version: "persona-runtime-policy/v6".to_string(),
+        schema_version: 7,
+        policy_version: "persona-runtime-policy/v7".to_string(),
         persona_version: active_persona.map(|persona| persona.version.clone()),
         provider: chat.config.provider.clone(),
         model: chat.config.model.clone(),
@@ -583,6 +586,7 @@ async fn build_turn_context(
         tool_policy: tool_policy.clone(),
         skill_policy: skill_policy.clone(),
         mcp_policy: mcp_policy.clone(),
+        persona_feature_policy: persona_feature_policy.clone(),
         skill_revision,
         skill_catalog_hash,
         skill_catalog,
@@ -608,6 +612,7 @@ async fn build_turn_context(
         tool_policy,
         skill_policy,
         mcp_policy,
+        persona_feature_policy,
         runtime_mode: mode_state.mode.as_str().to_string(),
         focus_phase: mode_state.focus_phase.as_str().to_string(),
         tool_preset: mode_state.tool_preset().as_str().to_string(),

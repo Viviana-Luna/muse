@@ -788,6 +788,32 @@ export function PersonaEditorDialog({
                 音色 ID 由当前 TTS 供应商解释，本地不会伪造可用性；上游拒绝后不会静默切换音色。
               </small>
             </label>
+            <label className="wide persona-runtime-reference-field">
+              长期情绪
+              <select
+                aria-label="长期情绪持久化"
+                value={editor.persona.feature_policy.emotion_persistence_enabled ? 'enabled' : 'disabled'}
+                onChange={(event) =>
+                  updatePersona('feature_policy', {
+                    ...editor.persona.feature_policy,
+                    emotion_persistence_enabled: event.target.value === 'enabled'
+                  })
+                }
+              >
+                <option value="enabled">保存已提交回合的情绪</option>
+                <option value="disabled">暂停保存，仅保留本轮动画</option>
+              </select>
+              <small>
+                关闭后不会新增长期情绪事件；实时表情仍会显示，已有状态不会被静默删除。
+              </small>
+            </label>
+            {editor.mode === 'edit' && editor.runtimeState && (
+              <div className="wide persona-runtime-state" role="status">
+                <strong>当前有效情绪：{editor.runtimeState.effective_emotion}</strong>
+                <span>强度 {editor.runtimeState.effective_intensity}/100 · revision {editor.runtimeState.revision}</span>
+                <small>来源回合：{editor.runtimeState.source_turn_id}</small>
+              </div>
+            )}
             <label className="wide">
               备注
               <textarea
