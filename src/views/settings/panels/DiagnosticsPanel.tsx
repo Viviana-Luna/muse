@@ -13,6 +13,40 @@ type DiagnosticsPanelProps = Pick<
   | 'onRefreshDiagnostics'
 >;
 
+type SystemStatusTone = 'info' | 'warning' | 'danger';
+
+interface SystemStatusItem {
+  id: string;
+  label: string;
+  detail: string;
+  badge: string;
+  tone: SystemStatusTone;
+}
+
+function permissionModeLabel(value: string) {
+  switch (value) {
+    case 'request_approval':
+      return '手动审批';
+    case 'approve_for_me':
+      return 'AUTO 模式';
+    case 'full_access':
+      return '旧版完全访问';
+    default:
+      return `未知权限模式（${value || '空值'}）`;
+  }
+}
+
+function sandboxModeLabel(value: string) {
+  switch (value) {
+    case 'workspace_write':
+      return '工作区写入';
+    case 'danger_full_access':
+      return '旧版完全文件访问';
+    default:
+      return `未知沙箱模式（${value || '空值'}）`;
+  }
+}
+
 export function DiagnosticsPanel({
   settingsConfig,
   busy,
@@ -53,12 +87,41 @@ export function DiagnosticsPanel({
             message: settingsConfig.speech_recognition.enabled ? '等待手动刷新检测。' : '未启用。'
           }
         ];
-  const logs = [
-    runtimeStatus ? `[RUNTIME] ${runtimeStatus}` : '[RUNTIME] 暂无运行时状态变更',
-    voiceStatus ? `[VOICE] ${voiceStatus}` : '[VOICE] 语音状态未上报',
-    modelFetchStatus.chat ? `[MODEL] ${modelFetchStatus.chat}` : '[MODEL] 模型列表尚未刷新',
-    `[WORKSPACE] permission=${workspacePermissionMode}, sandbox=${workspaceSandboxMode}`
-  ].slice(0, 50);
+  const workspaceNeedsAttention =
+    workspacePermissionMode === 'full_access' ||
+    workspaceSandboxMode === 'danger_full_access' ||
+    !['request_approval', 'approve_for_me'].includes(workspacePermissionMode) ||
+    workspaceSandboxMode !== 'workspace_write';
+  const systemStatuses: SystemStatusItem[] = [
+    {
+      id: 'runtime',
+      label: '对话运行时',
+      detail: runtimeStatus || '尚未收到运行时状态。',
+      badge: runtimeStatus ? '当前状态' : '未上报',
+      tone: runtimeStatus ? 'info' : 'warning'
+    },
+    {
+      id: 'voice',
+      label: '语音服务',
+      detail: voiceStatus || '尚未收到语音服务状态。',
+      badge: voiceStatus ? '当前状态' : '未上报',
+      tone: voiceStatus ? 'info' : 'warning'
+    },
+    {
+      id: 'model',
+      label: '模型目录',
+      detail: modelFetchStatus.chat || '模型目录尚未刷新。',
+      badge: modelFetchStatus.chat ? '当前状态' : '未刷新',
+      tone: modelFetchStatus.chat ? 'info' : 'warning'
+    },
+    {
+      id: 'workspace',
+      label: '工作区权限',
+      detail: `新会话审批：${permissionModeLabel(workspacePermissionMode)}；文件边界：${sandboxModeLabel(workspaceSandboxMode)}。`,
+      badge: workspaceNeedsAttention ? '需要检查' : '当前策略',
+      tone: workspaceNeedsAttention ? 'danger' : 'info'
+    }
+  ];
 
   return (
     <div className="settings-panel-body diagnostics-grid">
@@ -94,15 +157,19 @@ export function DiagnosticsPanel({
       <section className="settings-module diagnostics-card">
         <header className="settings-module-head">
           <div>
-            <h2>只读日志视图</h2>
-            <p>汇总最近的运行时、语音、模型和工具状态。</p>
+            <h2>当前系统状态</h2>
+            <p>展示此刻的运行时、语音、模型目录和工作区策略，不保存历史记录。</p>
           </div>
         </header>
-        <div className="diagnostics-log" role="log" aria-label="最近运行状态">
-          {logs.map((line) => (
-            <code key={line}>{line}</code>
+        <ul className="system-status-list" aria-label="当前系统状态">
+          {systemStatuses.map((item) => (
+            <li key={item.id}>
+              <strong>{item.label}</strong>
+              <small title={item.detail}>{item.detail}</small>
+              <span className={`system-status-badge ${item.tone}`}>{item.badge}</span>
+            </li>
           ))}
-        </div>
+        </ul>
       </section>
     </div>
   );

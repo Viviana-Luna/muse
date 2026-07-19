@@ -5603,23 +5603,64 @@ textarea {
   color: #ffb4b4;
 }
 
-.diagnostics-log {
+.system-status-list {
   display: grid;
-  gap: 5px;
-  overflow: auto;
-  max-height: 260px;
-  padding: 12px;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.24);
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
-.diagnostics-log code {
-  color: rgba(255, 255, 255, 0.68);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+.system-status-list li {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 42px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.system-status-list :is(strong, small, .system-status-badge) {
+  min-width: 0;
+}
+
+.system-status-list strong {
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+}
+
+.system-status-list small {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.52);
   font-size: 11px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.system-status-badge {
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.system-status-badge.info {
+  background: var(--color-info-bg);
+  color: #9cc4ff;
+}
+
+.system-status-badge.warning {
+  background: var(--color-warning-bg);
+  color: #ffd38a;
+}
+
+.system-status-badge.danger {
+  background: var(--color-danger-bg);
+  color: #ffb4b4;
 }
 
 .motion-reduced .portrait-wrap::before,
@@ -5764,7 +5805,8 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .connectivity-list span {
+  .connectivity-list span,
+  .system-status-list li {
     grid-template-columns: 1fr;
   }
 }
