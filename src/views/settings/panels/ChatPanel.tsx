@@ -22,6 +22,7 @@ type ChatPanelProps = Pick<
   | 'busy'
   | 'onSaveProviderCredential'
   | 'onDeleteProviderCredential'
+  | 'onSetProviderEnabled'
   | 'onVerifyCatalogProvider'
   | 'onCreateCatalogModel'
   | 'onUpdateCatalogModel'
@@ -75,6 +76,7 @@ export function ChatPanel(props: ChatPanelProps) {
     busy,
     onSaveProviderCredential,
     onDeleteProviderCredential,
+    onSetProviderEnabled,
     onVerifyCatalogProvider,
     onCreateCatalogModel,
     onUpdateCatalogModel,
@@ -84,7 +86,7 @@ export function ChatPanel(props: ChatPanelProps) {
   const providers = useMemo(
     () =>
       (modelCatalog?.providers ?? []).filter(
-        (provider) => provider.enabled && provider.capabilities.includes('chat')
+        (provider) => provider.capabilities.includes('chat') || provider.status === 'supported'
       ),
     [modelCatalog]
   );
@@ -212,6 +214,15 @@ export function ChatPanel(props: ChatPanelProps) {
     }
   }
 
+  async function toggleProviderEnabled() {
+    if (!selectedProvider) return;
+    try {
+      await onSetProviderEnabled(selectedProvider.id, !selectedProvider.enabled);
+    } catch {
+      // 开启前置条件或配置写入错误已经由控制器展示，保持当前状态。
+    }
+  }
+
   return (
     <>
       <section className="provider-settings-workspace" aria-label="模型配置">
@@ -234,7 +245,10 @@ export function ChatPanel(props: ChatPanelProps) {
               >
                 <span className="provider-library-copy">
                   <strong>{provider.name}</strong>
-                  <small>{provider.api_key_configured ? '凭据已配置' : '等待 API Key'}</small>
+                  <small>
+                    {provider.enabled ? '已开启' : '已关闭'} ·{' '}
+                    {provider.api_key_configured ? '凭据已配置' : '等待 API Key'}
+                  </small>
                 </span>
               </button>
             ))}
@@ -251,9 +265,23 @@ export function ChatPanel(props: ChatPanelProps) {
                     <small>{selectedProvider.notes || '对话模型供应商连接'}</small>
                   </span>
                 </div>
-                <i className={`provider-detail-status${selectedProvider.api_key_configured ? ' ready' : ''}`}>
-                  {selectedProvider.api_key_configured ? '已配置' : '未配置'}
-                </i>
+                <div className="provider-state-control">
+                  <span className={`provider-detail-status${selectedProvider.enabled ? ' ready' : ''}`}>
+                    {selectedProvider.enabled ? '已开启' : '已关闭'}
+                  </span>
+                  <button
+                    type="button"
+                    className={`switch provider-state-switch${selectedProvider.enabled ? ' on' : ''}`}
+                    role="switch"
+                    aria-checked={selectedProvider.enabled}
+                    aria-label={`${selectedProvider.enabled ? '关闭' : '开启'} ${selectedProvider.name}`}
+                    title={selectedProvider.enabled ? '关闭供应商' : '开启供应商'}
+                    disabled={busy}
+                    onClick={() => void toggleProviderEnabled()}
+                  >
+                    <i aria-hidden="true" />
+                  </button>
+                </div>
               </header>
 
               <div className="provider-detail-scroll">
@@ -388,7 +416,9 @@ export function ChatPanel(props: ChatPanelProps) {
                       <div className="managed-model-empty">
                         <Database aria-hidden="true" />
                         <strong>还没有模型</strong>
-                        <p>为 {selectedProvider.name} 新增一个模型后，它会出现在聊天页选择器中。</p>
+                        <p>
+                          为 {selectedProvider.name} 新增模型；供应商开启后才会出现在聊天页选择器中。
+                        </p>
                         <button type="button" className="primary" onClick={beginCreateModel} disabled={busy}>
                           <Plus aria-hidden="true" />
                           新增模型

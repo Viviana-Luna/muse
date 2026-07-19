@@ -8,6 +8,7 @@ import type {
   ModelCatalogItem,
   ModelCatalogMutation,
   ModelInfo,
+  ModelProviderCatalog,
   ModelsConfig,
   ProviderCredentialResponse,
   ProviderBalanceRequest,
@@ -72,6 +73,20 @@ export async function saveProviderCredential(
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(update)
+    })
+  );
+}
+
+// 更新供应商启停状态；关闭后其模型不会进入运行时选择器。
+export async function saveProviderEnabled(
+  providerId: string,
+  enabled: boolean
+): Promise<ModelProviderCatalog> {
+  return readJson<ModelProviderCatalog>(
+    await apiFetch(`/api/models/providers/${encodeURIComponent(providerId)}/state`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled })
     })
   );
 }

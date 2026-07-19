@@ -97,6 +97,7 @@ function createProps(): ComponentProps<typeof ChatPanel> {
     busy: false,
     onSaveProviderCredential: vi.fn(),
     onDeleteProviderCredential: vi.fn(),
+    onSetProviderEnabled: vi.fn(),
     onVerifyCatalogProvider: vi.fn(),
     onCreateCatalogModel: vi.fn(),
     onUpdateCatalogModel: vi.fn(),
@@ -149,5 +150,20 @@ describe('ChatPanel', () => {
       screen.getByRole('dialog', { name: '新增模型' }).querySelector('input[type="password"]')
     ).toBeNull();
     expect(screen.getByText(/API Key 不保存在模型上/)).toBeVisible();
+  });
+
+  it('关闭的供应商仍可管理，并通过可访问开关请求开启', () => {
+    const props = createProps();
+    props.modelCatalog = {
+      ...catalog,
+      providers: [{ ...deepSeekProvider, enabled: false }]
+    };
+    render(<ChatPanel {...props} />);
+
+    expect(screen.getAllByText('已关闭').length).toBeGreaterThan(0);
+    const toggle = screen.getByRole('switch', { name: '开启 DeepSeek' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(toggle);
+    expect(props.onSetProviderEnabled).toHaveBeenCalledWith('deepseek', true);
   });
 });

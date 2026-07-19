@@ -447,6 +447,7 @@ motion_level = "full"
         assert!(config.has_published_model_profiles());
         let content = std::fs::read_to_string(root.join("config.toml")).expect("应读取新配置");
         assert!(content.contains("[providers.deepseek]"));
+        assert!(content.contains("enabled = false"));
         assert!(content.contains("[providers.deepseek.models.deepseek-v4-flash]"));
         assert!(content.contains("[active_models.chat]"));
         assert!(!content.contains("providers = {"));

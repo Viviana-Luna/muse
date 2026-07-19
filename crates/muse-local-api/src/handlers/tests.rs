@@ -6,7 +6,7 @@ mod tests {
     };
     use crate::dto::{
         ActiveChatModelUpdateRequest, FetchModelCatalogRequest, ModelCatalogDeleteRequest,
-        PersonaUpsertRequest, PersonaVisualPackPatch,
+        PersonaUpsertRequest, PersonaVisualPackPatch, ProviderStateUpdateRequest,
     };
     use crate::state::{AppState, build_runtime_system_prompt};
     use axum::{Json, extract::State};
@@ -537,6 +537,9 @@ mod tests {
         config
             .update_provider_api_key("deepseek", Some("test-secret".to_string()))
             .expect("应配置测试 Provider Key");
+        config
+            .update_provider_enabled("deepseek", true)
+            .expect("应开启测试供应商");
         config
             .update_active_chat_model("deepseek", "deepseek-v4-pro")
             .expect("应配置测试活动模型");
@@ -4044,6 +4047,9 @@ mod tests {
                 )
                 .expect("应能保存测试 Provider Key");
             store
+                .update_provider_enabled("volcengine_agent_plan", true)
+                .expect("应能开启测试供应商");
+            store
                 .update_active_chat_model("volcengine_agent_plan", "glm-5.2")
                 .expect("应能激活测试模型");
         }
@@ -4080,12 +4086,20 @@ mod tests {
     async fn active_model_switch_requires_the_target_provider_credential_locally() {
         let config_dir = unique_temp_dir("active-model-no-key");
         let state = build_test_state(&config_dir);
-        state
-            .model_config
-            .lock()
-            .await
-            .ensure_runtime_model("volcengine_agent_plan", "glm-5.2")
-            .expect("补录测试模型");
+        {
+            let mut store = state.model_config.lock().await;
+            let mut profiles = muse_core::model::profile_config::ModelProfileConfig::default();
+            profiles.providers
+                .get_mut("volcengine_agent_plan")
+                .expect("应有内置供应商")
+                .enabled = true;
+            store
+                .publish_migrated_model_profiles(profiles)
+                .expect("应注入缺少凭据的启用状态");
+            store
+                .ensure_runtime_model("volcengine_agent_plan", "glm-5.2")
+                .expect("补录测试模型");
+        }
 
         let result = super::handle_put_active_chat_model(
             State(state),
@@ -4119,6 +4133,26 @@ mod tests {
         .0;
         assert!(response.api_key_configured);
 
+        let enabled = super::handle_put_provider_state(
+            State(state.clone()),
+            axum::extract::Path("deepseek".to_string()),
+            Json(ProviderStateUpdateRequest { enabled: true }),
+        )
+        .await
+        .expect("配置凭据后应能开启供应商")
+        .0;
+        assert!(enabled.enabled);
+        let _ = super::handle_put_active_chat_model(
+            State(state.clone()),
+            Json(ActiveChatModelUpdateRequest {
+                provider_id: "deepseek".to_string(),
+                model: "deepseek-v4-pro".to_string(),
+            }),
+        )
+        .await
+        .expect("应激活已开启供应商的聊天模型");
+        assert!(state.provider.lock().await.is_some());
+
         let content = std::fs::read_to_string(config_dir.join("config.toml"))
             .expect("应读取 Provider Profile");
         assert!(content.contains(&format!("api_key = \"{secret}\"")));
@@ -4147,10 +4181,23 @@ mod tests {
         let catalog_json = serde_json::to_string(&catalog).expect("目录应可序列化");
         assert!(!catalog_json.contains(secret));
         assert!(!catalog_json.contains("\"api_key\":"));
+
+        let disabled = super::handle_put_provider_state(
+            State(state.clone()),
+            axum::extract::Path("deepseek".to_string()),
+            Json(ProviderStateUpdateRequest { enabled: false }),
+        )
+        .await
+        .expect("活动供应商关闭时应同步清空聊天选择")
+        .0;
+        assert!(!disabled.enabled);
+        assert!(state.provider.lock().await.is_none());
         let config = super::handle_get_models_config(State(state.clone()))
             .await
             .expect("应读取模型配置")
             .0;
+        assert!(config.chat.provider.is_empty());
+        assert!(config.chat.model.is_empty());
         let config_json = serde_json::to_string(&config).expect("模型配置应可序列化");
         assert!(!config_json.contains(secret));
 
@@ -4185,6 +4232,9 @@ mod tests {
             .update_provider_api_key("deepseek", Some("manual-profile-key".to_string()))
             .expect("应手工配置 Provider Key");
         external
+            .update_provider_enabled("deepseek", true)
+            .expect("应手工开启供应商");
+        external
             .update_active_chat_model("deepseek", "deepseek-v4-pro")
             .expect("应手工选择活动模型");
 
@@ -4218,6 +4268,9 @@ mod tests {
                     Some("test-agent-plan-key".to_string()),
                 )
                 .expect("应能保存测试 Provider Key");
+            store
+                .update_provider_enabled("volcengine_agent_plan", true)
+                .expect("应能开启测试供应商");
             store
                 .update_active_chat_model("volcengine_agent_plan", "glm-5.2")
                 .expect("应能激活测试模型");

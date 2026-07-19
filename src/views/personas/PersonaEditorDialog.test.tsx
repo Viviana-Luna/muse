@@ -376,4 +376,19 @@ describe('PersonaEditorDialog', () => {
     );
     expect(screen.getByRole('status')).toHaveTextContent('引用会继续保留');
   });
+
+  it('关闭供应商的模型不会进入角色首选模型列表', () => {
+    renderEditor({}, {
+      modelCatalog: {
+        ...modelCatalog,
+        providers: modelCatalog.providers.map((provider) => ({
+          ...provider,
+          enabled: false
+        }))
+      }
+    });
+
+    expect(screen.queryByRole('option', { name: 'DeepSeek / DeepSeek V4 Pro' }))
+      .not.toBeInTheDocument();
+  });
 });

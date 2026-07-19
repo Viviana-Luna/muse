@@ -224,6 +224,10 @@ fn api_routes() -> Router<Arc<AppState>> {
             put(handlers::handle_put_provider_credential),
         )
         .route(
+            "/models/providers/{id}/state",
+            put(handlers::handle_put_provider_state),
+        )
+        .route(
             "/models/active",
             put(handlers::handle_put_active_chat_model),
         )

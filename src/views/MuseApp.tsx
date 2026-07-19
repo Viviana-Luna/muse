@@ -212,6 +212,7 @@ export function App() {
     handleRefreshDiagnostics,
     saveCatalogProviderCredential,
     deleteCatalogProviderCredential,
+    setCatalogProviderEnabled,
     verifyCatalogProvider,
     createManagedModel,
     updateManagedModel,
@@ -663,6 +664,7 @@ export function App() {
             onRefreshDiagnostics={handleRefreshDiagnostics}
             onSaveProviderCredential={saveCatalogProviderCredential}
             onDeleteProviderCredential={deleteCatalogProviderCredential}
+            onSetProviderEnabled={setCatalogProviderEnabled}
             onVerifyCatalogProvider={verifyCatalogProvider}
             onCreateCatalogModel={createManagedModel}
             onUpdateCatalogModel={updateManagedModel}

@@ -160,8 +160,16 @@ export function PersonaEditorDialog({
   const avatarPreviewPath = useAuthenticatedAssetUrl(avatarPath);
   const preferredModelRef = editor.persona.preferred_model_ref;
   const preferredModelValue = modelReferenceValue(preferredModelRef);
-  const chatModels = (modelCatalog?.models ?? []).filter((model) =>
-    model.functions.includes('chat')
+  const enabledProviderIds = new Set(
+    (modelCatalog?.providers ?? [])
+      .filter((provider) => provider.enabled)
+      .map((provider) => provider.id)
+  );
+  const chatModels = (modelCatalog?.models ?? []).filter(
+    (model) =>
+      model.enabled &&
+      enabledProviderIds.has(model.provider_id) &&
+      model.functions.includes('chat')
   );
   const preferredCatalogModel = preferredModelRef
     ? modelCatalog?.models.find(

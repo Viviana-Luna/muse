@@ -5,6 +5,7 @@ import {
   fetchModelCatalog,
   fetchModelsConfig,
   saveActiveChatModel,
+  saveProviderEnabled,
   saveProviderCredential
 } from '@/api';
 import type { ModelCatalog, ModelCatalogItem, ModelsConfig } from '@/types';
@@ -20,6 +21,7 @@ vi.mock('@/api', () => ({
   updateCatalogModel: vi.fn(),
   deleteCatalogModel: vi.fn(),
   saveProviderCredential: vi.fn(),
+  saveProviderEnabled: vi.fn(),
   saveActiveChatModel: vi.fn()
 }));
 
@@ -187,6 +189,87 @@ describe('useProviderCatalogController', () => {
       currentModel: '',
       commitOnSelect: true
     });
+  });
+
+  it('顶部模型选择器不会展示已关闭供应商的模型', async () => {
+    const disabledModel: ModelCatalogItem = {
+      ...agentPlanModel,
+      id: 'deepseek:deepseek-v4-pro',
+      provider_id: 'deepseek',
+      model: 'deepseek-v4-pro',
+      name: 'DeepSeek V4 Pro'
+    };
+    vi.mocked(fetchModelCatalog).mockResolvedValue({
+      ...catalog,
+      providers: [
+        ...catalog.providers,
+        {
+          ...catalog.providers[0],
+          id: 'deepseek',
+          name: 'DeepSeek',
+          enabled: false
+        }
+      ],
+      models: [...catalog.models, disabledModel]
+    });
+    const { result } = renderHook(() => {
+      const draft = useSettingsDraft();
+      return {
+        draft,
+        controller: useProviderCatalogController({
+          draft,
+          notify: vi.fn(),
+          setBusy: vi.fn(),
+          setModelLabel: vi.fn()
+        })
+      };
+    });
+
+    await act(async () => result.current.controller.openRuntimeModelPicker());
+
+    expect(result.current.draft.modelPicker?.models).toEqual([agentPlanModel]);
+  });
+
+  it('供应商开关提交后刷新管理目录', async () => {
+    const disabledProvider = {
+      ...catalog.providers[0],
+      enabled: false
+    };
+    vi.mocked(saveProviderEnabled).mockResolvedValue(disabledProvider);
+    vi.mocked(fetchModelCatalog).mockResolvedValue({
+      ...catalog,
+      providers: [disabledProvider]
+    });
+    const notify = vi.fn();
+    const setModelLabel = vi.fn();
+    const { result } = renderHook(() => {
+      const draft = useSettingsDraft();
+      return {
+        draft,
+        controller: useProviderCatalogController({
+          draft,
+          notify,
+          setBusy: vi.fn(),
+          setModelLabel
+        })
+      };
+    });
+    act(() => {
+      result.current.draft.setModelCatalog(catalog);
+      result.current.draft.markModelsSaved(config);
+    });
+
+    await act(async () =>
+      result.current.controller.setCatalogProviderEnabled('volcengine_agent_plan', false)
+    );
+
+    expect(saveProviderEnabled).toHaveBeenCalledWith('volcengine_agent_plan', false);
+    expect(result.current.draft.settingsConfig?.chat.provider).toBe('');
+    expect(result.current.draft.modelCatalog?.providers[0]?.enabled).toBe(false);
+    expect(setModelLabel).toHaveBeenCalledWith('未配置 / 未选择模型');
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ title: '供应商已关闭', tone: 'success' })
+    );
   });
 
   it('凭据写入成功但目录刷新失败时不再误报写入失败', async () => {

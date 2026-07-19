@@ -1040,6 +1040,12 @@ pub struct ProviderCredentialResponse {
     pub credential_diagnostic: Option<muse_core::model::catalog::ModelCredentialDiagnostic>,
 }
 
+/// 供应商启停请求。缺少字段会由 JSON 反序列化拒绝，避免把不完整请求误当作开启。
+#[derive(Deserialize)]
+pub struct ProviderStateUpdateRequest {
+    pub enabled: bool,
+}
+
 /// 供应商专属余额检测请求体。
 #[derive(Deserialize)]
 pub struct ProviderBalanceRequest {

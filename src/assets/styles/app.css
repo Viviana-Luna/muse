@@ -4479,6 +4479,19 @@ textarea {
   color: #84ddb2;
 }
 
+.provider-state-control {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.provider-state-switch {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+}
+
 .provider-config-section {
   display: grid;
   gap: 10px;

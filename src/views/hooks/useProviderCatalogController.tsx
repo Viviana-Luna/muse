@@ -16,6 +16,7 @@ import {
   fetchProviderBalance,
   fetchProviderModels,
   saveActiveChatModel,
+  saveProviderEnabled,
   saveProviderCredential,
   updateCatalogModel
 } from '@/api';
@@ -81,6 +82,10 @@ export function useProviderCatalogController(options: UseProviderCatalogControll
 
   function modelsForPurpose(purpose: ModelPurpose, providerId: string): ModelCatalogItem[] {
     if (!draft.modelCatalog) return [];
+    const providerEnabled = draft.modelCatalog.providers.some(
+      (provider) => provider.id === providerId && provider.enabled
+    );
+    if (!providerEnabled) return [];
     return draft.modelCatalog.models.filter(
       (model) =>
         model.provider_id === providerId && modelSupportsPurpose(model, purpose)
@@ -371,6 +376,54 @@ export function useProviderCatalogController(options: UseProviderCatalogControll
     }
   }
 
+  async function setCatalogProviderEnabled(providerId: string, enabled: boolean) {
+    options.setBusy(true);
+    try {
+      const disablingActiveProvider =
+        !enabled && draft.settingsConfig?.chat.provider === providerId;
+      const provider = await saveProviderEnabled(providerId, enabled);
+      draft.setModelCatalog((current) => current && ({
+        ...current,
+        providers: current.providers.map((item) =>
+          item.id === provider.id ? provider : item
+        )
+      }));
+      if (disablingActiveProvider && draft.settingsConfig) {
+        const config = {
+          ...draft.settingsConfig,
+          chat: {
+            ...draft.settingsConfig.chat,
+            provider: '',
+            api_base: '',
+            model: '',
+            api_key: null,
+            api_key_configured: false
+          }
+        };
+        draft.markModelsSaved(config);
+        options.setModelLabel('未配置 / 未选择模型');
+      }
+      await finishCommittedCatalogMutation(
+        enabled ? '供应商已开启' : '供应商已关闭',
+        disablingActiveProvider
+          ? `${provider.name} 已关闭，活动聊天模型已清空。`
+          : enabled
+          ? `${provider.name} 的模型现在可以用于对话。`
+          : `${provider.name} 的模型已从运行时选择器隐藏。`
+      );
+    } catch (err) {
+      const message = formatApiErrorMessage(err, enabled ? '开启供应商失败' : '关闭供应商失败');
+      options.notify({
+        title: enabled ? '开启供应商失败' : '关闭供应商失败',
+        description: message,
+        tone: 'error'
+      });
+      throw err;
+    } finally {
+      options.setBusy(false);
+    }
+  }
+
   async function verifyCatalogProvider(providerId: string, model?: string) {
     const provider = draft.modelCatalog?.providers.find((item) => item.id === providerId);
     if (!provider) {
@@ -470,9 +523,15 @@ export function useProviderCatalogController(options: UseProviderCatalogControll
     options.setBusy(true);
     try {
       const [config, catalog] = await Promise.all([fetchModelsConfig(), fetchModelCatalog()]);
-      const models = catalog.models.filter((model) => modelSupportsPurpose(model, 'chat'));
+      const enabledProviderIds = new Set(
+        catalog.providers.filter((provider) => provider.enabled).map((provider) => provider.id)
+      );
+      const models = catalog.models.filter(
+        (model) =>
+          enabledProviderIds.has(model.provider_id) && modelSupportsPurpose(model, 'chat')
+      );
       if (models.length === 0) {
-        throw new Error('模型目录中还没有可选择的聊天模型，请先到设置中心新增。');
+        throw new Error('没有已开启供应商的可选聊天模型，请先到设置中心完成配置并开启供应商。');
       }
 
       draft.setModelCatalog(catalog);
@@ -547,6 +606,7 @@ export function useProviderCatalogController(options: UseProviderCatalogControll
     loadProviderModels,
     saveCatalogProviderCredential,
     deleteCatalogProviderCredential,
+    setCatalogProviderEnabled,
     verifyCatalogProvider,
     createManagedModel,
     updateManagedModel,

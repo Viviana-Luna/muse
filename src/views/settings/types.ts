@@ -83,6 +83,7 @@ export interface SettingsDialogProps {
   onRefreshDiagnostics: () => void | Promise<void>;
   onSaveProviderCredential: (providerId: string, secret: string) => void | Promise<void>;
   onDeleteProviderCredential: (providerId: string) => void | Promise<void>;
+  onSetProviderEnabled: (providerId: string, enabled: boolean) => void | Promise<void>;
   onVerifyCatalogProvider: (providerId: string, model?: string) => void | Promise<void>;
   onCreateCatalogModel: (model: ModelCatalogMutation) => void | Promise<void>;
   onUpdateCatalogModel: (model: ModelCatalogMutation) => void | Promise<void>;

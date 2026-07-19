@@ -847,8 +847,8 @@ pub(crate) async fn handle_put_provider_credential(
         .model_config
         .lock()
         .await
-        .model_provider(&provider_id)
-        .ok_or_else(|| bad_request("当前供应商不存在或已停用。"))?;
+        .managed_model_provider(&provider_id)
+        .ok_or_else(|| bad_request("当前供应商不存在。"))?;
 
     if request.action == SecretUpdateAction::Keep {
         if request.value.is_some() {
@@ -906,6 +906,29 @@ pub(crate) async fn handle_put_provider_credential(
         .to_string(),
         credential_diagnostic: None,
     }))
+}
+
+/// 更新供应商启停状态。关闭状态仍可维护凭据和模型，但不会进入运行时模型选择器。
+pub(crate) async fn handle_put_provider_state(
+    State(state): State<Arc<AppState>>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<ProviderStateUpdateRequest>,
+) -> Result<
+    Json<muse_core::model::catalog::ModelProviderCatalog>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let _transition = state.model_configuration_transition_gate.lock().await;
+    let (provider, active_config) = {
+        let mut store = state.model_config.lock().await;
+        let provider = store
+            .update_provider_enabled(&provider_id, request.enabled)
+            .map_err(model_catalog_error_response)?;
+        (provider, store.config().clone())
+    };
+    *state.provider.lock().await = build_chat_provider(&active_config.chat)
+        .map_err(|error| bad_request(&error.to_string()))?;
+
+    Ok(Json(provider))
 }
 
 /// 切换后续对话使用的供应商与模型。该操作不修改模型目录或其他供应商凭据。

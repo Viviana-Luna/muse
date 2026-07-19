@@ -424,6 +424,10 @@ impl MuseConfigStore {
         self.config.model_profiles.provider(provider_id)
     }
 
+    pub fn managed_model_provider(&self, provider_id: &str) -> Option<ModelProviderCatalog> {
+        self.config.model_profiles.managed_provider(provider_id)
+    }
+
     pub fn catalog_model(&self, provider_id: &str, model_id: &str) -> Option<ModelCatalogItem> {
         self.config.model_profiles.model(provider_id, model_id)
     }
@@ -454,6 +458,20 @@ impl MuseConfigStore {
         self.commit_model_profiles(next)
             .map_err(ModelCatalogError::Config)?;
         Ok(configured)
+    }
+
+    pub fn update_provider_enabled(
+        &mut self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> Result<ModelProviderCatalog, ModelCatalogError> {
+        self.reject_external_modification()
+            .map_err(ModelCatalogError::Config)?;
+        let mut next = self.config.model_profiles.clone();
+        let provider = next.set_provider_enabled(provider_id, enabled)?;
+        self.commit_model_profiles(next)
+            .map_err(ModelCatalogError::Config)?;
+        Ok(provider)
     }
 
     pub fn create_catalog_model(

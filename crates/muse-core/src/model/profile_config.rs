@@ -195,7 +195,7 @@ pub struct ProviderProfileConfig {
     pub base_url: String,
     #[serde(default)]
     pub api_key: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub notes: String,
@@ -361,13 +361,11 @@ impl ModelProfileConfig {
         let providers = self
             .providers
             .iter()
-            .filter(|(_, provider)| provider.enabled)
             .map(|(id, provider)| provider.catalog_provider(id))
             .collect::<Vec<_>>();
         let models = self
             .providers
             .iter()
-            .filter(|(_, provider)| provider.enabled)
             .flat_map(|(provider_id, provider)| {
                 provider
                     .models
@@ -396,11 +394,27 @@ impl ModelProfileConfig {
             .map(|provider| provider.catalog_provider(provider_id))
     }
 
+    /// 返回设置中心使用的供应商事实，不把关闭状态误判为供应商不存在。
+    pub fn managed_provider(&self, provider_id: &str) -> Option<ModelProviderCatalog> {
+        self.providers
+            .get(provider_id)
+            .map(|provider| provider.catalog_provider(provider_id))
+    }
+
     pub fn model(&self, provider_id: &str, model_id: &str) -> Option<ModelCatalogItem> {
         let provider = self.providers.get(provider_id)?;
         if !provider.enabled {
             return None;
         }
+        provider
+            .models
+            .get(model_id)
+            .filter(|model| model.enabled)
+            .map(|model| model.catalog_item(provider_id, provider, model_id))
+    }
+
+    fn managed_model(&self, provider_id: &str, model_id: &str) -> Option<ModelCatalogItem> {
+        let provider = self.providers.get(provider_id)?;
         provider
             .models
             .get(model_id)
@@ -495,15 +509,9 @@ impl ModelProfileConfig {
         draft: ModelCatalogModelDraft,
     ) -> Result<ModelCatalogItem, ModelCatalogError> {
         let draft = validate_model_draft(draft)?;
-        let provider = self
-            .providers
-            .get_mut(&draft.provider_id)
-            .filter(|provider| provider.enabled)
-            .ok_or_else(|| {
-                ModelCatalogError::Validation(
-                    "创建模型时只能选择现有且已启用的供应商。".to_string(),
-                )
-            })?;
+        let provider = self.providers.get_mut(&draft.provider_id).ok_or_else(|| {
+            ModelCatalogError::Validation("创建模型时只能选择现有供应商。".to_string())
+        })?;
         if provider
             .models
             .get(&draft.model)
@@ -518,7 +526,7 @@ impl ModelProfileConfig {
             draft.model.clone(),
             ProviderModelConfig::from_catalog_draft(&draft),
         );
-        self.model(&draft.provider_id, &draft.model)
+        self.managed_model(&draft.provider_id, &draft.model)
             .ok_or_else(|| ModelCatalogError::NotFound("模型创建后无法读取。".to_string()))
     }
 
@@ -527,15 +535,9 @@ impl ModelProfileConfig {
         draft: ModelCatalogModelDraft,
     ) -> Result<ModelCatalogItem, ModelCatalogError> {
         let draft = validate_model_draft(draft)?;
-        let provider = self
-            .providers
-            .get_mut(&draft.provider_id)
-            .filter(|provider| provider.enabled)
-            .ok_or_else(|| {
-                ModelCatalogError::Validation(
-                    "编辑模型时只能选择现有且已启用的供应商。".to_string(),
-                )
-            })?;
+        let provider = self.providers.get_mut(&draft.provider_id).ok_or_else(|| {
+            ModelCatalogError::Validation("编辑模型时只能选择现有供应商。".to_string())
+        })?;
         let model = provider
             .models
             .get_mut(&draft.model)
@@ -554,7 +556,7 @@ impl ModelProfileConfig {
         model.speed = speed;
         model.response_format = response_format;
         model.language = language;
-        self.model(&draft.provider_id, &draft.model)
+        self.managed_model(&draft.provider_id, &draft.model)
             .ok_or_else(|| ModelCatalogError::NotFound("模型编辑后无法读取。".to_string()))
     }
 
@@ -617,12 +619,61 @@ impl ModelProfileConfig {
         let provider = self
             .providers
             .get_mut(provider_id)
-            .filter(|provider| provider.enabled)
-            .ok_or_else(|| ModelCatalogError::NotFound("当前供应商不存在或已停用。".to_string()))?;
+            .ok_or_else(|| ModelCatalogError::NotFound("当前供应商不存在。".to_string()))?;
         provider.api_key = api_key
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Ok(provider.api_key_configured())
+    }
+
+    pub fn set_provider_enabled(
+        &mut self,
+        provider_id: &str,
+        enabled: bool,
+    ) -> Result<ModelProviderCatalog, ModelCatalogError> {
+        let provider = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| ModelCatalogError::NotFound("当前供应商不存在。".to_string()))?;
+        if provider.enabled == enabled {
+            return Ok(provider.catalog_provider(provider_id));
+        }
+
+        if enabled {
+            if !chat_provider_runtime_supported(provider_id) {
+                return Err(ModelCatalogError::Validation(
+                    "provider_runtime_unsupported：当前供应商暂不支持聊天运行时。".to_string(),
+                ));
+            }
+            if !provider.api_key_configured() {
+                return Err(ModelCatalogError::Validation(
+                    "provider_api_key_required：请先保存该供应商的 API Key。".to_string(),
+                ));
+            }
+            let has_chat_model = provider.models.values().any(|model| {
+                model.enabled
+                    && (model.modality == CHAT_MODALITY
+                        || model
+                            .functions
+                            .iter()
+                            .any(|function| function == CHAT_MODALITY))
+            });
+            if !has_chat_model {
+                return Err(ModelCatalogError::Validation(
+                    "provider_chat_model_required：请先为该供应商配置至少一个聊天模型。"
+                        .to_string(),
+                ));
+            }
+        } else if self.active_models.chat.provider == provider_id {
+            self.active_models.chat = ActiveModelSelection::default();
+        }
+
+        let provider = self
+            .providers
+            .get_mut(provider_id)
+            .expect("供应商已在前置校验中确认存在");
+        provider.enabled = enabled;
+        Ok(provider.catalog_provider(provider_id))
     }
 
     pub fn set_active_chat(
@@ -1016,7 +1067,7 @@ fn builtin_provider_profiles() -> BTreeMap<String, ProviderProfileConfig> {
                 display_name: profile.name.to_string(),
                 base_url: profile.default_api_base.to_string(),
                 api_key: None,
-                enabled: true,
+                enabled: false,
                 notes: profile.notes.to_string(),
                 chat_model_list_url: profile.chat_model_list_url.to_string(),
                 tts_model_list_url: String::new(),
@@ -1071,14 +1122,75 @@ fn chat_provider_runtime_supported(provider_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ModelProfileConfig;
+    use super::{ModelProfileConfig, ProviderProfileConfig};
+
+    fn enable_provider(profiles: &mut ModelProfileConfig, provider_id: &str, secret: &str) {
+        profiles
+            .set_provider_api_key(provider_id, Some(secret.to_string()))
+            .expect("应保存 Provider Key");
+        profiles
+            .set_provider_enabled(provider_id, true)
+            .expect("凭据和聊天模型齐全时应能开启供应商");
+    }
+
+    #[test]
+    fn missing_provider_enabled_field_defaults_to_disabled() {
+        let provider: ProviderProfileConfig = toml_edit::de::from_str(
+            r#"
+kind = "deepseek"
+display_name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+"#,
+        )
+        .expect("缺少 enabled 的供应商仍应可解析");
+
+        assert!(!provider.enabled);
+    }
+
+    #[test]
+    fn default_catalog_keeps_disabled_providers_for_management_only() {
+        let profiles = ModelProfileConfig::default();
+        let catalog = profiles.catalog();
+        let provider = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deepseek")
+            .expect("管理目录应保留关闭供应商");
+
+        assert!(!provider.enabled);
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.provider_id == "deepseek")
+        );
+        assert!(profiles.model("deepseek", "deepseek-v4-pro").is_none());
+    }
+
+    #[test]
+    fn provider_enable_requires_key_and_disabling_active_provider_clears_selection() {
+        let mut profiles = ModelProfileConfig::default();
+        let error = profiles
+            .set_provider_enabled("deepseek", true)
+            .expect_err("缺少 API Key 时必须拒绝开启");
+        assert!(error.to_string().contains("provider_api_key_required"));
+
+        enable_provider(&mut profiles, "deepseek", "profile-secret");
+        profiles
+            .set_active_chat("deepseek", "deepseek-v4-pro")
+            .expect("应选择活动模型");
+        let disabled = profiles
+            .set_provider_enabled("deepseek", false)
+            .expect("当前活动供应商应能关闭");
+        assert!(!disabled.enabled);
+        assert!(profiles.active_models.chat.provider.is_empty());
+        assert!(profiles.resolve_runtime().chat.provider.is_empty());
+    }
 
     #[test]
     fn complete_provider_profile_resolves_active_runtime_parameters() {
         let mut profiles = ModelProfileConfig::default();
-        profiles
-            .set_provider_api_key("deepseek", Some("profile-secret".to_string()))
-            .expect("应保存 Provider Key");
+        enable_provider(&mut profiles, "deepseek", "profile-secret");
         profiles
             .set_active_chat("deepseek", "deepseek-v4-pro")
             .expect("应选择活动模型");
@@ -1095,9 +1207,7 @@ mod tests {
     #[test]
     fn resolves_persona_chat_reference_without_mutating_global_selection() {
         let mut profiles = ModelProfileConfig::default();
-        profiles
-            .set_provider_api_key("deepseek", Some("profile-secret".to_string()))
-            .expect("应保存 Provider Key");
+        enable_provider(&mut profiles, "deepseek", "profile-secret");
         profiles
             .set_active_chat("deepseek", "deepseek-v4-pro")
             .expect("应选择全局活动模型");
@@ -1124,9 +1234,7 @@ mod tests {
     #[test]
     fn reports_stable_diagnostic_for_missing_persona_model() {
         let mut profiles = ModelProfileConfig::default();
-        profiles
-            .set_provider_api_key("deepseek", Some("profile-secret".to_string()))
-            .expect("应保存 Provider Key");
+        enable_provider(&mut profiles, "deepseek", "profile-secret");
 
         let error = profiles
             .resolve_chat_model_reference("deepseek", "deleted-model")
@@ -1142,6 +1250,7 @@ mod tests {
         let mut profiles = ModelProfileConfig::default();
         let mut alias = profiles.providers["deepseek"].clone();
         alias.api_key = Some("profile-secret".to_string());
+        alias.enabled = true;
         profiles
             .providers
             .insert("deepseek-alias".to_string(), alias);
