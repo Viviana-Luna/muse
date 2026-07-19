@@ -26,7 +26,6 @@
   --accent-soft: color-mix(in srgb, var(--theme-color), transparent 84%);
   --accent-edge: color-mix(in srgb, var(--theme-color), transparent 52%);
   min-width: 0;
-  grid-template-columns: 102px minmax(0, 1fr);
   color: var(--text-primary);
   color-scheme: dark;
   border: 0;
@@ -62,7 +61,7 @@
  * 包裹所有 section（chat / sessions / roles / skills / mcp / settings）的圆角玻璃容器。
  * ========================================================================= */
 .app-main-surface {
-  margin: 14px 14px 14px 6px;
+  margin: 14px var(--app-main-right-inset) 14px var(--app-main-left-inset);
   border: 1px solid var(--glass-edge);
   border-radius: 28px;
   background: color-mix(in srgb, var(--glass-surface), transparent 26%);
@@ -1661,10 +1660,6 @@
 
 /* ≤1280px：导航栏收窄，三列布局隐藏历史抽屉 */
 @media (max-width: 1280px) {
-  .runtime-shell.story-shell.app-shell {
-    grid-template-columns: 84px minmax(0, 1fr);
-  }
-
   .app-rail {
     margin-left: 10px;
     padding-inline: 6px;
@@ -1688,7 +1683,7 @@
 /* ≤900px：故事工作区切换为上下双栏（舞台在上、阅读列在下） */
 @media (max-width: 900px) {
   .app-main-surface {
-    margin: 10px 10px 10px 4px;
+    margin: 10px var(--app-main-right-inset) 10px var(--app-main-left-inset);
     border-radius: 24px;
   }
 

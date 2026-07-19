@@ -1,10 +1,13 @@
 /* 共享应用壳：唯一左侧功能栏承载产品级导航，页面内部只保留对象列表与详情层级。 */
 .runtime-shell.story-shell.app-shell {
+  --app-shell-rail-width: 102px;
+  --app-main-left-inset: 6px;
+  --app-main-right-inset: 14px;
   display: grid;
   grid-template-areas:
     'titlebar titlebar'
     'rail main';
-  grid-template-columns: 128px minmax(0, 1fr);
+  grid-template-columns: var(--app-shell-rail-width) minmax(0, 1fr);
   grid-template-rows: 58px minmax(0, 1fr);
   min-width: 760px;
   height: 100dvh;
@@ -21,11 +24,10 @@
   z-index: 35;
   grid-area: titlebar;
   display: grid;
-  grid-template-columns: 128px minmax(0, 1fr);
-  column-gap: 6px;
+  grid-template-columns: calc(var(--app-shell-rail-width) + var(--app-main-left-inset)) minmax(0, 1fr);
   align-items: center;
   min-width: 0;
-  padding-right: 14px;
+  padding-right: var(--app-main-right-inset);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(8, 10, 16, 0.96);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
@@ -1060,6 +1062,10 @@
   box-shadow: none;
 }
 
+@media (max-width: 1280px) {
+  .runtime-shell.story-shell.app-shell { --app-shell-rail-width: 84px; }
+}
+
 @media (max-width: 1180px) {
   .app-shell .story-workspace.history-list-open.persistent-history {
     grid-template-areas: 'reading stage';
@@ -1079,11 +1085,9 @@
 }
 
 @media (max-width: 900px) {
-  .runtime-shell.story-shell.app-shell { grid-template-columns: 74px minmax(0, 1fr); }
-  .app-titlebar {
-    grid-template-columns: 74px minmax(0, 1fr);
-    column-gap: 4px;
-    padding-right: 10px;
+  .runtime-shell.story-shell.app-shell {
+    --app-main-left-inset: 4px;
+    --app-main-right-inset: 10px;
   }
   .titlebar-context-bar { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) 44px auto; }
   .titlebar-persona-segment { display: none; }
