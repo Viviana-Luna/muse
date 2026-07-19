@@ -1,13 +1,10 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Bot,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Maximize2,
   MessageSquareText,
   Minus,
-  PanelLeft,
   UserRound,
   X
 } from 'lucide-react';
@@ -25,7 +22,7 @@ export interface TitleBarConversationContext {
   usageLabel: string;
   tokenLabel: string;
   detailLabel: string;
-  costLabel?: string;
+  balanceLabel?: string;
 }
 
 function usesNativeMacWindowControls(): boolean {
@@ -39,8 +36,30 @@ function reportWindowCommandFailure(message: string): (error: unknown) => void {
   };
 }
 
+const timeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false
+});
+
+// 分钟对齐的整点刷新，避免固定间隔造成的分钟漂移。
+function useCurrentTime(): string {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    let timer = 0;
+    function scheduleNext() {
+      timer = window.setTimeout(() => {
+        setNow(new Date());
+        scheduleNext();
+      }, 60_000 - (Date.now() % 60_000));
+    }
+    scheduleNext();
+    return () => window.clearTimeout(timer);
+  }, []);
+  return timeFormatter.format(now);
+}
+
 export function AppTitleBar({
-  railCollapsed,
   activePersonaName,
   modelLabel,
   conversationContext,
@@ -53,7 +72,6 @@ export function AppTitleBar({
   modelSelectorOpen,
   modelSelectorDisabled,
   modelPickerContent,
-  onToggleRail,
   onOpenSessionSelector,
   onCloseSessionSelector,
   onOpenPersonaSelector,
@@ -61,7 +79,6 @@ export function AppTitleBar({
   onOpenModelSelector,
   onCloseModelSelector
 }: {
-  railCollapsed: boolean;
   activePersonaName?: string;
   modelLabel: string;
   conversationContext: TitleBarConversationContext;
@@ -74,7 +91,6 @@ export function AppTitleBar({
   modelSelectorOpen: boolean;
   modelSelectorDisabled: boolean;
   modelPickerContent?: ReactNode;
-  onToggleRail: () => void;
   onOpenSessionSelector: () => void;
   onCloseSessionSelector: () => void;
   onOpenPersonaSelector: () => void;
@@ -90,6 +106,7 @@ export function AppTitleBar({
   const personaLabel = activePersonaName || '未选择角色';
   const nativeMacWindowControls = usesNativeMacWindowControls();
   const contextProgress = Math.max(0, Math.min(100, conversationContext.contextProgress ?? 0));
+  const timeLabel = useCurrentTime();
 
   useEffect(() => {
     if (!sessionSelectorOpen && !personaSelectorOpen && !modelSelectorOpen) return;
@@ -142,109 +159,79 @@ export function AppTitleBar({
     <header className="app-titlebar" aria-label="Muse 窗口工具栏" data-tauri-drag-region="deep">
       <div
         className={`app-titlebar-left${nativeMacWindowControls ? ' native-macos-controls' : ''}`}
-        data-tauri-drag-region="false"
       >
-        {!nativeMacWindowControls && <div className="window-controls" aria-label="窗口控制">
-          <button
-            type="button"
-            className="window-control window-control-close"
-            aria-label="关闭窗口"
-            title="关闭窗口"
-            onClick={() => void closeDesktopWindow().catch(reportWindowCommandFailure('无法关闭窗口。'))}
-          >
-            <X aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className="window-control window-control-minimize"
-            aria-label="最小化窗口"
-            title="最小化窗口"
-            onClick={() =>
-              void minimizeDesktopWindow().catch(reportWindowCommandFailure('无法最小化窗口。'))
-            }
-          >
-            <Minus aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className="window-control window-control-maximize"
-            aria-label="最大化或还原窗口"
-            title="最大化或还原窗口"
-            onClick={() =>
-              void toggleDesktopWindowMaximize().catch(
-                reportWindowCommandFailure('无法切换窗口大小。')
-              )
-            }
-          >
-            <Maximize2 aria-hidden="true" />
-          </button>
-        </div>}
-        <button
-          type="button"
-          className="titlebar-action titlebar-rail-toggle"
-          aria-label={railCollapsed ? '展开功能栏' : '收起功能栏'}
-          aria-pressed={railCollapsed}
-          title={railCollapsed ? '展开功能栏' : '收起功能栏'}
-          onClick={onToggleRail}
-        >
-          <PanelLeft aria-hidden="true" />
-        </button>
-        <div className="titlebar-history-actions" aria-label="页面历史">
-          <button
-            type="button"
-            className="titlebar-action"
-            aria-label="后退"
-            title="后退"
-            onClick={() => window.history.back()}
-          >
-            <ChevronLeft aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className="titlebar-action"
-            aria-label="前进"
-            title="前进"
-            onClick={() => window.history.forward()}
-          >
-            <ChevronRight aria-hidden="true" />
-          </button>
-        </div>
+        {!nativeMacWindowControls && (
+          <div className="window-controls" aria-label="窗口控制" data-tauri-drag-region="false">
+            <button
+              type="button"
+              className="window-control window-control-close"
+              aria-label="关闭窗口"
+              title="关闭窗口"
+              onClick={() => void closeDesktopWindow().catch(reportWindowCommandFailure('无法关闭窗口。'))}
+            >
+              <X aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="window-control window-control-minimize"
+              aria-label="最小化窗口"
+              title="最小化窗口"
+              onClick={() =>
+                void minimizeDesktopWindow().catch(reportWindowCommandFailure('无法最小化窗口。'))
+              }
+            >
+              <Minus aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="window-control window-control-maximize"
+              aria-label="最大化或还原窗口"
+              title="最大化或还原窗口"
+              onClick={() =>
+                void toggleDesktopWindowMaximize().catch(
+                  reportWindowCommandFailure('无法切换窗口大小。')
+                )
+              }
+            >
+              <Maximize2 aria-hidden="true" />
+            </button>
+          </div>
+        )}
       </div>
 
-      <div
-        className="titlebar-conversation-picker-anchor"
-        ref={sessionPickerAnchorRef}
-        data-tauri-drag-region="false"
-      >
-        <button
-          type="button"
-          className="titlebar-context-selector titlebar-conversation-selector"
-          aria-label={`展开聊天记录：${conversationContext.title}`}
-          aria-haspopup="listbox"
-          aria-expanded={sessionSelectorOpen}
-          title={`${conversationContext.stateLabel}：${conversationContext.title}`}
-          disabled={sessionSelectorDisabled}
-          onClick={onOpenSessionSelector}
-        >
-          <MessageSquareText aria-hidden="true" />
-          <span>
-            <small>{conversationContext.stateLabel}</small>
-            <strong>{conversationContext.title}</strong>
-          </span>
-          <ChevronDown aria-hidden="true" />
-        </button>
-        {sessionSelectorOpen && sessionPickerContent}
-      </div>
-
-      <div className="titlebar-session-context" aria-label="当前对话环境" data-tauri-drag-region="false">
+      <div className="titlebar-context-bar" data-tauri-drag-region="false">
         <div
-          className="titlebar-persona-picker-anchor"
+          className="titlebar-segment"
+          ref={sessionPickerAnchorRef}
+          data-tauri-drag-region="false"
+        >
+          <button
+            type="button"
+            className="titlebar-segment-button titlebar-conversation-selector"
+            aria-label={`展开聊天记录：${conversationContext.title}`}
+            aria-haspopup="listbox"
+            aria-expanded={sessionSelectorOpen}
+            title={`${conversationContext.stateLabel}：${conversationContext.title}`}
+            disabled={sessionSelectorDisabled}
+            onClick={onOpenSessionSelector}
+          >
+            <MessageSquareText aria-hidden="true" />
+            <span>
+              <small>{conversationContext.stateLabel}</small>
+              <strong>{conversationContext.title}</strong>
+            </span>
+            <ChevronDown aria-hidden="true" />
+          </button>
+          {sessionSelectorOpen && sessionPickerContent}
+        </div>
+        <div
+          className="titlebar-segment titlebar-persona-segment"
           ref={personaPickerAnchorRef}
           data-tauri-drag-region="false"
         >
           <button
             type="button"
-            className="titlebar-context-selector titlebar-persona-selector"
+            className="titlebar-segment-button titlebar-persona-selector"
             aria-label={`切换当前角色：${personaLabel}`}
             aria-haspopup="listbox"
             aria-expanded={personaSelectorOpen}
@@ -261,10 +248,10 @@ export function AppTitleBar({
           </button>
           {personaSelectorOpen && personaPickerContent}
         </div>
-        <div className="titlebar-model-picker-anchor" ref={modelPickerAnchorRef}>
+        <div className="titlebar-segment" ref={modelPickerAnchorRef}>
           <button
             type="button"
-            className="titlebar-context-selector titlebar-model-selector"
+            className="titlebar-segment-button titlebar-model-selector"
             aria-label={`切换聊天模型：${modelLabel}`}
             aria-haspopup="listbox"
             aria-expanded={modelSelectorOpen}
@@ -284,51 +271,53 @@ export function AppTitleBar({
           </button>
           {modelSelectorOpen && modelPickerContent}
         </div>
-      </div>
 
-      <section
-        className="titlebar-runtime-summary"
-        aria-label="当前对话上下文状态"
-        data-tauri-drag-region="false"
-      >
-        <button
-          type="button"
-          className="titlebar-context-ring-button"
-          aria-label={`上下文使用率 ${conversationContext.usageLabel}`}
-          aria-describedby="titlebar-context-tooltip"
+        <section
+          className="titlebar-runtime-summary"
+          aria-label="当前对话上下文状态"
+          data-tauri-drag-region="false"
         >
-          <svg viewBox="0 0 36 36" aria-hidden="true">
-            <circle className="titlebar-context-ring-track" cx="18" cy="18" r="14" />
-            <circle
-              className="titlebar-context-ring-value"
-              cx="18"
-              cy="18"
-              r="14"
-              pathLength="100"
-              style={{ strokeDashoffset: 100 - contextProgress }}
-            />
-          </svg>
-        </button>
-        <div id="titlebar-context-tooltip" className="titlebar-context-tooltip" role="tooltip">
-          {conversationContext.costLabel !== undefined && (
+          <button
+            type="button"
+            className="titlebar-context-ring-button"
+            aria-label={`上下文使用率 ${conversationContext.usageLabel}`}
+            aria-describedby="titlebar-context-tooltip"
+          >
+            <svg viewBox="0 0 36 36" aria-hidden="true">
+              <circle className="titlebar-context-ring-track" cx="18" cy="18" r="14" />
+              <circle
+                className="titlebar-context-ring-value"
+                cx="18"
+                cy="18"
+                r="14"
+                pathLength="100"
+                style={{ strokeDashoffset: 100 - contextProgress }}
+              />
+            </svg>
+          </button>
+          <div id="titlebar-context-tooltip" className="titlebar-context-tooltip" role="tooltip">
+            {conversationContext.balanceLabel !== undefined && (
+              <span>
+                <small>余额</small>
+                <strong>{conversationContext.balanceLabel}</strong>
+              </span>
+            )}
             <span>
-              <small>成本</small>
-              <strong>{conversationContext.costLabel}</strong>
+              <small>使用率</small>
+              <strong>{conversationContext.usageLabel}</strong>
             </span>
-          )}
-          <span>
-            <small>使用率</small>
-            <strong>{conversationContext.usageLabel}</strong>
-          </span>
-          <span>
-            <small>Token</small>
-            <strong>{conversationContext.tokenLabel}</strong>
-          </span>
-          <em>{conversationContext.detailLabel}</em>
-        </div>
-      </section>
+            <span>
+              <small>Token</small>
+              <strong>{conversationContext.tokenLabel}</strong>
+            </span>
+            <em>{conversationContext.detailLabel}</em>
+          </div>
+        </section>
 
-      <div className="titlebar-drag-fill" aria-hidden="true" data-tauri-drag-region="deep" />
+        <span className="titlebar-clock" aria-label="当前时间">
+          {timeLabel}
+        </span>
+      </div>
     </header>
   );
 }

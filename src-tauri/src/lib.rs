@@ -467,7 +467,9 @@ pub fn run() {
             let window_builder = window_builder
                 .decorations(true)
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
-                .hidden_title(true);
+                .hidden_title(true)
+                // 红绿灯默认按系统 28px 标题栏定位，这里下移到与前端 58px 标题栏垂直居中。
+                .traffic_light_position(tauri::LogicalPosition::new(7.0, 30.5));
             #[cfg(not(target_os = "macos"))]
             let window_builder = window_builder.decorations(false);
 

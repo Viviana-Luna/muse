@@ -20,8 +20,28 @@ const conversationContext = {
   usageLabel: '1%',
   tokenLabel: '1,200',
   detailLabel: '1.2K / 128K，剩余 126.8K',
-  costLabel: 'US$0.0043'
+  balanceLabel: 'CNY 66.23'
 };
+
+function titleBarProps(overrides: Record<string, unknown> = {}) {
+  return {
+    modelLabel: 'DeepSeek / deepseek-chat',
+    conversationContext,
+    sessionSelectorOpen: false,
+    sessionSelectorDisabled: false,
+    personaSelectorOpen: false,
+    personaSelectorDisabled: false,
+    modelSelectorOpen: false,
+    modelSelectorDisabled: false,
+    onOpenSessionSelector: vi.fn(),
+    onCloseSessionSelector: vi.fn(),
+    onOpenPersonaSelector: vi.fn(),
+    onClosePersonaSelector: vi.fn(),
+    onOpenModelSelector: vi.fn(),
+    onCloseModelSelector: vi.fn(),
+    ...overrides
+  };
+}
 
 describe('AppTitleBar', () => {
   beforeEach(() => {
@@ -41,26 +61,7 @@ describe('AppTitleBar', () => {
   });
 
   it('使用自绘按钮调用桌面窗口控制命令', async () => {
-    render(
-      <AppTitleBar
-        railCollapsed={false}
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
-      />
-    );
+    render(<AppTitleBar {...titleBarProps()} />);
 
     fireEvent.click(screen.getByRole('button', { name: '关闭窗口' }));
     fireEvent.click(screen.getByRole('button', { name: '最小化窗口' }));
@@ -73,29 +74,18 @@ describe('AppTitleBar', () => {
     });
   });
 
-  it('把当前会话、角色、模型和环形上下文状态集中到标题栏', () => {
+  it('把当前会话、角色、模型、环形上下文状态和时间集中到标题栏', () => {
     const onOpenSessionSelector = vi.fn();
     const onOpenPersonaSelector = vi.fn();
     const onOpenModelSelector = vi.fn();
     render(
       <AppTitleBar
-        railCollapsed={false}
-        activePersonaName="爱丽丝"
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={onOpenSessionSelector}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={onOpenPersonaSelector}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={onOpenModelSelector}
-        onCloseModelSelector={vi.fn()}
+        {...titleBarProps({
+          activePersonaName: '爱丽丝',
+          onOpenSessionSelector,
+          onOpenPersonaSelector,
+          onOpenModelSelector
+        })}
       />
     );
 
@@ -107,120 +97,48 @@ describe('AppTitleBar', () => {
     expect(onOpenPersonaSelector).toHaveBeenCalledOnce();
     expect(onOpenModelSelector).toHaveBeenCalledOnce();
     expect(screen.getByRole('button', { name: '上下文使用率 1%' })).toBeInTheDocument();
-    expect(screen.getByRole('tooltip')).toHaveTextContent('成本US$0.0043');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('余额CNY 66.23');
     expect(screen.getByRole('tooltip')).toHaveTextContent('使用率1%');
     expect(screen.getByRole('tooltip')).toHaveTextContent('Token1,200');
-    expect(screen.queryByRole('combobox', { name: '搜索 Muse 功能' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('当前时间').textContent).toMatch(/^\d{2}:\d{2}$/);
   });
 
-  it('未提供成本时不在上下文详情中渲染成本行', () => {
+  it('未提供余额时不在上下文详情中渲染余额行', () => {
     render(
       <AppTitleBar
-        railCollapsed={false}
-        modelLabel="火山方舟 Agent Plan / glm-5.2"
-        conversationContext={{ ...conversationContext, costLabel: undefined }}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
+        {...titleBarProps({
+          modelLabel: '火山方舟 Agent Plan / glm-5.2',
+          conversationContext: { ...conversationContext, balanceLabel: undefined }
+        })}
       />
     );
 
-    expect(screen.getByRole('tooltip')).not.toHaveTextContent('成本');
+    expect(screen.getByRole('tooltip')).not.toHaveTextContent('余额');
     expect(screen.getByRole('tooltip')).toHaveTextContent('Token1,200');
   });
 
   it('macOS 使用原生窗口按钮并为其保留固定区域', () => {
     const platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('MacIntel');
-    const { container } = render(
-      <AppTitleBar
-        railCollapsed={false}
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
-      />
-    );
+    const { container } = render(<AppTitleBar {...titleBarProps()} />);
 
     expect(screen.queryByRole('button', { name: '关闭窗口' })).not.toBeInTheDocument();
     expect(container.querySelector('.app-titlebar-left')).toHaveClass('native-macos-controls');
     platform.mockRestore();
   });
 
-  it('侧栏按钮暴露当前折叠状态并触发切换', () => {
-    const onToggleRail = vi.fn();
-    render(
-      <AppTitleBar
-        railCollapsed
-        modelLabel="模型未配置"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen
-        modelSelectorDisabled={false}
-        onToggleRail={onToggleRail}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
-      />
-    );
-
-    const toggle = screen.getByRole('button', { name: '展开功能栏' });
-    expect(toggle).toHaveAttribute('aria-pressed', 'true');
-    fireEvent.click(toggle);
-    expect(onToggleRail).toHaveBeenCalledOnce();
-  });
-
   it('模型弹出菜单支持选中项聚焦、Escape 和点击外部关闭', async () => {
     const onCloseModelSelector = vi.fn();
     render(
       <AppTitleBar
-        railCollapsed={false}
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen
-        modelSelectorDisabled={false}
-        modelPickerContent={
-          <div role="listbox" aria-label="聊天模型">
-            <button type="button" role="option" aria-selected="true">DeepSeek Chat</button>
-          </div>
-        }
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={onCloseModelSelector}
+        {...titleBarProps({
+          modelSelectorOpen: true,
+          modelPickerContent: (
+            <div role="listbox" aria-label="聊天模型">
+              <button type="button" role="option" aria-selected="true">DeepSeek Chat</button>
+            </div>
+          ),
+          onCloseModelSelector
+        })}
       />
     );
 
@@ -236,28 +154,16 @@ describe('AppTitleBar', () => {
     const onClosePersonaSelector = vi.fn();
     render(
       <AppTitleBar
-        railCollapsed={false}
-        activePersonaName="爱丽丝"
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen={false}
-        sessionSelectorDisabled={false}
-        personaSelectorOpen
-        personaSelectorDisabled={false}
-        personaPickerContent={
-          <div role="listbox" aria-label="角色">
-            <button type="button" role="option" aria-selected="true">爱丽丝</button>
-          </div>
-        }
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={vi.fn()}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={onClosePersonaSelector}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
+        {...titleBarProps({
+          activePersonaName: '爱丽丝',
+          personaSelectorOpen: true,
+          personaPickerContent: (
+            <div role="listbox" aria-label="角色">
+              <button type="button" role="option" aria-selected="true">爱丽丝</button>
+            </div>
+          ),
+          onClosePersonaSelector
+        })}
       />
     );
 
@@ -273,27 +179,15 @@ describe('AppTitleBar', () => {
     const onCloseSessionSelector = vi.fn();
     render(
       <AppTitleBar
-        railCollapsed={false}
-        modelLabel="DeepSeek / deepseek-chat"
-        conversationContext={conversationContext}
-        sessionSelectorOpen
-        sessionSelectorDisabled={false}
-        sessionPickerContent={
-          <div role="listbox" aria-label="聊天记录">
-            <button type="button" role="option" aria-selected="true">雨夜重逢</button>
-          </div>
-        }
-        personaSelectorOpen={false}
-        personaSelectorDisabled={false}
-        modelSelectorOpen={false}
-        modelSelectorDisabled={false}
-        onToggleRail={vi.fn()}
-        onOpenSessionSelector={vi.fn()}
-        onCloseSessionSelector={onCloseSessionSelector}
-        onOpenPersonaSelector={vi.fn()}
-        onClosePersonaSelector={vi.fn()}
-        onOpenModelSelector={vi.fn()}
-        onCloseModelSelector={vi.fn()}
+        {...titleBarProps({
+          sessionSelectorOpen: true,
+          sessionPickerContent: (
+            <div role="listbox" aria-label="聊天记录">
+              <button type="button" role="option" aria-selected="true">雨夜重逢</button>
+            </div>
+          ),
+          onCloseSessionSelector
+        })}
       />
     );
 

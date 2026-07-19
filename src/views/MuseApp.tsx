@@ -27,15 +27,14 @@ import { beginPersonaImport } from '@/views/personas/personaImportFlow';
 import { useSettingsDraft } from '@/views/hooks/useSettingsDraft';
 import { useSettingsController } from '@/views/hooks/useSettingsController';
 import { useChatRuntime } from '@/views/chat/hooks/useChatRuntime';
+import { useProviderBalance } from '@/views/chat/hooks/useProviderBalance';
 import { type SettingsPanel } from '@/views/settings/types';
 import { StoryWorkspace } from '@/views/story/components/StoryWorkspace';
 import { useStoryWorkspaceState } from '@/views/story/hooks/useStoryWorkspaceState';
 import { sessionMeta, sessionTitle } from '@/views/chat/components/HistoryRail';
 import {
-  calculateDeepSeekUsdCost,
   formatExactTokenCount,
-  formatTokenCount,
-  formatUsdCost
+  formatTokenCount
 } from '@/views/chat/tokenActivity';
 import { SessionsPage } from '@/views/sessions/SessionsPage';
 import { SkillsPage } from '@/views/skills/SkillsPage';
@@ -53,7 +52,6 @@ const loadPersonaEditorDialog = () =>
 export function App() {
   const { toasts, notify, dismissToast } = useAppToast();
   const [pendingImportIntent, setPendingImportIntent] = useState(false);
-  const [railCollapsed, setRailCollapsed] = useState(false);
   const [personaSelectorOpen, setPersonaSelectorOpen] = useState(false);
   const [route, setRoute] = useState<MuseRoute>(() => {
     migrateLegacyMuseUrl();
@@ -237,6 +235,10 @@ export function App() {
     setModelLabel,
     navigateToStory: () => navigateMuseSection('chat')
   });
+  const providerBalanceLabel = useProviderBalance(
+    modelLabel,
+    chatRuntime.runtimeTokenUsage?.items.length ?? 0
+  );
 
   function navigateMuseSection(section: MuseSection, panel?: SettingsPanel, name?: string) {
     if (panel) setSettingsPanel(panel);
@@ -306,11 +308,6 @@ export function App() {
   const contextProgress = runtimeContextSnapshot
     ? Math.max(0, Math.min(100, runtimeContextSnapshot.usage_percent))
     : null;
-  const currentProviderLabel = modelLabel.split(' / ')[0]?.trim() ?? '';
-  const showDeepSeekCost = /^deepseek$/i.test(currentProviderLabel);
-  const deepSeekCost = showDeepSeekCost
-    ? calculateDeepSeekUsdCost(chatRuntime.runtimeTokenUsage?.items ?? [])
-    : null;
   const activeSessionNeedsFallback = !selectableSessions.some(
     (session) => session.conversation_id === chatRuntime.activeConversationId
   );
@@ -324,12 +321,11 @@ export function App() {
     <>
       <AppToastViewport toasts={toasts} themeMode={themeMode} onDismiss={dismissToast} />
       <main
-        className={`runtime-shell story-shell app-shell view-${route.section} theme-${themeMode} motion-${appearanceSettings.motionLevel}${railCollapsed ? ' rail-collapsed' : ''}`}
+        className={`runtime-shell story-shell app-shell view-${route.section} theme-${themeMode} motion-${appearanceSettings.motionLevel}`}
         style={rootStyle}
       >
       <RuntimeLiveRegion status={runtimeStatus} />
       <AppTitleBar
-        railCollapsed={railCollapsed}
         activePersonaName={activePersona?.name}
         modelLabel={modelLabel}
         conversationContext={{
@@ -343,7 +339,7 @@ export function App() {
           detailLabel: runtimeContextSnapshot
             ? `${formatTokenCount(runtimeContextSnapshot.used_total_tokens)} / ${formatTokenCount(runtimeContextSnapshot.context_window)}，剩余 ${formatTokenCount(runtimeContextSnapshot.remaining_tokens)}`
             : '等待上下文快照',
-          costLabel: showDeepSeekCost ? formatUsdCost(deepSeekCost) : undefined
+          balanceLabel: providerBalanceLabel ?? undefined
         }}
         sessionSelectorOpen={chatRuntime.sessionPanelOpen}
         sessionSelectorDisabled={busy}
@@ -494,7 +490,6 @@ export function App() {
             </section>
           ) : undefined
         }
-        onToggleRail={() => setRailCollapsed((collapsed) => !collapsed)}
         onOpenSessionSelector={() => {
           setPersonaSelectorOpen(false);
           setModelPicker(null);
