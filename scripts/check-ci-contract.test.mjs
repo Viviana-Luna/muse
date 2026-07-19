@@ -22,7 +22,7 @@ function manifestVersion(relativePath) {
   return match[1];
 }
 
-test('CI 触发器只覆盖约定的长期分支、正式标签和手动测试包入口', () => {
+test('CI 触发器只覆盖约定的长期分支、版本标签和手动测试包入口', () => {
   const workflow = read('.github/workflows/ci.yml');
   const triggerBlock = workflow.slice(0, workflow.indexOf('\npermissions:'));
 
@@ -49,6 +49,11 @@ test('CI 触发器只覆盖约定的长期分支、正式标签和手动测试�
     /git merge-base --is-ancestor "\$\{tag_commit\}" "refs\/remotes\/origin\/master"/,
     '正式标签必须校验提交属于 master。',
   );
+  assert.equal(
+    count(workflow, "!contains(github.ref_name, '-')"),
+    5,
+    'Beta 等预发布标签只能运行 quality，不得进入平台测试、打包或 Release。',
+  );
   assert.match(
     workflow,
     /github\.event_name == 'workflow_dispatch' &&\n      inputs\.build_test_packages && github\.ref == 'refs\/heads\/dev'/,
@@ -56,7 +61,8 @@ test('CI 触发器只覆盖约定的长期分支、正式标签和手动测试�
   );
   assert.match(
     workflow,
-    /release:\n[\s\S]*if: startsWith\(github\.ref, 'refs\/tags\/v'\)[\s\S]*permissions:\n      contents: write/,
+    /release:\n[\s\S]*!contains\(github\.ref_name, '-'\)[\s\S]*permissions:\n      contents: write/,
+    '只有不含预发布后缀的正式标签可以创建 Release。',
   );
 });
 

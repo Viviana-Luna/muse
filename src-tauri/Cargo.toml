@@ -1,6 +1,6 @@
 [package]
 name = "muse"
-version = "0.1.1"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "Muse 原生桌面宿主，负责本地运行时生命周期和窗口交付。"
 

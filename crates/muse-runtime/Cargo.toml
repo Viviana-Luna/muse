@@ -1,6 +1,6 @@
 [package]
 name = "muse-runtime"
-version = "0.1.1"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "Muse 运行时协调层，承载会话状态、回合快照、预算与安全边界。"
 

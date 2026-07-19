@@ -79,7 +79,7 @@ jobs:
     name: 平台专项环境测试（${{ matrix.os }}）
     if: >-
       github.repository == 'Viviana-Luna/muse' &&
-      (startsWith(github.ref, 'refs/tags/v') ||
+      ((startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
       (github.event_name == 'workflow_dispatch' &&
       inputs.build_test_packages && github.ref == 'refs/heads/dev'))
     needs: quality
@@ -106,7 +106,7 @@ jobs:
     name: 校验安装包构建来源
     if: >-
       github.repository == 'Viviana-Luna/muse' &&
-      (startsWith(github.ref, 'refs/tags/v') ||
+      ((startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
       (github.event_name == 'workflow_dispatch' && inputs.build_test_packages))
     needs: quality
     runs-on: ubuntu-latest
@@ -125,7 +125,7 @@ jobs:
           test "${GITHUB_REF}" = "refs/heads/dev"
 
       - name: 校验正式标签提交属于 master
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
         shell: bash
         run: |
           set -euo pipefail
@@ -138,7 +138,7 @@ jobs:
     name: 打包 ${{ matrix.label }}
     if: >-
       github.repository == 'Viviana-Luna/muse' &&
-      (startsWith(github.ref, 'refs/tags/v') ||
+      ((startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
       (github.event_name == 'workflow_dispatch' &&
       inputs.build_test_packages && github.ref == 'refs/heads/dev'))
     needs:
@@ -606,7 +606,10 @@ jobs:
 
   release:
     name: 发布 GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'Viviana-Luna/muse'
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      !contains(github.ref_name, '-') &&
+      github.repository == 'Viviana-Luna/muse'
     needs: package
     runs-on: ubuntu-latest
     permissions:

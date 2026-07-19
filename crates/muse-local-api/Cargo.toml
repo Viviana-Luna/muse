@@ -1,6 +1,6 @@
 [package]
 name = "muse-local-api"
-version = "0.1.1"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "Muse 本地 API 适配层，负责 Axum 路由、安全边界与运行时装配。"
 

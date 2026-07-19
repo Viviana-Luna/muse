@@ -1,6 +1,6 @@
 [package]
 name = "muse-core"
-version = "0.1.1"
+version = "1.0.0-beta.1"
 edition = "2024"
 description = "Muse 核心领域层，承载配置、角色、模型、工具、语音与存储能力。"
 
