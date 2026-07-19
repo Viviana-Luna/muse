@@ -1,4 +1,3 @@
-import { NumericSliderField } from './SettingsFields';
 import type { MotionLevel, SettingsDialogProps } from '../types';
 
 type AppearancePanelProps = Pick<
@@ -19,40 +18,6 @@ const MOTION_OPTIONS: Array<{
 export function AppearancePanel({ appearanceSettings, setAppearanceSettings }: AppearancePanelProps) {
   return (
     <div className="settings-panel-body">
-      <section className="settings-module">
-        <header className="settings-module-head">
-          <div>
-            <h2>舞台背景</h2>
-            <p>控制角色立绘背景的清晰度与可见程度。</p>
-          </div>
-        </header>
-        <div className="form-grid settings-module-grid">
-          <NumericSliderField
-            label="立绘背景模糊"
-            value={appearanceSettings.backgroundBlur}
-            min={0}
-            max={30}
-            step={1}
-            unit="px"
-            className="wide"
-            onChange={(value) =>
-              setAppearanceSettings((state) => ({ ...state, backgroundBlur: value }))
-            }
-          />
-          <NumericSliderField
-            label="背景可见度"
-            value={appearanceSettings.backgroundOpacity}
-            min={0.2}
-            max={1}
-            step={0.1}
-            className="wide"
-            onChange={(value) =>
-              setAppearanceSettings((state) => ({ ...state, backgroundOpacity: value }))
-            }
-          />
-        </div>
-      </section>
-
       <section className="settings-module">
         <header className="settings-module-head">
           <div>

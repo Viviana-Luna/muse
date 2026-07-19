@@ -8,8 +8,38 @@ import type { PersonaEditorState } from '@/views/personas/hooks/usePersonaState'
 import { PersonaEditorDialog } from './PersonaEditorDialog';
 
 const api = vi.hoisted(() => ({ uploadPersonaImage: vi.fn() }));
+const theme = vi.hoisted(() => ({
+  detectImageTheme: vi.fn().mockResolvedValue({
+    themeColor: '#a84f63',
+    themeMode: 'dark',
+    averageLuminance: 0.3
+  })
+}));
 
 vi.mock('@/api', () => api);
+vi.mock('@/hooks/usePersonaTheme', () => theme);
+vi.mock('@/views/personas/components/PersonaImageCropDialog', () => ({
+  PersonaImageCropDialog: ({
+    onCancel,
+    onConfirm
+  }: {
+    onCancel: () => void;
+    onConfirm: (files: { portrait: File; avatar: File }) => Promise<boolean>;
+  }) => (
+    <div role="dialog" aria-label="裁剪角色图片">
+      <button type="button" onClick={onCancel}>取消裁剪</button>
+      <button
+        type="button"
+        onClick={() => void onConfirm({
+          portrait: new File(['portrait'], 'portrait.webp', { type: 'image/webp' }),
+          avatar: new File(['avatar'], 'avatar.webp', { type: 'image/webp' })
+        })}
+      >
+        确认裁剪
+      </button>
+    </div>
+  )
+}));
 
 afterEach(() => {
   cleanup();
@@ -179,10 +209,10 @@ describe('PersonaEditorDialog', () => {
     renderEditor({}, { busy: true });
 
     const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
-    const portraitSlot = document.querySelector<HTMLElement>('.persona-image-slot');
-    expect(fileInputs).toHaveLength(3);
+    const sourceAction = document.querySelector<HTMLElement>('.persona-image-source-action');
+    expect(fileInputs).toHaveLength(1);
     for (const fileInput of fileInputs) expect(fileInput).toBeDisabled();
-    fireEvent.drop(portraitSlot!, {
+    fireEvent.drop(sourceAction!, {
       dataTransfer: {
         files: [new File(['image'], 'alice.png', { type: 'image/png' })]
       }
@@ -190,8 +220,10 @@ describe('PersonaEditorDialog', () => {
     expect(api.uploadPersonaImage).not.toHaveBeenCalled();
   });
 
-  it('上传头像只更新头像槽，不覆盖立绘与背景', async () => {
-    api.uploadPersonaImage.mockResolvedValue({ url: '/api/assets/uploaded/avatar.webp' });
+  it('同一原图裁剪后同时更新立绘与头像并清空旧背景', async () => {
+    api.uploadPersonaImage
+      .mockResolvedValueOnce({ url: '/api/assets/uploaded/portrait-new.webp' })
+      .mockResolvedValueOnce({ url: '/api/assets/uploaded/avatar-new.webp' });
     const setEditor = vi.fn();
     const initialEditor: PersonaEditorState = {
       open: true,
@@ -206,18 +238,26 @@ describe('PersonaEditorDialog', () => {
     };
     renderEditor(initialEditor, { setEditor });
 
-    const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
-    fireEvent.change(fileInputs[1], {
-      target: { files: [new File(['avatar'], 'avatar.png', { type: 'image/png' })] }
+    fireEvent.change(screen.getByLabelText('选择角色原图'), {
+      target: { files: [new File(['source'], 'source.png', { type: 'image/png' })] }
     });
+    expect(screen.getByRole('dialog', { name: '裁剪角色图片' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认裁剪' }));
 
-    await waitFor(() => expect(setEditor).toHaveBeenCalled());
+    await waitFor(() => expect(api.uploadPersonaImage).toHaveBeenCalledTimes(2));
+    expect(api.uploadPersonaImage.mock.calls[0][0]).toMatchObject({ name: 'portrait.webp' });
+    expect(api.uploadPersonaImage.mock.calls[1][0]).toMatchObject({ name: 'avatar.webp' });
     const updater = setEditor.mock.calls[0][0] as (state: PersonaEditorState) => PersonaEditorState;
     const next = updater(initialEditor);
     expect(next.visualPackDraft).toMatchObject({
-      portrait_path: '/api/assets/uploaded/portrait.webp',
-      background_path: '/api/assets/uploaded/background.webp',
-      avatar_path: '/api/assets/uploaded/avatar.webp'
+      portrait_path: '/api/assets/uploaded/portrait-new.webp',
+      background_path: '',
+      avatar_path: '/api/assets/uploaded/avatar-new.webp',
+      portrait_frame: 'portrait',
+      portrait_fit: 'cover',
+      portrait_position_x: 50,
+      portrait_position_y: 50,
+      portrait_scale: 100
     });
     expect(next.visualDirty).toBe(true);
   });
@@ -243,7 +283,7 @@ describe('PersonaEditorDialog', () => {
       'edit',
       expect.objectContaining({
         portrait_path: '',
-        background_path: undefined,
+        background_path: '',
         avatar_path: undefined,
         theme_color: '#bf5268',
         theme_mode: 'light'

@@ -20,8 +20,6 @@
   --theme-color-hover: #e06d81;
   --theme-color-glow: rgba(216, 89, 111, 0.25);
   --theme-color-bg: rgba(216, 89, 111, 0.12);
-  --stage-background-blur: 18px;
-  --stage-background-opacity: 1;
   --layer-stage: 0;
   --layer-content: 10;
   --layer-composer: 20;
@@ -249,20 +247,6 @@ textarea {
   height: 46vh;
   background: linear-gradient(180deg, rgba(14, 14, 18, 0), rgba(14, 14, 18, 0.86) 62%, rgba(14, 14, 18, 0.96));
   pointer-events: none;
-}
-
-.stage-background {
-  position: absolute;
-  inset: -34px;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: center 32%;
-  transform: scale(1.08);
-  opacity: var(--stage-background-opacity);
-  filter: blur(var(--stage-background-blur)) saturate(1.05) contrast(1.08) brightness(0.58);
-  user-select: none;
-  -webkit-user-drag: none;
 }
 
 .stage-vignette {
@@ -3085,34 +3069,89 @@ textarea {
 }
 
 .persona-file-input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  border: 0;
+  opacity: 0;
 }
 
-.persona-image-slots {
+.persona-image-source {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
+  padding: 13px;
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
 }
 
-.persona-image-slot {
+.persona-image-source > div {
+  display: grid;
+  gap: 4px;
+}
+
+.persona-image-source > div > span,
+.persona-image-hint {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.56);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.55;
+}
+
+.persona-image-source-action {
+  display: grid;
+  min-height: 40px;
+  padding: 8px 12px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--theme-color), transparent 42%);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--theme-color), transparent 84%);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 750;
+  text-align: center;
+}
+
+.persona-image-source-action:focus-within {
+  outline: 2px solid var(--theme-color);
+  outline-offset: 2px;
+}
+
+.persona-image-results {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(82px, 2fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.persona-image-result {
   position: relative;
   display: grid;
-  min-height: 96px;
-  aspect-ratio: var(--persona-slot-ratio);
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
   place-items: center;
-  border: 1px dashed rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.035);
-  color: rgba(255, 255, 255, 0.58);
-  cursor: pointer;
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(255, 255, 255, 0.5);
 }
 
-.persona-image-slot.has-image {
-  border-style: solid;
+.persona-image-result.is-portrait {
+  aspect-ratio: 3 / 4;
 }
 
-.persona-image-slot img {
+.persona-image-result.is-avatar {
+  aspect-ratio: 1;
+}
+
+.persona-image-result img {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -3120,65 +3159,17 @@ textarea {
   object-fit: cover;
 }
 
-.persona-image-slot span,
-.persona-image-slot strong {
-  position: relative;
+.persona-image-result figcaption {
+  position: absolute;
+  inset: auto 7px 7px;
   z-index: 1;
-  text-align: center;
-}
-
-.persona-image-slot strong {
-  align-self: end;
-  width: calc(100% - 12px);
-  margin-bottom: 6px;
-  padding: 6px;
-  border-radius: 9px;
-  background: rgba(12, 12, 18, 0.76);
+  padding: 5px 7px;
+  border-radius: 8px;
+  background: rgba(10, 10, 15, 0.76);
   color: rgba(255, 255, 255, 0.9);
   font-size: 11px;
-}
-
-.persona-portrait-preview {
-  position: relative;
-  display: grid;
-  width: 100%;
-  aspect-ratio: var(--editor-frame-ratio, 3 / 4);
-  overflow: hidden;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.persona-portrait-preview img {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: var(--editor-portrait-fit);
-  object-position: var(--editor-portrait-object-x) var(--editor-portrait-object-y);
-  transform: scale(var(--editor-portrait-scale));
-  transform-origin: var(--editor-portrait-object-x) var(--editor-portrait-object-y);
-}
-
-.persona-image-controls {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.persona-image-controls label {
-  gap: 6px;
-  font-size: 12px;
-}
-
-.persona-image-controls label:nth-child(n + 3) {
-  grid-column: 1 / -1;
-}
-
-.persona-image-controls input[type="range"] {
-  height: 34px;
-  padding: 0;
+  font-weight: 700;
+  text-align: center;
 }
 
 .persona-color-inputs {
@@ -6049,10 +6040,6 @@ textarea {
     linear-gradient(180deg, rgba(8, 8, 13, 0.15), rgba(8, 8, 13, 0.78));
 }
 
-.story-shell .stage-background {
-  filter: blur(calc(var(--stage-background-blur) * 0.62)) saturate(0.86) brightness(0.5);
-}
-
 .story-shell .stage-vignette {
   background:
     radial-gradient(circle at 76% 38%, color-mix(in srgb, var(--theme-color), transparent 76%), transparent 22%),
@@ -6942,6 +6929,257 @@ button.muse-runtime-model svg {
   color: rgba(255, 220, 220, 0.72);
   font-size: 11px;
   white-space: pre-wrap;
+}
+
+.persona-crop-modal {
+  z-index: calc(var(--layer-stacked-modal) + 1);
+  padding: 24px;
+  background: rgba(5, 5, 9, 0.82);
+  backdrop-filter: blur(20px);
+}
+
+.persona-crop-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(920px, calc(100vw - 48px));
+  max-height: min(880px, calc(100dvh - 48px));
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 20px;
+  background: rgba(18, 18, 24, 0.98);
+  box-shadow: 0 32px 110px rgba(0, 0, 0, 0.58);
+}
+
+.persona-crop-dialog > header,
+.persona-crop-dialog > footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+}
+
+.persona-crop-dialog > header {
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.persona-crop-dialog > header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.persona-crop-dialog > header strong {
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 17px;
+}
+
+.persona-crop-dialog > header span,
+.persona-crop-dialog > footer > span {
+  color: rgba(255, 255, 255, 0.56);
+  font-size: 12px;
+}
+
+.persona-crop-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.persona-crop-dialog > footer > span {
+  margin-right: auto;
+}
+
+.persona-crop-dialog > footer button:last-child {
+  border-color: color-mix(in srgb, var(--theme-color), transparent 30%);
+  background: var(--theme-color);
+  color: #fff;
+}
+
+.persona-crop-body {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 16px 22px;
+  min-height: 0;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.persona-crop-tabs {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.persona-crop-tabs button {
+  display: grid;
+  gap: 4px;
+  min-height: 68px;
+  padding: 12px;
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.035);
+  text-align: left;
+}
+
+.persona-crop-tabs button.active {
+  border-color: color-mix(in srgb, var(--theme-color), transparent 28%);
+  background: color-mix(in srgb, var(--theme-color), transparent 84%);
+}
+
+.persona-crop-tabs small {
+  color: rgba(255, 255, 255, 0.48);
+}
+
+.persona-crop-stage {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  gap: 10px;
+  place-items: center;
+}
+
+.persona-crop-stage > p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 12px;
+  text-align: center;
+}
+
+.persona-crop-frame {
+  position: relative;
+  width: auto;
+  max-width: 100%;
+  height: min(58dvh, 560px);
+  max-height: 100%;
+  overflow: hidden;
+  border: 2px solid var(--theme-color);
+  border-radius: 4px;
+  background: #0b0b0e;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2), 0 20px 58px rgba(0, 0, 0, 0.44);
+  cursor: grab;
+  touch-action: none;
+}
+
+.persona-crop-frame:active {
+  cursor: grabbing;
+}
+
+.persona-crop-frame:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--theme-color), white 34%);
+  outline-offset: 4px;
+}
+
+.persona-crop-frame.is-portrait {
+  aspect-ratio: 3 / 4;
+}
+
+.persona-crop-frame.is-avatar {
+  aspect-ratio: 1;
+  height: min(50dvh, 500px);
+}
+
+.persona-crop-frame > img {
+  position: absolute;
+  max-width: none;
+  user-select: none;
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
+.persona-crop-guide {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent 33.1%, rgba(255, 255, 255, 0.34) 33.3%, transparent 33.5%, transparent 66.5%, rgba(255, 255, 255, 0.34) 66.7%, transparent 66.9%),
+    linear-gradient(180deg, transparent 33.1%, rgba(255, 255, 255, 0.34) 33.3%, transparent 33.5%, transparent 66.5%, rgba(255, 255, 255, 0.34) 66.7%, transparent 66.9%);
+  opacity: 0.46;
+}
+
+.persona-crop-controls {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.persona-crop-controls label {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr) 52px;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.persona-crop-controls input[type="range"] {
+  min-width: 0;
+  height: 34px;
+  padding: 0;
+}
+
+.persona-crop-controls output {
+  color: rgba(255, 255, 255, 0.58);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.persona-crop-error {
+  grid-column: 2;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 112, 112, 0.28);
+  border-radius: 10px;
+  background: rgba(116, 31, 31, 0.18);
+  color: #ffb1b1;
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .persona-crop-modal {
+    padding: 0;
+  }
+
+  .persona-crop-dialog {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .persona-crop-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    padding: 14px;
+  }
+
+  .persona-crop-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .persona-crop-frame {
+    height: min(48dvh, 460px);
+  }
+
+  .persona-crop-frame.is-avatar {
+    height: min(42dvh, 420px);
+  }
+
+  .persona-crop-controls,
+  .persona-crop-error {
+    grid-column: 1;
+  }
+
+  .persona-crop-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .persona-crop-dialog > footer > span {
+    display: none;
+  }
 }
 
 /* 角色编辑器同样采用工作区而不是遮罩表单，方便持续调校角色资料。 */
@@ -8112,10 +8350,6 @@ button.muse-runtime-model svg {
     linear-gradient(180deg, rgba(247, 244, 242, 0.18), rgba(247, 244, 242, 0.72));
 }
 
-.story-shell.theme-light .stage-background {
-  filter: blur(calc(var(--stage-background-blur) * 0.5)) saturate(0.82) brightness(0.96);
-}
-
 .story-shell.theme-light .stage-vignette {
   background:
     radial-gradient(circle at 76% 38%, color-mix(in srgb, var(--theme-color), transparent 82%), transparent 24%),
@@ -8435,7 +8669,7 @@ button.muse-runtime-model svg {
   color: rgba(54, 42, 50, 0.48);
 }
 
-/* 顶部应用栏没有填充层，角色背景可以直接延伸到页面顶部。 */
+/* 顶部应用栏保持透明，让主题氛围层自然延伸到页面顶部。 */
 .story-shell .muse-app-bar,
 .story-shell.theme-light .muse-app-bar {
   border-bottom-color: transparent;
@@ -8483,15 +8717,45 @@ button.muse-runtime-model svg {
 }
 
 .story-shell.theme-light .role-editor-modal .persona-image-panel,
-.story-shell.theme-light .role-editor-modal .persona-image-slot,
-.story-shell.theme-light .role-editor-modal .persona-portrait-preview {
+.story-shell.theme-light .role-editor-modal .persona-image-source,
+.story-shell.theme-light .role-editor-modal .persona-image-result {
   border-color: rgba(54, 42, 50, 0.13);
   background: rgba(255, 255, 255, 0.62);
 }
 
 .story-shell.theme-light .role-editor-modal :is(.persona-image-panel, .persona-editor-main) label,
-.story-shell.theme-light .role-editor-modal .persona-image-slot span {
+.story-shell.theme-light .role-editor-modal :is(.persona-image-result, .persona-image-source) span,
+.story-shell.theme-light .role-editor-modal .persona-image-hint {
   color: rgba(54, 42, 50, 0.72);
+}
+
+.story-shell.theme-light .persona-crop-dialog {
+  border-color: rgba(54, 42, 50, 0.14);
+  background: rgba(250, 248, 247, 0.98);
+  color: rgba(39, 31, 38, 0.92);
+}
+
+.story-shell.theme-light .persona-crop-dialog > header,
+.story-shell.theme-light .persona-crop-dialog > footer {
+  border-color: rgba(54, 42, 50, 0.1);
+}
+
+.story-shell.theme-light .persona-crop-dialog > header strong,
+.story-shell.theme-light .persona-crop-controls label {
+  color: rgba(39, 31, 38, 0.92);
+}
+
+.story-shell.theme-light .persona-crop-dialog :is(header, footer) span,
+.story-shell.theme-light .persona-crop-stage > p,
+.story-shell.theme-light .persona-crop-tabs small,
+.story-shell.theme-light .persona-crop-controls output {
+  color: rgba(54, 42, 50, 0.58);
+}
+
+.story-shell.theme-light .persona-crop-tabs button {
+  border-color: rgba(54, 42, 50, 0.12);
+  background: rgba(255, 255, 255, 0.64);
+  color: rgba(39, 31, 38, 0.86);
 }
 
 .story-shell.theme-light .settings-workspace-head strong,

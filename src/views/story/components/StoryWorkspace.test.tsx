@@ -110,7 +110,6 @@ function createRuntime(overrides: Record<string, unknown> = {}) {
 }
 
 const theme = {
-  backgroundPath: '/assets/alice-background.png',
   portraitPath: '/assets/alice-portrait.png',
   avatarPath: '/assets/alice-portrait.png',
   stageStateClass: 'is-idle',
@@ -121,7 +120,6 @@ const theme = {
 
 const themeWithoutImage = {
   ...theme,
-  backgroundPath: '',
   portraitPath: '',
   avatarPath: ''
 } as ReturnType<typeof usePersonaTheme>;

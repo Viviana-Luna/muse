@@ -172,7 +172,6 @@ function ActiveWorkspace({
     retryBootstrap
   } = runtime;
   const {
-    backgroundPath,
     portraitPath,
     stageStateClass
   } = theme;
@@ -188,7 +187,6 @@ function ActiveWorkspace({
       <audio ref={audioRef} className="voice-player" preload="auto" />
       <StageView
         stageStateClass={stageStateClass}
-        backgroundPath={backgroundPath}
         portraitPath={portraitPath}
         personaName={persona.name}
         showPortrait={false}

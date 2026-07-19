@@ -809,7 +809,10 @@ fn build_persona_visual_pack_from_patch(
     let existing = visual_packs.get(&format!("visual-{}", persona.id));
     let portrait_path = trim_optional_patch_value(Some(patch.portrait_path))
         .or_else(|| existing.map(|pack| pack.portrait_path.clone()));
-    let background_path = trim_optional_patch_value(patch.background_path)
+    // 背景字段保留给旧卡片兼容；显式空值代表产品已退场并清除旧引用，None 才表示保留。
+    let background_path = patch
+        .background_path
+        .map(|value| value.trim().to_string())
         .or_else(|| existing.map(|pack| pack.background_path.clone()));
     let avatar_path = trim_optional_patch_value(patch.avatar_path)
         .or_else(|| existing.map(|pack| pack.avatar_path.clone()));

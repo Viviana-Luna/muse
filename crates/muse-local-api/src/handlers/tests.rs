@@ -4381,6 +4381,34 @@ mod tests {
         assert_eq!(updated.portrait_path, "/api/assets/uploaded/portrait.webp");
         assert_eq!(updated.background_path, "/api/assets/uploaded/background.webp");
         assert_eq!(updated.avatar_path, "/api/assets/uploaded/avatar-new.webp");
+
+        let without_background = super::build_persona_visual_pack_from_patch(
+            &store,
+            &mut persona,
+            Some(PersonaVisualPackPatch {
+                portrait_path: String::new(),
+                background_path: Some(String::new()),
+                avatar_path: None,
+                theme_color: None,
+                theme_mode: None,
+                portrait_frame: None,
+                portrait_fit: None,
+                portrait_position_x: None,
+                portrait_position_y: None,
+                portrait_scale: None,
+            }),
+        )
+        .expect("显式空背景应生成清理后的展示包补丁");
+
+        assert_eq!(
+            without_background.portrait_path,
+            "/api/assets/uploaded/portrait.webp"
+        );
+        assert!(without_background.background_path.is_empty());
+        assert_eq!(
+            without_background.avatar_path,
+            "/api/assets/uploaded/avatar-old.webp"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

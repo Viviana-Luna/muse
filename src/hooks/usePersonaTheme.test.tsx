@@ -37,16 +37,34 @@ describe('resolveThemeModeFromLuminance', () => {
   it('没有视觉包时保持图片路径为空，不注入默认角色资产', () => {
     const { result } = renderHook(() => usePersonaTheme(null));
 
-    expect(result.current.backgroundPath).toBe('');
     expect(result.current.portraitPath).toBe('');
     expect(result.current.avatarPath).toBe('');
   });
 
-  it('头像、立绘与背景使用各自独立的资源路径', () => {
+  it('只解析头像与立绘，不再向舞台暴露旧背景资源', () => {
     const { result } = renderHook(() => usePersonaTheme(visualPack));
 
-    expect(result.current.backgroundPath).toBe('/assets/background.webp');
+    expect(result.current).not.toHaveProperty('backgroundPath');
     expect(result.current.portraitPath).toBe('/assets/portrait.webp');
     expect(result.current.avatarPath).toBe('/assets/avatar.webp');
+  });
+
+  it('旧展示构图字段不再改变固定裁剪结果的舞台展示', () => {
+    const { result } = renderHook(() => usePersonaTheme({
+      ...visualPack,
+      portrait_frame: 'wide',
+      portrait_fit: 'contain',
+      portrait_position_x: 10,
+      portrait_position_y: 90,
+      portrait_scale: 170
+    }));
+
+    expect(result.current.rootStyle).toMatchObject({
+      '--portrait-frame-ratio': '3 / 4',
+      '--portrait-fit': 'cover',
+      '--portrait-object-x': '50%',
+      '--portrait-object-y': '50%',
+      '--portrait-scale': '1'
+    });
   });
 });

@@ -6,11 +6,6 @@ import { resolveAuthenticatedAssetUrl, useAuthenticatedAssetUrl } from '@/hooks/
 
 const DEFAULT_THEME_COLOR = '#d8596f';
 
-interface PersonaAppearanceOptions {
-  backgroundBlur?: number;
-  backgroundOpacity?: number;
-}
-
 export type ResolvedVisualThemeMode = Exclude<VisualThemeMode, 'auto'>;
 
 export interface DetectedImageTheme {
@@ -28,8 +23,6 @@ type PersonaThemeStyle = CSSProperties & {
   '--theme-color-hover': string;
   '--theme-color-glow': string;
   '--theme-color-bg': string;
-  '--stage-background-blur': string;
-  '--stage-background-opacity': string;
   '--portrait-frame-ratio': string;
   '--portrait-fit': string;
   '--portrait-object-x': string;
@@ -50,22 +43,6 @@ function normalizeThemeColor(color: string | undefined): string {
 function normalizeThemeMode(mode: string | undefined): VisualThemeMode {
   if (mode === 'dark' || mode === 'light') return mode;
   return 'auto';
-}
-
-function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {
-  if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
-  return Math.min(max, Math.max(min, value));
-}
-
-function normalizePortraitFit(value: string | undefined): string {
-  return value === 'contain' ? 'contain' : 'cover';
-}
-
-function resolvePortraitFrameRatio(value: string | undefined): string {
-  if (value === 'square') return '1 / 1';
-  if (value === 'wide') return '16 / 9';
-  if (value === 'full') return '4 / 3';
-  return '3 / 4';
 }
 
 function hexToRgb(color: string): [number, number, number] | null {
@@ -186,27 +163,23 @@ function resolveStageStateClass(voiceStatus?: string): string {
 
 export function usePersonaTheme(
   visualPack: VisualPack | null,
-  voiceStatus?: string,
-  appearance: PersonaAppearanceOptions = {}
+  voiceStatus?: string
 ) {
-  const configuredBackgroundPath = normalizeVisualAsset(visualPack?.background_path || visualPack?.portrait_path);
   const configuredPortraitPath = normalizeVisualAsset(visualPack?.portrait_path);
   const configuredAvatarPath = normalizeVisualAsset(visualPack?.avatar_path);
-  const resolvedBackgroundPath = useAuthenticatedAssetUrl(configuredBackgroundPath);
   const resolvedPortraitPath = useAuthenticatedAssetUrl(configuredPortraitPath);
   const resolvedAvatarPath = useAuthenticatedAssetUrl(configuredAvatarPath);
-  const backgroundPath = resolvedBackgroundPath;
   const configuredThemeMode = normalizeThemeMode(visualPack?.theme_mode);
   const [detectedThemeMode, setDetectedThemeMode] = useState<ResolvedVisualThemeMode>('dark');
 
   useEffect(() => {
     if (configuredThemeMode !== 'auto') return;
-    if (!backgroundPath) {
+    if (!resolvedPortraitPath) {
       setDetectedThemeMode('dark');
       return;
     }
     let cancelled = false;
-    void detectImageTheme(backgroundPath)
+    void detectImageTheme(resolvedPortraitPath)
       .then((detected) => {
         if (!cancelled) setDetectedThemeMode(detected.themeMode);
       })
@@ -216,20 +189,14 @@ export function usePersonaTheme(
     return () => {
       cancelled = true;
     };
-  }, [backgroundPath, configuredThemeMode]);
+  }, [configuredThemeMode, resolvedPortraitPath]);
 
   const resolvedThemeMode = configuredThemeMode === 'auto' ? detectedThemeMode : configuredThemeMode;
   const theme = useMemo(() => {
     const themeColor = normalizeThemeColor(visualPack?.theme_color);
-    const backgroundBlur = clampNumber(appearance.backgroundBlur, 0, 30, 18);
-    const backgroundOpacity = clampNumber(appearance.backgroundOpacity, 0.2, 1, 1);
-    const portraitPositionX = clampNumber(visualPack?.portrait_position_x, 0, 100, 50);
-    const portraitPositionY = clampNumber(visualPack?.portrait_position_y, 0, 100, 50);
-    const portraitScale = clampNumber(visualPack?.portrait_scale, 70, 180, 100);
     return {
       themeColor,
       themeMode: resolvedThemeMode,
-      backgroundPath,
       portraitPath: resolvedPortraitPath,
       avatarPath: resolvedAvatarPath,
       stageStateClass: resolveStageStateClass(voiceStatus),
@@ -238,16 +205,14 @@ export function usePersonaTheme(
         '--theme-color-hover': colorWithAlpha(themeColor, 0.88),
         '--theme-color-glow': colorWithAlpha(themeColor, 0.25),
         '--theme-color-bg': colorWithAlpha(themeColor, 0.12),
-        '--stage-background-blur': `${backgroundBlur}px`,
-        '--stage-background-opacity': `${backgroundOpacity}`,
-        '--portrait-frame-ratio': resolvePortraitFrameRatio(visualPack?.portrait_frame),
-        '--portrait-fit': normalizePortraitFit(visualPack?.portrait_fit),
-        '--portrait-object-x': `${portraitPositionX}%`,
-        '--portrait-object-y': `${portraitPositionY}%`,
-        '--portrait-scale': `${portraitScale / 100}`
+        '--portrait-frame-ratio': '3 / 4',
+        '--portrait-fit': 'cover',
+        '--portrait-object-x': '50%',
+        '--portrait-object-y': '50%',
+        '--portrait-scale': '1'
       } as PersonaThemeStyle
     };
-  }, [appearance.backgroundBlur, appearance.backgroundOpacity, backgroundPath, resolvedAvatarPath, resolvedPortraitPath, resolvedThemeMode, visualPack, voiceStatus]);
+  }, [resolvedAvatarPath, resolvedPortraitPath, resolvedThemeMode, visualPack, voiceStatus]);
 
   return theme;
 }

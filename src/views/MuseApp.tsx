@@ -281,7 +281,7 @@ export function App() {
   }, [route.section, openImportDialog, pendingImportIntent]);
 
 
-  const personaTheme = usePersonaTheme(activeVisualPack, voice.status, appearanceSettings);
+  const personaTheme = usePersonaTheme(activeVisualPack, voice.status);
   const { themeMode, rootStyle } = personaTheme;
   const selectableSessions = chatRuntime.runtimeSessions.filter(
     (session) => session.can_resume && session.records > 0

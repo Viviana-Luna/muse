@@ -1522,11 +1522,6 @@
  * 亮色主题覆盖（.theme-light）
  * 针对舞台、各玻璃表面与表单控件的浅色适配。
  * ========================================================================= */
-.theme-light .stage-background {
-  filter: blur(calc(var(--stage-background-blur) * 0.72)) saturate(0.72) contrast(0.92) brightness(1.08);
-  opacity: calc(var(--stage-background-opacity) * 0.54);
-}
-
 .theme-light .app-main-surface > .stage::after {
   background:
     linear-gradient(90deg, rgba(239, 240, 245, 0.92) 0%, rgba(239, 240, 245, 0.7) 44%, rgba(239, 240, 245, 0.18) 76%, rgba(239, 240, 245, 0.48) 100%),

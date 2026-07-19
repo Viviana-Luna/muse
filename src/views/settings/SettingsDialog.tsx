@@ -72,8 +72,8 @@ const SETTINGS_PANELS: SettingsPanelDefinition[] = [
   {
     id: 'appearance',
     label: '外观配置',
-    description: '调整角色舞台背景、可见度与动效强度。',
-    marker: '景'
+    description: '调整界面动效强度与可访问性偏好。',
+    marker: '效'
   },
   {
     id: 'diagnostics',

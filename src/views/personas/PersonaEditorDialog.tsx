@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { CSSProperties, Dispatch, DragEvent, FormEvent, SetStateAction } from 'react';
+import type { Dispatch, DragEvent, FormEvent, SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 
 import { uploadPersonaImage } from '@/api';
@@ -19,6 +19,8 @@ import type {
   PersonaEditorMode,
   PersonaEditorState
 } from '@/views/personas/hooks/usePersonaState';
+import { PersonaImageCropDialog } from '@/views/personas/components/PersonaImageCropDialog';
+import type { PersonaCropTargetKey } from '@/views/personas/utils/personaImageCrop';
 
 const MAX_PERSONA_IMAGE_BYTES = 5 * 1024 * 1024;
 const PERSONA_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
@@ -27,62 +29,6 @@ const DEFAULT_PORTRAIT_FRAME = 'portrait';
 const DEFAULT_PORTRAIT_FIT = 'cover';
 const DEFAULT_PORTRAIT_POSITION = 50;
 const DEFAULT_PORTRAIT_SCALE = 100;
-type PersonaImageSlot = 'portrait_path' | 'avatar_path' | 'background_path';
-
-const PERSONA_IMAGE_SLOTS: Array<{
-  key: PersonaImageSlot;
-  label: string;
-  ratio: string;
-  width: number;
-  height: number;
-}> = [
-  { key: 'portrait_path', label: '立绘', ratio: '3 / 4', width: 900, height: 1200 },
-  { key: 'avatar_path', label: '头像', ratio: '1 / 1', width: 768, height: 768 },
-  { key: 'background_path', label: '背景', ratio: '16 / 9', width: 1600, height: 900 }
-];
-
-async function cropPersonaImage(file: File, slot: PersonaImageSlot): Promise<File> {
-  if (typeof createImageBitmap !== 'function') return file;
-  const target = PERSONA_IMAGE_SLOTS.find((candidate) => candidate.key === slot);
-  if (!target) return file;
-  const bitmap = await createImageBitmap(file);
-  try {
-    const sourceRatio = bitmap.width / bitmap.height;
-    const targetRatio = target.width / target.height;
-    const sourceWidth = sourceRatio > targetRatio ? bitmap.height * targetRatio : bitmap.width;
-    const sourceHeight = sourceRatio > targetRatio ? bitmap.height : bitmap.width / targetRatio;
-    const sourceX = (bitmap.width - sourceWidth) / 2;
-    const sourceY = (bitmap.height - sourceHeight) / 2;
-    const canvas = document.createElement('canvas');
-    canvas.width = target.width;
-    canvas.height = target.height;
-    const context = canvas.getContext('2d');
-    if (!context) return file;
-    context.drawImage(
-      bitmap,
-      sourceX,
-      sourceY,
-      sourceWidth,
-      sourceHeight,
-      0,
-      0,
-      target.width,
-      target.height
-    );
-    const outputType = file.type;
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, outputType, 0.92)
-    );
-    if (!blob) return file;
-    const extension =
-      blob.type === 'image/png' ? 'png' : blob.type === 'image/jpeg' ? 'jpg' : 'webp';
-    if (!PERSONA_IMAGE_MIME_TYPES.includes(blob.type)) return file;
-    const baseName = file.name.replace(/\.[^.]+$/u, '') || 'persona-image';
-    return new File([blob], `${baseName}-${slot}.${extension}`, { type: blob.type });
-  } finally {
-    bitmap.close();
-  }
-}
 
 interface PersonaValidationIssue {
   field: keyof Persona;
@@ -135,16 +81,6 @@ function parseModelReference(value: string): PersonaModelReference | null {
   return null;
 }
 
-function clampVisualNumber(
-  value: number | undefined,
-  min: number,
-  max: number,
-  fallback: number
-): number {
-  if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
-  return Math.min(max, Math.max(min, value));
-}
-
 function trimDraftValue(value?: string): string | undefined {
   const trimmed = value?.trim() ?? '';
   return trimmed || undefined;
@@ -154,35 +90,20 @@ function buildVisualPackPatch(
   draft: PersonaVisualPackPatch
 ): PersonaVisualPackPatch {
   const portraitPath = trimDraftValue(draft.portrait_path);
-  const backgroundPath = trimDraftValue(draft.background_path);
   const avatarPath = trimDraftValue(draft.avatar_path);
   return {
     portrait_path: portraitPath ?? '',
-    background_path: backgroundPath,
+    // 兼容字段继续存在，但新编辑流程显式清空旧角色背景。
+    background_path: '',
     avatar_path: avatarPath,
     theme_color: trimDraftValue(draft.theme_color) ?? DEFAULT_PERSONA_THEME_COLOR,
     theme_mode:
       draft.theme_mode === 'dark' || draft.theme_mode === 'light' ? draft.theme_mode : 'auto',
-    portrait_frame: trimDraftValue(draft.portrait_frame) ?? DEFAULT_PORTRAIT_FRAME,
-    portrait_fit: trimDraftValue(draft.portrait_fit) ?? DEFAULT_PORTRAIT_FIT,
-    portrait_position_x: clampVisualNumber(
-      draft.portrait_position_x,
-      0,
-      100,
-      DEFAULT_PORTRAIT_POSITION
-    ),
-    portrait_position_y: clampVisualNumber(
-      draft.portrait_position_y,
-      0,
-      100,
-      DEFAULT_PORTRAIT_POSITION
-    ),
-    portrait_scale: clampVisualNumber(
-      draft.portrait_scale,
-      70,
-      180,
-      DEFAULT_PORTRAIT_SCALE
-    )
+    portrait_frame: DEFAULT_PORTRAIT_FRAME,
+    portrait_fit: DEFAULT_PORTRAIT_FIT,
+    portrait_position_x: DEFAULT_PORTRAIT_POSITION,
+    portrait_position_y: DEFAULT_PORTRAIT_POSITION,
+    portrait_scale: DEFAULT_PORTRAIT_SCALE
   };
 }
 
@@ -213,13 +134,6 @@ function normalizePersonaFieldErrors(fieldErrors: Record<string, string>) {
   );
 }
 
-function resolveEditorFrameRatio(value?: string): string {
-  if (value === 'square') return '1 / 1';
-  if (value === 'wide') return '16 / 9';
-  if (value === 'full') return '4 / 3';
-  return '3 / 4';
-}
-
 export function PersonaEditorDialog({
   editor,
   modelCatalog = null,
@@ -237,14 +151,13 @@ export function PersonaEditorDialog({
 }: PersonaEditorDialogProps) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [imageUploading, setImageUploading] = useState(false);
+  const [cropSourceFile, setCropSourceFile] = useState<File | null>(null);
   const [themeDetecting, setThemeDetecting] = useState(false);
   const modalRef = useModalAccessibility<HTMLElement>(true, onClose);
   const portraitPath = editor.visualPackDraft.portrait_path.trim();
   const avatarPath = editor.visualPackDraft.avatar_path?.trim() ?? '';
-  const backgroundPath = editor.visualPackDraft.background_path?.trim() ?? '';
   const portraitPreviewPath = useAuthenticatedAssetUrl(portraitPath);
   const avatarPreviewPath = useAuthenticatedAssetUrl(avatarPath);
-  const backgroundPreviewPath = useAuthenticatedAssetUrl(backgroundPath);
   const preferredModelRef = editor.persona.preferred_model_ref;
   const preferredModelValue = modelReferenceValue(preferredModelRef);
   const chatModels = (modelCatalog?.models ?? []).filter((model) =>
@@ -282,24 +195,11 @@ export function PersonaEditorDialog({
     ? `${globalChatModel.provider} / ${globalChatModel.model}`
     : '尚未配置';
   const globalVoiceId = modelsConfig?.tts.voice_id.trim() || '尚未配置';
-  const previewPaths: Record<PersonaImageSlot, string> = {
-    portrait_path: portraitPreviewPath,
-    avatar_path: avatarPreviewPath,
-    background_path: backgroundPreviewPath
-  };
   const hasPortrait = portraitPath.length > 0;
   const visualPackIdPreview =
     editor.visualDirty
       ? `visual-${editor.persona.id || 'persona'}`
       : editor.persona.default_visual_pack_id;
-  const portraitStyle = {
-    '--editor-frame-ratio': resolveEditorFrameRatio(editor.visualPackDraft.portrait_frame),
-    '--editor-portrait-fit': editor.visualPackDraft.portrait_fit || DEFAULT_PORTRAIT_FIT,
-    '--editor-portrait-object-x': `${clampVisualNumber(editor.visualPackDraft.portrait_position_x, 0, 100, DEFAULT_PORTRAIT_POSITION)}%`,
-    '--editor-portrait-object-y': `${clampVisualNumber(editor.visualPackDraft.portrait_position_y, 0, 100, DEFAULT_PORTRAIT_POSITION)}%`,
-    '--editor-portrait-scale': `${clampVisualNumber(editor.visualPackDraft.portrait_scale, 70, 180, DEFAULT_PORTRAIT_SCALE) / 100}`
-  } as CSSProperties;
-
   function focusField(field: string) {
     window.requestAnimationFrame(() => {
       modalRef.current?.querySelector<HTMLElement>(`[name="${field}"]`)?.focus();
@@ -357,7 +257,7 @@ export function PersonaEditorDialog({
     }
   }
 
-  async function uploadImage(slot: PersonaImageSlot, file?: File | null) {
+  function selectCropSource(file?: File | null) {
     if (!file || busy) return;
     if (!PERSONA_IMAGE_MIME_TYPES.includes(file.type)) {
       notify({
@@ -372,38 +272,50 @@ export function PersonaEditorDialog({
       return;
     }
 
+    setCropSourceFile(file);
+  }
+
+  async function uploadCroppedImages(
+    files: Record<PersonaCropTargetKey, File>
+  ): Promise<boolean> {
     setImageUploading(true);
     try {
-      const cropped = await cropPersonaImage(file, slot).catch(() => file);
-      const uploaded = await uploadPersonaImage(cropped);
-      const detectedTheme =
-        slot === 'portrait_path'
-          ? await detectImageTheme(uploaded.url).catch(() => undefined)
-          : undefined;
+      const portrait = await uploadPersonaImage(files.portrait);
+      const avatar = await uploadPersonaImage(files.avatar);
+      const detectedTheme = await detectImageTheme(portrait.url).catch(() => undefined);
       setEditor((state) => ({
         ...state,
         visualPackDraft: {
           ...state.visualPackDraft,
-          [slot]: uploaded.url,
+          portrait_path: portrait.url,
+          avatar_path: avatar.url,
+          background_path: '',
           theme_color:
             detectedTheme?.themeColor ??
             state.visualPackDraft.theme_color ??
             DEFAULT_PERSONA_THEME_COLOR,
-          theme_mode: detectedTheme?.themeMode ?? state.visualPackDraft.theme_mode ?? 'auto'
+          theme_mode: detectedTheme?.themeMode ?? state.visualPackDraft.theme_mode ?? 'auto',
+          portrait_frame: DEFAULT_PORTRAIT_FRAME,
+          portrait_fit: DEFAULT_PORTRAIT_FIT,
+          portrait_position_x: DEFAULT_PORTRAIT_POSITION,
+          portrait_position_y: DEFAULT_PORTRAIT_POSITION,
+          portrait_scale: DEFAULT_PORTRAIT_SCALE
         },
         visualDirty: true
       }));
       notify({
-        title: `${PERSONA_IMAGE_SLOTS.find((candidate) => candidate.key === slot)?.label ?? '角色图片'}已上传`,
-        description: '图片已按目标比例裁剪；其他图片槽保持不变。',
+        title: '角色图片已更新',
+        description: '已从同一原图生成 3:4 立绘和 1:1 头像。',
         tone: 'success'
       });
+      return true;
     } catch (err) {
       notify({
         title: '上传图片失败',
         description: err instanceof Error ? err.message : '上传角色图片时遇到错误。',
         tone: 'error'
       });
+      return false;
     } finally {
       setImageUploading(false);
     }
@@ -439,9 +351,9 @@ export function PersonaEditorDialog({
     }
   }
 
-  function handleImageDrop(slot: PersonaImageSlot, event: DragEvent<HTMLLabelElement>) {
+  function handleImageDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
-    void uploadImage(slot, event.dataTransfer.files[0]);
+    selectCropSource(event.dataTransfer.files[0]);
   }
 
   const dialog = (
@@ -471,97 +383,57 @@ export function PersonaEditorDialog({
         </header>
         <div className="persona-editor-layout">
           <section className="persona-image-panel" aria-label="角色形象">
-            <div className="persona-image-slots" aria-label="角色视觉资源">
-              {PERSONA_IMAGE_SLOTS.map((slot) => {
-                const path = editor.visualPackDraft[slot.key]?.trim() ?? '';
-                const previewPath = previewPaths[slot.key];
-                return (
-                  <label
-                    key={slot.key}
-                    className={path ? 'persona-image-slot has-image' : 'persona-image-slot'}
-                    style={{ '--persona-slot-ratio': slot.ratio } as CSSProperties}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={(event) => handleImageDrop(slot.key, event)}
-                  >
-                    <input
-                      className="persona-file-input"
-                      type="file"
-                      disabled={busy || imageUploading}
-                      accept={PERSONA_IMAGE_MIME_TYPES.join(',')}
-                      onChange={(event) => {
-                        void uploadImage(slot.key, event.target.files?.[0]);
-                        event.target.value = '';
-                      }}
-                    />
-                    {path && previewPath ? (
-                      <img src={previewPath} alt={`${slot.label}预览`} draggable={false} />
-                    ) : (
-                      <span>暂无{slot.label}</span>
-                    )}
-                    <strong>{imageUploading ? '处理中' : path ? `更换${slot.label}` : `上传${slot.label}`}</strong>
-                  </label>
-                );
-              })}
-            </div>
-            {hasPortrait && (
-              <div className="persona-portrait-preview" style={portraitStyle}>
-                {portraitPreviewPath && <img src={portraitPreviewPath} alt="立绘构图预览" draggable={false} />}
+            <div className="persona-image-source">
+              <div>
+                <strong>角色原图</strong>
+                <span>选择一张图片，分别裁剪立绘和头像。</span>
               </div>
-            )}
-            <div className="persona-image-controls">
-              <label>
-                展示比例
-                <select
-                  value={editor.visualPackDraft.portrait_frame || DEFAULT_PORTRAIT_FRAME}
-                  onChange={(event) => updateEditorVisualDraft('portrait_frame', event.target.value)}
-                >
-                  <option value="portrait">竖向</option>
-                  <option value="square">方形</option>
-                  <option value="wide">横向</option>
-                  <option value="full">全幅</option>
-                </select>
-              </label>
-              <label>
-                适配
-                <select
-                  value={editor.visualPackDraft.portrait_fit || DEFAULT_PORTRAIT_FIT}
-                  onChange={(event) => updateEditorVisualDraft('portrait_fit', event.target.value)}
-                >
-                  <option value="cover">裁切</option>
-                  <option value="contain">完整</option>
-                </select>
-              </label>
-              <label>
-                大小
+              <label
+                className="persona-image-source-action"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={handleImageDrop}
+              >
                 <input
-                  type="range"
-                  min="70"
-                  max="180"
-                  value={editor.visualPackDraft.portrait_scale ?? DEFAULT_PORTRAIT_SCALE}
-                  onChange={(event) => updateEditorVisualDraft('portrait_scale', Number(event.target.value))}
+                  className="persona-file-input"
+                  type="file"
+                  aria-label="选择角色原图"
+                  disabled={busy || imageUploading}
+                  accept={PERSONA_IMAGE_MIME_TYPES.join(',')}
+                  onChange={(event) => {
+                    selectCropSource(event.target.files?.[0]);
+                    event.target.value = '';
+                  }}
                 />
-              </label>
-              <label>
-                水平
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  value={editor.visualPackDraft.portrait_position_x ?? DEFAULT_PORTRAIT_POSITION}
-                  onChange={(event) => updateEditorVisualDraft('portrait_position_x', Number(event.target.value))}
-                />
-              </label>
-              <label>
-                垂直
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  value={editor.visualPackDraft.portrait_position_y ?? DEFAULT_PORTRAIT_POSITION}
-                  onChange={(event) => updateEditorVisualDraft('portrait_position_y', Number(event.target.value))}
-                />
+                {imageUploading
+                  ? '正在上传'
+                  : portraitPath || avatarPath
+                    ? '重新选择并裁剪'
+                    : '选择原图并裁剪'}
               </label>
             </div>
+            <div className="persona-image-results" aria-label="角色图片裁剪结果">
+              <figure className="persona-image-result is-portrait">
+                {portraitPreviewPath ? (
+                  <img src={portraitPreviewPath} alt="立绘预览" draggable={false} />
+                ) : (
+                  <span>暂无立绘</span>
+                )}
+                <figcaption>立绘 · 3:4</figcaption>
+              </figure>
+              <figure className="persona-image-result is-avatar">
+                {avatarPreviewPath ? (
+                  <img src={avatarPreviewPath} alt="头像预览" draggable={false} />
+                ) : (
+                  <span>暂无头像</span>
+                )}
+                <figcaption>头像 · 1:1</figcaption>
+              </figure>
+            </div>
+            {!hasPortrait && !avatarPath && (
+              <p className="persona-image-hint">
+                支持 PNG、JPEG、WebP，原图不超过 5MB。裁剪结果固定为 900×1200 与 768×768。
+              </p>
+            )}
             <label>
               名称
               <input
@@ -912,5 +784,17 @@ export function PersonaEditorDialog({
   );
 
   const portalHost = document.querySelector<HTMLElement>('.runtime-shell') ?? document.body;
-  return createPortal(dialog, portalHost);
+  return (
+    <>
+      {createPortal(dialog, portalHost)}
+      {cropSourceFile && (
+        <PersonaImageCropDialog
+          file={cropSourceFile}
+          busy={imageUploading}
+          onCancel={() => setCropSourceFile(null)}
+          onConfirm={uploadCroppedImages}
+        />
+      )}
+    </>
+  );
 }

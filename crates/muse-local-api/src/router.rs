@@ -789,8 +789,10 @@ check_on_startup = true
         let visual_pack_id = format!("visual-{persona_id}");
         let old_avatar_name = format!("{}.webp", "a".repeat(64));
         let kept_portrait_name = format!("{}.webp", "b".repeat(64));
+        let old_background_name = format!("{}.webp", "d".repeat(64));
         let old_avatar_url = format!("/api/assets/uploaded/{old_avatar_name}");
         let kept_portrait_url = format!("/api/assets/uploaded/{kept_portrait_name}");
+        let old_background_url = format!("/api/assets/uploaded/{old_background_name}");
         let new_avatar_url = format!("/api/assets/uploaded/{}.webp", "c".repeat(64));
         {
             let mut personas = state.personas.lock().await;
@@ -803,7 +805,7 @@ check_on_startup = true
             let mut visual_packs = state.visual_packs.lock().await;
             let mut pack = test_visual_pack(&visual_pack_id, "#d8596f");
             pack.portrait_path = kept_portrait_url.clone();
-            pack.background_path = kept_portrait_url.clone();
+            pack.background_path = old_background_url;
             pack.avatar_path = old_avatar_url.clone();
             visual_packs.upsert(pack).expect("应写入测试展示包");
             visual_packs.save().expect("应保存测试展示包");
@@ -814,6 +816,8 @@ check_on_startup = true
             .expect("应写入待清理头像");
         std::fs::write(uploaded_dir.join(&kept_portrait_name), b"kept-portrait")
             .expect("应写入仍被引用的立绘");
+        std::fs::write(uploaded_dir.join(&old_background_name), b"old-background")
+            .expect("应写入待清理的旧角色背景");
         let persona = state
             .personas
             .lock()
@@ -835,7 +839,7 @@ check_on_startup = true
                             "persona": persona,
                             "visual_pack_patch": {
                                 "portrait_path": kept_portrait_url,
-                                "background_path": kept_portrait_url,
+                                "background_path": "",
                                 "avatar_path": new_avatar_url
                             }
                         })
@@ -848,6 +852,7 @@ check_on_startup = true
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!uploaded_dir.join(old_avatar_name).exists());
+        assert!(!uploaded_dir.join(old_background_name).exists());
         assert!(uploaded_dir.join(&kept_portrait_name).exists());
 
         let delete_response = app
