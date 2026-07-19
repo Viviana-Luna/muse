@@ -7,6 +7,7 @@ import {
   fetchModelInfo,
   fetchPersonas,
   fetchRuntimeContextSnapshot,
+  fetchRuntimeApprovalMode,
   fetchRuntimeMode,
   fetchRuntimeSessions,
   fetchRuntimeState,
@@ -15,6 +16,7 @@ import {
   forkRuntimeSession,
   resetConversation,
   resumeRuntimeSession,
+  updateRuntimeApprovalMode,
   updateRuntimeMode
 } from '@/api';
 import type { AppToastInput } from '@/hooks/useAppToast';
@@ -33,6 +35,8 @@ import type {
   ActivePersonaResponse,
   Persona,
   RuntimeStateResponse,
+  RuntimeApprovalModePreset,
+  RuntimeApprovalModeResponse,
   RuntimeTokenUsage
 } from '@/types';
 import type { PlanModeChoice } from '@/views/chat/components/PlanModeToggle';
@@ -126,6 +130,9 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
   const [runtimeFocusPhase, setRuntimeFocusPhase] = useState('build');
   const [runtimeToolPreset, setRuntimeToolPreset] = useState('focus_build');
   const [runtimeModeSwitching, setRuntimeModeSwitching] = useState(false);
+  const [approvalMode, setApprovalMode] = useState<RuntimeApprovalModePreset>('manual');
+  const [approvalModeRevision, setApprovalModeRevision] = useState(0);
+  const [approvalModeSwitching, setApprovalModeSwitching] = useState(false);
 
   const session = useSessionState();
   const revision = useRuntimeStateRevision();
@@ -230,10 +237,11 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
         sessions.sessions,
         activeConversationId
       );
-      const [history, tokenUsage, context] = await Promise.all([
+      const [history, tokenUsage, context, approval] = await Promise.all([
         fetchHistory(selectedConversationId),
         fetchRuntimeTokenUsage(selectedConversationId, 'day'),
-        fetchRuntimeContextSnapshot(selectedConversationId)
+        fetchRuntimeContextSnapshot(selectedConversationId),
+        fetchRuntimeApprovalMode()
       ]);
       return {
         personas,
@@ -246,7 +254,8 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
         history,
         todos: todos.todos,
         tokenUsage,
-        contextSnapshot: context.snapshot ?? null
+        contextSnapshot: context.snapshot ?? null,
+        approvalMode: approval
       };
     });
     if (value.activeStateRevision !== state.state_revision) {
@@ -257,6 +266,9 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       : value.active;
     if (value.personas.active_persona_id !== state.active_persona_id) {
       throw new Error('角色列表不属于最终稳定 revision。');
+    }
+    if (value.approvalMode.conversation_id !== state.active_conversation_id) {
+      throw new Error('审批模式不属于最终稳定会话。');
     }
     return {
       stateRevision: state.state_revision,
@@ -269,7 +281,8 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       history: value.history,
       todos: value.todos,
       tokenUsage: value.tokenUsage,
-      contextSnapshot: value.contextSnapshot
+      contextSnapshot: value.contextSnapshot,
+      approvalMode: value.approvalMode
     };
   }
 
@@ -291,6 +304,8 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     overview.setActiveTodos(snapshot.todos);
     overview.setRuntimeTokenUsage(snapshot.tokenUsage);
     overview.setRuntimeContextSnapshot(snapshot.contextSnapshot);
+    setApprovalMode(snapshot.approvalMode.preset);
+    setApprovalModeRevision(snapshot.approvalMode.revision);
     setDialogue(lastDialogueLine(messages, snapshot.active?.persona ?? null));
     return true;
   }
@@ -318,6 +333,15 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       }
     },
     onRuntimeModeChange: applyRuntimeMode,
+    onApprovalModeChange: (preset, revision) => {
+      setApprovalMode(preset);
+      setApprovalModeRevision(revision);
+      optionsRef.current.notify({
+        title: '已回退为手动审批',
+        description: 'AUTO 连续三次未放行，后续动作由你确认。',
+        tone: 'warning'
+      });
+    },
     onRuntimeTodosChange: overview.setActiveTodos,
     onRuntimeTokenUsage: (usage: RuntimeTokenUsage) => {
       void overview.refreshRuntimeUsage(usage.conversation_id);
@@ -459,6 +483,52 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
       });
     } finally {
       setRuntimeModeSwitching(false);
+    }
+  }
+
+  function applyApprovalMode(response: RuntimeApprovalModeResponse) {
+    setApprovalMode(response.preset);
+    setApprovalModeRevision(response.revision);
+  }
+
+  async function handleApprovalModeChange(nextPreset: RuntimeApprovalModePreset): Promise<void> {
+    if (stream.busy || approvalModeSwitching || nextPreset === approvalMode) return;
+    if (rejectBlockedMutation('切换审批模式')) return;
+    if (session.selectedConversationReadOnly) {
+      optionsRef.current.notify({
+        title: '只读历史不能切换审批模式',
+        description: '请先恢复或分叉会话。',
+        tone: 'info'
+      });
+      return;
+    }
+    setApprovalModeSwitching(true);
+    try {
+      const response = await updateRuntimeApprovalMode(nextPreset, approvalModeRevision);
+      applyApprovalMode(response);
+      optionsRef.current.notify({
+        title: `${nextPreset === 'manual' ? '手动审批' : nextPreset === 'auto' ? 'AUTO 模式' : 'YOLO 模式'}已启用`,
+        description:
+          nextPreset === 'auto'
+            ? '后续审批将由隔离审查器评估，异常时转为人工确认。'
+            : nextPreset === 'yolo'
+              ? '仅当前会话与本次应用运行期有效；MCP 仍遵守独立策略。'
+              : '后续需要审批的动作将由你确认。',
+        tone: nextPreset === 'yolo' ? 'warning' : 'success'
+      });
+    } catch (error) {
+      optionsRef.current.notify({
+        title: '切换审批模式失败',
+        description: error instanceof Error ? error.message : '运行时未接受本次切换。',
+        tone: 'error'
+      });
+      try {
+        applyApprovalMode(await fetchRuntimeApprovalMode());
+      } catch {
+        // 保留最后一个可信会话快照，等待下一次完整同步。
+      }
+    } finally {
+      setApprovalModeSwitching(false);
     }
   }
 
@@ -687,6 +757,8 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     runtimeFocusPhase,
     runtimeToolPreset,
     runtimeModeSwitching,
+    approvalMode,
+    approvalModeSwitching,
     ...session,
     ...overview,
     messages: stream.messages,
@@ -720,6 +792,7 @@ export function useChatRuntime(options: UseChatRuntimeOptions) {
     synchronizeRuntimeAfterPersonaReset,
     handleSend,
     handleRuntimeModeChange,
+    handleApprovalModeChange,
     handleReset,
     handleResumeSession,
     handleForkSession,

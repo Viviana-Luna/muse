@@ -105,6 +105,20 @@ pub(crate) async fn handle_activate_persona(
             .map_err(internal_error)?;
             return Err(internal_error(error.to_string()));
         }
+        if let Err(error) = restore_active_approval_mode(&state, &conversation_id).await {
+            rollback_persona_runtime_transition(
+                &state,
+                previous_store,
+                previous_conversation,
+                previous_todos,
+                previous_conversation_id,
+            )
+            .await
+            .map_err(internal_error)?;
+            return Err(internal_error(format!(
+                "恢复会话审批模式失败：{error}"
+            )));
+        }
         true
     } else {
         reset_conversation_for_active_persona(&state).await;
@@ -180,6 +194,7 @@ pub(crate) async fn initialize_active_persona_session(state: &Arc<AppState>) -> 
         repository
             .set_workspace_state(&active_persona.id, &conversation_id)
             .map_err(|error| error.to_string())?;
+        restore_active_approval_mode(state, &conversation_id).await?;
     } else {
         reset_conversation_for_active_persona(state).await;
     }

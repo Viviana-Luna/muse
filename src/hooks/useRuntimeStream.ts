@@ -11,6 +11,7 @@ import {
 import type {
   Message,
   RuntimeContextSnapshot,
+  RuntimeApprovalModePreset,
   RuntimeEvent,
   RuntimeTurnStartedEvent,
   RuntimeTodoItem,
@@ -91,6 +92,7 @@ interface UseRuntimeStreamOptions {
   onDialogue: (line: RuntimeDialogueLine) => void;
   onConversationChange?: (conversationId: string) => void;
   onRuntimeModeChange?: (mode: string, focusPhase: string, toolPreset: string) => void;
+  onApprovalModeChange?: (preset: RuntimeApprovalModePreset, revision: number) => void;
   onRuntimeTodosChange?: (todos: RuntimeTodoItem[]) => void;
   onRuntimeTokenUsage?: (usage: RuntimeTokenUsage) => void;
   onRuntimeContextSnapshot?: (snapshot: RuntimeContextSnapshot) => void;
@@ -351,6 +353,7 @@ export function useRuntimeStream({
   onDialogue,
   onConversationChange,
   onRuntimeModeChange,
+  onApprovalModeChange,
   onRuntimeTodosChange,
   onRuntimeTokenUsage,
   onRuntimeContextSnapshot,
@@ -800,6 +803,44 @@ export function useRuntimeStream({
             approvalHint: payload.detail ?? payload.reason ?? undefined
           });
         }
+        if (payload.type === 'approval_review_started') {
+          appendChatProcess(currentAssistantId, {
+            type: 'status',
+            phase: 'thinking',
+            message: 'AUTO 审查器正在评估工具风险。',
+            detail: payload.name ? `工具：${payload.name}` : undefined,
+            state: 'active'
+          });
+        }
+        if (
+          payload.type === 'approval_review_completed' ||
+          payload.type === 'approval_review_denied' ||
+          payload.type === 'approval_review_timed_out' ||
+          payload.type === 'approval_review_aborted'
+        ) {
+          const allowed = payload.type === 'approval_review_completed';
+          appendChatProcess(currentAssistantId, {
+            type: 'status',
+            phase: allowed ? 'tool_running' : 'thinking',
+            message: allowed
+              ? 'AUTO 审查已允许，继续执行工具。'
+              : payload.type === 'approval_review_denied'
+                ? 'AUTO 审查未放行，等待人工复核。'
+                : 'AUTO 审查异常，已安全转为人工审批。',
+            detail: payload.rationale ?? payload.reason ?? undefined,
+            state: 'completed'
+          });
+        }
+        if (payload.type === 'approval_mode_changed') {
+          onApprovalModeChange?.(payload.preset, payload.revision);
+          appendChatProcess(currentAssistantId, {
+            type: 'status',
+            phase: 'thinking',
+            message: '当前会话已回退为手动审批。',
+            detail: payload.reason,
+            state: 'completed'
+          });
+        }
         if (payload.type === 'approval_resolved') {
           const cancelled = !payload.approved && payload.reason?.includes('取消');
           appendChatProcess(currentAssistantId, {
@@ -939,6 +980,7 @@ export function useRuntimeStream({
       flushRuntimeDeltas,
       onDialogue,
       onConversationChange,
+      onApprovalModeChange,
       onRuntimeModeChange,
       onRuntimeContextSnapshot,
       onTurnStarted,

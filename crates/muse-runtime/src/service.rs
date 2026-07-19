@@ -12,7 +12,6 @@ use muse_core::domain::mcp::{McpClientManager, McpServerCheckStatus, McpToolCata
 use muse_core::domain::runtime::{RuntimeModeState, RuntimeTodoItem};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
-use crate::FrozenExecutionPolicy;
 use crate::coordinator::{
     IdleLease, RuntimeCoordinator, RuntimeCoordinatorError, RuntimePhase, RuntimeStateSnapshot,
     TurnLease,
@@ -23,6 +22,7 @@ use crate::interactions::{
 };
 use crate::session::SessionStore;
 use crate::session_metadata::{SessionRepository, SessionRepositoryError};
+use crate::{ApprovalModePreset, ApprovalsReviewer, FrozenExecutionPolicy};
 
 /// 运行时服务自身的状态访问错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,7 @@ pub struct RuntimeService {
     active_conversation_id: StdMutex<String>,
     conversation: Mutex<Conversation>,
     execution_policy: StdMutex<FrozenExecutionPolicy>,
+    approval_review_failures: StdMutex<BTreeMap<String, u8>>,
     interactions: Mutex<InteractionRegistries>,
     runtime_mode: StdMutex<RuntimeModeState>,
     active_todos: Mutex<Vec<RuntimeTodoItem>>,
@@ -91,6 +92,7 @@ impl RuntimeService {
                 "workspace_write",
                 Vec::new(),
             )),
+            approval_review_failures: StdMutex::new(BTreeMap::new()),
             interactions: Mutex::new(InteractionRegistries::default()),
             runtime_mode: StdMutex::new(RuntimeModeState::default()),
             active_todos: Mutex::new(Vec::new()),
@@ -149,11 +151,51 @@ impl RuntimeService {
         &self,
         policy: FrozenExecutionPolicy,
     ) -> Result<u64, RuntimeServiceError> {
+        if policy.approvals_reviewer != ApprovalsReviewer::AutoReview {
+            let conversation_id = self.active_conversation_id()?;
+            self.approval_review_failures
+                .lock()
+                .map_err(|_| RuntimeServiceError::ExecutionPolicyStatePoisoned)?
+                .remove(&conversation_id);
+        }
         *self
             .execution_policy
             .lock()
             .map_err(|_| RuntimeServiceError::ExecutionPolicyStatePoisoned)? = policy;
         Ok(self.coordinator.touch())
+    }
+
+    /// 记录当前会话的自动审查结果；连续三次未放行时收紧为手动审批。
+    pub fn record_approval_review_outcome(
+        &self,
+        allowed: bool,
+    ) -> Result<bool, RuntimeServiceError> {
+        let conversation_id = self.active_conversation_id()?;
+        let mut failures = self
+            .approval_review_failures
+            .lock()
+            .map_err(|_| RuntimeServiceError::ExecutionPolicyStatePoisoned)?;
+        if allowed {
+            failures.remove(&conversation_id);
+            return Ok(false);
+        }
+        let count = failures.entry(conversation_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < 3 {
+            return Ok(false);
+        }
+        let current = self.execution_policy()?;
+        let manual = FrozenExecutionPolicy::from_preset(
+            ApprovalModePreset::Manual,
+            current.allowed_roots,
+            current.revision.saturating_add(1),
+        );
+        *self
+            .execution_policy
+            .lock()
+            .map_err(|_| RuntimeServiceError::ExecutionPolicyStatePoisoned)? = manual;
+        self.coordinator.touch();
+        Ok(true)
     }
 
     /// 读取当前运行模式事实。
@@ -664,8 +706,8 @@ mod tests {
             vec![std::path::PathBuf::from("/workspace")],
         ));
         assert_eq!(
-            service.execution_policy().unwrap().permission_mode,
-            "full_access"
+            service.execution_policy().unwrap().preset(),
+            crate::ApprovalModePreset::Yolo
         );
 
         let turn = service.begin_turn("turn-1", "conversation-1").unwrap();
@@ -682,8 +724,8 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            service.execution_policy().unwrap().permission_mode,
-            "request_approval"
+            service.execution_policy().unwrap().preset(),
+            crate::ApprovalModePreset::Manual
         );
     }
 }

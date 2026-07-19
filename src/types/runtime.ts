@@ -275,6 +275,33 @@ export interface RuntimeApprovalResolvedEvent extends RuntimeEventBase {
   reason?: string;
 }
 
+// 独立自动审查器生命周期事件。
+export interface RuntimeApprovalReviewEvent extends RuntimeEventBase {
+  type:
+    | 'approval_review_started'
+    | 'approval_review_completed'
+    | 'approval_review_denied'
+    | 'approval_review_timed_out'
+    | 'approval_review_aborted';
+  approval_id?: string;
+  call_id?: string;
+  name?: string;
+  risk?: ToolRisk;
+  risk_level?: 'low' | 'medium' | 'high' | 'critical' | string;
+  user_authorization?: 'explicit' | 'implicit' | 'unclear' | 'denied' | string;
+  rationale?: string;
+  reason?: string;
+  elapsed_ms?: number;
+  policy_revision?: number;
+}
+
+export interface RuntimeApprovalModeChangedEvent extends RuntimeEventBase {
+  type: 'approval_mode_changed';
+  preset: RuntimeApprovalModePreset;
+  revision: number;
+  reason: string;
+}
+
 // 用户问题选项。
 export interface RuntimeUserQuestionOption {
   label: string;
@@ -344,6 +371,19 @@ export interface RuntimeWorkspacesResponse {
   roots: RuntimeWorkspaceRoot[];
   permission_mode: 'request_approval' | 'approve_for_me' | 'full_access' | string;
   sandbox_mode: 'workspace_write' | 'danger_full_access' | string;
+}
+
+export type RuntimeApprovalModePreset = 'manual' | 'auto' | 'yolo';
+
+// 当前会话审批模式的三轴事实。
+export interface RuntimeApprovalModeResponse {
+  conversation_id: string;
+  preset: RuntimeApprovalModePreset;
+  approval_policy: 'on_request' | 'never';
+  approvals_reviewer: 'user' | 'auto_review';
+  permission_profile: 'workspace_write' | 'danger_full_access';
+  revision: number;
+  status: string;
 }
 
 // 运行模式。
@@ -508,6 +548,8 @@ export type RuntimeEvent =
   | RuntimeStatusEvent
   | RuntimeApprovalEvent
   | RuntimeApprovalResolvedEvent
+  | RuntimeApprovalReviewEvent
+  | RuntimeApprovalModeChangedEvent
   | RuntimeUserQuestionEvent
   | RuntimeUserQuestionResolvedEvent
   | RuntimeSpeechEvent

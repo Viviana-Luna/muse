@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
   fetchModelInfo: vi.fn(),
   fetchPersonas: vi.fn(),
   fetchRuntimeContextSnapshot: vi.fn(),
+  fetchRuntimeApprovalMode: vi.fn(),
   fetchRuntimeMode: vi.fn(),
   fetchRuntimeSessions: vi.fn(),
   fetchRuntimeState: vi.fn(),
@@ -28,6 +29,7 @@ const api = vi.hoisted(() => ({
   streamRuntimeChat: vi.fn(),
   synthesizeSpeech: vi.fn(),
   transcribeAudio: vi.fn(),
+  updateRuntimeApprovalMode: vi.fn(),
   updateRuntimeMode: vi.fn()
 }));
 
@@ -138,6 +140,17 @@ describe('useChatRuntime', () => {
       records: []
     });
     api.fetchRuntimeContextSnapshot.mockResolvedValue({ snapshot: null });
+    api.fetchRuntimeApprovalMode.mockImplementation(() =>
+      Promise.resolve({
+        conversation_id: activeConversationId,
+        preset: 'manual',
+        approval_policy: 'on_request',
+        approvals_reviewer: 'user',
+        permission_profile: 'workspace_write',
+        revision: 0,
+        status: 'ok'
+      })
+    );
     api.fetchVoiceCapabilities.mockResolvedValue({
       tts: false,
       speech_recognition: false
@@ -158,6 +171,15 @@ describe('useChatRuntime', () => {
       focus_phase: 'build',
       tool_preset: 'focus_build',
       status: 'ok'
+    });
+    api.updateRuntimeApprovalMode.mockResolvedValue({
+      conversation_id: activeConversationId,
+      preset: 'auto',
+      approval_policy: 'on_request',
+      approvals_reviewer: 'auto_review',
+      permission_profile: 'workspace_write',
+      revision: 2,
+      status: 'updated'
     });
   });
 
@@ -256,6 +278,22 @@ describe('useChatRuntime', () => {
         description: '运行时忙碌',
         tone: 'error'
       })
+    );
+  });
+
+  it('以会话 revision 切换 AUTO 模式', async () => {
+    const { result, notify } = setup();
+    await waitFor(() => expect(result.current.runtimeStatus).toBe(''));
+
+    await act(async () => {
+      await result.current.handleApprovalModeChange('auto');
+    });
+
+    expect(api.updateRuntimeApprovalMode).toHaveBeenCalledWith('auto', 0);
+    expect(result.current.approvalMode).toBe('auto');
+    expect(result.current.approvalModeSwitching).toBe(false);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'AUTO 模式已启用', tone: 'success' })
     );
   });
 
@@ -381,6 +419,15 @@ describe('useChatRuntime', () => {
         state_revision: stateRevision
       };
     });
+    api.fetchRuntimeApprovalMode.mockImplementation(async () => ({
+      conversation_id: stateRevision === 1 ? 'active' : 'history-b',
+      preset: 'manual',
+      approval_policy: 'on_request',
+      approvals_reviewer: 'user',
+      permission_profile: 'workspace_write',
+      revision: 0,
+      status: 'ok'
+    }));
     api.fetchHistory.mockImplementation(async (conversationId = 'active') => {
       historyAttempt += 1;
       if (historyAttempt === 1) {

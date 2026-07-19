@@ -1656,6 +1656,10 @@ async fn reset_conversation_for_active_persona(state: &Arc<AppState>) {
     replace_runtime_todos(state, Vec::new()).await;
     let conversation_id = next_runtime_session_id();
     let _ = set_active_conversation_id(state, &conversation_id);
+    if let Err(error) = initialize_new_session_approval_mode(state, &conversation_id).await {
+        tracing::warn!(%error, "初始化新会话审批模式失败，继续使用手动审批");
+        let _ = set_active_approval_mode(state, ApprovalModePreset::Manual, 0);
+    }
 }
 
 fn next_runtime_id(prefix: &str) -> String {
@@ -1912,9 +1916,17 @@ fn load_runtime_harness_config() -> RuntimeWorkspaceRootsFile {
         config.sandbox_mode = default_runtime_sandbox_mode();
     }
     if config.permission_mode == "full_access" {
-        config.sandbox_mode = "danger_full_access".to_string();
+        config.permission_mode = default_runtime_permission_mode();
+        config.sandbox_mode = default_runtime_sandbox_mode();
     }
     config
+}
+
+fn default_new_session_approval_preset() -> ApprovalModePreset {
+    match load_runtime_harness_config().permission_mode.as_str() {
+        "approve_for_me" => ApprovalModePreset::Auto,
+        _ => ApprovalModePreset::Manual,
+    }
 }
 
 async fn save_runtime_harness_config(config: &RuntimeWorkspaceRootsFile) -> Result<(), String> {
@@ -1989,27 +2001,96 @@ fn allowed_file_roots() -> Result<Vec<PathBuf>, String> {
     Ok(vec![workspace_root()?])
 }
 
-fn runtime_execution_policy_from_harness_config(
-    config: &RuntimeWorkspaceRootsFile,
-) -> Result<FrozenExecutionPolicy, String> {
-    let roots = allowed_file_roots()?
+fn canonical_runtime_roots() -> Result<Vec<PathBuf>, String> {
+    allowed_file_roots()?
         .into_iter()
         .map(|root| {
             root.canonicalize()
                 .map_err(|err| format!("无法解析运行时工作区权限根：{err}"))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(FrozenExecutionPolicy::new(
-        config.permission_mode.clone(),
-        config.sandbox_mode.clone(),
-        roots,
-    ))
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn set_active_approval_mode(
+    state: &Arc<AppState>,
+    preset: ApprovalModePreset,
+    revision: u64,
+) -> Result<u64, String> {
+    let current_roots = state
+        .runtime_service
+        .execution_policy()
+        .map(|policy| policy.allowed_roots)
+        .unwrap_or_default();
+    let roots = if current_roots.is_empty() {
+        canonical_runtime_roots()?
+    } else {
+        current_roots
+    };
+    state
+        .runtime_service
+        .set_execution_policy(FrozenExecutionPolicy::from_preset(
+            preset, roots, revision,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+async fn restore_active_approval_mode(
+    state: &Arc<AppState>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| error.to_string())?;
+    let saved = repository
+        .approval_mode_for_resume(conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    set_active_approval_mode(state, saved.preset, saved.revision)?;
+    Ok(())
+}
+
+async fn initialize_new_session_approval_mode(
+    state: &Arc<AppState>,
+    conversation_id: &str,
+) -> Result<(), String> {
+    let preset = default_new_session_approval_preset();
+    set_active_approval_mode(state, preset, 0)?;
+    if preset == ApprovalModePreset::Manual {
+        return Ok(());
+    }
+    let active_persona = {
+        let personas = state.personas.lock().await;
+        personas.active_persona().cloned()
+    }
+    .ok_or_else(|| "当前没有活动角色，无法保存新会话审批默认值。".to_string())?;
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| error.to_string())?;
+    repository
+        .ensure_persona_binding(
+            conversation_id,
+            &active_persona.id,
+            &active_persona.name,
+            &active_persona.version,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let saved = repository
+        .update_approval_mode(conversation_id, preset)
+        .await
+        .map_err(|error| error.to_string())?;
+    set_active_approval_mode(state, saved.preset, saved.revision)?;
+    Ok(())
 }
 
 fn should_require_tool_approval(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
-    risk: &str,
+    _risk: &str,
     default_requires_approval: bool,
 ) -> bool {
     // 外部 MCP 的本地信任已经冻结在 ToolDef 中。全局完全访问模式不得再放宽
@@ -2017,17 +2098,9 @@ fn should_require_tool_approval(
     if mcp::is_external_mcp_tool_name(&call.name) {
         return default_requires_approval;
     }
-    match policy.permission_mode.as_str() {
-        "full_access" => false,
-        "approve_for_me" => match call.name.as_str() {
-            "file_write" | "file_edit" => false,
-            "tts_speak" => false,
-            _ => {
-                matches!(risk, "network" | "execute_command" | "external_side_effect")
-                    || default_requires_approval
-            }
-        },
-        _ => default_requires_approval,
+    match policy.approval_policy {
+        ApprovalPolicy::Never => false,
+        ApprovalPolicy::OnRequest => default_requires_approval,
     }
 }
 
@@ -2036,8 +2109,7 @@ fn can_bypass_workspace_boundary(
     allow_approved_external_path: bool,
 ) -> bool {
     allow_approved_external_path
-        || policy.sandbox_mode == "danger_full_access"
-        || policy.permission_mode == "full_access"
+        || policy.permission_profile == PermissionProfile::DangerFullAccess
 }
 
 fn resolve_workspace_path(
@@ -2835,128 +2907,6 @@ fn tool_result_content_for_model(tool_name: &str, result: &ToolResult) -> String
     }
 }
 
-async fn wait_for_tool_approval(
-    state: &Arc<AppState>,
-    tx: Option<&RuntimeSseSender>,
-    turn: &TurnContext,
-    call: &ToolCall,
-    risk: &str,
-    summary: String,
-    cancel_token: &RuntimeTurnCancel,
-) -> Result<(bool, String), ()> {
-    let Some(tx) = tx else {
-        return Ok((false, "no_event_channel".to_string()));
-    };
-    let approval_id = next_runtime_id("approval");
-    let (approval_tx, approval_rx) = oneshot::channel::<ApprovalDecision>();
-    state
-        .runtime_service
-        .transition_active(&turn.turn_id, RuntimePhase::WaitingApproval)
-        .map_err(|_| ())?;
-    state
-        .runtime_service
-        .register_pending_approval(
-            approval_id.clone(),
-            PendingApproval {
-                turn_id: turn.turn_id.clone(),
-                tool_name: call.name.clone(),
-                risk: risk.to_string(),
-                summary: summary.clone(),
-                tx: approval_tx,
-            },
-        )
-        .await
-        .map_err(|_| ())?;
-    let _pending_guard = PendingInteractionGuard::approval(state, &turn.turn_id, &approval_id);
-    append_transcript_record(
-        state,
-        "approval_pending",
-        serde_json::json!({
-            "conversation_id": turn.conversation_id,
-            "turn_id": turn.turn_id,
-            "approval_id": approval_id,
-            "call_id": call.call_id,
-            "tool": call.name,
-            "risk": risk,
-            "audit_note": "工具审批请求已登记；命令、查询、参数和说明未写入审计事件。",
-        }),
-    )
-    .await
-    .map_err(|err| {
-        tracing::error!(target: "muse::transcript", error = %err, "持久化审批请求失败");
-    })?;
-    emit_json_event(
-        tx,
-        runtime_approval_pending_event(
-            &approval_id,
-            &call.call_id,
-            &call.name,
-            risk,
-            "这个工具需要你的确认后才能继续。",
-            Some(&summary),
-            &call.arguments,
-        ),
-    )
-    .await?;
-    let (approved, reason) = tokio::select! {
-        result = approval_rx => match result {
-            Ok(decision) => {
-                let reason = if decision.approved {
-                    decision.reason.unwrap_or_else(|| "approved".to_string())
-                } else {
-                    decision.reason.unwrap_or_else(|| "rejected".to_string())
-                };
-                (decision.approved, reason)
-            }
-            Err(_) => (false, "approval_channel_dropped".to_string()),
-        },
-        _ = tokio::time::sleep(Duration::from_secs(TOOL_APPROVAL_TIMEOUT_SECS)) => {
-            state.runtime_service.remove_pending_approval(&approval_id, &turn.turn_id).await;
-            (false, "timeout".to_string())
-        },
-        _ = wait_for_turn_cancel(cancel_token) => {
-            state.runtime_service.remove_pending_approval(&approval_id, &turn.turn_id).await;
-            (false, "turn_cancelled".to_string())
-        },
-        _ = tx.closed() => {
-            state.runtime_service.remove_pending_approval(&approval_id, &turn.turn_id).await;
-            (false, "client_disconnected".to_string())
-        },
-    };
-    if state.runtime_service.snapshot().is_ok_and(|snapshot| {
-        snapshot.turn_id.as_deref() == Some(turn.turn_id.as_str())
-            && snapshot.phase == RuntimePhase::WaitingApproval
-    }) {
-        let _ = state
-            .runtime_service
-            .transition_active(&turn.turn_id, RuntimePhase::Running);
-    }
-    append_transcript_record(
-        state,
-        "approval_resolved",
-        serde_json::json!({
-            "conversation_id": turn.conversation_id,
-            "turn_id": turn.turn_id,
-            "approval_id": approval_id,
-            "call_id": call.call_id,
-            "tool": call.name,
-            "approved": approved,
-            "audit_note": "工具审批结果已登记；用户说明未写入审计事件。",
-        }),
-    )
-    .await
-    .map_err(|err| {
-        tracing::error!(target: "muse::transcript", error = %err, "持久化审批结果失败");
-    })?;
-    if !tx.is_closed() {
-        let _ = emit_json_event(
-            tx,
-            runtime_approval_resolved_event(&approval_id, approved, Some(&reason)),
-        )
-        .await;
-    }
-    Ok((approved, reason))
-}
 
 async fn wait_for_user_question_answer(
     state: &Arc<AppState>,
@@ -3273,6 +3223,9 @@ fn redact_private_session_text(value: &str) -> String {
     }
     for marker in [
         "bearer ",
+        "authorization=",
+        "proxy_authorization=",
+        "proxy-authorization=",
         "api_key=",
         "apikey=",
         "access_token=",

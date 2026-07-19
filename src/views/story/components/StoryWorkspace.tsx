@@ -146,6 +146,8 @@ function ActiveWorkspace({
     skillPicker,
     runtimeToolPreset,
     runtimeModeSwitching,
+    approvalMode,
+    approvalModeSwitching,
     selectedRuntimeSession,
     selectedConversationReadOnly,
     messages,
@@ -167,6 +169,7 @@ function ActiveWorkspace({
     scrollToLatest,
     handleSend,
     handleRuntimeModeChange,
+    handleApprovalModeChange,
     handleResumeSession,
     handleForkSession,
     retryBootstrap
@@ -234,6 +237,8 @@ function ActiveWorkspace({
               inputValue={inputValue}
               runtimeToolPreset={runtimeToolPreset}
               runtimeModeSwitching={runtimeModeSwitching}
+              approvalMode={approvalMode}
+              approvalModeSwitching={approvalModeSwitching}
               skillPicker={skillPicker}
               voice={voice}
               visualizerCanvasRef={visualizerCanvasRef}
@@ -242,6 +247,7 @@ function ActiveWorkspace({
               placeholder={`对${persona.name}说点什么…`}
               onInputValueChange={setInputValue}
               onRuntimeModeChange={handleRuntimeModeChange}
+              onApprovalModeChange={handleApprovalModeChange}
               onSend={handleSend}
               onStartVoiceInput={startVoiceInput}
               onToggleVoice={() => toggleVoice(dialogue)}

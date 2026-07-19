@@ -78,6 +78,11 @@ fn api_routes() -> Router<Arc<AppState>> {
             "/runtime/mode",
             get(handlers::handle_runtime_mode).put(handlers::handle_runtime_mode_update),
         )
+        .route(
+            "/runtime/approval-mode",
+            get(handlers::handle_runtime_approval_mode)
+                .put(handlers::handle_runtime_approval_mode_update),
+        )
         .route("/runtime/todos", get(handlers::handle_runtime_todos))
         .route(
             "/runtime/token-usage",
@@ -622,6 +627,133 @@ mod tests {
         assert!(payload["visual_pack"].is_null());
         assert!(payload["state_revision"].is_u64());
         assert_eq!(payload.as_object().map(serde_json::Map::len), Some(4));
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn approval_mode_route_exposes_three_axes_and_rejects_stale_revision() {
+        let config_dir = unique_temp_dir("approval-mode-route");
+        let app = api_routes().with_state(build_test_state(&config_dir));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/runtime/approval-mode")
+                    .body(Body::empty())
+                    .expect("应构造审批模式查询"),
+            )
+            .await
+            .expect("审批模式查询应返回响应");
+        assert_eq!(response.status(), StatusCode::OK);
+        let initial = response_json(response).await;
+        assert_eq!(initial["preset"], "manual");
+        assert_eq!(initial["approval_policy"], "on_request");
+        assert_eq!(initial["approvals_reviewer"], "user");
+        assert_eq!(initial["permission_profile"], "workspace_write");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/runtime/approval-mode")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preset": "auto",
+                            "expected_revision": initial["revision"]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应构造 AUTO 模式更新"),
+            )
+            .await
+            .expect("AUTO 模式更新应返回响应");
+        assert_eq!(response.status(), StatusCode::OK);
+        let auto = response_json(response).await;
+        assert_eq!(auto["preset"], "auto");
+        assert_eq!(auto["approval_policy"], "on_request");
+        assert_eq!(auto["approvals_reviewer"], "auto_review");
+        assert_eq!(auto["permission_profile"], "workspace_write");
+        assert!(auto["revision"].as_u64() > initial["revision"].as_u64());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/runtime/approval-mode")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preset": "yolo",
+                            "expected_revision": initial["revision"]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应构造过期 revision 更新"),
+            )
+            .await
+            .expect("过期 revision 更新应返回响应");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/runtime/approval-mode")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preset": "yolo",
+                            "expected_revision": auto["revision"]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应构造 YOLO 模式更新"),
+            )
+            .await
+            .expect("YOLO 模式更新应返回响应");
+        assert_eq!(response.status(), StatusCode::OK);
+        let yolo = response_json(response).await;
+        assert_eq!(yolo["preset"], "yolo");
+        assert_eq!(yolo["approval_policy"], "never");
+        assert_eq!(yolo["approvals_reviewer"], "user");
+        assert_eq!(yolo["permission_profile"], "danger_full_access");
+        let _ = std::fs::remove_dir_all(config_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_defaults_reject_persistent_yolo_policy() {
+        let config_dir = unique_temp_dir("workspace-default-yolo");
+        let app = api_routes().with_state(build_test_state(&config_dir));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/runtime/workspaces")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "permission_mode": "full_access",
+                            "sandbox_mode": "danger_full_access"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("应构造持久化 YOLO 默认值请求"),
+            )
+            .await
+            .expect("持久化 YOLO 默认值请求应返回响应");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|message| { message.contains("YOLO 不能保存为全局默认") })
+        );
         let _ = std::fs::remove_dir_all(config_dir);
     }
 

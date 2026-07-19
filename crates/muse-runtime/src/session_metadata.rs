@@ -9,13 +9,16 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::ApprovalModePreset;
 use crate::session::{
     SessionEventV3, SessionIndexIdentity, SessionMigrationReport, SessionStore, SessionStoreError,
     conversation_file_name,
 };
 
 pub const SESSION_METADATA_EVENT_KIND: &str = "session_metadata_updated";
+pub const SESSION_APPROVAL_MODE_EVENT_KIND: &str = "session_approval_mode_updated";
 const SESSION_METADATA_PAYLOAD_SCHEMA: &str = "muse-session-metadata/v2";
+const SESSION_APPROVAL_MODE_PAYLOAD_SCHEMA: &str = "muse-session-approval-mode/v1";
 const DEFAULT_SESSION_SUMMARY: &str = "未命名会话";
 const MAX_INDEX_SUMMARY_CHARS: usize = 120;
 
@@ -69,6 +72,13 @@ pub struct SessionMetadata {
     pub archived: bool,
     pub source_conversation_id: Option<String>,
     pub updated_at: String,
+    pub revision: u64,
+}
+
+/// 会话级审批模式事实。revision 直接使用 Session v3 的全局提交序号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionApprovalMode {
+    pub preset: ApprovalModePreset,
     pub revision: u64,
 }
 
@@ -229,6 +239,72 @@ impl SessionRepository {
         self.update_index_after_committed_event(&event, &previous_identity)
             .await;
         Ok(event)
+    }
+
+    /// 追加会话级审批模式事件；YOLO 也会留下审计事实，但恢复时不会重新启用。
+    pub async fn update_approval_mode(
+        &self,
+        conversation_id: &str,
+        preset: ApprovalModePreset,
+    ) -> Result<SessionApprovalMode, SessionRepositoryError> {
+        validate_conversation_id(conversation_id)?;
+        let event = self
+            .append_event(
+                conversation_id,
+                None,
+                SESSION_APPROVAL_MODE_EVENT_KIND,
+                serde_json::json!({
+                    "schema_version": SESSION_APPROVAL_MODE_PAYLOAD_SCHEMA,
+                    "preset": preset,
+                    "volatile": preset == ApprovalModePreset::Yolo,
+                }),
+            )
+            .await?;
+        Ok(SessionApprovalMode {
+            preset,
+            revision: event.commit_seq,
+        })
+    }
+
+    /// 读取最后一个会话级审批模式。恢复路径会把历史 YOLO 收紧为手动审批。
+    pub async fn approval_mode_for_resume(
+        &self,
+        conversation_id: &str,
+    ) -> Result<SessionApprovalMode, SessionRepositoryError> {
+        validate_conversation_id(conversation_id)?;
+        let events = self.store.events_for_conversation(conversation_id).await?;
+        let Some(event) = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == SESSION_APPROVAL_MODE_EVENT_KIND)
+        else {
+            return Ok(SessionApprovalMode {
+                preset: ApprovalModePreset::Manual,
+                revision: 0,
+            });
+        };
+        let schema = event.payload.get("schema_version").and_then(Value::as_str);
+        if schema != Some(SESSION_APPROVAL_MODE_PAYLOAD_SCHEMA) {
+            return Err(SessionRepositoryError::InvalidData(
+                "会话审批模式事件 schema 无效。".to_string(),
+            ));
+        }
+        let preset = event
+            .payload
+            .get("preset")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ApprovalModePreset>(value).ok())
+            .ok_or_else(|| {
+                SessionRepositoryError::InvalidData("会话审批模式事件内容无效。".to_string())
+            })?;
+        Ok(SessionApprovalMode {
+            preset: if preset == ApprovalModePreset::Yolo {
+                ApprovalModePreset::Manual
+            } else {
+                preset
+            },
+            revision: event.commit_seq,
+        })
     }
 
     pub async fn update_metadata(
@@ -990,6 +1066,8 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    use crate::ApprovalModePreset;
+
     use super::SessionRepository;
 
     async fn bind(repository: &SessionRepository, conversation_id: &str) {
@@ -997,6 +1075,37 @@ mod tests {
             .ensure_persona_binding(conversation_id, "persona-a", "角色 A", "1.0.0")
             .await
             .expect("应建立 v2 Persona 绑定");
+    }
+
+    #[tokio::test]
+    async fn session_approval_mode_persists_auto_but_restores_yolo_as_manual() {
+        let temp = tempdir().expect("应创建测试目录");
+        let (repository, _) = SessionRepository::open(temp.path())
+            .await
+            .expect("应打开仓储");
+        bind(&repository, "policy-chat").await;
+
+        let auto = repository
+            .update_approval_mode("policy-chat", ApprovalModePreset::Auto)
+            .await
+            .expect("应保存 AUTO 模式");
+        let restored = repository
+            .approval_mode_for_resume("policy-chat")
+            .await
+            .expect("应恢复 AUTO 模式");
+        assert_eq!(restored.preset, ApprovalModePreset::Auto);
+        assert_eq!(restored.revision, auto.revision);
+
+        let yolo = repository
+            .update_approval_mode("policy-chat", ApprovalModePreset::Yolo)
+            .await
+            .expect("应保存 YOLO 审计事实");
+        let restored = repository
+            .approval_mode_for_resume("policy-chat")
+            .await
+            .expect("应安全恢复历史 YOLO");
+        assert_eq!(restored.preset, ApprovalModePreset::Manual);
+        assert_eq!(restored.revision, yolo.revision);
     }
 
     #[tokio::test]

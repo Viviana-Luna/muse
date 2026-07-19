@@ -136,6 +136,26 @@ pub struct RuntimeWorkspacesResponse {
     pub sandbox_mode: String,
 }
 
+/// 当前会话审批模式更新请求。
+#[derive(Deserialize)]
+pub struct RuntimeApprovalModeUpdateRequest {
+    pub preset: String,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+/// 当前会话审批模式的规范化三轴事实。
+#[derive(Serialize)]
+pub struct RuntimeApprovalModeResponse {
+    pub conversation_id: String,
+    pub preset: String,
+    pub approval_policy: String,
+    pub approvals_reviewer: String,
+    pub permission_profile: String,
+    pub revision: u64,
+    pub status: String,
+}
+
 /// 运行模式切换请求体。
 #[derive(Deserialize)]
 pub struct RuntimeModeUpdateRequest {

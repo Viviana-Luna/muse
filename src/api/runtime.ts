@@ -4,6 +4,8 @@ import type {
   RuntimeContextSnapshotResponse,
   RuntimeMode,
   RuntimeModeResponse,
+  RuntimeApprovalModePreset,
+  RuntimeApprovalModeResponse,
   RuntimeSessionDeleteResponse,
   RuntimeSessionForkResponse,
   RuntimeSessionListResponse,
@@ -170,6 +172,26 @@ export async function updateRuntimeMode(
       body: JSON.stringify({
         mode,
         focus_phase: focusPhase
+      })
+    })
+  );
+}
+
+export async function fetchRuntimeApprovalMode(): Promise<RuntimeApprovalModeResponse> {
+  return readJson<RuntimeApprovalModeResponse>(await apiFetch('/api/runtime/approval-mode'));
+}
+
+export async function updateRuntimeApprovalMode(
+  preset: RuntimeApprovalModePreset,
+  expectedRevision: number
+): Promise<RuntimeApprovalModeResponse> {
+  return readJson<RuntimeApprovalModeResponse>(
+    await apiFetch('/api/runtime/approval-mode', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        preset,
+        expected_revision: expectedRevision
       })
     })
   );

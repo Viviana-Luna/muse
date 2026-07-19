@@ -17,6 +17,59 @@ use std::time::{Duration, Instant};
 
 use muse_core::domain::tool::ToolDef;
 use muse_core::domain::turn::TurnContext;
+use serde::{Deserialize, Serialize};
+
+/// 工具遇到风险边界时的审批策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    OnRequest,
+    Never,
+}
+
+/// 需要审批时由谁作出决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalsReviewer {
+    User,
+    AutoReview,
+}
+
+/// 工具执行时允许触达的本机边界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfile {
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+/// 输入区对外暴露的三个稳定组合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalModePreset {
+    Manual,
+    Auto,
+    Yolo,
+}
+
+impl ApprovalModePreset {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manual" => Some(Self::Manual),
+            "auto" => Some(Self::Auto),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+            Self::Yolo => "yolo",
+        }
+    }
+}
 
 /// 单轮执行的固定资源上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,38 +85,118 @@ pub struct TurnBudget {
 /// 回合开始时冻结的权限与 sandbox 边界。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenExecutionPolicy {
-    pub permission_mode: String,
-    pub sandbox_mode: String,
+    pub approval_policy: ApprovalPolicy,
+    pub approvals_reviewer: ApprovalsReviewer,
+    pub permission_profile: PermissionProfile,
     pub allowed_roots: Vec<PathBuf>,
+    pub revision: u64,
 }
 
 impl FrozenExecutionPolicy {
+    /// 从旧版二轴字符串迁移到三轴模型。
+    ///
+    /// 该入口仅用于兼容旧配置与测试；新代码应使用 `from_preset`。
     pub fn new(
         permission_mode: impl Into<String>,
         sandbox_mode: impl Into<String>,
         allowed_roots: Vec<PathBuf>,
     ) -> Self {
+        let permission_mode = permission_mode.into();
+        let sandbox_mode = sandbox_mode.into();
+        let preset = match (permission_mode.as_str(), sandbox_mode.as_str()) {
+            ("full_access", _) | (_, "danger_full_access") => ApprovalModePreset::Yolo,
+            ("approve_for_me", _) => ApprovalModePreset::Auto,
+            _ => ApprovalModePreset::Manual,
+        };
+        Self::from_preset(preset, allowed_roots, 0)
+    }
+
+    pub fn from_preset(
+        preset: ApprovalModePreset,
+        allowed_roots: Vec<PathBuf>,
+        revision: u64,
+    ) -> Self {
+        let (approval_policy, approvals_reviewer, permission_profile) = match preset {
+            ApprovalModePreset::Manual => (
+                ApprovalPolicy::OnRequest,
+                ApprovalsReviewer::User,
+                PermissionProfile::WorkspaceWrite,
+            ),
+            ApprovalModePreset::Auto => (
+                ApprovalPolicy::OnRequest,
+                ApprovalsReviewer::AutoReview,
+                PermissionProfile::WorkspaceWrite,
+            ),
+            ApprovalModePreset::Yolo => (
+                ApprovalPolicy::Never,
+                ApprovalsReviewer::User,
+                PermissionProfile::DangerFullAccess,
+            ),
+        };
         Self {
-            permission_mode: permission_mode.into(),
-            sandbox_mode: sandbox_mode.into(),
+            approval_policy,
+            approvals_reviewer,
+            permission_profile,
             allowed_roots,
+            revision,
+        }
+    }
+
+    pub const fn preset(&self) -> ApprovalModePreset {
+        match (
+            self.approval_policy,
+            self.approvals_reviewer,
+            self.permission_profile,
+        ) {
+            (ApprovalPolicy::Never, _, PermissionProfile::DangerFullAccess) => {
+                ApprovalModePreset::Yolo
+            }
+            (
+                ApprovalPolicy::OnRequest,
+                ApprovalsReviewer::AutoReview,
+                PermissionProfile::WorkspaceWrite,
+            ) => ApprovalModePreset::Auto,
+            _ => ApprovalModePreset::Manual,
+        }
+    }
+
+    pub const fn legacy_permission_mode(&self) -> &'static str {
+        match self.preset() {
+            ApprovalModePreset::Manual => "request_approval",
+            ApprovalModePreset::Auto => "approve_for_me",
+            ApprovalModePreset::Yolo => "full_access",
+        }
+    }
+
+    pub const fn legacy_sandbox_mode(&self) -> &'static str {
+        match self.permission_profile {
+            PermissionProfile::WorkspaceWrite => "workspace_write",
+            PermissionProfile::DangerFullAccess => "danger_full_access",
         }
     }
 
     /// 当前设置只能收紧既有快照，不能在回合中扩大权限或 sandbox 范围。
     pub fn restricted_by(&self, current: &Self) -> Self {
-        let permission_mode =
-            if permission_rank(&current.permission_mode) < permission_rank(&self.permission_mode) {
-                current.permission_mode.clone()
-            } else {
-                self.permission_mode.clone()
-            };
-        let sandbox_mode = if self.sandbox_mode == "workspace_write"
-            || current.sandbox_mode == "workspace_write"
+        let approval_policy = if self.approval_policy == ApprovalPolicy::OnRequest
+            || current.approval_policy == ApprovalPolicy::OnRequest
         {
-            "workspace_write".to_string()
+            ApprovalPolicy::OnRequest
         } else {
-            self.sandbox_mode.clone()
+            ApprovalPolicy::Never
+        };
+        let approvals_reviewer = if self.approvals_reviewer == ApprovalsReviewer::User
+            || current.approvals_reviewer == ApprovalsReviewer::User
+        {
+            ApprovalsReviewer::User
+        } else {
+            ApprovalsReviewer::AutoReview
+        };
+        let permission_profile = if self.permission_profile == PermissionProfile::WorkspaceWrite
+            || current.permission_profile == PermissionProfile::WorkspaceWrite
+        {
+            PermissionProfile::WorkspaceWrite
+        } else {
+            PermissionProfile::DangerFullAccess
         };
         // 根目录求交集时必须保留更窄的一侧。比如冻结根是 `/workspace`，
         // 当前撤销后只剩 `/workspace/sub`，继续保留冻结根会把已撤销的父目录重新开放。
@@ -78,18 +211,12 @@ impl FrozenExecutionPolicy {
             }
         }
         Self {
-            permission_mode,
-            sandbox_mode,
+            approval_policy,
+            approvals_reviewer,
+            permission_profile,
             allowed_roots: allowed_roots.into_iter().collect(),
+            revision: self.revision.max(current.revision),
         }
-    }
-}
-
-fn permission_rank(mode: &str) -> u8 {
-    match mode {
-        "full_access" => 2,
-        "approve_for_me" => 1,
-        _ => 0,
     }
 }
 
@@ -383,7 +510,10 @@ mod tests {
     use muse_core::domain::tool::{ToolDef, ToolExecutionOwner, ToolRisk};
     use muse_core::domain::turn::TurnContext;
 
-    use super::{FrozenExecutionPolicy, TurnBudget, TurnBudgetError, TurnSnapshot};
+    use super::{
+        ApprovalPolicy, ApprovalsReviewer, FrozenExecutionPolicy, PermissionProfile, TurnBudget,
+        TurnBudgetError, TurnSnapshot,
+    };
 
     #[test]
     fn default_budget_matches_product_contract() {
@@ -474,8 +604,12 @@ mod tests {
         let expanded =
             FrozenExecutionPolicy::new("full_access", "danger_full_access", vec!["/".into()]);
         let still_frozen = frozen.restricted_by(&expanded);
-        assert_eq!(still_frozen.permission_mode, "request_approval");
-        assert_eq!(still_frozen.sandbox_mode, "workspace_write");
+        assert_eq!(still_frozen.approval_policy, ApprovalPolicy::OnRequest);
+        assert_eq!(still_frozen.approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            still_frozen.permission_profile,
+            PermissionProfile::WorkspaceWrite
+        );
 
         let permissive = FrozenExecutionPolicy::new(
             "full_access",
@@ -483,8 +617,12 @@ mod tests {
             vec!["/workspace".into()],
         );
         let revoked = permissive.restricted_by(&frozen);
-        assert_eq!(revoked.permission_mode, "request_approval");
-        assert_eq!(revoked.sandbox_mode, "workspace_write");
+        assert_eq!(revoked.approval_policy, ApprovalPolicy::OnRequest);
+        assert_eq!(revoked.approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            revoked.permission_profile,
+            PermissionProfile::WorkspaceWrite
+        );
     }
 
     #[test]

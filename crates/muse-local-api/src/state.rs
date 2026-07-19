@@ -440,7 +440,9 @@ fn initial_runtime_execution_policy() -> FrozenExecutionPolicy {
         harness.sandbox_mode = default_runtime_prompt_sandbox_mode();
     }
     if harness.permission_mode == "full_access" {
-        harness.sandbox_mode = "danger_full_access".to_string();
+        // YOLO 只在当前进程的当前会话有效，禁止从旧全局配置静默恢复。
+        harness.permission_mode = default_runtime_prompt_permission_mode();
+        harness.sandbox_mode = default_runtime_prompt_sandbox_mode();
     }
     let roots = std::env::current_dir()
         .ok()
@@ -452,7 +454,7 @@ fn initial_runtime_execution_policy() -> FrozenExecutionPolicy {
 
 fn runtime_prompt_permission_mode_label(value: &str) -> &'static str {
     match value {
-        "approve_for_me" => "自动审批",
+        "approve_for_me" => "AUTO 模式",
         "full_access" => "完全访问权限",
         _ => "审批模式",
     }
@@ -473,7 +475,8 @@ fn build_runtime_environment_context() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut harness = load_runtime_prompt_harness_config();
     if harness.permission_mode == "full_access" {
-        harness.sandbox_mode = "danger_full_access".to_string();
+        harness.permission_mode = default_runtime_prompt_permission_mode();
+        harness.sandbox_mode = default_runtime_prompt_sandbox_mode();
     }
 
     let _legacy_allowed_roots = &harness.roots;
@@ -483,7 +486,7 @@ fn build_runtime_environment_context() -> String {
         .unwrap_or_else(|| "未知".to_string());
 
     format!(
-        "【运行环境上下文】\n当前项目工作区：{}\n权限模式：{}（{}）\n沙箱模式：{}（{}）\n用户 Home：{}，可用 `~` 表示。\n{}\n\n【路径定位规则】\n相对路径默认按当前项目工作区解析。用户给出绝对路径或 `~` 路径时，先按原路径解析，再由 harness 判断是否需要审批。用户用“下载文件夹、桌面、文稿、项目目录”等自然语言描述路径时，先基于当前工作区、用户 Home、常见用户目录候选和消息上下文解析成最小候选路径；候选唯一时直接调用具体目标工具；候选多个时按 Codex 风格选择最像用户意图的路径：当前工作区优先，其次 Home 下浅层的非隐藏用户目录，再其次用户明确提到的隐藏目录或配置目录，并在最终回复中说明选择依据；只有候选含义完全等价或缺少文件名时再向用户澄清。不要为了确认权限或寻找用户目录去列出磁盘根、用户根目录、Home 根目录等宽泛目录；当前边界已经由本运行环境上下文提供。旧版“文件工具允许目录”白名单已停用，外部路径由单次操作审批或完全访问权限决定。",
+        "【运行环境上下文】\n当前项目工作区：{}\n新会话默认审批：{}（{}）\n新会话默认沙箱：{}（{}）\n用户 Home：{}，可用 `~` 表示。\n{}\n\n【路径定位规则】\n相对路径默认按当前项目工作区解析。用户给出绝对路径或 `~` 路径时，先按原路径解析，再由 harness 判断是否需要审批。用户用“下载文件夹、桌面、文稿、项目目录”等自然语言描述路径时，先基于当前工作区、用户 Home、常见用户目录候选和消息上下文解析成最小候选路径；候选唯一时直接调用具体目标工具；候选多个时按 Codex 风格选择最像用户意图的路径：当前工作区优先，其次 Home 下浅层的非隐藏用户目录，再其次用户明确提到的隐藏目录或配置目录，并在最终回复中说明选择依据；只有候选含义完全等价或缺少文件名时再向用户澄清。不要为了确认权限或寻找用户目录去列出磁盘根、用户根目录、Home 根目录等宽泛目录；当前会话的真实审批与权限以本轮冻结快照为准。旧版“文件工具允许目录”白名单已停用，外部路径由单次操作审批或当前会话 YOLO 决定。",
         cwd.display(),
         runtime_prompt_permission_mode_label(&harness.permission_mode),
         harness.permission_mode,

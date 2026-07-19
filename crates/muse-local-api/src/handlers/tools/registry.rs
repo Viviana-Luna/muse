@@ -223,14 +223,25 @@ async fn execute_runtime_tool(
         if requires_workspace_boundary_approval {
             summary.push_str("\n目标路径不在当前允许工作区内；允许后仅本次工具调用可访问该路径。");
         }
+        let approvals_reviewer = if mcp::is_external_mcp_tool_name(&call.name) {
+            ApprovalsReviewer::User
+        } else {
+            execution_boundary.approvals_reviewer
+        };
         let (approved, approval_reason) = wait_for_tool_approval(
             state,
-            tx,
-            turn,
-            &call,
-            def.risk.as_str(),
-            summary,
-            cancel_token,
+            ToolApprovalRequest {
+                tx,
+                turn,
+                call: &call,
+                risk: def.risk.as_str(),
+                summary,
+                cancel_token,
+                provider,
+                conversation,
+                approvals_reviewer,
+                policy_revision: execution_boundary.revision,
+            },
         )
         .await
         .map_err(|_| "工具审批等待被中断。".to_string())?;

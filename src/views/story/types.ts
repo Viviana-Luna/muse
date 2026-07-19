@@ -3,6 +3,7 @@ import type {
   Message,
   PersonaListResponse,
   RuntimeContextSnapshot,
+  RuntimeApprovalModeResponse,
   RuntimeSessionListResponse,
   RuntimeTodoItem,
   RuntimeTokenUsageResponse
@@ -41,6 +42,7 @@ export interface StoryRuntimeSnapshot extends StoryPersonaSnapshot {
   todos: RuntimeTodoItem[];
   tokenUsage: RuntimeTokenUsageResponse;
   contextSnapshot: RuntimeContextSnapshot | null;
+  approvalMode: RuntimeApprovalModeResponse;
 }
 
 export interface RevisionBoundActivePersona {

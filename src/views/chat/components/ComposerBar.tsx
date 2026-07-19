@@ -3,8 +3,9 @@ import type { FormEvent, ReactNode, RefObject } from 'react';
 import { Mic, MicOff, Sparkles, Square, Volume2, VolumeX, X } from 'lucide-react';
 
 import type { VoiceRuntime } from '@/hooks/useVoiceRuntime';
-import type { RuntimeToolPreset } from '@/types';
+import type { RuntimeApprovalModePreset, RuntimeToolPreset } from '@/types';
 import type { SkillPickerController } from '@/views/chat/hooks/useSkillPicker';
+import { ApprovalModePicker } from './ApprovalModePicker';
 import { PlanModeToggle, type PlanModeChoice } from './PlanModeToggle';
 import { SkillPickerDrawer } from './SkillPickerDrawer';
 
@@ -15,6 +16,8 @@ interface ComposerBarProps {
   inputValue: string;
   runtimeToolPreset: RuntimeToolPreset;
   runtimeModeSwitching?: boolean;
+  approvalMode: RuntimeApprovalModePreset;
+  approvalModeSwitching?: boolean;
   skillPicker: SkillPickerController;
   voice: VoiceRuntime;
   sendIcon: ReactNode;
@@ -23,6 +26,7 @@ interface ComposerBarProps {
   placeholder?: string;
   onInputValueChange: (value: string) => void;
   onRuntimeModeChange: (value: PlanModeChoice) => void | Promise<void>;
+  onApprovalModeChange: (value: RuntimeApprovalModePreset) => void | Promise<void>;
   onSend: () => void | Promise<void>;
   onStartVoiceInput: () => void | Promise<void>;
   onToggleVoice: () => void;
@@ -37,6 +41,8 @@ export function ComposerBar({
   inputValue,
   runtimeToolPreset,
   runtimeModeSwitching = false,
+  approvalMode,
+  approvalModeSwitching = false,
   skillPicker,
   voice,
   sendIcon,
@@ -45,6 +51,7 @@ export function ComposerBar({
   placeholder,
   onInputValueChange,
   onRuntimeModeChange,
+  onApprovalModeChange,
   onSend,
   onStartVoiceInput,
   onToggleVoice,
@@ -157,6 +164,13 @@ export function ComposerBar({
               disabled={busy || writeLocked}
               disabledReason={sendDisabledReason}
               onChange={onRuntimeModeChange}
+            />
+            <ApprovalModePicker
+              value={approvalMode}
+              switching={approvalModeSwitching}
+              disabled={busy || writeLocked}
+              disabledReason={sendDisabledReason}
+              onChange={onApprovalModeChange}
             />
           </div>
           <div className="composer-status">

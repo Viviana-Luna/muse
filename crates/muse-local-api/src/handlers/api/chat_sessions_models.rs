@@ -537,6 +537,18 @@ pub(crate) async fn handle_runtime_session_resume(
         .map_err(internal_error)?;
         return Err(internal_error(error.to_string()));
     }
+    if let Err(error) = restore_active_approval_mode(&state, &conversation_id).await {
+        rollback_persona_runtime_transition(
+            &state,
+            previous_personas,
+            previous_conversation,
+            previous_todos,
+            previous_conversation_id,
+        )
+        .await
+        .map_err(internal_error)?;
+        return Err(internal_error(error));
+    }
     finish_runtime_idle_lease(idle_lease)?;
     state.runtime_service.touch();
 
@@ -569,6 +581,10 @@ pub(crate) async fn handle_runtime_session_fork(
         .await
         .map_err(session_metadata_read_error)?
         .ok_or_else(|| bad_request("来源会话缺少 v2 Persona metadata。"))?;
+    let source_approval_mode = repository
+        .approval_mode_for_resume(&source_conversation_id)
+        .await
+        .map_err(session_metadata_read_error)?;
     let target_persona_id = req
         .target_persona_id
         .clone()
@@ -638,6 +654,16 @@ pub(crate) async fn handle_runtime_session_fork(
         .map_err(internal_error)?;
         return Err(internal_error(error.to_string()));
     }
+    let inherited_approval_mode = repository
+        .update_approval_mode(&conversation_id, source_approval_mode.preset)
+        .await
+        .map_err(session_metadata_read_error)?;
+    set_active_approval_mode(
+        &state,
+        inherited_approval_mode.preset,
+        inherited_approval_mode.revision,
+    )
+    .map_err(internal_error)?;
     finish_runtime_idle_lease(idle_lease)?;
     state.runtime_service.touch();
 
@@ -683,6 +709,9 @@ pub(crate) async fn handle_runtime_session_delete(
         replace_runtime_todos(&state, Vec::new()).await;
         active_after_delete = next_runtime_session_id();
         set_active_conversation_id(&state, &active_after_delete).map_err(internal_error)?;
+        initialize_new_session_approval_mode(&state, &active_after_delete)
+            .await
+            .map_err(internal_error)?;
     }
     finish_runtime_idle_lease(idle_lease)?;
     state.runtime_service.touch();
@@ -713,6 +742,9 @@ pub(crate) async fn handle_reset(
     replace_runtime_todos(&state, Vec::new()).await;
     let conversation_id = next_runtime_session_id();
     let _ = set_active_conversation_id(&state, &conversation_id);
+    initialize_new_session_approval_mode(&state, &conversation_id)
+        .await
+        .map_err(internal_error)?;
     finish_runtime_idle_lease(idle_lease)?;
     state.runtime_service.touch();
     Ok(Json(serde_json::json!({

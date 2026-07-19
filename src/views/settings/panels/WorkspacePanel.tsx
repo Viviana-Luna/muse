@@ -1,5 +1,3 @@
-import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
-
 import type { SettingsDialogProps } from '../types';
 
 type WorkspacePanelProps = Pick<
@@ -18,8 +16,8 @@ export function WorkspacePanel({
       <section className="settings-module">
         <header className="settings-module-head">
           <div>
-            <h2>审批策略</h2>
-            <p>决定工具请求何时需要确认，以及允许自动执行的风险范围。</p>
+            <h2>新会话默认审批</h2>
+            <p>这里只设置新会话默认值；当前会话请在输入框底栏切换。</p>
           </div>
         </header>
         <div className="permission-mode-list wide">
@@ -29,8 +27,8 @@ export function WorkspacePanel({
             onClick={() => void onUpdateWorkspacePolicy('request_approval', 'workspace_write')}
             disabled={busy}
           >
-            <strong>请求批准</strong>
-            <small>写文件、联网和命令执行始终请求确认。</small>
+            <strong>手动审批</strong>
+            <small>需要审批的动作由用户确认，权限限制在当前工作区。</small>
           </button>
           <button
             type="button"
@@ -38,26 +36,9 @@ export function WorkspacePanel({
             onClick={() => void onUpdateWorkspacePolicy('approve_for_me', 'workspace_write')}
             disabled={busy}
           >
-            <strong>替我审批</strong>
-            <small>低风险动作自动执行；长期副作用仍按风险策略处理。</small>
+            <strong>AUTO 模式</strong>
+            <small>需要审批的动作交给独立审查器；异常时安全转人工。</small>
           </button>
-          <ConfirmDialog
-            title="开启完全访问权限？"
-            description="这将允许大模型访问和操作本地电脑上的所有文件与命令，有潜在数据丢失风险。"
-            confirmLabel="开启完全访问"
-            cancelLabel="继续保持限制"
-            tone="danger"
-            onConfirm={() => void onUpdateWorkspacePolicy('full_access', 'danger_full_access')}
-          >
-            <button
-              type="button"
-              className={workspacePermissionMode === 'full_access' ? 'active danger' : 'danger'}
-              disabled={busy}
-            >
-              <strong>完全访问权限</strong>
-              <small>不再请求审批，并允许访问本机任意路径。</small>
-            </button>
-          </ConfirmDialog>
         </div>
       </section>
 
@@ -72,8 +53,8 @@ export function WorkspacePanel({
           <strong>当前沙箱</strong>
           <small>
             {workspaceSandboxMode === 'danger_full_access'
-              ? '全盘访问：文件工具不再限制目录。'
-              : '工作区写入：默认限制在当前项目工作区；外部路径由本次操作审批决定。'}
+              ? '检测到旧版完全访问默认值；它不会在应用重启后恢复，请改为手动或 AUTO。'
+              : '工作区写入：默认限制在当前项目工作区；YOLO 只能在当前会话输入区临时开启。'}
           </small>
         </div>
         <div className="workspace-flow wide" aria-label="工具审批流程">

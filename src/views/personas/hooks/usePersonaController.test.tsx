@@ -102,7 +102,16 @@ function runtimeSnapshot(candidate: RevisionBoundActivePersona): StoryRuntimeSna
     history: [],
     todos: [],
     tokenUsage: {} as StoryRuntimeSnapshot['tokenUsage'],
-    contextSnapshot: null
+    contextSnapshot: null,
+    approvalMode: {
+      conversation_id: 'default',
+      preset: 'manual',
+      approval_policy: 'on_request',
+      approvals_reviewer: 'user',
+      permission_profile: 'workspace_write',
+      revision: 0,
+      status: 'ok'
+    }
   };
 }
 

@@ -32,6 +32,7 @@ describe('ComposerBar', () => {
         busy={false}
         inputValue=""
         runtimeToolPreset="focus_build"
+        approvalMode="manual"
         skillPicker={createSkillPicker()}
         voice={{
           status: '语音未启用',
@@ -43,6 +44,7 @@ describe('ComposerBar', () => {
         sendIcon={<span>发送图标</span>}
         onInputValueChange={vi.fn()}
         onRuntimeModeChange={vi.fn()}
+        onApprovalModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}
@@ -63,6 +65,7 @@ describe('ComposerBar', () => {
         busy={false}
         inputValue="尚未发送的消息"
         runtimeToolPreset="focus_plan"
+        approvalMode="auto"
         skillPicker={createSkillPicker()}
         voice={{
           status: '语音已就绪',
@@ -75,6 +78,7 @@ describe('ComposerBar', () => {
         sendDisabledReason="角色状态已过期，请先重试同步。"
         onInputValueChange={vi.fn()}
         onRuntimeModeChange={vi.fn()}
+        onApprovalModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}
@@ -93,6 +97,7 @@ describe('ComposerBar', () => {
     expect(composer.getByRole('button', { name: '发送' })).toBeDisabled();
     expect(composer.getByRole('button', { name: 'Skill' })).toBeDisabled();
     expect(composer.getByRole('button', { name: '退出计划模式' })).toBeDisabled();
+    expect(composer.getByRole('button', { name: /AUTO 模式/ })).toBeDisabled();
   });
 
   it('展示已选择的 Skill 附件并允许在空闲时移除', () => {
@@ -103,6 +108,7 @@ describe('ComposerBar', () => {
         busy={false}
         inputValue="生成一份报告"
         runtimeToolPreset="focus_build"
+        approvalMode="manual"
         skillPicker={createSkillPicker({
           selectedSkill: {
             name: 'pdf',
@@ -123,6 +129,7 @@ describe('ComposerBar', () => {
         sendIcon={<span>发送图标</span>}
         onInputValueChange={vi.fn()}
         onRuntimeModeChange={vi.fn()}
+        onApprovalModeChange={vi.fn()}
         onSend={vi.fn()}
         onStartVoiceInput={vi.fn()}
         onToggleVoice={vi.fn()}

@@ -2361,6 +2361,37 @@ mod tests {
         ));
     }
 
+    fn auto_mode_routes_required_tools_to_reviewer_instead_of_hardcoded_bypass() {
+        let auto = muse_runtime::FrozenExecutionPolicy::from_preset(
+            muse_runtime::ApprovalModePreset::Auto,
+            Vec::new(),
+            7,
+        );
+        let write = test_tool_call("file_write", serde_json::json!({ "path": "report.md" }));
+        assert!(super::should_require_tool_approval(
+            &auto,
+            &write,
+            "write_file",
+            true,
+        ));
+        assert_eq!(
+            auto.approvals_reviewer,
+            muse_runtime::ApprovalsReviewer::AutoReview
+        );
+
+        let yolo = muse_runtime::FrozenExecutionPolicy::from_preset(
+            muse_runtime::ApprovalModePreset::Yolo,
+            Vec::new(),
+            8,
+        );
+        assert!(!super::should_require_tool_approval(
+            &yolo,
+            &write,
+            "write_file",
+            true,
+        ));
+    }
+
     fn active_turn_mode_transition_uses_the_completed_tool_result() {
         let result = ToolResult::success(
             "已进入计划模式。",
@@ -5399,6 +5430,11 @@ mod tests {
         {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(full_access_does_not_bypass_frozen_mcp_write_approval)).is_err() {
                 failures.push("full_access_does_not_bypass_frozen_mcp_write_approval");
+            }
+        }
+        {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(auto_mode_routes_required_tools_to_reviewer_instead_of_hardcoded_bypass)).is_err() {
+                failures.push("auto_mode_routes_required_tools_to_reviewer_instead_of_hardcoded_bypass");
             }
         }
         {

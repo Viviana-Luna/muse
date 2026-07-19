@@ -121,6 +121,110 @@ pub(crate) async fn handle_runtime_workspaces(
         .map_err(runtime_workspace_error_response)
 }
 
+fn runtime_approval_mode_response(
+    conversation_id: String,
+    policy: &FrozenExecutionPolicy,
+    status: impl Into<String>,
+) -> RuntimeApprovalModeResponse {
+    RuntimeApprovalModeResponse {
+        conversation_id,
+        preset: policy.preset().as_str().to_string(),
+        approval_policy: match policy.approval_policy {
+            ApprovalPolicy::OnRequest => "on_request",
+            ApprovalPolicy::Never => "never",
+        }
+        .to_string(),
+        approvals_reviewer: match policy.approvals_reviewer {
+            ApprovalsReviewer::User => "user",
+            ApprovalsReviewer::AutoReview => "auto_review",
+        }
+        .to_string(),
+        permission_profile: match policy.permission_profile {
+            PermissionProfile::WorkspaceWrite => "workspace_write",
+            PermissionProfile::DangerFullAccess => "danger_full_access",
+        }
+        .to_string(),
+        revision: policy.revision,
+        status: status.into(),
+    }
+}
+
+/// 查询当前活动会话的审批模式。
+pub(crate) async fn handle_runtime_approval_mode(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RuntimeApprovalModeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let conversation_id = active_conversation_id(&state);
+    let policy = state
+        .runtime_service
+        .execution_policy()
+        .map_err(|error| internal_error(error.to_string()))?;
+    Ok(Json(runtime_approval_mode_response(
+        conversation_id,
+        &policy,
+        "ok",
+    )))
+}
+
+/// 原子更新当前活动会话的审批模式；更新只在空闲期生效。
+pub(crate) async fn handle_runtime_approval_mode_update(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RuntimeApprovalModeUpdateRequest>,
+) -> Result<Json<RuntimeApprovalModeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let preset = ApprovalModePreset::parse(req.preset.trim())
+        .ok_or_else(|| bad_request("未知审批模式。"))?;
+    let active_persona = require_active_persona_http(&state).await?;
+    let idle_lease = acquire_runtime_idle_lease(&state, "update_approval_mode")?;
+    let conversation_id = active_conversation_id(&state);
+    let current = state
+        .runtime_service
+        .execution_policy()
+        .map_err(|error| internal_error(error.to_string()))?;
+    if let Some(expected) = req.expected_revision
+        && expected != current.revision
+    {
+        let _ = finish_runtime_idle_lease(idle_lease);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "审批模式已经变化，请刷新后重试。".to_string(),
+            }),
+        ));
+    }
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    repository
+        .ensure_persona_binding(
+            &conversation_id,
+            &active_persona.id,
+            &active_persona.name,
+            &active_persona.version,
+        )
+        .await
+        .map_err(session_metadata_read_error)?;
+    let saved = repository
+        .update_approval_mode(&conversation_id, preset)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let policy = FrozenExecutionPolicy::from_preset(
+        saved.preset,
+        current.allowed_roots,
+        saved.revision,
+    );
+    state
+        .runtime_service
+        .set_execution_policy(policy.clone())
+        .map_err(|error| internal_error(error.to_string()))?;
+    finish_runtime_idle_lease(idle_lease)?;
+    Ok(Json(runtime_approval_mode_response(
+        conversation_id,
+        &policy,
+        "updated",
+    )))
+}
+
 /// 执行设置中心连通性诊断。
 pub(crate) async fn handle_diagnostics_connectivity(
     State(state): State<Arc<AppState>>,
@@ -475,15 +579,17 @@ pub(crate) async fn handle_runtime_mode_update(
 
 /// 更新运行底座工作区权限策略。
 pub(crate) async fn handle_runtime_workspace_policy_update(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<RuntimeWorkspacePolicyRequest>,
 ) -> Result<Json<RuntimeWorkspacesResponse>, (StatusCode, Json<ErrorResponse>)> {
     let permission_mode = normalize_runtime_permission_mode(&req.permission_mode)
         .ok_or_else(|| runtime_workspace_error_response("未知权限模式。".to_string()))?;
-    let mut sandbox_mode = normalize_runtime_sandbox_mode(&req.sandbox_mode)
+    let sandbox_mode = normalize_runtime_sandbox_mode(&req.sandbox_mode)
         .ok_or_else(|| runtime_workspace_error_response("未知沙箱模式。".to_string()))?;
-    if permission_mode == "full_access" {
-        sandbox_mode = "danger_full_access".to_string();
+    if permission_mode == "full_access" || sandbox_mode == "danger_full_access" {
+        return Err(runtime_workspace_error_response(
+            "YOLO 不能保存为全局默认，请在当前会话输入区临时开启。".to_string(),
+        ));
     }
     let mut config = load_runtime_harness_config();
     config.permission_mode = permission_mode;
@@ -494,12 +600,7 @@ pub(crate) async fn handle_runtime_workspace_policy_update(
     save_runtime_harness_config(&config)
         .await
         .map_err(runtime_workspace_error_response)?;
-    let policy = runtime_execution_policy_from_harness_config(&config)
-        .map_err(runtime_workspace_error_response)?;
-    state
-        .runtime_service
-        .set_execution_policy(policy)
-        .map_err(|err| runtime_workspace_error_response(err.to_string()))?;
+    // 设置页只维护新会话默认值；当前会话始终由输入区会话级选择器控制。
     runtime_workspaces_response()
         .map(Json)
         .map_err(runtime_workspace_error_response)

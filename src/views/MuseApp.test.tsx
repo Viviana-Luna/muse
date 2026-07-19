@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   fetchHistory: vi.fn(),
   fetchModelInfo: vi.fn(),
   fetchPersonas: vi.fn(),
+  fetchRuntimeApprovalMode: vi.fn(),
   fetchRuntimeContextSnapshot: vi.fn(),
   fetchRuntimeMode: vi.fn(),
   fetchRuntimeSessions: vi.fn(),
@@ -89,6 +90,15 @@ describe('MuseApp 角色导入意图', () => {
     api.fetchRuntimeContextSnapshot.mockResolvedValue({
       conversation_id: 'default',
       snapshot: null,
+      status: 'ok'
+    });
+    api.fetchRuntimeApprovalMode.mockResolvedValue({
+      conversation_id: 'default',
+      preset: 'manual',
+      approval_policy: 'on_request',
+      approvals_reviewer: 'user',
+      permission_profile: 'workspace_write',
+      revision: 0,
       status: 'ok'
     });
     api.fetchModelInfo.mockResolvedValue({ provider: 'mock', model: 'model' });
