@@ -13,7 +13,6 @@ config.toml
 .muse/
 /runtime/
 .agents/
-.agent/
 .codex/
 __pycache__/
 *.pyc
