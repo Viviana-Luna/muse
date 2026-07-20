@@ -20,6 +20,10 @@ const MAIN_WINDOW_LABEL: &str = "muse";
 const SINGLE_INSTANCE_CI_MARKER_ENV: &str = "MUSE_DESKTOP_CI_SINGLE_INSTANCE_MARKER_FILE";
 const SINGLE_INSTANCE_CI_MARKER_SCHEMA: &str = "muse-single-instance-probe/v1";
 
+/// 桌面进程在整个生命周期内共享的运行时状态。
+///
+/// `_instance_lock` 仅持有不读取，目的是把数据目录排他锁保留到进程退出；一旦释放，
+/// 第二次启动就能重复进入并破坏单实例语义。
 struct DesktopRuntimeState {
     bootstrap: LocalApiBootstrap,
     data_dir: PathBuf,
@@ -27,16 +31,21 @@ struct DesktopRuntimeState {
     _instance_lock: DataDirLock,
 }
 
+/// `start_local_server` 的返回值：已绑定端口的本地服务与对应关停通道。
 struct StartedLocalServer {
     bootstrap: LocalApiBootstrap,
     shutdown: oneshot::Sender<()>,
 }
 
+/// 解析后的桌面数据路径。
+///
+/// `legacy_dir` 仅在未显式设置 `MUSE_DATA_DIR` 且当前目录是受认可的仓库根时出现。
 struct DesktopDataPaths {
     data_dir: PathBuf,
     legacy_dir: Option<PathBuf>,
 }
 
+/// 已取得锁并完成 legacy 迁移的运行时数据。
 struct PreparedDesktopData {
     instance_lock: DataDirLock,
     migration: Option<LegacyWorkspaceMigrationReport>,
@@ -79,6 +88,10 @@ fn runtime_ready(
     write_desktop_ready_file(&path, &protocol_version, &instance_id, &state.data_dir)
 }
 
+/// 写入打包 CI 用的桌面就绪证明文件。
+///
+/// 仅在设置了 `MUSE_DESKTOP_READY_FILE` 时由 `runtime_ready` 调用。证明只含协议版本、
+/// 实例 ID 和数据目录，不含 Bearer 等凭据；相同实例重复写入幂等，其他实例不得覆盖。
 fn write_desktop_ready_file(
     path: &std::path::Path,
     protocol_version: &str,
@@ -169,6 +182,10 @@ fn write_single_instance_ci_marker(
     Ok(())
 }
 
+/// 对命令行参数做脱敏，供单实例 CI marker 记录使用。
+///
+/// 形如 `--api-token`、`--authorization=...` 的敏感项整体替换为占位符；不带 `=` 的
+/// 敏感键会把紧随其后的值一并脱敏，避免凭据写入 marker 文件。
 fn redact_single_instance_args(args: &[String]) -> Vec<String> {
     let mut redact_next = false;
     args.iter()
@@ -206,6 +223,9 @@ fn redact_single_instance_args(args: &[String]) -> Vec<String> {
 }
 
 /// 启动随机回环端口上的 API 服务。
+///
+/// 绑定 `127.0.0.1:0` 取系统分配端口，装配 Axum 路由并独立 spawn 服务任务；返回供
+/// 主窗口 Bootstrap 的安全上下文与关停通道。
 async fn start_local_server(dev_url: Option<tauri::Url>) -> Result<StartedLocalServer, String> {
     let data_dir = Config::data_dir();
     let (session_store, migration) = muse_runtime::session::SessionStore::open(&data_dir)
@@ -296,6 +316,10 @@ async fn start_local_server(dev_url: Option<tauri::Url>) -> Result<StartedLocalS
     })
 }
 
+/// 向内嵌页面的响应注入本地 API 的 CSP 连接来源。
+///
+/// 仅放宽 `connect-src`，加入本次进程的回环 HTTP 与 WebSocket origin，不引入任意
+/// https/wss 来源，也不改动其他 CSP 指令。
 fn inject_runtime_csp(
     response: &mut tauri::http::Response<std::borrow::Cow<'static, [u8]>>,
     api_origin: &str,
@@ -329,6 +353,11 @@ fn inject_runtime_csp(
     }
 }
 
+/// 判断 webview 导航目标是否可信。
+///
+/// 生产环境只放行内嵌应用 origin（macOS 为 `tauri://localhost`，其他平台为
+/// `http://tauri.localhost`）；dev 模式额外允许与 `devUrl` 完全一致的回环 origin，
+/// 端口或主机不符一律拒绝，防止跳转到外部站点。
 fn is_trusted_app_navigation(url: &tauri::Url, dev_url: Option<&tauri::Url>) -> bool {
     if cfg!(dev)
         && dev_url.is_some_and(|dev_url| {
@@ -350,6 +379,10 @@ fn is_trusted_app_navigation(url: &tauri::Url, dev_url: Option<&tauri::Url>) -> 
     }
 }
 
+/// 解析桌面应用的数据目录与可选 legacy 目录。
+///
+/// `MUSE_DATA_DIR` 非空时直接采用且不参与 legacy 迁移；否则使用默认用户目录，并在
+/// 当前目录是受认可的仓库根时识别出 legacy `.agent-vp-data`。
 fn resolve_runtime_data_paths() -> Result<DesktopDataPaths, Box<dyn std::error::Error>> {
     let paths = if let Some(configured) = std::env::var_os("MUSE_DATA_DIR") {
         if configured.is_empty() {
@@ -378,6 +411,10 @@ fn recognized_legacy_workspace_dir(current_dir: &std::path::Path) -> Option<Path
     Config::discover_legacy_workspace_data(current_dir)
 }
 
+/// 在双锁保护下准备运行时数据。
+///
+/// 目标锁必须先于任何检查或复制取得，并由调用方持有到进程退出；legacy 迁移在额外
+/// 取得 legacy 源锁后执行校验、暂存复制与原子提交，提交后立即释放源锁。
 fn prepare_runtime_data(
     paths: &DesktopDataPaths,
 ) -> Result<PreparedDesktopData, Box<dyn std::error::Error>> {
@@ -411,6 +448,10 @@ fn prepare_runtime_data(
     })
 }
 
+/// 桌面宿主总装配入口。
+///
+/// 依次解析数据目录、注册单实例插件与 IPC 命令，在 setup 中准备数据、启动本地 API
+/// 服务、构建主窗口并绑定 CSP 注入与导航白名单，退出时触发服务优雅关停。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_paths = resolve_runtime_data_paths().expect("无法解析 Muse 应用数据目录");
