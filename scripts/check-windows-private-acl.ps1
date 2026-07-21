@@ -82,7 +82,7 @@ function Assert-PrivateAcl {
       continue
     }
     if (-not $allowedSids.Contains($sid)) {
-      throw "$Label 向非允许主体开放了文件内容或修改权限。"
+      throw "$Label 向非允许主体 $sid 开放了文件内容或修改权限。"
     }
     if ($sid -eq $currentUserSid) {
       $currentUserCanAccess = $true
