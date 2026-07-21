@@ -1814,6 +1814,39 @@ mod tests {
         parse_mcp_servers_map(entries)
     }
 
+    /// 返回创建标记文件后以指定码退出的平台命令，用于验证 stdio Server 是否被真实启动。
+    fn touch_marker_command(
+        marker: &std::path::Path,
+        exit_code: i32,
+    ) -> (&'static str, Vec<String>) {
+        #[cfg(unix)]
+        {
+            (
+                "/bin/sh",
+                vec![
+                    "-c".to_string(),
+                    format!("touch '{}'; exit {exit_code}", marker.display()),
+                ],
+            )
+        }
+        #[cfg(windows)]
+        {
+            (
+                "powershell.exe",
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "New-Item -Path '{}' -ItemType File -Force | Out-Null; exit {exit_code}",
+                        marker.display()
+                    ),
+                ],
+            )
+        }
+    }
+
     #[tokio::test]
     async fn disabled_scope_does_not_spawn_configured_stdio_server() {
         let marker = std::env::temp_dir().join(format!(
@@ -1822,13 +1855,8 @@ mod tests {
             current_millis()
         ));
         let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "denied".to_string(),
-            test_profile(
-                "/bin/sh",
-                vec!["-c".to_string(), format!("touch '{}'", marker.display())],
-            ),
-        );
+        let (command, args) = touch_marker_command(&marker, 0);
+        profiles.insert("denied".to_string(), test_profile(command, args));
         let snapshot = McpProfileConfig {
             mcp_servers: profiles,
         }
@@ -1861,26 +1889,16 @@ mod tests {
             std::process::id(),
             current_millis()
         ));
+        let (allowed_command, allowed_args) = touch_marker_command(&allowed_marker, 1);
+        let (denied_command, denied_args) = touch_marker_command(&denied_marker, 1);
         let profiles = BTreeMap::from([
             (
                 "allowed".to_string(),
-                test_profile(
-                    "/bin/sh",
-                    vec![
-                        "-c".to_string(),
-                        format!("touch '{}'; exit 1", allowed_marker.display()),
-                    ],
-                ),
+                test_profile(allowed_command, allowed_args),
             ),
             (
                 "denied".to_string(),
-                test_profile(
-                    "/bin/sh",
-                    vec![
-                        "-c".to_string(),
-                        format!("touch '{}'; exit 1", denied_marker.display()),
-                    ],
-                ),
+                test_profile(denied_command, denied_args),
             ),
         ]);
         let snapshot = McpProfileConfig {
@@ -1888,11 +1906,15 @@ mod tests {
         }
         .runtime_snapshot(std::env::temp_dir().join("muse-mcp-single.toml"));
 
-        let _ =
+        let catalog =
             discover_external_mcp_tools_for_scope(&snapshot, &EffectiveMcpScope::only("allowed"))
                 .await;
 
-        assert!(allowed_marker.exists(), "目标 Server 应被实际测试");
+        assert!(
+            allowed_marker.exists(),
+            "目标 Server 应被实际测试；catalog 诊断：{:?}",
+            catalog.errors
+        );
         assert!(!denied_marker.exists(), "单 Server 测试不得启动其他 Server");
         let _ = std::fs::remove_file(allowed_marker);
     }

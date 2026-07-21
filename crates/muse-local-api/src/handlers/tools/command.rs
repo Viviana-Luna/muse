@@ -65,7 +65,7 @@ async fn tool_command_run(
         }
     };
     let child_pid = child.id();
-    let mut process_tree_guard = match muse_core::process_supervision::ProcessTreeGuard::attach(&child) {
+    let process_tree_guard = match muse_core::process_supervision::ProcessTreeGuard::attach(&child) {
         Ok(guard) => guard,
         Err(error) => {
             // 此时 PowerShell 仍处于 CREATE_SUSPENDED，失败必须先回收再返回，不能降级裸跑。

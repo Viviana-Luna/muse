@@ -16,7 +16,6 @@ directories = "6"
 futures = "0.3"
 getrandom = "0.3"
 keyring = { version = "3", default-features = false }
-libc = "0.2"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +25,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 toml_edit = { version = "0.22.27", features = ["serde"] }
 tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

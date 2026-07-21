@@ -1790,9 +1790,13 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
     }
 
     async fn command_run_rejects_known_process_tree_escape_before_spawn() {
+        #[cfg(unix)]
+        let escape_command = "setsid sh -lc 'sleep 30'";
+        #[cfg(windows)]
+        let escape_command = "schtasks /create /tn muse-test /tr notepad.exe /sc once";
         let call = test_tool_call(
             "command_run",
-            serde_json::json!({ "command": "setsid sh -lc 'sleep 30'" }),
+            serde_json::json!({ "command": escape_command }),
         );
         let (_coordinator, _lease, cancel_token) = test_cancel_token("command-escape");
 

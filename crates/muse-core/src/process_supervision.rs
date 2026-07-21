@@ -59,7 +59,7 @@ impl ProcessTreeGuard {
     }
 
     /// 正常退出且已确认进程树没有遗留成员后解除同步兜底。
-    pub fn disarm(&mut self) {
+    pub fn disarm(mut self) {
         self.armed = false;
     }
 }

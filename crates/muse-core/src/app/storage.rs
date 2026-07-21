@@ -1,7 +1,9 @@
 //! 提供运行时统一存储路径、连接参数、显式迁移与耐久文件写入。
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, backup::Backup};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
