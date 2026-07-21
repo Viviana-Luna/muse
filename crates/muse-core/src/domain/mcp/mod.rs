@@ -1788,11 +1788,18 @@ fn truncate_tool_text(text: &str) -> (String, bool) {
 mod tests {
     use super::*;
 
+    // Windows 上 PowerShell 冷启动可能超过 1 秒；虚假 Server 建完标记文件立即退出，
+    // 正常路径不会真正等到超时，宽限只覆盖进程启动耗时。
+    #[cfg(unix)]
+    const TEST_REQUEST_TIMEOUT_MS: u64 = 1_000;
+    #[cfg(windows)]
+    const TEST_REQUEST_TIMEOUT_MS: u64 = 15_000;
+
     fn test_profile(command: &str, args: Vec<String>) -> McpServerProfile {
         McpServerProfile {
             transport: "stdio".to_string(),
             enabled: true,
-            request_timeout_ms: Some(1_000),
+            request_timeout_ms: Some(TEST_REQUEST_TIMEOUT_MS),
             enabled_tools: None,
             disabled_tools: Vec::new(),
             approval_policy: Default::default(),
