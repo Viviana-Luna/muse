@@ -60,8 +60,10 @@ function Assert-PrivateAcl {
 
   $acl = Get-Acl -LiteralPath $LiteralPath
   $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-  if ($ownerSid -ne $currentUserSid) {
-    throw "$Label 的所有者不是当前用户。"
+  # 管理员组成员创建的对象，所有者默认是 Administrators 组而非创建者本人（CI runner
+  # 即如此）；这不放宽 DACL，普通本机用户仍无访问权，故所有者允许这两种主体。
+  if ($ownerSid -ne $currentUserSid -and $ownerSid -ne 'S-1-5-32-544') {
+    throw "$Label 的所有者不是当前用户或 Administrators 组。"
   }
 
   $currentUserCanAccess = $false
