@@ -582,12 +582,21 @@ fn ensure_data_directory(path: &Path, source: &str) -> Result<(), DataDirError> 
 }
 
 fn make_data_directory_private(path: &Path, source: &str) -> Result<(), DataDirError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = (path, source);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            DataDirError::new(format!(
+                "无法收紧 {source} `{}` 的访问权限：{error}",
+                path.display()
+            ))
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        super::windows_acl::restrict_directory_dacl(path).map_err(|error| {
             DataDirError::new(format!(
                 "无法收紧 {source} `{}` 的访问权限：{error}",
                 path.display()

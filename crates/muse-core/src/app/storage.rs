@@ -420,7 +420,8 @@ fn atomic_write_synced_with_permissions(
 
 /// 确保已存在的敏感配置或数据库不会继续沿用过宽的 Unix 文件权限。
 ///
-/// Windows 文件继承用户数据目录 ACL；其当前用户专属 ACL 由 Windows 实机门禁验证。
+/// Windows 侧依赖数据目录在创建时显式收紧的受保护 DACL：目录内文件自动继承
+/// 仅含当前用户、SYSTEM 与 Administrators 的 ACE，无需逐文件处理。
 pub fn restrict_sensitive_file_permissions(path: &Path) -> Result<(), std::io::Error> {
     reject_non_regular_file_path(path)?;
     if !path.exists() {
