@@ -1,0 +1,3 @@
+# 统一以 LF 签出文本文件，避免 Windows autocrlf 把工作区转成 CRLF
+# 后破坏 shell 测试与 CI 契约检查。
+* text=auto eol=lf
