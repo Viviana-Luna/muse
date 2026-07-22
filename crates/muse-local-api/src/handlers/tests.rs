@@ -4404,7 +4404,8 @@ data: {"result":{"content":[{"type":"text","text":"Title: Exa\nURL: https://exa.
             .update_active_chat_model("deepseek", "deepseek-v4-pro")
             .expect("应手工选择活动模型");
 
-        let appearance = super::handle_get_appearance_preferences(State(state.clone())).await;
+        let appearance =
+            crate::api::preferences::handle_get_appearance_preferences(State(state.clone())).await;
         assert!(appearance.is_ok(), "外观读取应接管同一 TOML revision");
         assert!(
             state.provider.lock().await.is_some(),

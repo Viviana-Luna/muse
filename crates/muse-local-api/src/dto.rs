@@ -1,5 +1,15 @@
 //! 网页接口 DTO 模块，集中定义请求体、响应体和运行时配置传输结构。
 
+mod common;
+mod preferences;
+mod skills;
+
+pub use common::RevisionQuery;
+pub(crate) use preferences::{
+    AppearancePreferencesResponse, AppearancePreferencesUpdateRequest, ConfigMutationErrorResponse,
+};
+pub use skills::{SkillCreateRequest, SkillUpdateRequest};
+
 use muse_core::app::preferences::WebSearchProvider;
 use muse_core::domain::conversation::Message;
 use muse_core::domain::mcp;
@@ -568,32 +578,6 @@ pub struct PersonaCardImportResponse {
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub status: String,
-}
-
-/// Skill 创建请求。
-#[derive(Deserialize)]
-pub struct SkillCreateRequest {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-/// Skill 更新请求。
-#[derive(Deserialize)]
-pub struct SkillUpdateRequest {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-    pub enabled: bool,
-    pub revision: String,
-}
-
-/// 使用 revision 的删除请求。
-#[derive(Deserialize)]
-pub struct RevisionQuery {
-    pub revision: String,
 }
 
 fn default_true() -> bool {

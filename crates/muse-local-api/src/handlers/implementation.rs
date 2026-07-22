@@ -4,7 +4,7 @@ use axum::{
     Json,
     body::Body,
     extract::{
-        Extension, Multipart, Path, Query, State,
+        Extension, Path, Query, State,
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::asset_support::*;
 use crate::dto::*;
 use crate::error::{
     bad_request, internal_error, model_catalog_error_response, persona_card_error_response,
@@ -107,7 +108,6 @@ const PERSONA_REQUIRED_ERROR: &str =
     "persona_required：当前没有激活角色，请先创建、导入或选择角色。";
 const RUNTIME_FACT_SNAPSHOT_MAX_ATTEMPTS: usize = 8;
 const MAX_SKILL_DOCUMENT_BYTES: u64 = 128 * 1024;
-const MAX_PERSONA_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SPEECH_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const DEFAULT_PERSONA_THEME_COLOR: &str = "#d8596f";
 
@@ -1908,7 +1908,6 @@ async fn rollback_runtime_turn(
 }
 
 include!("api/runtime_assets_voice.rs");
-include!("api/app_preferences.rs");
 include!("api/chat_sessions_models.rs");
 include!("api/runtime_policy.rs");
 include!("api/personas_stream.rs");

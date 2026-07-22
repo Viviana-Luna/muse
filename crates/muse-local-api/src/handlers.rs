@@ -5,10 +5,6 @@
 
 mod implementation;
 mod runtime_api;
-mod skills;
 
 pub(crate) use implementation::*;
 pub(crate) use runtime_api::{handle_runtime_mode, handle_runtime_todos};
-pub(crate) use skills::{
-    handle_create_skill, handle_delete_skill, handle_get_skill, handle_skills, handle_update_skill,
-};

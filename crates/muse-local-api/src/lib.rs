@@ -1,6 +1,7 @@
 //! Muse 本地 API 适配模块，暴露 HTTP 路由、处理器、运行时事件和共享状态。
 
 mod api;
+mod asset_support;
 mod command_environment;
 pub mod dto;
 pub mod error;

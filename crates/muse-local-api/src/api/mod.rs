@@ -6,7 +6,7 @@ mod diagnostics;
 mod mcp;
 mod models;
 mod personas;
-mod preferences;
+pub(crate) mod preferences;
 mod runtime;
 mod sessions;
 mod skills;
