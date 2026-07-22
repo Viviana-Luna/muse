@@ -1,16 +1,26 @@
-// 用户 Skill 管理 API，只操作 Muse 数据目录下的 `skills/`。
+//! 用户 Skill 管理 HTTP handler。
 
+use std::sync::Arc;
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
 use muse_core::domain::skill::{
     SkillCatalogSnapshot, SkillDraft, SkillRecord, SkillStore, SkillStoreError, SkillStoreErrorKind,
+};
+
+use crate::{
+    dto::{ErrorResponse, RevisionQuery, SkillCreateRequest, SkillUpdateRequest},
+    state::AppState,
 };
 
 fn user_skill_store(state: &AppState) -> SkillStore {
     SkillStore::from_data_dir(state.runtime_service.data_dir())
 }
 
-fn skill_store_error_response(
-    error: SkillStoreError,
-) -> (StatusCode, Json<ErrorResponse>) {
+fn skill_store_error_response(error: SkillStoreError) -> (StatusCode, Json<ErrorResponse>) {
     let (status, prefix) = match error.kind {
         SkillStoreErrorKind::Invalid => (StatusCode::BAD_REQUEST, "skill_invalid："),
         SkillStoreErrorKind::NotFound => (StatusCode::NOT_FOUND, ""),
@@ -48,12 +58,15 @@ pub(crate) async fn handle_create_skill(
 ) -> Result<(StatusCode, Json<SkillRecord>), (StatusCode, Json<ErrorResponse>)> {
     let mut config = state.user_config.lock().await;
     let record = user_skill_store(&state)
-        .create(SkillDraft {
-            name: request.name,
-            description: request.description,
-            content: request.content,
-            enabled: request.enabled,
-        }, &mut config)
+        .create(
+            SkillDraft {
+                name: request.name,
+                description: request.description,
+                content: request.content,
+                enabled: request.enabled,
+            },
+            &mut config,
+        )
         .map_err(skill_store_error_response)?;
     state.runtime_service.touch();
     Ok((StatusCode::CREATED, Json(record)))

@@ -1913,7 +1913,6 @@ include!("api/chat_sessions_models.rs");
 include!("api/runtime_policy.rs");
 include!("api/personas_stream.rs");
 include!("api/persona_session_binding.rs");
-include!("api/skills_management.rs");
 include!("api/mcp_management.rs");
 include!("tools/approval_review.rs");
 include!("tools/approval_flow.rs");
