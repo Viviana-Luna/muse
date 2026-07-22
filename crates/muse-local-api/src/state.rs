@@ -468,7 +468,7 @@ fn runtime_prompt_sandbox_mode_label(value: &str) -> &'static str {
 }
 
 fn runtime_prompt_home_dir() -> Option<PathBuf> {
-    crate::platform_path::home_dir()
+    crate::platform::path::home_dir()
 }
 
 fn build_runtime_environment_context() -> String {
@@ -493,7 +493,7 @@ fn build_runtime_environment_context() -> String {
         runtime_prompt_sandbox_mode_label(&harness.sandbox_mode),
         harness.sandbox_mode,
         home,
-        crate::platform_path::known_user_directories_prompt()
+        crate::platform::path::known_user_directories_prompt()
     )
 }
 

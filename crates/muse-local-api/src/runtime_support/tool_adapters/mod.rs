@@ -2,6 +2,11 @@
 
 use super::*;
 
+mod capabilities;
+pub(in crate::runtime_support) use capabilities::*;
+pub(in crate::runtime_support) mod command_environment;
+pub(in crate::runtime_support) mod result_archive;
+
 mod approval_review;
 pub(in crate::runtime_support) use approval_review::*;
 mod approval_flow;

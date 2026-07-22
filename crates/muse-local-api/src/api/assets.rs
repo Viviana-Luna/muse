@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use tokio::fs;
 
 use super::ApiRouter;
-use crate::asset_support::{
+use crate::assets::storage::{
     content_hash_hex, discard_unreferenced_uploaded_asset, persist_uploaded_asset,
     uploaded_assets_dir, uploaded_image_extension, uploaded_image_extension_from_bytes,
     validated_uploaded_asset_name,

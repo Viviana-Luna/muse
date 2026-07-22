@@ -12,7 +12,7 @@ pub(in crate::runtime_support) async fn tool_command_run(
     let Some(command) = tool_arg_string(&call.arguments, "command") else {
         return tool_failed("command_run 缺少 command 参数。", "missing_command");
     };
-    if let Some(reason) = crate::command_environment::command_containment_escape_reason(&command) {
+    if let Some(reason) = super::command_environment::command_containment_escape_reason(&command) {
         return tool_failed(reason, "command_containment_escape");
     }
     let timeout_ms = call
@@ -55,7 +55,7 @@ pub(in crate::runtime_support) async fn tool_command_run(
         process.arg("-lc").arg(&command);
         process
     };
-    crate::command_environment::apply_command_environment(&mut process);
+    super::command_environment::apply_command_environment(&mut process);
     process.current_dir(&cwd);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     muse_core::process_supervision::configure_process_tree(&mut process);

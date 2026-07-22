@@ -692,7 +692,7 @@ pub(in crate::runtime_support) fn read_command_audit_resource_from_base(
     let audit_id = parts.next().unwrap_or_default();
     let stream = parts.next().unwrap_or_default();
     if parts.next().is_some()
-        || !crate::tool_result_archive::is_safe_result_id(audit_id)
+        || !super::result_archive::is_safe_result_id(audit_id)
         || !matches!(stream, "stdout" | "stderr")
     {
         return Err("命令审计资源 URI 含非法标识或流名称。".to_string());
@@ -937,7 +937,7 @@ pub(in crate::runtime_support) fn prepare_command_audit_files_in(
 ) -> Result<PreparedCommandAuditFiles, String> {
     let audit_dir = ensure_command_audit_directory(base_dir)?;
     let audit_id = next_runtime_id("command-audit");
-    if !crate::tool_result_archive::is_safe_result_id(&audit_id) {
+    if !super::result_archive::is_safe_result_id(&audit_id) {
         return Err("生成的命令审计标识不安全。".to_string());
     }
     let stdout = create_command_audit_stream(&audit_dir, &audit_id, "stdout")?;
@@ -1068,8 +1068,7 @@ pub(in crate::runtime_support) fn create_command_audit_stream(
     audit_id: &str,
     stream: &'static str,
 ) -> Result<CommandAuditStreamWriter, String> {
-    if !matches!(stream, "stdout" | "stderr")
-        || !crate::tool_result_archive::is_safe_result_id(audit_id)
+    if !matches!(stream, "stdout" | "stderr") || !super::result_archive::is_safe_result_id(audit_id)
     {
         return Err("命令审计文件标识无效。".to_string());
     }

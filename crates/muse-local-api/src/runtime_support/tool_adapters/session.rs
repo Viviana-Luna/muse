@@ -48,7 +48,7 @@ pub(in crate::runtime_support) async fn tool_result_read(call: &ToolCall) -> Too
             "missing_result_id",
         );
     };
-    if !crate::tool_result_archive::is_safe_result_id(&result_id) {
+    if !super::result_archive::is_safe_result_id(&result_id) {
         return tool_failed(
             "tool_result_read result_id 含非法字符。",
             "invalid_result_id",
@@ -65,7 +65,7 @@ pub(in crate::runtime_support) async fn tool_result_read(call: &ToolCall) -> Too
         TOOL_RESULT_READ_DEFAULT_CHARS,
         TOOL_RESULT_READ_MAX_CHARS,
     );
-    let content = match crate::tool_result_archive::read(&result_id).await {
+    let content = match super::result_archive::read(&result_id).await {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return tool_failed(

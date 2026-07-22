@@ -16,7 +16,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
-pub(crate) fn is_safe_result_id(result_id: &str) -> bool {
+pub(in crate::runtime_support) fn is_safe_result_id(result_id: &str) -> bool {
     !result_id.trim().is_empty()
         && result_id.len() <= 160
         && result_id
@@ -24,7 +24,10 @@ pub(crate) fn is_safe_result_id(result_id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-pub(crate) async fn write_new(result_id: &str, content: String) -> io::Result<()> {
+pub(in crate::runtime_support) async fn write_new(
+    result_id: &str,
+    content: String,
+) -> io::Result<()> {
     let root = archive_root();
     let result_id = result_id.to_string();
     tokio::task::spawn_blocking(move || write_new_at(&root, &result_id, content.as_bytes()))
@@ -32,7 +35,7 @@ pub(crate) async fn write_new(result_id: &str, content: String) -> io::Result<()
         .map_err(|error| io::Error::other(format!("归档写入任务异常结束：{error}")))?
 }
 
-pub(crate) async fn read(result_id: &str) -> io::Result<String> {
+pub(in crate::runtime_support) async fn read(result_id: &str) -> io::Result<String> {
     let root = archive_root();
     let result_id = result_id.to_string();
     tokio::task::spawn_blocking(move || read_at(&root, &result_id))

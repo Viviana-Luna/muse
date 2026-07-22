@@ -1,3 +1,5 @@
+//! 将领域层和运行时错误转换为稳定的 HTTP 响应。
+
 use axum::{Json, http::StatusCode};
 use muse_core::domain::persona::character::card::PersonaCardError;
 use muse_core::domain::persona::character::store::PersonaStoreError;

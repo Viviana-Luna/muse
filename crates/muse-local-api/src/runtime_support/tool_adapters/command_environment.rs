@@ -9,7 +9,9 @@ use tokio::process::Command;
 /// Unix 进程组和 Windows Job Object 能可靠回收正常派生的子孙，但无法承诺回收
 /// `setsid`、系统服务管理器或计划任务接管后的进程。命令工具对这些已知逃逸入口
 /// fail-closed；需要长期服务时应由用户在工具外显式管理。
-pub(crate) fn command_containment_escape_reason(command: &str) -> Option<&'static str> {
+pub(in crate::runtime_support) fn command_containment_escape_reason(
+    command: &str,
+) -> Option<&'static str> {
     #[cfg(unix)]
     {
         unix_containment_escape_reason(command)
@@ -113,7 +115,7 @@ fn first_effective_executable(segment: &str) -> Option<&str> {
 }
 
 /// 清空继承环境，只向命令子进程传递运行 shell 所需的最小白名单。
-pub(crate) fn apply_command_environment(process: &mut Command) {
+pub(in crate::runtime_support) fn apply_command_environment(process: &mut Command) {
     apply_command_environment_from(process, std::env::vars_os());
 }
 

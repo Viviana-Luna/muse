@@ -3,6 +3,7 @@
 mod assets;
 mod chat;
 mod diagnostics;
+pub(crate) mod error;
 mod mcp;
 mod models;
 mod personas;

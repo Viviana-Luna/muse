@@ -1915,7 +1915,7 @@ pub(in crate::runtime_support) fn runtime_tool_handler(
     name: &str,
 ) -> Option<&'static dyn RuntimeToolHandler> {
     // 能力矩阵是运行时工具的单一准入表；处理器没有登记就不能被分发执行。
-    crate::runtime_tools::capability(name)?;
+    capability(name)?;
     RUNTIME_TOOL_HANDLERS
         .iter()
         .copied()

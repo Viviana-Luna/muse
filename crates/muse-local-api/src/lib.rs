@@ -1,22 +1,33 @@
-//! Muse 本地 API 适配模块，暴露 HTTP 路由、处理器、运行时事件和共享状态。
+//! Muse 本地 API 适配模块，暴露路由、安全上下文、运行时事件与共享状态。
 
 mod api;
-mod asset_support;
-mod command_environment;
+mod assets;
 pub mod dto;
-pub mod error;
 mod middleware;
-mod platform_path;
+mod platform;
 pub mod router;
-pub mod runtime;
 mod runtime_support;
-pub(crate) mod runtime_tools;
 pub mod security;
-mod startup_migration;
+mod startup;
 pub mod state;
-mod tool_result_archive;
+
+/// 保留原有 HTTP 错误适配公共路径。
+pub mod error {
+    pub use crate::api::error::{
+        bad_request, internal_error, model_catalog_error_response, persona_card_error_response,
+        persona_store_error_response, visual_pack_store_error_response, voice_error_response,
+    };
+}
+
+/// 保留原有 SSE 运行时事件公共路径。
+pub mod runtime {
+    pub use crate::runtime_support::events::{
+        RuntimeEventEmitter, RuntimeSseSender, RuntimeTurnOutcome, runtime_event_payload,
+    };
+}
+
 pub use router::build_router_with_security;
 pub use security::{LocalApiBootstrap, LocalApiSecurity, LocalApiSecurityOptions};
-pub use startup_migration::{
+pub use startup::migration::{
     LegacyDefaultPersonaMigrationOutcome, migrate_pristine_legacy_default_persona,
 };

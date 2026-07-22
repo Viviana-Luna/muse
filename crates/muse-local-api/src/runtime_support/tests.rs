@@ -885,9 +885,9 @@ fn command_run_schema_matches_runtime_timeout_and_audit_contract() {
 }
 
 fn runtime_tool_capability_matrix_matches_handler_registry() {
-    for capability in crate::runtime_tools::capabilities() {
+    for capability in crate::runtime_support::tool_adapters::capabilities() {
         assert!(
-            crate::runtime_tools::capability(capability.name).is_some(),
+            crate::runtime_support::tool_adapters::capability(capability.name).is_some(),
             "能力矩阵应能按名称查回 `{}`",
             capability.name
         );
@@ -3561,16 +3561,16 @@ fn runtime_tool_handlers_render_model_results() {
         .expect("runtime handler registry 应包含 file_search");
     let search_result = ToolResult {
         status: ToolResultStatus::Success,
-        content: "在 `.` 下找到 1 个 `handlers` 的候选路径。".to_string(),
+        content: "在 `.` 下找到 1 个 `runtime_support` 的候选路径。".to_string(),
         structured: Some(serde_json::json!({
             "results": [
-                { "path": "crates/muse-local-api/src/handlers.rs", "kind": "file" }
+                { "path": "crates/muse-local-api/src/runtime_support/mod.rs", "kind": "file" }
             ]
         })),
     };
     let rendered = search_handler.render_result_for_model(&search_result);
     assert!(rendered.contains("搜索候选路径（供模型继续决策）："));
-    assert!(rendered.contains("crates/muse-local-api/src/handlers.rs"));
+    assert!(rendered.contains("crates/muse-local-api/src/runtime_support/mod.rs"));
 
     let compact_handler = super::runtime_tool_handler("session_compact")
         .expect("runtime handler registry 应包含 session_compact");

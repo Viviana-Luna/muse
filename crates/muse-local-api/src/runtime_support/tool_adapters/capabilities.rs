@@ -1,18 +1,18 @@
 //! 运行时工具层基础契约和能力矩阵。
 //!
-//! 具体工具执行暂时仍由 `handlers` 中的运行底座处理器承接；本模块先沉淀
-//! 不依赖 HTTP handler 私有状态的稳定类型，作为后续按工具族拆分的入口。
+//! 具体工具执行由同目录的适配器承接；本模块只定义中断策略、上下文影响和
+//! 不依赖 HTTP handler 私有状态的稳定能力事实。
 
 /// 工具在当前 turn 被取消时的处理策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeToolInterruptBehavior {
+pub(in crate::runtime_support) enum RuntimeToolInterruptBehavior {
     Block,
     Cancel,
 }
 
 impl RuntimeToolInterruptBehavior {
     /// 返回写入 SSE 事件和 transcript 时使用的稳定字符串。
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(in crate::runtime_support) fn as_str(self) -> &'static str {
         match self {
             RuntimeToolInterruptBehavior::Block => "block",
             RuntimeToolInterruptBehavior::Cancel => "cancel",
@@ -22,7 +22,7 @@ impl RuntimeToolInterruptBehavior {
 
 /// 工具结果对后续模型上下文的影响。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeToolContextEffect {
+pub(in crate::runtime_support) enum RuntimeToolContextEffect {
     Append {
         title: &'static str,
         content: String,
@@ -35,7 +35,7 @@ pub(crate) enum RuntimeToolContextEffect {
 
 impl RuntimeToolContextEffect {
     /// 将上下文效果合并到模型可读工具结果中。
-    pub(crate) fn apply_to_model_content(&self, base: String) -> String {
+    pub(in crate::runtime_support) fn apply_to_model_content(&self, base: String) -> String {
         match self {
             RuntimeToolContextEffect::Append { title, content } => {
                 let effect = content.trim();
@@ -50,7 +50,7 @@ impl RuntimeToolContextEffect {
     }
 
     /// 转换为 transcript 中记录的结构化上下文效果。
-    pub(crate) fn to_json(&self) -> serde_json::Value {
+    pub(in crate::runtime_support) fn to_json(&self) -> serde_json::Value {
         match self {
             RuntimeToolContextEffect::Append { title, content } => serde_json::json!({
                 "mode": "append",
@@ -68,18 +68,18 @@ impl RuntimeToolContextEffect {
 
 /// 运行时工具能力快照，用于冻结当前 Web runtime 承接范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RuntimeToolCapability {
-    pub(crate) name: &'static str,
-    pub(crate) family: RuntimeToolFamily,
-    pub(crate) mutating: bool,
-    pub(crate) interrupt_behavior: RuntimeToolInterruptBehavior,
-    pub(crate) writes_transcript: bool,
-    pub(crate) has_context_effect: bool,
+pub(in crate::runtime_support) struct RuntimeToolCapability {
+    pub(in crate::runtime_support) name: &'static str,
+    pub(in crate::runtime_support) family: RuntimeToolFamily,
+    pub(in crate::runtime_support) mutating: bool,
+    pub(in crate::runtime_support) interrupt_behavior: RuntimeToolInterruptBehavior,
+    pub(in crate::runtime_support) writes_transcript: bool,
+    pub(in crate::runtime_support) has_context_effect: bool,
 }
 
 /// 运行时工具族，后续按该边界拆分具体实现文件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeToolFamily {
+pub(in crate::runtime_support) enum RuntimeToolFamily {
     Planning,
     Interaction,
     Speech,
@@ -355,12 +355,12 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
 
 /// 返回能力矩阵完整快照，仅用于回归测试验证处理器注册表没有漂移。
 #[cfg(test)]
-pub(crate) fn capabilities() -> &'static [RuntimeToolCapability] {
+pub(in crate::runtime_support) fn capabilities() -> &'static [RuntimeToolCapability] {
     RUNTIME_TOOL_CAPABILITIES
 }
 
 /// 按工具名查询运行时能力。
-pub(crate) fn capability(name: &str) -> Option<&'static RuntimeToolCapability> {
+pub(in crate::runtime_support) fn capability(name: &str) -> Option<&'static RuntimeToolCapability> {
     RUNTIME_TOOL_CAPABILITIES
         .iter()
         .find(|capability| capability.name == name)

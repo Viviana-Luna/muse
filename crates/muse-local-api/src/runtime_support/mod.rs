@@ -1,4 +1,4 @@
-//! Handler 共享实现，后续子模块通过本模块复用统一状态与安全边界。
+//! 本地 API 与 `muse-runtime` 之间的共享编排和传输辅助。
 
 use axum::{
     Json,
@@ -27,22 +27,19 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::asset_support::*;
+use crate::assets::storage::*;
 use crate::dto::*;
 use crate::error::{
     bad_request, internal_error, model_catalog_error_response, persona_card_error_response,
     persona_store_error_response, visual_pack_store_error_response, voice_error_response,
 };
-use crate::runtime::{
-    RuntimeEventEmitter, RuntimeSseSender, RuntimeTurnOutcome, runtime_event_payload,
-};
-use crate::runtime_tools::{RuntimeToolContextEffect, RuntimeToolInterruptBehavior};
 use crate::security::{LocalApiSecurity, RuntimeHealthResponse, WsTicketResponse};
 use crate::state::{
     AppState, ChatRequestRegistryError, build_chat_provider,
     build_runtime_system_prompt_with_mode_state, effective_tts_config, missing_chat_provider_error,
     next_runtime_session_id, rebuild_speech_provider_from_state, rebuild_tts_provider_from_state,
 };
+use events::{RuntimeEventEmitter, RuntimeSseSender, RuntimeTurnOutcome, runtime_event_payload};
 use muse_core::domain::conversation::{Conversation, Message, Role};
 use muse_core::domain::mcp;
 use muse_core::domain::persona::Persona;
@@ -79,6 +76,7 @@ use muse_runtime::{
     ApprovalModePreset, ApprovalPolicy, ApprovalsReviewer, FrozenExecutionPolicy,
     PermissionProfile, TurnBudget, TurnSnapshot,
 };
+use tool_adapters::RuntimeToolInterruptBehavior;
 
 struct SanitizedAssistantReply {
     content: String,
@@ -1909,6 +1907,7 @@ async fn rollback_runtime_turn(
 
 mod runtime;
 pub(crate) use runtime::*;
+pub(crate) mod events;
 mod voice;
 pub(crate) use voice::*;
 mod chat;

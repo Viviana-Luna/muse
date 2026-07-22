@@ -1,4 +1,4 @@
-//! 上传资源的持久化、校验与引用清理能力。
+//! 上传资源的持久化、校验与引用清理。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

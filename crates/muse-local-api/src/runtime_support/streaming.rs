@@ -1609,7 +1609,7 @@ pub(super) fn resolve_workspace_path(
     let bypass_workspace_boundary =
         can_bypass_workspace_boundary(policy, allow_approved_external_path);
     let workspace = workspace_root()?;
-    let candidate = crate::platform_path::expand_user_path(raw, &workspace);
+    let candidate = crate::platform::path::expand_user_path(raw, &workspace);
     if candidate
         .components()
         .any(|part| matches!(part, std::path::Component::ParentDir))
@@ -2300,9 +2300,12 @@ pub(super) async fn maybe_externalize_tool_result(
         "structured": result.structured.clone(),
     });
 
-    if crate::tool_result_archive::write_new(&result_id, archive_record.to_string())
-        .await
-        .is_err()
+    if crate::runtime_support::tool_adapters::result_archive::write_new(
+        &result_id,
+        archive_record.to_string(),
+    )
+    .await
+    .is_err()
     {
         return result.clone();
     }
