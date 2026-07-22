@@ -1,4 +1,8 @@
-async fn tool_mcp_list_resources(
+//! MCP 资源查询与本地资源读取工具适配。
+
+use super::*;
+
+pub(in crate::runtime_support) async fn tool_mcp_list_resources(
     frozen_mcp_catalog: &mcp::McpToolCatalog,
     call: &ToolCall,
 ) -> ToolResult {
@@ -13,9 +17,7 @@ async fn tool_mcp_list_resources(
             "local_cursor_unsupported",
         );
     }
-    let include_local = server
-        .as_deref()
-        .is_none_or(is_local_mcp_server);
+    let include_local = server.as_deref().is_none_or(is_local_mcp_server);
     let include_external = server
         .as_deref()
         .is_none_or(|value| !is_local_mcp_server(value));
@@ -83,7 +85,7 @@ async fn tool_mcp_list_resources(
     }
 }
 
-async fn tool_mcp_list_resource_templates(
+pub(in crate::runtime_support) async fn tool_mcp_list_resource_templates(
     frozen_mcp_catalog: &mcp::McpToolCatalog,
     call: &ToolCall,
 ) -> ToolResult {
@@ -135,7 +137,7 @@ async fn tool_mcp_list_resource_templates(
     }
 }
 
-async fn tool_mcp_read_resource(
+pub(in crate::runtime_support) async fn tool_mcp_read_resource(
     state: &Arc<AppState>,
     frozen_mcp_catalog: &mcp::McpToolCatalog,
     call: &ToolCall,
@@ -187,7 +189,9 @@ async fn tool_mcp_read_resource(
     read_runtime_mcp_resource(state, resource, conversation).await
 }
 
-fn external_mcp_resource_success(result: mcp::ExternalMcpReadResource) -> ToolResult {
+pub(in crate::runtime_support) fn external_mcp_resource_success(
+    result: mcp::ExternalMcpReadResource,
+) -> ToolResult {
     let (content, truncated) = truncate_text_with_flag(&result.content, MCP_RESOURCE_MAX_CHARS);
     let mut structured = result.structured;
     if let Some(object) = structured.as_object_mut() {
@@ -203,7 +207,7 @@ fn external_mcp_resource_success(result: mcp::ExternalMcpReadResource) -> ToolRe
     }
 }
 
-async fn read_runtime_mcp_resource(
+pub(in crate::runtime_support) async fn read_runtime_mcp_resource(
     state: &Arc<AppState>,
     resource: RuntimeMcpResource,
     conversation: &Conversation,
@@ -255,7 +259,7 @@ async fn read_runtime_mcp_resource(
     }
 }
 
-fn mcp_resource_success(
+pub(in crate::runtime_support) fn mcp_resource_success(
     resource: RuntimeMcpResource,
     raw_content: String,
     exists: bool,
@@ -279,12 +283,12 @@ fn mcp_resource_success(
     }
 }
 
-struct RuntimeSessionListPayload {
-    exists: bool,
-    sessions: Vec<serde_json::Value>,
+pub(in crate::runtime_support) struct RuntimeSessionListPayload {
+    pub(in crate::runtime_support) exists: bool,
+    pub(in crate::runtime_support) sessions: Vec<serde_json::Value>,
 }
 
-async fn runtime_session_list_payload(
+pub(in crate::runtime_support) async fn runtime_session_list_payload(
     state: &Arc<AppState>,
 ) -> Result<RuntimeSessionListPayload, String> {
     let virtual_path = state

@@ -1,4 +1,8 @@
-async fn tool_file_read(
+//! 文件读取、检索与写入工具适配。
+
+use super::*;
+
+pub(in crate::runtime_support) async fn tool_file_read(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     allow_approved_external_path: bool,
@@ -22,7 +26,7 @@ async fn tool_file_read(
         Err(err) => tool_failed(format!("读取文件失败：{err}"), "read_failed"),
     }
 }
-async fn tool_file_list(
+pub(in crate::runtime_support) async fn tool_file_list(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     allow_approved_external_path: bool,
@@ -62,7 +66,10 @@ async fn tool_file_list(
     }
 }
 
-async fn tool_file_search(policy: &FrozenExecutionPolicy, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_file_search(
+    policy: &FrozenExecutionPolicy,
+    call: &ToolCall,
+) -> ToolResult {
     let Some(query) = tool_arg_string(&call.arguments, "query") else {
         return tool_failed("file_search 缺少 query 参数。", "missing_query");
     };
@@ -237,7 +244,10 @@ async fn tool_file_search(policy: &FrozenExecutionPolicy, call: &ToolCall) -> To
 
 /// 解析 file_search 的搜索起点。该工具无论当前是否 full_access、是否经过审批，
 /// 都只能使用冻结策略与当前撤销策略交集后的 canonical 根目录。
-fn resolve_file_search_base(policy: &FrozenExecutionPolicy, raw: &str) -> Result<PathBuf, String> {
+pub(in crate::runtime_support) fn resolve_file_search_base(
+    policy: &FrozenExecutionPolicy,
+    raw: &str,
+) -> Result<PathBuf, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("file_search 的 base 不能为空。".to_string());
@@ -276,21 +286,21 @@ fn resolve_file_search_base(policy: &FrozenExecutionPolicy, raw: &str) -> Result
     Ok(canonical)
 }
 
-fn is_filesystem_root(path: &StdPath) -> bool {
+pub(in crate::runtime_support) fn is_filesystem_root(path: &StdPath) -> bool {
     path.parent().is_none()
 }
 
-struct FileSearchCandidate<'a> {
-    path: &'a StdPath,
-    base: &'a StdPath,
-    metadata: &'a std::fs::Metadata,
-    query_lower: &'a str,
-    kind: &'a str,
-    match_mode: &'a str,
-    include_hidden: bool,
+pub(in crate::runtime_support) struct FileSearchCandidate<'a> {
+    pub(in crate::runtime_support) path: &'a StdPath,
+    pub(in crate::runtime_support) base: &'a StdPath,
+    pub(in crate::runtime_support) metadata: &'a std::fs::Metadata,
+    pub(in crate::runtime_support) query_lower: &'a str,
+    pub(in crate::runtime_support) kind: &'a str,
+    pub(in crate::runtime_support) match_mode: &'a str,
+    pub(in crate::runtime_support) include_hidden: bool,
 }
 
-async fn maybe_push_file_search_result(
+pub(in crate::runtime_support) async fn maybe_push_file_search_result(
     results: &mut Vec<serde_json::Value>,
     candidate: FileSearchCandidate<'_>,
 ) {
@@ -341,7 +351,10 @@ async fn maybe_push_file_search_result(
     }));
 }
 
-async fn file_content_contains(path: &StdPath, query_lower: &str) -> bool {
+pub(in crate::runtime_support) async fn file_content_contains(
+    path: &StdPath,
+    query_lower: &str,
+) -> bool {
     const MAX_CONTENT_SEARCH_BYTES: u64 = 256 * 1024;
     let Ok(metadata) = fs::metadata(path).await else {
         return false;
@@ -360,7 +373,7 @@ async fn file_content_contains(path: &StdPath, query_lower: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn tool_file_write(
+pub(in crate::runtime_support) async fn tool_file_write(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     allow_approved_external_path: bool,
@@ -409,7 +422,7 @@ async fn tool_file_write(
     }
 }
 
-async fn tool_file_edit(
+pub(in crate::runtime_support) async fn tool_file_edit(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     allow_approved_external_path: bool,
@@ -466,26 +479,26 @@ async fn tool_file_edit(
     }
 }
 
-fn command_audit_output_requested(call: &ToolCall) -> bool {
+pub(in crate::runtime_support) fn command_audit_output_requested(call: &ToolCall) -> bool {
     call.arguments
         .get("audit_output")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
 }
 
-struct CommandOutputSummaryBuffer {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    total_bytes: u64,
+pub(in crate::runtime_support) struct CommandOutputSummaryBuffer {
+    pub(in crate::runtime_support) head: Vec<u8>,
+    pub(in crate::runtime_support) tail: VecDeque<u8>,
+    pub(in crate::runtime_support) total_bytes: u64,
 }
 
-struct CommandOutputSummary {
-    text: String,
-    omitted_bytes: u64,
+pub(in crate::runtime_support) struct CommandOutputSummary {
+    pub(in crate::runtime_support) text: String,
+    pub(in crate::runtime_support) omitted_bytes: u64,
 }
 
 impl CommandOutputSummaryBuffer {
-    fn new() -> Self {
+    pub(in crate::runtime_support) fn new() -> Self {
         Self {
             head: Vec::with_capacity(COMMAND_OUTPUT_MEMORY_LIMIT_BYTES / 2),
             tail: VecDeque::with_capacity(COMMAND_OUTPUT_MEMORY_LIMIT_BYTES / 2),
@@ -493,7 +506,7 @@ impl CommandOutputSummaryBuffer {
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) {
+    pub(in crate::runtime_support) fn push(&mut self, bytes: &[u8]) {
         self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
         let head_capacity = COMMAND_OUTPUT_MEMORY_LIMIT_BYTES / 2;
         let head_take = bytes
@@ -523,7 +536,10 @@ impl CommandOutputSummaryBuffer {
         self.tail.extend(remaining.iter().copied());
     }
 
-    fn finish(mut self, stream: &'static str) -> CommandOutputSummary {
+    pub(in crate::runtime_support) fn finish(
+        mut self,
+        stream: &'static str,
+    ) -> CommandOutputSummary {
         if self.total_bytes <= COMMAND_OUTPUT_MEMORY_LIMIT_BYTES as u64 {
             let mut bytes = self.head;
             bytes.extend(self.tail);
@@ -566,7 +582,7 @@ impl CommandOutputSummaryBuffer {
     }
 }
 
-fn command_output_omission_marker(
+pub(in crate::runtime_support) fn command_output_omission_marker(
     stream: &'static str,
     total_bytes: u64,
     omitted_bytes: u64,
@@ -580,7 +596,7 @@ fn command_output_omission_marker(
 ///
 /// `String::from_utf8_lossy` 会把一个非法字节扩成三字节替换符，无法满足严格的
 /// 1 MiB 上限。这里逐段保留有效 UTF-8，并把每个非法字节替换成单字节 `?`。
-fn sanitize_command_output_bytes(bytes: &[u8]) -> String {
+pub(in crate::runtime_support) fn sanitize_command_output_bytes(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len());
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -609,50 +625,50 @@ fn sanitize_command_output_bytes(bytes: &[u8]) -> String {
 }
 
 #[derive(Clone)]
-struct CommandAuditIdentity {
-    audit_id: String,
-    stream: &'static str,
-    path: PathBuf,
+pub(in crate::runtime_support) struct CommandAuditIdentity {
+    pub(in crate::runtime_support) audit_id: String,
+    pub(in crate::runtime_support) stream: &'static str,
+    pub(in crate::runtime_support) path: PathBuf,
 }
 
-struct CommandAuditStreamWriter {
-    identity: CommandAuditIdentity,
-    file: tokio::fs::File,
-    written_bytes: u64,
-    write_error: Option<String>,
+pub(in crate::runtime_support) struct CommandAuditStreamWriter {
+    pub(in crate::runtime_support) identity: CommandAuditIdentity,
+    pub(in crate::runtime_support) file: tokio::fs::File,
+    pub(in crate::runtime_support) written_bytes: u64,
+    pub(in crate::runtime_support) write_error: Option<String>,
 }
 
-struct CommandAuditStreamSink {
-    identity: CommandAuditIdentity,
-    sender: Option<mpsc::Sender<Vec<u8>>>,
-    writer_task: tokio::task::JoinHandle<CommandAuditReference>,
-    total_bytes: Arc<AtomicU64>,
-    accepting_chunks: bool,
+pub(in crate::runtime_support) struct CommandAuditStreamSink {
+    pub(in crate::runtime_support) identity: CommandAuditIdentity,
+    pub(in crate::runtime_support) sender: Option<mpsc::Sender<Vec<u8>>>,
+    pub(in crate::runtime_support) writer_task: tokio::task::JoinHandle<CommandAuditReference>,
+    pub(in crate::runtime_support) total_bytes: Arc<AtomicU64>,
+    pub(in crate::runtime_support) accepting_chunks: bool,
 }
 
-struct PreparedCommandAuditFiles {
-    stdout: CommandAuditStreamWriter,
-    stderr: CommandAuditStreamWriter,
+pub(in crate::runtime_support) struct PreparedCommandAuditFiles {
+    pub(in crate::runtime_support) stdout: CommandAuditStreamWriter,
+    pub(in crate::runtime_support) stderr: CommandAuditStreamWriter,
 }
 
 #[derive(Clone)]
-struct CommandAuditReference {
-    audit_id: String,
-    stream: &'static str,
-    resource_uri: String,
-    captured_bytes: u64,
-    omitted_bytes: u64,
-    write_error: Option<String>,
+pub(in crate::runtime_support) struct CommandAuditReference {
+    pub(in crate::runtime_support) audit_id: String,
+    pub(in crate::runtime_support) stream: &'static str,
+    pub(in crate::runtime_support) resource_uri: String,
+    pub(in crate::runtime_support) captured_bytes: u64,
+    pub(in crate::runtime_support) omitted_bytes: u64,
+    pub(in crate::runtime_support) write_error: Option<String>,
 }
 
 #[derive(Debug)]
-struct CommandAuditResourceContent {
-    content: String,
-    captured_bytes: u64,
-    truncated: bool,
+pub(in crate::runtime_support) struct CommandAuditResourceContent {
+    pub(in crate::runtime_support) content: String,
+    pub(in crate::runtime_support) captured_bytes: u64,
+    pub(in crate::runtime_support) truncated: bool,
 }
 
-async fn read_command_audit_resource(
+pub(in crate::runtime_support) async fn read_command_audit_resource(
     resource_uri: String,
 ) -> Result<CommandAuditResourceContent, String> {
     tokio::task::spawn_blocking(move || {
@@ -665,7 +681,7 @@ async fn read_command_audit_resource(
     .map_err(|error| format!("命令审计读取任务异常结束：{error}"))?
 }
 
-fn read_command_audit_resource_from_base(
+pub(in crate::runtime_support) fn read_command_audit_resource_from_base(
     base_dir: &StdPath,
     resource_uri: &str,
 ) -> Result<CommandAuditResourceContent, String> {
@@ -741,7 +757,7 @@ fn read_command_audit_resource_from_base(
 }
 
 impl CommandAuditReference {
-    fn to_json(&self) -> serde_json::Value {
+    pub(in crate::runtime_support) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "audit_id": self.audit_id.as_str(),
             "stream": self.stream,
@@ -755,7 +771,7 @@ impl CommandAuditReference {
 }
 
 impl CommandAuditStreamWriter {
-    async fn write_chunk(&mut self, bytes: &[u8]) {
+    pub(in crate::runtime_support) async fn write_chunk(&mut self, bytes: &[u8]) {
         if self.write_error.is_some() {
             return;
         }
@@ -771,7 +787,10 @@ impl CommandAuditStreamWriter {
         self.written_bytes = self.written_bytes.saturating_add(write_len as u64);
     }
 
-    async fn finish(mut self, total_bytes: u64) -> CommandAuditReference {
+    pub(in crate::runtime_support) async fn finish(
+        mut self,
+        total_bytes: u64,
+    ) -> CommandAuditReference {
         if self.write_error.is_none()
             && let Err(error) = self.file.flush().await
         {
@@ -810,7 +829,7 @@ impl CommandAuditStreamWriter {
 }
 
 impl CommandAuditStreamSink {
-    fn new(writer: CommandAuditStreamWriter) -> Self {
+    pub(in crate::runtime_support) fn new(writer: CommandAuditStreamWriter) -> Self {
         let identity = writer.identity.clone();
         let total_bytes = Arc::new(AtomicU64::new(0));
         let total_for_writer = total_bytes.clone();
@@ -833,7 +852,7 @@ impl CommandAuditStreamSink {
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) {
+    pub(in crate::runtime_support) fn push(&mut self, bytes: &[u8]) {
         self.total_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if !self.accepting_chunks {
@@ -856,7 +875,7 @@ impl CommandAuditStreamSink {
         }
     }
 
-    async fn finish(mut self) -> CommandAuditReference {
+    pub(in crate::runtime_support) async fn finish(mut self) -> CommandAuditReference {
         self.sender.take();
         match self.writer_task.await {
             Ok(reference) => reference,
@@ -869,7 +888,7 @@ impl CommandAuditStreamSink {
     }
 }
 
-fn command_audit_fallback_reference(
+pub(in crate::runtime_support) fn command_audit_fallback_reference(
     identity: &CommandAuditIdentity,
     total_bytes: u64,
     error: String,
@@ -893,11 +912,13 @@ fn command_audit_fallback_reference(
 }
 
 impl PreparedCommandAuditFiles {
-    fn into_streams(self) -> (CommandAuditStreamWriter, CommandAuditStreamWriter) {
+    pub(in crate::runtime_support) fn into_streams(
+        self,
+    ) -> (CommandAuditStreamWriter, CommandAuditStreamWriter) {
         (self.stdout, self.stderr)
     }
 
-    async fn cleanup(self) {
+    pub(in crate::runtime_support) async fn cleanup(self) {
         let stdout_path = self.stdout.identity.path.clone();
         let stderr_path = self.stderr.identity.path.clone();
         drop(self);
@@ -906,11 +927,14 @@ impl PreparedCommandAuditFiles {
     }
 }
 
-fn prepare_command_audit_files() -> Result<PreparedCommandAuditFiles, String> {
+pub(in crate::runtime_support) fn prepare_command_audit_files()
+-> Result<PreparedCommandAuditFiles, String> {
     prepare_command_audit_files_in(&muse_core::config::Config::config_dir())
 }
 
-fn prepare_command_audit_files_in(base_dir: &StdPath) -> Result<PreparedCommandAuditFiles, String> {
+pub(in crate::runtime_support) fn prepare_command_audit_files_in(
+    base_dir: &StdPath,
+) -> Result<PreparedCommandAuditFiles, String> {
     let audit_dir = ensure_command_audit_directory(base_dir)?;
     let audit_id = next_runtime_id("command-audit");
     if !crate::tool_result_archive::is_safe_result_id(&audit_id) {
@@ -938,7 +962,9 @@ fn prepare_command_audit_files_in(base_dir: &StdPath) -> Result<PreparedCommandA
     Ok(PreparedCommandAuditFiles { stdout, stderr })
 }
 
-fn ensure_command_audit_directory(base_dir: &StdPath) -> Result<PathBuf, String> {
+pub(in crate::runtime_support) fn ensure_command_audit_directory(
+    base_dir: &StdPath,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(base_dir)
         .map_err(|error| format!("创建 Muse 数据目录失败：{error}"))?;
     let canonical_base = std::fs::canonicalize(base_dir)
@@ -978,7 +1004,9 @@ fn ensure_command_audit_directory(base_dir: &StdPath) -> Result<PathBuf, String>
 }
 
 /// 只验证已经存在的审计目录，纯读取路径绝不能创建目录或文件。
-fn existing_command_audit_directory(base_dir: &StdPath) -> Result<PathBuf, String> {
+pub(in crate::runtime_support) fn existing_command_audit_directory(
+    base_dir: &StdPath,
+) -> Result<PathBuf, String> {
     let base_metadata = std::fs::symlink_metadata(base_dir).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "命令审计资源不存在。".to_string()
@@ -1020,18 +1048,22 @@ fn existing_command_audit_directory(base_dir: &StdPath) -> Result<PathBuf, Strin
 }
 
 #[cfg(windows)]
-fn metadata_is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+pub(in crate::runtime_support) fn metadata_is_windows_reparse_point(
+    metadata: &std::fs::Metadata,
+) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(not(windows))]
-fn metadata_is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+pub(in crate::runtime_support) fn metadata_is_windows_reparse_point(
+    _metadata: &std::fs::Metadata,
+) -> bool {
     false
 }
 
-fn create_command_audit_stream(
+pub(in crate::runtime_support) fn create_command_audit_stream(
     audit_dir: &StdPath,
     audit_id: &str,
     stream: &'static str,
@@ -1075,28 +1107,32 @@ fn create_command_audit_stream(
 }
 
 #[cfg(unix)]
-fn sync_command_audit_directory(path: &StdPath) -> Result<(), String> {
+pub(in crate::runtime_support) fn sync_command_audit_directory(
+    path: &StdPath,
+) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("同步命令审计目录失败：{error}"))
 }
 
 #[cfg(not(unix))]
-fn sync_command_audit_directory(_path: &StdPath) -> Result<(), String> {
+pub(in crate::runtime_support) fn sync_command_audit_directory(
+    _path: &StdPath,
+) -> Result<(), String> {
     Ok(())
 }
 
-struct CommandStreamCapture {
-    summary: String,
-    total_bytes: u64,
-    omitted_bytes: u64,
-    sse_omitted_bytes: u64,
-    audit: Option<CommandAuditReference>,
-    reader_error: Option<String>,
+pub(in crate::runtime_support) struct CommandStreamCapture {
+    pub(in crate::runtime_support) summary: String,
+    pub(in crate::runtime_support) total_bytes: u64,
+    pub(in crate::runtime_support) omitted_bytes: u64,
+    pub(in crate::runtime_support) sse_omitted_bytes: u64,
+    pub(in crate::runtime_support) audit: Option<CommandAuditReference>,
+    pub(in crate::runtime_support) reader_error: Option<String>,
 }
 
 impl CommandStreamCapture {
-    fn reader_failure(message: String) -> Self {
+    pub(in crate::runtime_support) fn reader_failure(message: String) -> Self {
         Self {
             summary: String::new(),
             total_bytes: 0,

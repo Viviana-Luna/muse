@@ -1,5 +1,9 @@
+//! 网页抓取、联网搜索与本地 MCP 资源描述适配。
+
+use super::*;
+
 /// 抓取一页公开文本网页，并在每次跳转后重新执行 SSRF 边界校验。
-async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
     let Some(value) = tool_arg_string(&call.arguments, "url") else {
         return tool_failed("web_fetch 缺少 url 参数。", "missing_url");
     };
@@ -77,20 +81,20 @@ async fn tool_web_fetch(call: &ToolCall) -> ToolResult {
     tool_failed("网页跳转处理异常结束。", "redirect_failed")
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TrustedSearchEndpoint {
+pub(in crate::runtime_support) enum TrustedSearchEndpoint {
     ExaFreeMcp,
     ExaApi,
 }
 
 impl TrustedSearchEndpoint {
-    fn url(self) -> &'static str {
+    pub(in crate::runtime_support) fn url(self) -> &'static str {
         match self {
             Self::ExaFreeMcp => "https://mcp.exa.ai/mcp",
             Self::ExaApi => "https://api.exa.ai/search",
         }
     }
 
-    fn expected_host(self) -> &'static str {
+    pub(in crate::runtime_support) fn expected_host(self) -> &'static str {
         match self {
             Self::ExaFreeMcp => "mcp.exa.ai",
             Self::ExaApi => "api.exa.ai",
@@ -103,7 +107,7 @@ impl TrustedSearchEndpoint {
 /// 可信端点仍由 HTTPS/TLS 校验域名，并禁用环境代理与自动重定向；这里只是不预解析
 /// 和固定 IP，让 macOS VPN/TUN 能处理 Fake-IP 映射。任意网页仍必须走
 /// `validate_public_https_url` 与 `build_pinned_https_client`。
-fn build_trusted_search_client(
+pub(in crate::runtime_support) fn build_trusted_search_client(
     endpoint: TrustedSearchEndpoint,
     timeout: Duration,
 ) -> Result<(reqwest::Client, reqwest::Url), String> {
@@ -130,7 +134,7 @@ fn build_trusted_search_client(
 }
 
 /// 构造 API 模式未配置凭据时的稳定、可操作失败结果。
-fn web_search_not_configured_result() -> ToolResult {
+pub(in crate::runtime_support) fn web_search_not_configured_result() -> ToolResult {
     tool_failed(
         "当前选择了 Exa API Key 搜索，但尚未配置密钥。请在 Muse 设置中心的“联网搜索”中配置，或切换回默认的免费搜索。",
         "search_not_configured",
@@ -138,7 +142,10 @@ fn web_search_not_configured_result() -> ToolResult {
 }
 
 /// 按用户配置选择 Exa 免费 MCP 或正式 Search API。
-async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_web_search(
+    state: &Arc<AppState>,
+    call: &ToolCall,
+) -> ToolResult {
     use muse_core::app::preferences::WebSearchProvider;
 
     let Some(query) = tool_arg_string(&call.arguments, "query") else {
@@ -181,7 +188,10 @@ async fn tool_web_search(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
     }
 }
 
-async fn exa_free_mcp_search(query: &str, limit: usize) -> ToolResult {
+pub(in crate::runtime_support) async fn exa_free_mcp_search(
+    query: &str,
+    limit: usize,
+) -> ToolResult {
     let (client, url) = match build_trusted_search_client(
         TrustedSearchEndpoint::ExaFreeMcp,
         Duration::from_secs(WEB_FETCH_TIMEOUT_SECS),
@@ -233,7 +243,11 @@ async fn exa_free_mcp_search(query: &str, limit: usize) -> ToolResult {
     )
 }
 
-async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult {
+pub(in crate::runtime_support) async fn exa_api_search(
+    query: &str,
+    limit: usize,
+    api_key: &str,
+) -> ToolResult {
     let (client, url) = match build_trusted_search_client(
         TrustedSearchEndpoint::ExaApi,
         Duration::from_secs(WEB_FETCH_TIMEOUT_SECS),
@@ -262,7 +276,9 @@ async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult 
     }
     let payload: serde_json::Value = match serde_json::from_str(&body) {
         Ok(payload) => payload,
-        Err(err) => return tool_failed(format!("Exa API 响应不是有效 JSON：{err}"), "invalid_json"),
+        Err(err) => {
+            return tool_failed(format!("Exa API 响应不是有效 JSON：{err}"), "invalid_json");
+        }
     };
     let results = normalize_exa_api_results(&payload, limit);
     let readable = results
@@ -272,9 +288,15 @@ async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult 
             format!(
                 "{}. {}\nURL: {}\n摘要: {}",
                 index + 1,
-                item.get("title").and_then(serde_json::Value::as_str).unwrap_or(""),
-                item.get("url").and_then(serde_json::Value::as_str).unwrap_or(""),
-                item.get("snippet").and_then(serde_json::Value::as_str).unwrap_or("")
+                item.get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                item.get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                item.get("snippet")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
             )
         })
         .collect::<Vec<_>>()
@@ -296,7 +318,10 @@ async fn exa_api_search(query: &str, limit: usize, api_key: &str) -> ToolResult 
     )
 }
 
-fn exa_free_mcp_request(query: &str, limit: usize) -> serde_json::Value {
+pub(in crate::runtime_support) fn exa_free_mcp_request(
+    query: &str,
+    limit: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -314,7 +339,10 @@ fn exa_free_mcp_request(query: &str, limit: usize) -> serde_json::Value {
     })
 }
 
-fn exa_api_search_request(query: &str, limit: usize) -> serde_json::Value {
+pub(in crate::runtime_support) fn exa_api_search_request(
+    query: &str,
+    limit: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "query": query,
         "numResults": limit,
@@ -323,7 +351,7 @@ fn exa_api_search_request(query: &str, limit: usize) -> serde_json::Value {
     })
 }
 
-fn normalize_exa_api_results(
+pub(in crate::runtime_support) fn normalize_exa_api_results(
     payload: &serde_json::Value,
     limit: usize,
 ) -> Vec<serde_json::Value> {
@@ -348,7 +376,7 @@ fn normalize_exa_api_results(
         .unwrap_or_default()
 }
 
-fn exa_api_result_snippet(item: &serde_json::Value) -> String {
+pub(in crate::runtime_support) fn exa_api_result_snippet(item: &serde_json::Value) -> String {
     if let Some(highlights) = item.get("highlights").and_then(serde_json::Value::as_array) {
         let joined = highlights
             .iter()
@@ -365,7 +393,10 @@ fn exa_api_result_snippet(item: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-fn exa_search_http_failure(status: u16, free_mcp: bool) -> ToolResult {
+pub(in crate::runtime_support) fn exa_search_http_failure(
+    status: u16,
+    free_mcp: bool,
+) -> ToolResult {
     match status {
         401 | 403 if !free_mcp => tool_failed(
             "Exa API Key 无效或无权执行搜索，请在设置中心更新密钥。",
@@ -391,7 +422,9 @@ fn exa_search_http_failure(status: u16, free_mcp: bool) -> ToolResult {
     }
 }
 
-fn parse_exa_mcp_search_response(body: &str) -> Result<String, String> {
+pub(in crate::runtime_support) fn parse_exa_mcp_search_response(
+    body: &str,
+) -> Result<String, String> {
     let trimmed = body.trim();
     if trimmed.starts_with('{') {
         let value = serde_json::from_str::<serde_json::Value>(trimmed)
@@ -413,7 +446,9 @@ fn parse_exa_mcp_search_response(body: &str) -> Result<String, String> {
     Err("Exa MCP 响应中没有可读取的搜索结果。".to_string())
 }
 
-fn exa_mcp_payload_text(value: &serde_json::Value) -> Result<Option<String>, String> {
+pub(in crate::runtime_support) fn exa_mcp_payload_text(
+    value: &serde_json::Value,
+) -> Result<Option<String>, String> {
     if let Some(error) = value.get("error") {
         let message = error
             .get("message")
@@ -451,15 +486,18 @@ fn exa_mcp_payload_text(value: &serde_json::Value) -> Result<Option<String>, Str
     Ok((!text.is_empty()).then_some(text))
 }
 
-const LOCAL_MCP_SERVER_NAME: &str = "muse-local";
-const LEGACY_LOCAL_MCP_SERVER_NAME: &str = "agent-vp-local";
-const MCP_CURRENT_CONVERSATION_URI: &str = "muse://conversation/current";
-const MCP_RUNTIME_TRANSCRIPT_URI: &str = "muse://session/runtime-transcript";
-const MCP_WORKSPACE_POLICY_URI: &str = "muse://harness/workspace-policy";
-const MCP_RESOURCE_MAX_CHARS: usize = 40_000;
+pub(in crate::runtime_support) const LOCAL_MCP_SERVER_NAME: &str = "muse-local";
+pub(in crate::runtime_support) const LEGACY_LOCAL_MCP_SERVER_NAME: &str = "agent-vp-local";
+pub(in crate::runtime_support) const MCP_CURRENT_CONVERSATION_URI: &str =
+    "muse://conversation/current";
+pub(in crate::runtime_support) const MCP_RUNTIME_TRANSCRIPT_URI: &str =
+    "muse://session/runtime-transcript";
+pub(in crate::runtime_support) const MCP_WORKSPACE_POLICY_URI: &str =
+    "muse://harness/workspace-policy";
+pub(in crate::runtime_support) const MCP_RESOURCE_MAX_CHARS: usize = 40_000;
 
 #[derive(Clone)]
-enum RuntimeMcpResourceSource {
+pub(in crate::runtime_support) enum RuntimeMcpResourceSource {
     CurrentConversation,
     VirtualTranscript,
     File {
@@ -469,17 +507,17 @@ enum RuntimeMcpResourceSource {
 }
 
 #[derive(Clone)]
-struct RuntimeMcpResource {
-    server: &'static str,
-    uri: &'static str,
-    name: &'static str,
-    description: &'static str,
-    mime_type: &'static str,
-    source: RuntimeMcpResourceSource,
+pub(in crate::runtime_support) struct RuntimeMcpResource {
+    pub(in crate::runtime_support) server: &'static str,
+    pub(in crate::runtime_support) uri: &'static str,
+    pub(in crate::runtime_support) name: &'static str,
+    pub(in crate::runtime_support) description: &'static str,
+    pub(in crate::runtime_support) mime_type: &'static str,
+    pub(in crate::runtime_support) source: RuntimeMcpResourceSource,
 }
 
 impl RuntimeMcpResource {
-    fn exists(&self) -> bool {
+    pub(in crate::runtime_support) fn exists(&self) -> bool {
         match &self.source {
             RuntimeMcpResourceSource::CurrentConversation
             | RuntimeMcpResourceSource::VirtualTranscript => true,
@@ -487,7 +525,7 @@ impl RuntimeMcpResource {
         }
     }
 
-    fn info_json(&self) -> serde_json::Value {
+    pub(in crate::runtime_support) fn info_json(&self) -> serde_json::Value {
         let source = if matches!(&self.source, RuntimeMcpResourceSource::VirtualTranscript) {
             "virtual_aggregate"
         } else {
@@ -509,7 +547,7 @@ impl RuntimeMcpResource {
     }
 }
 
-fn runtime_mcp_resources() -> Vec<RuntimeMcpResource> {
+pub(in crate::runtime_support) fn runtime_mcp_resources() -> Vec<RuntimeMcpResource> {
     vec![
         RuntimeMcpResource {
             server: LOCAL_MCP_SERVER_NAME,
@@ -541,7 +579,9 @@ fn runtime_mcp_resources() -> Vec<RuntimeMcpResource> {
     ]
 }
 
-fn validate_mcp_server_argument(call: &ToolCall) -> Result<(), ToolResult> {
+pub(in crate::runtime_support) fn validate_mcp_server_argument(
+    call: &ToolCall,
+) -> Result<(), ToolResult> {
     let Some(server) = tool_arg_string(&call.arguments, "server") else {
         return Ok(());
     };
@@ -558,11 +598,11 @@ fn validate_mcp_server_argument(call: &ToolCall) -> Result<(), ToolResult> {
     }
 }
 
-fn is_local_mcp_server(server: &str) -> bool {
+pub(in crate::runtime_support) fn is_local_mcp_server(server: &str) -> bool {
     server == LOCAL_MCP_SERVER_NAME || server == LEGACY_LOCAL_MCP_SERVER_NAME
 }
 
-fn normalize_local_mcp_uri(uri: &str) -> &str {
+pub(in crate::runtime_support) fn normalize_local_mcp_uri(uri: &str) -> &str {
     match uri {
         "agent-vp://conversation/current" => MCP_CURRENT_CONVERSATION_URI,
         "agent-vp://session/runtime-transcript" => MCP_RUNTIME_TRANSCRIPT_URI,
@@ -571,7 +611,7 @@ fn normalize_local_mcp_uri(uri: &str) -> &str {
     }
 }
 
-fn is_valid_external_mcp_server_name(server: &str) -> bool {
+pub(in crate::runtime_support) fn is_valid_external_mcp_server_name(server: &str) -> bool {
     !server.is_empty()
         && server
             .chars()

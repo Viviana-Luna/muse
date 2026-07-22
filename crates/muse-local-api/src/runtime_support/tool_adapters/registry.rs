@@ -1,13 +1,18 @@
-struct RuntimeToolExecutionContext<'a> {
-    snapshot: &'a TurnSnapshot,
-    frozen_mcp_catalog: &'a mcp::McpToolCatalog,
-    provider: &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
-    request_capability_epoch: u64,
-    turn: &'a TurnContext,
-    cancel_token: &'a RuntimeTurnCancel,
-    conversation: &'a Conversation,
+//! 运行时工具注册、权限边界与分派实现。
+
+use super::*;
+
+pub(in crate::runtime_support) struct RuntimeToolExecutionContext<'a> {
+    pub(in crate::runtime_support) snapshot: &'a TurnSnapshot,
+    pub(in crate::runtime_support) frozen_mcp_catalog: &'a mcp::McpToolCatalog,
+    pub(in crate::runtime_support) provider:
+        &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
+    pub(in crate::runtime_support) request_capability_epoch: u64,
+    pub(in crate::runtime_support) turn: &'a TurnContext,
+    pub(in crate::runtime_support) cancel_token: &'a RuntimeTurnCancel,
+    pub(in crate::runtime_support) conversation: &'a Conversation,
 }
-async fn execute_runtime_tool(
+pub(in crate::runtime_support) async fn execute_runtime_tool(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     context: RuntimeToolExecutionContext<'_>,
@@ -348,7 +353,7 @@ async fn execute_runtime_tool(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_runtime_tool_with_latest_policy(
+pub(in crate::runtime_support) async fn dispatch_runtime_tool_with_latest_policy(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     snapshot: &TurnSnapshot,
@@ -406,7 +411,7 @@ async fn dispatch_runtime_tool_with_latest_policy(
     .await)
 }
 
-fn execution_boundary_for_dispatch(
+pub(in crate::runtime_support) fn execution_boundary_for_dispatch(
     snapshot: &TurnSnapshot,
     current_policy: &FrozenExecutionPolicy,
     call: &ToolCall,
@@ -447,7 +452,7 @@ fn execution_boundary_for_dispatch(
     Ok(execution_boundary)
 }
 
-async fn persist_external_effect_boundary_before_dispatch(
+pub(in crate::runtime_support) async fn persist_external_effect_boundary_before_dispatch(
     state: &Arc<AppState>,
     turn: &TurnContext,
     call: &ToolCall,
@@ -486,7 +491,11 @@ async fn persist_external_effect_boundary_before_dispatch(
     Ok(())
 }
 
-async fn durable_effect_boundary_before_dispatch<Persist, PersistFuture, Mark>(
+pub(in crate::runtime_support) async fn durable_effect_boundary_before_dispatch<
+    Persist,
+    PersistFuture,
+    Mark,
+>(
     persist: Persist,
     mark: Mark,
 ) -> Result<(), String>
@@ -500,81 +509,85 @@ where
     Ok(())
 }
 
-type RuntimeToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+pub(in crate::runtime_support) type RuntimeToolFuture<'a> =
+    Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
 
-struct RuntimeToolInvocation<'a> {
-    state: &'a Arc<AppState>,
-    tx: Option<&'a RuntimeSseSender>,
-    execution_policy: &'a FrozenExecutionPolicy,
-    frozen_mcp_catalog: &'a mcp::McpToolCatalog,
-    provider: &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
-    turn: &'a TurnContext,
-    call: &'a ToolCall,
-    cancel_token: &'a RuntimeTurnCancel,
-    conversation: &'a Conversation,
-    allow_approved_external_path: bool,
+pub(in crate::runtime_support) struct RuntimeToolInvocation<'a> {
+    pub(in crate::runtime_support) state: &'a Arc<AppState>,
+    pub(in crate::runtime_support) tx: Option<&'a RuntimeSseSender>,
+    pub(in crate::runtime_support) execution_policy: &'a FrozenExecutionPolicy,
+    pub(in crate::runtime_support) frozen_mcp_catalog: &'a mcp::McpToolCatalog,
+    pub(in crate::runtime_support) provider:
+        &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
+    pub(in crate::runtime_support) turn: &'a TurnContext,
+    pub(in crate::runtime_support) call: &'a ToolCall,
+    pub(in crate::runtime_support) cancel_token: &'a RuntimeTurnCancel,
+    pub(in crate::runtime_support) conversation: &'a Conversation,
+    pub(in crate::runtime_support) allow_approved_external_path: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct AskUserQuestionOption {
-    label: String,
-    description: String,
+pub(in crate::runtime_support) struct AskUserQuestionOption {
+    pub(in crate::runtime_support) label: String,
+    pub(in crate::runtime_support) description: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct AskUserQuestionItem {
-    question: String,
-    header: String,
-    options: Vec<AskUserQuestionOption>,
+pub(in crate::runtime_support) struct AskUserQuestionItem {
+    pub(in crate::runtime_support) question: String,
+    pub(in crate::runtime_support) header: String,
+    pub(in crate::runtime_support) options: Vec<AskUserQuestionOption>,
     #[serde(default, rename = "multiSelect", alias = "multi_select")]
-    multi_select: bool,
+    pub(in crate::runtime_support) multi_select: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct AskUserQuestionRequest {
-    questions: Vec<AskUserQuestionItem>,
+pub(in crate::runtime_support) struct AskUserQuestionRequest {
+    pub(in crate::runtime_support) questions: Vec<AskUserQuestionItem>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TodoWriteItemInput {
+pub(in crate::runtime_support) struct TodoWriteItemInput {
     #[serde(default)]
-    id: Option<String>,
-    content: String,
-    status: String,
+    pub(in crate::runtime_support) id: Option<String>,
+    pub(in crate::runtime_support) content: String,
+    pub(in crate::runtime_support) status: String,
     #[serde(default)]
-    priority: Option<String>,
+    pub(in crate::runtime_support) priority: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TodoWriteRequest {
-    todos: Vec<TodoWriteItemInput>,
+pub(in crate::runtime_support) struct TodoWriteRequest {
+    pub(in crate::runtime_support) todos: Vec<TodoWriteItemInput>,
     #[serde(default)]
-    summary: Option<String>,
+    pub(in crate::runtime_support) summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ExitPlanModeRequest {
-    plan_summary: String,
+pub(in crate::runtime_support) struct ExitPlanModeRequest {
+    pub(in crate::runtime_support) plan_summary: String,
     #[serde(default)]
-    steps: Vec<String>,
+    pub(in crate::runtime_support) steps: Vec<String>,
     #[serde(default)]
-    risks: Vec<String>,
+    pub(in crate::runtime_support) risks: Vec<String>,
     #[serde(default)]
-    next_action: Option<String>,
+    pub(in crate::runtime_support) next_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct AgentTaskRequest {
-    task: String,
+pub(in crate::runtime_support) struct AgentTaskRequest {
+    pub(in crate::runtime_support) task: String,
     #[serde(default)]
-    context: Option<String>,
+    pub(in crate::runtime_support) context: Option<String>,
     #[serde(default)]
-    expected_output: Option<String>,
+    pub(in crate::runtime_support) expected_output: Option<String>,
     #[serde(default)]
-    priority: Option<String>,
+    pub(in crate::runtime_support) priority: Option<String>,
 }
 
-trait RuntimeToolHandler: Send + Sync {
+pub(in crate::runtime_support) trait RuntimeToolHandler:
+    Send + Sync
+{
     fn name(&self) -> &'static str;
 
     fn validate_input(&self, _call: &ToolCall) -> Result<(), ToolResult> {
@@ -641,38 +654,38 @@ trait RuntimeToolHandler: Send + Sync {
     fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a>;
 }
 
-struct AskUserQuestionHandler;
-struct TtsSpeakHandler;
-struct VoiceCurrentHandler;
-struct FileReadHandler;
-struct FileListHandler;
-struct FileSearchHandler;
-struct FileWriteHandler;
-struct FileEditHandler;
-struct CommandRunHandler;
-struct WebFetchHandler;
-struct WebSearchHandler;
-struct SessionListHandler;
-struct SessionReadHandler;
-struct ToolResultReadHandler;
-struct SessionCompactHandler;
-struct ModelInfoHandler;
-struct PersonaInfoHandler;
-struct PersonaSwitchHandler;
-struct McpListResourcesHandler;
-struct McpListResourceTemplatesHandler;
-struct McpReadResourceHandler;
-struct TodoWriteHandler;
-struct EnterPlanModeHandler;
-struct ExitPlanModeHandler;
-struct SendUserMessageHandler;
-struct BriefHandler;
-struct SkillHandler {
+pub(in crate::runtime_support) struct AskUserQuestionHandler;
+pub(in crate::runtime_support) struct TtsSpeakHandler;
+pub(in crate::runtime_support) struct VoiceCurrentHandler;
+pub(in crate::runtime_support) struct FileReadHandler;
+pub(in crate::runtime_support) struct FileListHandler;
+pub(in crate::runtime_support) struct FileSearchHandler;
+pub(in crate::runtime_support) struct FileWriteHandler;
+pub(in crate::runtime_support) struct FileEditHandler;
+pub(in crate::runtime_support) struct CommandRunHandler;
+pub(in crate::runtime_support) struct WebFetchHandler;
+pub(in crate::runtime_support) struct WebSearchHandler;
+pub(in crate::runtime_support) struct SessionListHandler;
+pub(in crate::runtime_support) struct SessionReadHandler;
+pub(in crate::runtime_support) struct ToolResultReadHandler;
+pub(in crate::runtime_support) struct SessionCompactHandler;
+pub(in crate::runtime_support) struct ModelInfoHandler;
+pub(in crate::runtime_support) struct PersonaInfoHandler;
+pub(in crate::runtime_support) struct PersonaSwitchHandler;
+pub(in crate::runtime_support) struct McpListResourcesHandler;
+pub(in crate::runtime_support) struct McpListResourceTemplatesHandler;
+pub(in crate::runtime_support) struct McpReadResourceHandler;
+pub(in crate::runtime_support) struct TodoWriteHandler;
+pub(in crate::runtime_support) struct EnterPlanModeHandler;
+pub(in crate::runtime_support) struct ExitPlanModeHandler;
+pub(in crate::runtime_support) struct SendUserMessageHandler;
+pub(in crate::runtime_support) struct BriefHandler;
+pub(in crate::runtime_support) struct SkillHandler {
     name: &'static str,
 }
-struct CreateSkillHandler;
-struct AgentHandler;
-struct TaskStopHandler;
+pub(in crate::runtime_support) struct CreateSkillHandler;
+pub(in crate::runtime_support) struct AgentHandler;
+pub(in crate::runtime_support) struct TaskStopHandler;
 
 impl RuntimeToolHandler for TodoWriteHandler {
     fn name(&self) -> &'static str {
@@ -918,9 +931,9 @@ impl RuntimeToolHandler for SkillHandler {
     }
 
     fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a> {
-        Box::pin(async move {
-            tool_skill(invocation.state, invocation.turn, invocation.call).await
-        })
+        Box::pin(
+            async move { tool_skill(invocation.state, invocation.turn, invocation.call).await },
+        )
     }
 }
 
@@ -1817,41 +1830,53 @@ impl RuntimeToolHandler for McpReadResourceHandler {
     }
 }
 
-static ASK_USER_QUESTION_HANDLER: AskUserQuestionHandler = AskUserQuestionHandler;
-static TTS_SPEAK_HANDLER: TtsSpeakHandler = TtsSpeakHandler;
-static VOICE_CURRENT_HANDLER: VoiceCurrentHandler = VoiceCurrentHandler;
-static FILE_READ_HANDLER: FileReadHandler = FileReadHandler;
-static FILE_LIST_HANDLER: FileListHandler = FileListHandler;
-static FILE_SEARCH_HANDLER: FileSearchHandler = FileSearchHandler;
-static FILE_WRITE_HANDLER: FileWriteHandler = FileWriteHandler;
-static FILE_EDIT_HANDLER: FileEditHandler = FileEditHandler;
-static COMMAND_RUN_HANDLER: CommandRunHandler = CommandRunHandler;
-static WEB_FETCH_HANDLER: WebFetchHandler = WebFetchHandler;
-static WEB_SEARCH_HANDLER: WebSearchHandler = WebSearchHandler;
-static SESSION_LIST_HANDLER: SessionListHandler = SessionListHandler;
-static SESSION_READ_HANDLER: SessionReadHandler = SessionReadHandler;
-static TOOL_RESULT_READ_HANDLER: ToolResultReadHandler = ToolResultReadHandler;
-static SESSION_COMPACT_HANDLER: SessionCompactHandler = SessionCompactHandler;
-static MODEL_INFO_HANDLER: ModelInfoHandler = ModelInfoHandler;
-static PERSONA_INFO_HANDLER: PersonaInfoHandler = PersonaInfoHandler;
-static PERSONA_SWITCH_HANDLER: PersonaSwitchHandler = PersonaSwitchHandler;
-static MCP_LIST_RESOURCES_HANDLER: McpListResourcesHandler = McpListResourcesHandler;
-static MCP_LIST_RESOURCE_TEMPLATES_HANDLER: McpListResourceTemplatesHandler =
-    McpListResourceTemplatesHandler;
-static MCP_READ_RESOURCE_HANDLER: McpReadResourceHandler = McpReadResourceHandler;
-static TODO_WRITE_HANDLER: TodoWriteHandler = TodoWriteHandler;
-static ENTER_PLAN_MODE_HANDLER: EnterPlanModeHandler = EnterPlanModeHandler;
-static EXIT_PLAN_MODE_HANDLER: ExitPlanModeHandler = ExitPlanModeHandler;
-static SEND_USER_MESSAGE_HANDLER: SendUserMessageHandler = SendUserMessageHandler;
-static BRIEF_HANDLER: BriefHandler = BriefHandler;
-static LOAD_SKILL_HANDLER: SkillHandler = SkillHandler { name: "load_skill" };
-static USE_SKILL_HANDLER: SkillHandler = SkillHandler { name: "use_skill" };
-static SKILL_HANDLER: SkillHandler = SkillHandler { name: "skill" };
-static CREATE_SKILL_HANDLER: CreateSkillHandler = CreateSkillHandler;
-static AGENT_HANDLER: AgentHandler = AgentHandler;
-static TASK_STOP_HANDLER: TaskStopHandler = TaskStopHandler;
+pub(in crate::runtime_support) static ASK_USER_QUESTION_HANDLER: AskUserQuestionHandler =
+    AskUserQuestionHandler;
+pub(in crate::runtime_support) static TTS_SPEAK_HANDLER: TtsSpeakHandler = TtsSpeakHandler;
+pub(in crate::runtime_support) static VOICE_CURRENT_HANDLER: VoiceCurrentHandler =
+    VoiceCurrentHandler;
+pub(in crate::runtime_support) static FILE_READ_HANDLER: FileReadHandler = FileReadHandler;
+pub(in crate::runtime_support) static FILE_LIST_HANDLER: FileListHandler = FileListHandler;
+pub(in crate::runtime_support) static FILE_SEARCH_HANDLER: FileSearchHandler = FileSearchHandler;
+pub(in crate::runtime_support) static FILE_WRITE_HANDLER: FileWriteHandler = FileWriteHandler;
+pub(in crate::runtime_support) static FILE_EDIT_HANDLER: FileEditHandler = FileEditHandler;
+pub(in crate::runtime_support) static COMMAND_RUN_HANDLER: CommandRunHandler = CommandRunHandler;
+pub(in crate::runtime_support) static WEB_FETCH_HANDLER: WebFetchHandler = WebFetchHandler;
+pub(in crate::runtime_support) static WEB_SEARCH_HANDLER: WebSearchHandler = WebSearchHandler;
+pub(in crate::runtime_support) static SESSION_LIST_HANDLER: SessionListHandler = SessionListHandler;
+pub(in crate::runtime_support) static SESSION_READ_HANDLER: SessionReadHandler = SessionReadHandler;
+pub(in crate::runtime_support) static TOOL_RESULT_READ_HANDLER: ToolResultReadHandler =
+    ToolResultReadHandler;
+pub(in crate::runtime_support) static SESSION_COMPACT_HANDLER: SessionCompactHandler =
+    SessionCompactHandler;
+pub(in crate::runtime_support) static MODEL_INFO_HANDLER: ModelInfoHandler = ModelInfoHandler;
+pub(in crate::runtime_support) static PERSONA_INFO_HANDLER: PersonaInfoHandler = PersonaInfoHandler;
+pub(in crate::runtime_support) static PERSONA_SWITCH_HANDLER: PersonaSwitchHandler =
+    PersonaSwitchHandler;
+pub(in crate::runtime_support) static MCP_LIST_RESOURCES_HANDLER: McpListResourcesHandler =
+    McpListResourcesHandler;
+pub(in crate::runtime_support) static MCP_LIST_RESOURCE_TEMPLATES_HANDLER:
+    McpListResourceTemplatesHandler = McpListResourceTemplatesHandler;
+pub(in crate::runtime_support) static MCP_READ_RESOURCE_HANDLER: McpReadResourceHandler =
+    McpReadResourceHandler;
+pub(in crate::runtime_support) static TODO_WRITE_HANDLER: TodoWriteHandler = TodoWriteHandler;
+pub(in crate::runtime_support) static ENTER_PLAN_MODE_HANDLER: EnterPlanModeHandler =
+    EnterPlanModeHandler;
+pub(in crate::runtime_support) static EXIT_PLAN_MODE_HANDLER: ExitPlanModeHandler =
+    ExitPlanModeHandler;
+pub(in crate::runtime_support) static SEND_USER_MESSAGE_HANDLER: SendUserMessageHandler =
+    SendUserMessageHandler;
+pub(in crate::runtime_support) static BRIEF_HANDLER: BriefHandler = BriefHandler;
+pub(in crate::runtime_support) static LOAD_SKILL_HANDLER: SkillHandler =
+    SkillHandler { name: "load_skill" };
+pub(in crate::runtime_support) static USE_SKILL_HANDLER: SkillHandler =
+    SkillHandler { name: "use_skill" };
+pub(in crate::runtime_support) static SKILL_HANDLER: SkillHandler = SkillHandler { name: "skill" };
+pub(in crate::runtime_support) static CREATE_SKILL_HANDLER: CreateSkillHandler = CreateSkillHandler;
+pub(in crate::runtime_support) static AGENT_HANDLER: AgentHandler = AgentHandler;
+pub(in crate::runtime_support) static TASK_STOP_HANDLER: TaskStopHandler = TaskStopHandler;
 
-static RUNTIME_TOOL_HANDLERS: &[&dyn RuntimeToolHandler] = &[
+pub(in crate::runtime_support) static RUNTIME_TOOL_HANDLERS: &[&dyn RuntimeToolHandler] = &[
     &TODO_WRITE_HANDLER,
     &ENTER_PLAN_MODE_HANDLER,
     &EXIT_PLAN_MODE_HANDLER,
@@ -1886,7 +1911,9 @@ static RUNTIME_TOOL_HANDLERS: &[&dyn RuntimeToolHandler] = &[
     &MCP_READ_RESOURCE_HANDLER,
 ];
 
-fn runtime_tool_handler(name: &str) -> Option<&'static dyn RuntimeToolHandler> {
+pub(in crate::runtime_support) fn runtime_tool_handler(
+    name: &str,
+) -> Option<&'static dyn RuntimeToolHandler> {
     // 能力矩阵是运行时工具的单一准入表；处理器没有登记就不能被分发执行。
     crate::runtime_tools::capability(name)?;
     RUNTIME_TOOL_HANDLERS
@@ -1895,7 +1922,7 @@ fn runtime_tool_handler(name: &str) -> Option<&'static dyn RuntimeToolHandler> {
         .find(|handler| handler.name() == name)
 }
 
-struct RuntimeToolDispatchContext<'a> {
+pub(in crate::runtime_support) struct RuntimeToolDispatchContext<'a> {
     execution_policy: &'a FrozenExecutionPolicy,
     frozen_mcp_catalog: &'a mcp::McpToolCatalog,
     provider: &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
@@ -1905,7 +1932,7 @@ struct RuntimeToolDispatchContext<'a> {
     allow_approved_external_path: bool,
 }
 
-async fn dispatch_runtime_tool(
+pub(in crate::runtime_support) async fn dispatch_runtime_tool(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     context: RuntimeToolDispatchContext<'_>,

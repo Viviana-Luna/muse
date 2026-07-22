@@ -1,474 +1,6 @@
-/// 查询当前可暴露给模型的工具定义。
-pub(crate) async fn handle_tools(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let active_persona = current_active_persona(&state).await;
-    let defs = runtime_tool_defs_for_policy(&state, active_persona.as_ref()).await;
-    Json(serde_json::json!({ "tools": defs }))
-}
+//! WebSocket、流式协议和运行时共享辅助。
 
-/// 查询角色列表。
-pub(crate) async fn handle_personas(
-    State(state): State<Arc<AppState>>,
-) -> Json<PersonaListResponse> {
-    let personas = state.personas.lock().await;
-    let summaries = personas.list();
-    let active_persona_id = personas.active_persona_id().map(str::to_string);
-    // 角色与展示包始终按 personas -> visual_packs 的顺序取锁，
-    // 一次快照完成全部关联，避免列表项逐个查询或拼接不同时点的事实。
-    let visual_packs = state.visual_packs.lock().await;
-    let visual_pack_by_id: HashMap<&str, &VisualPack> = visual_packs
-        .visual_packs()
-        .iter()
-        .map(|pack| (pack.id.as_str(), pack))
-        .collect();
-    let personas = summaries
-        .into_iter()
-        .map(|persona| {
-            let visual_pack = visual_pack_by_id
-                .get(persona.default_visual_pack_id.as_str())
-                .copied();
-            PersonaLibraryItem::from_summary(persona, visual_pack)
-        })
-        .collect();
-    Json(PersonaListResponse {
-        personas,
-        active_persona_id,
-    })
-}
-
-/// 查询当前激活角色。
-pub(crate) async fn handle_active_persona(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<ActivePersonaResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    for _ in 0..RUNTIME_FACT_SNAPSHOT_MAX_ATTEMPTS {
-        let snapshot_before = state
-            .runtime_service
-            .snapshot()
-            .map_err(|error| internal_error(error.to_string()))?;
-        let (active_persona, active_persona_id, visual_pack) =
-            active_persona_visual_snapshot(&state).await;
-        let snapshot_after = state
-            .runtime_service
-            .snapshot()
-            .map_err(|error| internal_error(error.to_string()))?;
-        if snapshot_before != snapshot_after {
-            tokio::task::yield_now().await;
-            continue;
-        }
-        return Ok(Json(ActivePersonaResponse {
-            active_persona,
-            active_persona_id,
-            visual_pack,
-            state_revision: snapshot_after.state_revision,
-        }));
-    }
-    Err((
-        StatusCode::CONFLICT,
-        Json(ErrorResponse {
-            error: "runtime_snapshot_unstable：运行时事实正在连续变化，请重试。".to_string(),
-        }),
-    ))
-}
-
-/// 在统一锁顺序下读取当前角色及其视觉包，避免跨角色拼接事实响应。
-async fn active_persona_visual_snapshot(
-    state: &Arc<AppState>,
-) -> (Option<Persona>, Option<String>, Option<VisualPack>) {
-    let personas = state.personas.lock().await;
-    let active_persona = personas.active_persona().cloned();
-    let active_persona_id = active_persona.as_ref().map(|persona| persona.id.clone());
-    let visual_pack = match active_persona.as_ref() {
-        Some(persona) => {
-            let visual_packs = state.visual_packs.lock().await;
-            resolve_persona_visual_pack_from_store(&visual_packs, persona)
-        }
-        None => None,
-    };
-    (active_persona, active_persona_id, visual_pack)
-}
-
-/// 查询指定角色详情。
-pub(crate) async fn handle_get_persona(
-    Path(id): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<PersonaDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let personas = state.personas.lock().await;
-    let Some(persona) = personas.get(&id).cloned() else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("角色 `{id}` 不存在"),
-            }),
-        ));
-    };
-    drop(personas);
-    let runtime_state = state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .persona_state(&persona.id)
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .map(|projection| projection.effective_at(chrono::Utc::now()));
-
-    Ok(Json(PersonaDetailResponse {
-        visual_pack: resolve_persona_visual_pack(&state, &persona).await,
-        runtime_state,
-        persona,
-    }))
-}
-
-/// 导出指定角色卡片。
-pub(crate) async fn handle_export_persona_card(
-    Path(id): Path<String>,
-    Query(query): Query<PersonaCardExportQuery>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<PersonaCard>, (StatusCode, Json<ErrorResponse>)> {
-    let personas = state.personas.lock().await;
-    let Some(persona) = personas.get(&id).cloned() else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("角色 `{id}` 不存在"),
-            }),
-        ));
-    };
-    drop(personas);
-
-    let visual_pack = {
-        let visual_packs = state.visual_packs.lock().await;
-        visual_packs.get(&persona.default_visual_pack_id).cloned()
-    };
-    Ok(Json(PersonaCard::build(
-        &persona,
-        visual_pack.as_ref(),
-        query.level,
-    )))
-}
-
-/// 导入角色卡片。
-pub(crate) async fn handle_import_persona_card(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PersonaCardImportRequest>,
-) -> Result<(StatusCode, Json<PersonaCardImportResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "import_persona")?;
-    let personas_snapshot = {
-        let personas = state.personas.lock().await;
-        personas.clone()
-    };
-    let visual_packs_snapshot = {
-        let visual_packs = state.visual_packs.lock().await;
-        visual_packs.clone()
-    };
-
-    let import_plan = req
-        .card
-        .prepare_import(
-            &personas_snapshot,
-            &visual_packs_snapshot,
-            req.conflict_strategy.clone(),
-        )
-        .map_err(persona_card_error_response)?;
-
-    if let Some(visual_pack) = import_plan.visual_pack.clone() {
-        let mut visual_packs = state.visual_packs.lock().await;
-        visual_packs
-            .upsert(visual_pack)
-            .map_err(visual_pack_store_error_response)?;
-        visual_packs
-            .save()
-            .map_err(visual_pack_store_error_response)?;
-    }
-
-    let (persona, runtime_reset) = {
-        let mut personas = state.personas.lock().await;
-        let active_persona_id_before = personas.active_persona_id().map(str::to_string);
-
-        if personas.get(&import_plan.persona.id).is_some() {
-            personas
-                .update(import_plan.persona.clone())
-                .map_err(persona_store_error_response)?;
-        } else {
-            personas
-                .create(import_plan.persona.clone())
-                .map_err(persona_store_error_response)?;
-        }
-
-        if req.activate_after_import {
-            personas
-                .set_active(&import_plan.persona.id)
-                .map_err(persona_store_error_response)?;
-        }
-
-        personas.save().map_err(persona_store_error_response)?;
-
-        (
-            import_plan.persona.clone(),
-            req.activate_after_import
-                || active_persona_id_before.as_deref() == Some(import_plan.persona.id.as_str()),
-        )
-    };
-
-    if runtime_reset {
-        reset_conversation_for_active_persona(&state).await;
-    }
-
-    finish_runtime_idle_lease(idle_lease)?;
-    let mutation = persona_mutation_response(&state, persona, runtime_reset).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(PersonaCardImportResponse {
-            affected_persona: mutation.affected_persona,
-            active_persona: mutation.active_persona,
-            active_persona_id: mutation.active_persona_id,
-            visual_pack: mutation.visual_pack,
-            notices: import_plan.notices,
-            runtime_reset,
-            conversation_id: mutation.conversation_id,
-            state_revision: mutation.state_revision,
-        }),
-    ))
-}
-
-/// 创建新角色。
-pub(crate) async fn handle_create_persona(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PersonaUpsertRequest>,
-) -> Result<(StatusCode, Json<PersonaMutationResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "create_persona")?;
-    let activate_after_create = req.activate_after_create;
-    let mut persona = req.persona;
-    {
-        let mut personas = state.personas.lock().await;
-        if personas.get(&persona.id).is_some() {
-            return Err(persona_store_error_response(
-                PersonaStoreError::DuplicateId(persona.id.clone()),
-            ));
-        }
-
-        let mut visual_packs = state.visual_packs.lock().await;
-        let mut persona_candidate = personas.clone();
-        let mut visual_pack_candidate = visual_packs.clone();
-        let patched_visual_pack = build_persona_visual_pack_from_patch(
-            &visual_pack_candidate,
-            &mut persona,
-            req.visual_pack_patch,
-        );
-
-        persona_candidate
-            .create(persona.clone())
-            .map_err(persona_store_error_response)?;
-        if activate_after_create {
-            persona_candidate
-                .set_active(&persona.id)
-                .map_err(persona_store_error_response)?;
-        }
-        if let Some(visual_pack) = patched_visual_pack.clone() {
-            visual_pack_candidate
-                .upsert(visual_pack)
-                .map_err(visual_pack_store_error_response)?;
-            visual_pack_candidate
-                .save()
-                .map_err(visual_pack_store_error_response)?;
-        }
-        persona_candidate
-            .save()
-            .map_err(persona_store_error_response)?;
-
-        *visual_packs = visual_pack_candidate;
-        *personas = persona_candidate;
-    }
-
-    if activate_after_create {
-        reset_conversation_for_active_persona(&state).await;
-    }
-
-    finish_runtime_idle_lease(idle_lease)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(persona_mutation_response(&state, persona, activate_after_create).await),
-    ))
-}
-
-/// 更新已有角色。
-pub(crate) async fn handle_update_persona(
-    Path(id): Path<String>,
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PersonaUpsertRequest>,
-) -> Result<Json<PersonaMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if id != req.persona.id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "路径中的角色 id 与请求体不一致".to_string(),
-            }),
-        ));
-    }
-    if req.activate_after_create {
-        return Err(bad_request(
-            "activate_after_create 只允许用于创建角色。",
-        ));
-    }
-
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "update_persona")?;
-
-    let mut persona = req.persona;
-    let (should_reset_runtime, stale_asset_candidates) = {
-        let mut personas = state.personas.lock().await;
-        if personas.get(&id).is_none() {
-            return Err(persona_store_error_response(
-                PersonaStoreError::PersonaNotFound(id.clone()),
-            ));
-        }
-        let should_reset_runtime = personas.active_persona_id() == Some(id.as_str());
-
-        let mut visual_packs = state.visual_packs.lock().await;
-        let mut persona_candidate = personas.clone();
-        let mut visual_pack_candidate = visual_packs.clone();
-        let previous_paths = visual_pack_candidate
-            .get(&format!("visual-{}", persona.id))
-            .map(visual_pack_paths)
-            .unwrap_or_default();
-        let patched_visual_pack = build_persona_visual_pack_from_patch(
-            &visual_pack_candidate,
-            &mut persona,
-            req.visual_pack_patch,
-        );
-
-        persona_candidate
-            .update(persona.clone())
-            .map_err(persona_store_error_response)?;
-        if let Some(visual_pack) = patched_visual_pack.clone() {
-            visual_pack_candidate
-                .upsert(visual_pack)
-                .map_err(visual_pack_store_error_response)?;
-            visual_pack_candidate
-                .save()
-                .map_err(visual_pack_store_error_response)?;
-        }
-        persona_candidate
-            .save()
-            .map_err(persona_store_error_response)?;
-
-        *visual_packs = visual_pack_candidate;
-        *personas = persona_candidate;
-        (should_reset_runtime, previous_paths)
-    };
-
-    cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
-
-    if should_reset_runtime {
-        reset_conversation_for_active_persona(&state).await;
-    }
-
-    finish_runtime_idle_lease(idle_lease)?;
-    Ok(Json(
-        persona_mutation_response(&state, persona, should_reset_runtime).await,
-    ))
-}
-
-/// 删除指定角色。
-pub(crate) async fn handle_delete_persona(
-    Path(id): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<PersonaMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "delete_persona")?;
-    let (deleted_active, deleted_persona) = {
-        let mut personas = state.personas.lock().await;
-        let deleted_active = personas.active_persona_id() == Some(id.as_str());
-        let deleted_persona = personas.get(&id).cloned().ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("角色 `{id}` 不存在"),
-                }),
-            )
-        })?;
-        if !personas.delete(&id) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("角色 `{id}` 不存在"),
-                }),
-            ));
-        }
-
-        personas.save().map_err(persona_store_error_response)?;
-        (deleted_active, deleted_persona)
-    };
-
-    let stale_asset_candidates = {
-        let mut visual_packs = state.visual_packs.lock().await;
-        let mut candidate = visual_packs.clone();
-        let generated_visual_pack_id = format!("visual-{id}");
-        let paths = candidate
-            .get(&generated_visual_pack_id)
-            .map(visual_pack_paths)
-            .unwrap_or_default();
-        if candidate.delete(&generated_visual_pack_id) {
-            match candidate.save() {
-                Ok(()) => *visual_packs = candidate,
-                Err(error) => tracing::warn!(
-                    target: "muse::persona_assets",
-                    persona_id = %id,
-                    error = %error,
-                    "角色已删除，但展示包清理失败；保留展示包等待后续诊断"
-                ),
-            }
-        }
-        paths
-    };
-    cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
-    state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .clear_workspace_state(&id)
-        .map_err(|error| internal_error(error.to_string()))?;
-
-    if deleted_active {
-        reset_conversation_for_active_persona(&state).await;
-    }
-
-    finish_runtime_idle_lease(idle_lease)?;
-    Ok(Json(
-        persona_mutation_response(&state, deleted_persona, deleted_active).await,
-    ))
-}
-
-async fn persona_mutation_response(
-    state: &Arc<AppState>,
-    affected_persona: Persona,
-    runtime_reset: bool,
-) -> PersonaMutationResponse {
-    state.runtime_service.touch();
-    // 活动角色与视觉包必须来自同一锁定快照，禁止把受影响角色的视觉包
-    // 与另一个当前活动角色拼接成无法成立的响应事实。
-    let (active_persona, active_persona_id, visual_pack) =
-        active_persona_visual_snapshot(state).await;
-    let state_revision = state
-        .runtime_service
-        .snapshot()
-        .map(|snapshot| snapshot.state_revision)
-        .unwrap_or_default();
-    PersonaMutationResponse {
-        affected_persona,
-        active_persona,
-        active_persona_id,
-        visual_pack,
-        runtime_reset,
-        conversation_id: active_conversation_id(state),
-        active_conversation_id: active_conversation_id(state),
-        session_restored: false,
-        state_revision,
-    }
-}
+use super::*;
 
 /// 建立情绪广播 WebSocket 连接。
 pub(crate) async fn handle_ws(
@@ -518,7 +50,7 @@ pub(crate) async fn handle_ws(
         .into_response()
 }
 
-async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
+pub(super) async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.emotion_tx.subscribe();
 
     let ready = serde_json::json!({"type":"ready","model":"dafeng"}).to_string();
@@ -545,12 +77,12 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
 }
 
 #[derive(Default)]
-struct EmotionPrefixState {
+pub(super) struct EmotionPrefixState {
     resolved: bool,
     buffer: String,
 }
 
-enum PrefixParseResult {
+pub(super) enum PrefixParseResult {
     Pending,
     Resolved {
         emotion: Option<PersonaEmotionEffect>,
@@ -558,13 +90,13 @@ enum PrefixParseResult {
     },
 }
 
-enum ToolCallPrefixParseResult {
+pub(super) enum ToolCallPrefixParseResult {
     Pending,
     Text(String),
     ToolCall { call: ToolCall, text: String },
 }
 
-enum RuntimeModelItem {
+pub(super) enum RuntimeModelItem {
     AssistantMessage {
         content: String,
         reasoning_content: Option<String>,
@@ -575,14 +107,14 @@ enum RuntimeModelItem {
     },
 }
 
-struct StreamedTurn {
-    items: Vec<RuntimeModelItem>,
-    usage: Option<ProviderTokenUsage>,
-    emotion_candidate: Option<PersonaEmotionEffect>,
+pub(super) struct StreamedTurn {
+    pub(super) items: Vec<RuntimeModelItem>,
+    pub(super) usage: Option<ProviderTokenUsage>,
+    pub(super) emotion_candidate: Option<PersonaEmotionEffect>,
 }
 
 impl EmotionPrefixState {
-    fn push_chunk(&mut self, chunk: &str) -> PrefixParseResult {
+    pub(super) fn push_chunk(&mut self, chunk: &str) -> PrefixParseResult {
         if self.resolved {
             return PrefixParseResult::Resolved {
                 emotion: None,
@@ -619,10 +151,7 @@ impl EmotionPrefixState {
                 .trim_start_matches(|ch: char| ch.is_whitespace())
                 .to_string();
             self.buffer.clear();
-            return PrefixParseResult::Resolved {
-                emotion,
-                text,
-            };
+            return PrefixParseResult::Resolved { emotion, text };
         }
 
         let Some(line_end) = trimmed.find('\n') else {
@@ -649,7 +178,7 @@ impl EmotionPrefixState {
         }
     }
 
-    fn finish(&mut self) -> Option<String> {
+    pub(super) fn finish(&mut self) -> Option<String> {
         if self.resolved || self.buffer.is_empty() {
             return None;
         }
@@ -663,20 +192,20 @@ impl EmotionPrefixState {
         }
     }
 
-    fn mark_resolved(&mut self) {
+    pub(super) fn mark_resolved(&mut self) {
         self.resolved = true;
         self.buffer.clear();
     }
 }
 
 #[derive(Default)]
-struct ToolCallPrefixState {
+pub(super) struct ToolCallPrefixState {
     suppressed: bool,
     buffer: String,
 }
 
 impl ToolCallPrefixState {
-    fn push_chunk(&mut self, chunk: &str) -> ToolCallPrefixParseResult {
+    pub(super) fn push_chunk(&mut self, chunk: &str) -> ToolCallPrefixParseResult {
         if self.suppressed {
             return ToolCallPrefixParseResult::Text(String::new());
         }
@@ -685,7 +214,7 @@ impl ToolCallPrefixState {
         self.drain_ready(false)
     }
 
-    fn finish(&mut self) -> ToolCallPrefixParseResult {
+    pub(super) fn finish(&mut self) -> ToolCallPrefixParseResult {
         if self.suppressed {
             self.buffer.clear();
             return ToolCallPrefixParseResult::Text(String::new());
@@ -733,31 +262,33 @@ impl ToolCallPrefixState {
     }
 }
 
-fn parse_emotion_json(text: &str) -> Option<PersonaEmotionEffect> {
+pub(super) fn parse_emotion_json(text: &str) -> Option<PersonaEmotionEffect> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     parse_emotion_candidate(value)
 }
 
-fn parse_emotion_json_prefix(text: &str) -> Option<(Option<PersonaEmotionEffect>, usize)> {
+pub(super) fn parse_emotion_json_prefix(
+    text: &str,
+) -> Option<(Option<PersonaEmotionEffect>, usize)> {
     let consumed = json_object_prefix_len(text)?;
     let value = serde_json::from_str::<serde_json::Value>(&text[..consumed]).ok()?;
     value.get("emotion")?;
     Some((parse_emotion_candidate(value), consumed))
 }
 
-fn parse_emotion_candidate(value: serde_json::Value) -> Option<PersonaEmotionEffect> {
+pub(super) fn parse_emotion_candidate(value: serde_json::Value) -> Option<PersonaEmotionEffect> {
     let candidate = serde_json::from_value::<PersonaEmotionEffect>(value).ok()?;
     candidate.validate().ok()?;
     Some(candidate)
 }
 
-fn parse_tool_call_json_prefix(text: &str) -> Option<(ToolCall, usize)> {
+pub(super) fn parse_tool_call_json_prefix(text: &str) -> Option<(ToolCall, usize)> {
     let consumed = json_object_prefix_len(text)?;
     let call = muse_core::domain::tool::ToolRegistry::parse_tool_call(&text[..consumed])?;
     Some((call, consumed))
 }
 
-fn find_tool_call_json_start(text: &str) -> Option<usize> {
+pub(super) fn find_tool_call_json_start(text: &str) -> Option<usize> {
     for (index, ch) in text.char_indices() {
         if ch == '{' && looks_like_tool_call_json_start(&text[index..]) {
             return Some(index);
@@ -766,7 +297,7 @@ fn find_tool_call_json_start(text: &str) -> Option<usize> {
     None
 }
 
-fn looks_like_tool_call_json_start(text: &str) -> bool {
+pub(super) fn looks_like_tool_call_json_start(text: &str) -> bool {
     let Some(rest) = text.strip_prefix('{') else {
         return false;
     };
@@ -786,7 +317,7 @@ fn looks_like_tool_call_json_start(text: &str) -> bool {
     .any(|prefix| rest.starts_with(prefix))
 }
 
-fn json_object_prefix_len(text: &str) -> Option<usize> {
+pub(super) fn json_object_prefix_len(text: &str) -> Option<usize> {
     if !text.starts_with('{') {
         return None;
     }
@@ -824,7 +355,7 @@ fn json_object_prefix_len(text: &str) -> Option<usize> {
     None
 }
 
-fn sanitize_assistant_reply(raw: &str) -> SanitizedAssistantReply {
+pub(super) fn sanitize_assistant_reply(raw: &str) -> SanitizedAssistantReply {
     let stripped = strip_reasoning_blocks(raw);
     let trimmed = stripped.trim_start();
     if let Some((_emotion, consumed)) = parse_emotion_json_prefix(trimmed) {
@@ -840,7 +371,7 @@ fn sanitize_assistant_reply(raw: &str) -> SanitizedAssistantReply {
     }
 }
 
-fn strip_reasoning_blocks(text: &str) -> String {
+pub(super) fn strip_reasoning_blocks(text: &str) -> String {
     let mut output = text.to_string();
     for tag in ["think", "thinking"] {
         strip_named_tag_blocks(&mut output, tag);
@@ -848,7 +379,7 @@ fn strip_reasoning_blocks(text: &str) -> String {
     output
 }
 
-fn strip_named_tag_blocks(text: &mut String, tag: &str) {
+pub(super) fn strip_named_tag_blocks(text: &mut String, tag: &str) {
     let open_tag = format!("<{tag}>");
     let close_tag = format!("</{tag}>");
     loop {
@@ -867,7 +398,7 @@ fn strip_named_tag_blocks(text: &mut String, tag: &str) {
     }
 }
 
-fn strip_leading_reasoning_blocks(buffer: &mut String) -> bool {
+pub(super) fn strip_leading_reasoning_blocks(buffer: &mut String) -> bool {
     loop {
         let leading_ws = buffer.len() - buffer.trim_start().len();
         let trimmed = &buffer[leading_ws..];
@@ -889,7 +420,7 @@ fn strip_leading_reasoning_blocks(buffer: &mut String) -> bool {
     }
 }
 
-fn leading_reasoning_tag(trimmed: &str) -> Option<(usize, &'static str)> {
+pub(super) fn leading_reasoning_tag(trimmed: &str) -> Option<(usize, &'static str)> {
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("<think>") {
         Some(("<think>".len(), "</think>"))
@@ -900,14 +431,14 @@ fn leading_reasoning_tag(trimmed: &str) -> Option<(usize, &'static str)> {
     }
 }
 
-fn is_partial_reasoning_tag(trimmed: &str) -> bool {
+pub(super) fn is_partial_reasoning_tag(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     ["<think>", "<thinking>"]
         .iter()
         .any(|tag| tag.starts_with(&lower) && lower.len() < tag.len())
 }
 
-async fn refresh_mcp_tool_catalog_if_needed(
+pub(super) async fn refresh_mcp_tool_catalog_if_needed(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
 ) -> mcp::McpToolCatalog {
@@ -918,9 +449,8 @@ async fn refresh_mcp_tool_catalog_if_needed(
         }
         store.mcp_runtime_snapshot()
     };
-    let scope = mcp::EffectiveMcpScope::from_policy(
-        active_persona.map(|persona| &persona.mcp_policy),
-    );
+    let scope =
+        mcp::EffectiveMcpScope::from_policy(active_persona.map(|persona| &persona.mcp_policy));
     let config_hash = format!("{}:{}", snapshot.config_hash(), scope.cache_key());
     {
         if let Some(catalog) = state
@@ -945,7 +475,7 @@ async fn refresh_mcp_tool_catalog_if_needed(
     catalog
 }
 
-async fn runtime_tool_defs_for_policy(
+pub(crate) async fn runtime_tool_defs_for_policy(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
 ) -> Vec<ToolDef> {
@@ -956,7 +486,7 @@ async fn runtime_tool_defs_for_policy(
     )
 }
 
-async fn runtime_frozen_tool_defs_for_policy(
+pub(super) async fn runtime_frozen_tool_defs_for_policy(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
 ) -> Vec<ToolDef> {
@@ -964,7 +494,7 @@ async fn runtime_frozen_tool_defs_for_policy(
     runtime_frozen_tool_defs_for_policy_with_catalog(state, active_persona, &catalog)
 }
 
-fn runtime_frozen_tool_defs_for_policy_with_catalog(
+pub(super) fn runtime_frozen_tool_defs_for_policy_with_catalog(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
     catalog: &mcp::McpToolCatalog,
@@ -1008,7 +538,7 @@ fn runtime_frozen_tool_defs_for_policy_with_catalog(
     defs
 }
 
-async fn current_runtime_system_prompt(state: &Arc<AppState>) -> String {
+pub(super) async fn current_runtime_system_prompt(state: &Arc<AppState>) -> String {
     let active_persona = current_active_persona(state).await;
     let tool_defs = runtime_tool_defs_for_policy(state, active_persona.as_ref()).await;
     build_runtime_system_prompt_with_mode_state(
@@ -1019,7 +549,7 @@ async fn current_runtime_system_prompt(state: &Arc<AppState>) -> String {
     )
 }
 
-fn update_conversation_system_prompt(conv: &mut Conversation, system_prompt: String) {
+pub(super) fn update_conversation_system_prompt(conv: &mut Conversation, system_prompt: String) {
     if let Some(message) = conv
         .messages
         .iter_mut()
@@ -1041,29 +571,29 @@ fn update_conversation_system_prompt(conv: &mut Conversation, system_prompt: Str
     );
 }
 
-async fn current_active_persona(state: &Arc<AppState>) -> Option<Persona> {
+pub(crate) async fn current_active_persona(state: &Arc<AppState>) -> Option<Persona> {
     let personas = state.personas.lock().await;
     personas.active_persona().cloned()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct RuntimeTranscriptReplayStats {
-    source_records: usize,
-    records: usize,
-    restored_messages: usize,
-    skipped_records: usize,
-    latest_task_state: Option<String>,
-    latest_todos: Option<Vec<RuntimeTodoItem>>,
+pub(super) struct RuntimeTranscriptReplayStats {
+    pub(super) source_records: usize,
+    pub(super) records: usize,
+    pub(super) restored_messages: usize,
+    pub(super) skipped_records: usize,
+    pub(super) latest_task_state: Option<String>,
+    pub(super) latest_todos: Option<Vec<RuntimeTodoItem>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayTurnOutcome {
+pub(super) enum ReplayTurnOutcome {
     Committed,
     Aborted,
     InterruptedWithEffects,
 }
 
-async fn persist_fork_snapshot(
+pub(super) async fn persist_fork_snapshot(
     state: &Arc<AppState>,
     conversation_id: &str,
     source_conversation_id: &str,
@@ -1131,7 +661,7 @@ async fn persist_fork_snapshot(
     Ok(())
 }
 
-async fn load_conversation_from_runtime_transcript(
+pub(super) async fn load_conversation_from_runtime_transcript(
     state: &Arc<AppState>,
     conversation_id: &str,
     before_user_message_index: Option<usize>,
@@ -1159,7 +689,7 @@ async fn load_conversation_from_runtime_transcript(
     Ok(result)
 }
 
-fn replay_runtime_transcript_lines(
+pub(super) fn replay_runtime_transcript_lines(
     system_prompt: String,
     max_history: usize,
     content: &str,
@@ -1350,7 +880,7 @@ fn replay_runtime_transcript_lines(
     (conv, stats)
 }
 
-fn transcript_record_turn_id(
+pub(super) fn transcript_record_turn_id(
     record: &serde_json::Value,
     payload: &serde_json::Value,
 ) -> Option<String> {
@@ -1363,7 +893,7 @@ fn transcript_record_turn_id(
         .map(ToString::to_string)
 }
 
-fn transcript_record_turn_outcome(
+pub(super) fn transcript_record_turn_outcome(
     record: &serde_json::Value,
     payload: &serde_json::Value,
 ) -> Option<ReplayTurnOutcome> {
@@ -1382,7 +912,7 @@ fn transcript_record_turn_outcome(
     }
 }
 
-fn interrupted_turn_recovery_context(payload: &serde_json::Value) -> String {
+pub(super) fn interrupted_turn_recovery_context(payload: &serde_json::Value) -> String {
     let message = payload
         .get("message")
         .and_then(|value| value.as_str())
@@ -1399,7 +929,7 @@ fn interrupted_turn_recovery_context(payload: &serde_json::Value) -> String {
     )
 }
 
-fn restore_fork_snapshot_messages(
+pub(super) fn restore_fork_snapshot_messages(
     conv: &mut Conversation,
     payload: &serde_json::Value,
     before_user_message_index: Option<usize>,
@@ -1432,7 +962,7 @@ fn restore_fork_snapshot_messages(
     Some((restored_count, reached_cutoff))
 }
 
-fn transcript_record_conversation_id(
+pub(super) fn transcript_record_conversation_id(
     record: &serde_json::Value,
     payload: &serde_json::Value,
 ) -> String {
@@ -1445,7 +975,7 @@ fn transcript_record_conversation_id(
         .to_string()
 }
 
-fn replay_runtime_transcript_record(
+pub(super) fn replay_runtime_transcript_record(
     conv: &mut Conversation,
     kind: &str,
     payload: &serde_json::Value,
@@ -1526,7 +1056,7 @@ fn replay_runtime_transcript_record(
     }
 }
 
-fn replay_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
+pub(super) fn replay_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
     if let Some(arguments) = payload.get("canonical_arguments") {
         return arguments.clone();
     }
@@ -1545,12 +1075,14 @@ fn replay_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn todo_state_items_for_replay(payload: &serde_json::Value) -> Option<Vec<RuntimeTodoItem>> {
+pub(super) fn todo_state_items_for_replay(
+    payload: &serde_json::Value,
+) -> Option<Vec<RuntimeTodoItem>> {
     let todos = payload.get("todos")?.clone();
     serde_json::from_value::<Vec<RuntimeTodoItem>>(todos).ok()
 }
 
-fn task_state_summary_for_replay(payload: &serde_json::Value) -> Option<String> {
+pub(super) fn task_state_summary_for_replay(payload: &serde_json::Value) -> Option<String> {
     let status = payload
         .get("status")
         .and_then(|value| value.as_str())
@@ -1583,7 +1115,7 @@ fn task_state_summary_for_replay(payload: &serde_json::Value) -> Option<String> 
     ))
 }
 
-fn transcript_payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+pub(super) fn transcript_payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
     payload
         .get(key)
         .and_then(|value| value.as_str())
@@ -1592,11 +1124,11 @@ fn transcript_payload_string(payload: &serde_json::Value, key: &str) -> Option<S
         .map(ToString::to_string)
 }
 
-fn trim_replayed_conversation(conv: &mut Conversation) {
+pub(super) fn trim_replayed_conversation(conv: &mut Conversation) {
     conv.trim_to_budget();
 }
 
-async fn reset_conversation_for_active_persona(state: &Arc<AppState>) {
+pub(super) async fn reset_conversation_for_active_persona(state: &Arc<AppState>) {
     let system_prompt = current_runtime_system_prompt(state).await;
     let mut conv = state.runtime_service.lock_conversation().await;
     *conv = muse_core::domain::conversation::Conversation::new(
@@ -1613,13 +1145,13 @@ async fn reset_conversation_for_active_persona(state: &Arc<AppState>) {
     }
 }
 
-fn next_runtime_id(prefix: &str) -> String {
+pub(super) fn next_runtime_id(prefix: &str) -> String {
     let seq = RUNTIME_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{}-{seq}", chrono::Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
-fn sanitize_runtime_path_component(value: &str) -> String {
+pub(super) fn sanitize_runtime_path_component(value: &str) -> String {
     let sanitized = value
         .chars()
         .map(|ch| {
@@ -1639,13 +1171,13 @@ fn sanitize_runtime_path_component(value: &str) -> String {
 }
 
 #[derive(Default)]
-struct RuntimeSessionDeleteOutcome {
-    deleted_records: usize,
-    deleted_files: usize,
+pub(super) struct RuntimeSessionDeleteOutcome {
+    pub(super) deleted_records: usize,
+    pub(super) deleted_files: usize,
 }
 
 #[cfg(test)]
-fn remove_runtime_transcript_for_conversation(
+pub(super) fn remove_runtime_transcript_for_conversation(
     content: &str,
     conversation_id: &str,
 ) -> (String, usize) {
@@ -1677,7 +1209,7 @@ fn remove_runtime_transcript_for_conversation(
     (next_content, removed)
 }
 
-async fn delete_runtime_transcript_for_conversation(
+pub(super) async fn delete_runtime_transcript_for_conversation(
     state: &Arc<AppState>,
     conversation_id: &str,
 ) -> std::io::Result<RuntimeSessionDeleteOutcome> {
@@ -1696,7 +1228,7 @@ async fn delete_runtime_transcript_for_conversation(
     })
 }
 
-async fn read_runtime_transcript_for_conversation(
+pub(super) async fn read_runtime_transcript_for_conversation(
     state: &Arc<AppState>,
     conversation_id: &str,
 ) -> std::io::Result<String> {
@@ -1718,7 +1250,7 @@ async fn read_runtime_transcript_for_conversation(
     Ok(session_events_as_jsonl(&events))
 }
 
-async fn append_transcript_record(
+pub(super) async fn append_transcript_record(
     state: &Arc<AppState>,
     kind: &str,
     payload: serde_json::Value,
@@ -1740,7 +1272,7 @@ async fn append_transcript_record(
         .map_err(|err| format!("写入 v3 会话事件 `{kind}` 失败：{err}"))
 }
 
-async fn durable_turn_event<Write, WriteFuture>(write: Write) -> Result<(), String>
+pub(super) async fn durable_turn_event<Write, WriteFuture>(write: Write) -> Result<(), String>
 where
     Write: FnOnce() -> WriteFuture,
     WriteFuture: Future<Output = Result<(), String>>,
@@ -1748,7 +1280,7 @@ where
     write().await
 }
 
-async fn append_required_turn_event(
+pub(super) async fn append_required_turn_event(
     state: &Arc<AppState>,
     kind: &str,
     payload: serde_json::Value,
@@ -1756,7 +1288,7 @@ async fn append_required_turn_event(
     durable_turn_event(|| append_transcript_record(state, kind, payload)).await
 }
 
-fn session_events_as_jsonl(events: &[muse_runtime::session::SessionEventV3]) -> String {
+pub(super) fn session_events_as_jsonl(events: &[muse_runtime::session::SessionEventV3]) -> String {
     let mut content = String::new();
     for event in events {
         let record = event.legacy_record.clone().unwrap_or_else(|| {
@@ -1779,7 +1311,7 @@ fn session_events_as_jsonl(events: &[muse_runtime::session::SessionEventV3]) -> 
     content
 }
 
-async fn append_task_state_record(
+pub(super) async fn append_task_state_record(
     state: &Arc<AppState>,
     turn: &TurnContext,
     status: &str,
@@ -1801,50 +1333,50 @@ async fn append_task_state_record(
     .await
 }
 
-fn workspace_root() -> Result<PathBuf, String> {
+pub(super) fn workspace_root() -> Result<PathBuf, String> {
     std::env::current_dir().map_err(|err| format!("无法获取当前工作区：{err}"))
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
-struct RuntimeWorkspaceRootsFile {
+pub(super) struct RuntimeWorkspaceRootsFile {
     #[serde(default)]
-    roots: Vec<String>,
+    pub(super) roots: Vec<String>,
     #[serde(default = "default_runtime_permission_mode")]
-    permission_mode: String,
+    pub(super) permission_mode: String,
     #[serde(default = "default_runtime_sandbox_mode")]
-    sandbox_mode: String,
+    pub(super) sandbox_mode: String,
 }
 
-fn default_runtime_permission_mode() -> String {
+pub(super) fn default_runtime_permission_mode() -> String {
     "request_approval".to_string()
 }
 
-fn default_runtime_sandbox_mode() -> String {
+pub(super) fn default_runtime_sandbox_mode() -> String {
     "workspace_write".to_string()
 }
 
-fn normalize_runtime_permission_mode(value: &str) -> Option<String> {
+pub(super) fn normalize_runtime_permission_mode(value: &str) -> Option<String> {
     match value {
         "request_approval" | "approve_for_me" | "full_access" => Some(value.to_string()),
         _ => None,
     }
 }
 
-fn normalize_runtime_sandbox_mode(value: &str) -> Option<String> {
+pub(super) fn normalize_runtime_sandbox_mode(value: &str) -> Option<String> {
     match value {
         "workspace_write" | "danger_full_access" => Some(value.to_string()),
         _ => None,
     }
 }
 
-fn custom_allowed_file_roots_path() -> PathBuf {
+pub(super) fn custom_allowed_file_roots_path() -> PathBuf {
     muse_core::config::Config::resolved_data_dir()
         .unwrap_or_else(|_| PathBuf::from(".muse"))
         .join("harness")
         .join("allowed-file-roots.json")
 }
 
-fn load_runtime_harness_config() -> RuntimeWorkspaceRootsFile {
+pub(super) fn load_runtime_harness_config() -> RuntimeWorkspaceRootsFile {
     let path = custom_allowed_file_roots_path();
     let Ok(content) = std::fs::read_to_string(path) else {
         return RuntimeWorkspaceRootsFile {
@@ -1873,14 +1405,16 @@ fn load_runtime_harness_config() -> RuntimeWorkspaceRootsFile {
     config
 }
 
-fn default_new_session_approval_preset() -> ApprovalModePreset {
+pub(super) fn default_new_session_approval_preset() -> ApprovalModePreset {
     match load_runtime_harness_config().permission_mode.as_str() {
         "approve_for_me" => ApprovalModePreset::Auto,
         _ => ApprovalModePreset::Manual,
     }
 }
 
-async fn save_runtime_harness_config(config: &RuntimeWorkspaceRootsFile) -> Result<(), String> {
+pub(super) async fn save_runtime_harness_config(
+    config: &RuntimeWorkspaceRootsFile,
+) -> Result<(), String> {
     let path = custom_allowed_file_roots_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1901,7 +1435,7 @@ async fn save_runtime_harness_config(config: &RuntimeWorkspaceRootsFile) -> Resu
         .map_err(|err| format!("保存工具工作区配置失败：{err}"))
 }
 
-fn runtime_workspace_root_info(
+pub(super) fn runtime_workspace_root_info(
     path: PathBuf,
     kind: &str,
     label: &str,
@@ -1923,7 +1457,7 @@ fn runtime_workspace_root_info(
     }
 }
 
-fn runtime_workspaces_response() -> Result<RuntimeWorkspacesResponse, String> {
+pub(super) fn runtime_workspaces_response() -> Result<RuntimeWorkspacesResponse, String> {
     let config = load_runtime_harness_config();
     let workspace = workspace_root()?
         .canonicalize()
@@ -1941,18 +1475,20 @@ fn runtime_workspaces_response() -> Result<RuntimeWorkspacesResponse, String> {
     })
 }
 
-fn runtime_workspace_error_response(message: String) -> (StatusCode, Json<ErrorResponse>) {
+pub(super) fn runtime_workspace_error_response(
+    message: String,
+) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse { error: message }),
     )
 }
 
-fn allowed_file_roots() -> Result<Vec<PathBuf>, String> {
+pub(super) fn allowed_file_roots() -> Result<Vec<PathBuf>, String> {
     Ok(vec![workspace_root()?])
 }
 
-fn canonical_runtime_roots() -> Result<Vec<PathBuf>, String> {
+pub(super) fn canonical_runtime_roots() -> Result<Vec<PathBuf>, String> {
     allowed_file_roots()?
         .into_iter()
         .map(|root| {
@@ -1962,7 +1498,7 @@ fn canonical_runtime_roots() -> Result<Vec<PathBuf>, String> {
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn set_active_approval_mode(
+pub(super) fn set_active_approval_mode(
     state: &Arc<AppState>,
     preset: ApprovalModePreset,
     revision: u64,
@@ -1979,13 +1515,11 @@ fn set_active_approval_mode(
     };
     state
         .runtime_service
-        .set_execution_policy(FrozenExecutionPolicy::from_preset(
-            preset, roots, revision,
-        ))
+        .set_execution_policy(FrozenExecutionPolicy::from_preset(preset, roots, revision))
         .map_err(|error| error.to_string())
 }
 
-async fn restore_active_approval_mode(
+pub(super) async fn restore_active_approval_mode(
     state: &Arc<AppState>,
     conversation_id: &str,
 ) -> Result<(), String> {
@@ -2002,7 +1536,7 @@ async fn restore_active_approval_mode(
     Ok(())
 }
 
-async fn initialize_new_session_approval_mode(
+pub(super) async fn initialize_new_session_approval_mode(
     state: &Arc<AppState>,
     conversation_id: &str,
 ) -> Result<(), String> {
@@ -2038,7 +1572,7 @@ async fn initialize_new_session_approval_mode(
     Ok(())
 }
 
-fn should_require_tool_approval(
+pub(super) fn should_require_tool_approval(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     _risk: &str,
@@ -2055,15 +1589,14 @@ fn should_require_tool_approval(
     }
 }
 
-fn can_bypass_workspace_boundary(
+pub(super) fn can_bypass_workspace_boundary(
     policy: &FrozenExecutionPolicy,
     allow_approved_external_path: bool,
 ) -> bool {
-    allow_approved_external_path
-        || policy.permission_profile == PermissionProfile::DangerFullAccess
+    allow_approved_external_path || policy.permission_profile == PermissionProfile::DangerFullAccess
 }
 
-fn resolve_workspace_path(
+pub(super) fn resolve_workspace_path(
     policy: &FrozenExecutionPolicy,
     raw: &str,
     for_write: bool,
@@ -2127,7 +1660,7 @@ fn resolve_workspace_path(
     Ok(candidate)
 }
 
-fn path_requires_workspace_boundary_approval(
+pub(super) fn path_requires_workspace_boundary_approval(
     policy: &FrozenExecutionPolicy,
     raw: &str,
     for_write: bool,
@@ -2141,7 +1674,7 @@ fn path_requires_workspace_boundary_approval(
     )
 }
 
-fn tool_arg_string(arguments: &serde_json::Value, key: &str) -> Option<String> {
+pub(super) fn tool_arg_string(arguments: &serde_json::Value, key: &str) -> Option<String> {
     arguments
         .get(key)
         .and_then(|value| value.as_str())
@@ -2150,7 +1683,7 @@ fn tool_arg_string(arguments: &serde_json::Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn parse_ask_user_question_request(
+pub(super) fn parse_ask_user_question_request(
     arguments: &serde_json::Value,
 ) -> Result<AskUserQuestionRequest, ToolResult> {
     let request =
@@ -2222,7 +1755,9 @@ fn parse_ask_user_question_request(
     Ok(request)
 }
 
-fn parse_todo_write_request(arguments: &serde_json::Value) -> Result<TodoWriteRequest, ToolResult> {
+pub(super) fn parse_todo_write_request(
+    arguments: &serde_json::Value,
+) -> Result<TodoWriteRequest, ToolResult> {
     let request = serde_json::from_value::<TodoWriteRequest>(arguments.clone()).map_err(|err| {
         tool_failed(
             format!("todo_write 参数格式错误：{err}"),
@@ -2276,7 +1811,7 @@ fn parse_todo_write_request(arguments: &serde_json::Value) -> Result<TodoWriteRe
     Ok(request)
 }
 
-fn parse_exit_plan_mode_request(
+pub(super) fn parse_exit_plan_mode_request(
     arguments: &serde_json::Value,
 ) -> Result<ExitPlanModeRequest, ToolResult> {
     let request =
@@ -2298,7 +1833,9 @@ fn parse_exit_plan_mode_request(
     Ok(request)
 }
 
-fn parse_agent_task_request(arguments: &serde_json::Value) -> Result<AgentTaskRequest, ToolResult> {
+pub(super) fn parse_agent_task_request(
+    arguments: &serde_json::Value,
+) -> Result<AgentTaskRequest, ToolResult> {
     match arguments.get("task") {
         Some(serde_json::Value::String(task)) if !task.trim().is_empty() => {}
         Some(serde_json::Value::String(_)) | None => {
@@ -2325,7 +1862,7 @@ fn parse_agent_task_request(arguments: &serde_json::Value) -> Result<AgentTaskRe
     Ok(request)
 }
 
-fn mode_state_json(mode_state: RuntimeModeState) -> serde_json::Value {
+pub(super) fn mode_state_json(mode_state: RuntimeModeState) -> serde_json::Value {
     serde_json::json!({
         "mode": mode_state.mode.as_str(),
         "focus_phase": mode_state.focus_phase.as_str(),
@@ -2333,7 +1870,7 @@ fn mode_state_json(mode_state: RuntimeModeState) -> serde_json::Value {
     })
 }
 
-fn runtime_mode_state_from_tool_result(result: &ToolResult) -> Option<RuntimeModeState> {
+pub(super) fn runtime_mode_state_from_tool_result(result: &ToolResult) -> Option<RuntimeModeState> {
     let value = result
         .structured
         .as_ref()?
@@ -2342,7 +1879,7 @@ fn runtime_mode_state_from_tool_result(result: &ToolResult) -> Option<RuntimeMod
     serde_json::from_value(value).ok()
 }
 
-fn todo_items_from_request(request: TodoWriteRequest) -> Vec<RuntimeTodoItem> {
+pub(super) fn todo_items_from_request(request: TodoWriteRequest) -> Vec<RuntimeTodoItem> {
     request
         .todos
         .into_iter()
@@ -2363,7 +1900,7 @@ fn todo_items_from_request(request: TodoWriteRequest) -> Vec<RuntimeTodoItem> {
         .collect()
 }
 
-fn todo_items_text(todos: &[RuntimeTodoItem]) -> String {
+pub(super) fn todo_items_text(todos: &[RuntimeTodoItem]) -> String {
     if todos.is_empty() {
         return "当前没有活跃任务。".to_string();
     }
@@ -2384,7 +1921,7 @@ fn todo_items_text(todos: &[RuntimeTodoItem]) -> String {
         .join("\n")
 }
 
-fn exit_plan_confirmation_request(plan: &ExitPlanModeRequest) -> AskUserQuestionRequest {
+pub(super) fn exit_plan_confirmation_request(plan: &ExitPlanModeRequest) -> AskUserQuestionRequest {
     let mut description = truncate_text(plan.plan_summary.trim(), 180);
     if !plan.next_action.as_deref().unwrap_or("").trim().is_empty()
         && let Some(next_action) = plan.next_action.as_deref()
@@ -2415,7 +1952,7 @@ fn exit_plan_confirmation_request(plan: &ExitPlanModeRequest) -> AskUserQuestion
     }
 }
 
-fn exit_plan_answer_label(decision: &UserQuestionDecision) -> Option<String> {
+pub(super) fn exit_plan_answer_label(decision: &UserQuestionDecision) -> Option<String> {
     let answers = decision.answers.as_ref()?.as_object()?;
     answers.values().find_map(|answer| match answer {
         serde_json::Value::String(value) => Some(value.clone()),
@@ -2426,7 +1963,7 @@ fn exit_plan_answer_label(decision: &UserQuestionDecision) -> Option<String> {
     })
 }
 
-fn ask_user_question_answers_text(
+pub(super) fn ask_user_question_answers_text(
     answers: &serde_json::Value,
     annotations: Option<&serde_json::Value>,
 ) -> String {
@@ -2463,7 +2000,7 @@ fn ask_user_question_answers_text(
     }
 }
 
-fn require_text_argument(call: &ToolCall, key: &str) -> Result<(), ToolResult> {
+pub(super) fn require_text_argument(call: &ToolCall, key: &str) -> Result<(), ToolResult> {
     if tool_arg_string(&call.arguments, key).is_some() {
         Ok(())
     } else {
@@ -2474,7 +2011,7 @@ fn require_text_argument(call: &ToolCall, key: &str) -> Result<(), ToolResult> {
     }
 }
 
-fn require_string_argument(
+pub(super) fn require_string_argument(
     call: &ToolCall,
     key: &str,
     allow_empty: bool,
@@ -2495,7 +2032,7 @@ fn require_string_argument(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandRiskLevel {
+pub(super) enum CommandRiskLevel {
     Medium,
     High,
 }
@@ -2510,14 +2047,14 @@ impl CommandRiskLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CommandRiskFinding {
+pub(super) struct CommandRiskFinding {
     code: &'static str,
     label: &'static str,
     detail: &'static str,
     level: CommandRiskLevel,
 }
 
-fn command_risk_findings(command: &str) -> Vec<CommandRiskFinding> {
+pub(super) fn command_risk_findings(command: &str) -> Vec<CommandRiskFinding> {
     let normalized = command.to_lowercase();
     let mut findings = Vec::new();
     let mut push_once = |finding: CommandRiskFinding| {
@@ -2633,7 +2170,7 @@ fn command_risk_findings(command: &str) -> Vec<CommandRiskFinding> {
     findings
 }
 
-fn command_risk_safety_notes(command: &str) -> Vec<String> {
+pub(super) fn command_risk_safety_notes(command: &str) -> Vec<String> {
     command_risk_findings(command)
         .into_iter()
         .map(|finding| {
@@ -2647,7 +2184,11 @@ fn command_risk_safety_notes(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn tool_arg_limit(arguments: &serde_json::Value, default_value: usize, max_value: usize) -> usize {
+pub(super) fn tool_arg_limit(
+    arguments: &serde_json::Value,
+    default_value: usize,
+    max_value: usize,
+) -> usize {
     arguments
         .get("limit")
         .and_then(|value| value.as_u64())
@@ -2657,7 +2198,7 @@ fn tool_arg_limit(arguments: &serde_json::Value, default_value: usize, max_value
         .unwrap_or(default_value)
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
+pub(super) fn truncate_text(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for ch in text.chars().take(max_chars) {
         out.push(ch);
@@ -2668,7 +2209,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn truncate_text_head_tail(text: &str, max_chars: usize) -> String {
+pub(super) fn truncate_text_head_tail(text: &str, max_chars: usize) -> String {
     let total_chars = text.chars().count();
     if total_chars <= max_chars {
         return text.to_string();
@@ -2684,24 +2225,24 @@ fn truncate_text_head_tail(text: &str, max_chars: usize) -> String {
     format!("{head}{MARKER}{}", tail.into_iter().collect::<String>())
 }
 
-fn truncate_text_with_flag(text: &str, max_chars: usize) -> (String, bool) {
+pub(super) fn truncate_text_with_flag(text: &str, max_chars: usize) -> (String, bool) {
     let truncated = text.chars().count() > max_chars;
     (truncate_text(text, max_chars), truncated)
 }
 
-const TOOL_RESULT_EXTERNALIZE_MIN_CHARS: usize = 16_000;
-const TOOL_RESULT_CONTENT_PREVIEW_CHARS: usize = 4_000;
-const TOOL_RESULT_STRUCTURED_PREVIEW_CHARS: usize = 4_000;
-const TOOL_RESULT_READ_DEFAULT_CHARS: usize = 20_000;
-const TOOL_RESULT_READ_MAX_CHARS: usize = 50_000;
+pub(super) const TOOL_RESULT_EXTERNALIZE_MIN_CHARS: usize = 16_000;
+pub(super) const TOOL_RESULT_CONTENT_PREVIEW_CHARS: usize = 4_000;
+pub(super) const TOOL_RESULT_STRUCTURED_PREVIEW_CHARS: usize = 4_000;
+pub(super) const TOOL_RESULT_READ_DEFAULT_CHARS: usize = 20_000;
+pub(super) const TOOL_RESULT_READ_MAX_CHARS: usize = 50_000;
 
-fn tool_result_json_text(value: &Option<serde_json::Value>) -> Option<String> {
+pub(super) fn tool_result_json_text(value: &Option<serde_json::Value>) -> Option<String> {
     value.as_ref().map(|structured| {
         serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string())
     })
 }
 
-fn should_externalize_tool_result(tool_name: &str, result: &ToolResult) -> bool {
+pub(super) fn should_externalize_tool_result(tool_name: &str, result: &ToolResult) -> bool {
     let externalizable_tool = mcp::is_external_mcp_tool_name(tool_name)
         || matches!(
             tool_name,
@@ -2727,7 +2268,7 @@ fn should_externalize_tool_result(tool_name: &str, result: &ToolResult) -> bool 
         || structured_chars > TOOL_RESULT_EXTERNALIZE_MIN_CHARS
 }
 
-async fn maybe_externalize_tool_result(
+pub(super) async fn maybe_externalize_tool_result(
     turn: &TurnContext,
     call: &ToolCall,
     result: &ToolResult,
@@ -2779,7 +2320,7 @@ async fn maybe_externalize_tool_result(
     externalized_tool_result(result, result_ref, structured_text.as_deref())
 }
 
-fn externalized_tool_result(
+pub(super) fn externalized_tool_result(
     result: &ToolResult,
     result_ref: serde_json::Value,
     structured_text: Option<&str>,
@@ -2824,14 +2365,14 @@ fn externalized_tool_result(
     }
 }
 
-fn slice_text_by_chars(text: &str, offset: usize, limit: usize) -> (String, bool) {
+pub(super) fn slice_text_by_chars(text: &str, offset: usize, limit: usize) -> (String, bool) {
     let total = text.chars().count();
     let body = text.chars().skip(offset).take(limit).collect::<String>();
     let next_offset = offset.saturating_add(body.chars().count());
     (body, next_offset < total)
 }
 
-fn default_tool_result_content_for_model(result: &ToolResult) -> String {
+pub(super) fn default_tool_result_content_for_model(result: &ToolResult) -> String {
     let Some(structured) = result.structured.as_ref() else {
         return result.content.clone();
     };
@@ -2847,7 +2388,7 @@ fn default_tool_result_content_for_model(result: &ToolResult) -> String {
     )
 }
 
-fn tool_result_content_for_model(tool_name: &str, result: &ToolResult) -> String {
+pub(super) fn tool_result_content_for_model(tool_name: &str, result: &ToolResult) -> String {
     let Some(handler) = runtime_tool_handler(tool_name) else {
         return default_tool_result_content_for_model(result);
     };
@@ -2858,8 +2399,7 @@ fn tool_result_content_for_model(tool_name: &str, result: &ToolResult) -> String
     }
 }
 
-
-async fn wait_for_user_question_answer(
+pub(super) async fn wait_for_user_question_answer(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,
@@ -3010,17 +2550,17 @@ async fn wait_for_user_question_answer(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RuntimeToolExecutionPolicy {
-    requires_approval: bool,
-    requires_workspace_boundary_approval: bool,
-    is_read_only: bool,
-    is_mutating: bool,
-    concurrency_safe: bool,
-    interrupt_behavior: RuntimeToolInterruptBehavior,
+pub(super) struct RuntimeToolExecutionPolicy {
+    pub(super) requires_approval: bool,
+    pub(super) requires_workspace_boundary_approval: bool,
+    pub(super) is_read_only: bool,
+    pub(super) is_mutating: bool,
+    pub(super) concurrency_safe: bool,
+    pub(super) interrupt_behavior: RuntimeToolInterruptBehavior,
 }
 
 impl RuntimeToolExecutionPolicy {
-    fn unknown() -> Self {
+    pub(super) fn unknown() -> Self {
         Self {
             requires_approval: false,
             requires_workspace_boundary_approval: false,
@@ -3031,7 +2571,7 @@ impl RuntimeToolExecutionPolicy {
         }
     }
 
-    fn from_handler(
+    pub(super) fn from_handler(
         handler: Option<&dyn RuntimeToolHandler>,
         call: &ToolCall,
         def: &ToolDef,
@@ -3063,10 +2603,10 @@ impl RuntimeToolExecutionPolicy {
     }
 }
 
-const PRIVATE_SESSION_SECRET_MARKER: &str = "[MUSE_REDACTED_SECRET]";
+pub(super) const PRIVATE_SESSION_SECRET_MARKER: &str = "[MUSE_REDACTED_SECRET]";
 
 /// 日志或只读展示使用的工具请求摘要，不参与 provider 会话恢复。
-fn tool_request_audit_metadata(arguments: &serde_json::Value) -> serde_json::Value {
+pub(super) fn tool_request_audit_metadata(arguments: &serde_json::Value) -> serde_json::Value {
     let mut argument_names = arguments
         .as_object()
         .map(|values| values.keys().cloned().collect::<Vec<_>>())
@@ -3079,15 +2619,15 @@ fn tool_request_audit_metadata(arguments: &serde_json::Value) -> serde_json::Val
     })
 }
 
-struct CanonicalSessionToolResult {
-    content: String,
-    structured: Option<serde_json::Value>,
-    context_effect: Option<serde_json::Value>,
+pub(super) struct CanonicalSessionToolResult {
+    pub(super) content: String,
+    pub(super) structured: Option<serde_json::Value>,
+    pub(super) context_effect: Option<serde_json::Value>,
 }
 
 /// 私有 canonical session 保留工具协议语义，仅清除可识别的密钥字段和值。
 /// command、path、URL、查询词、stdout/stderr 与 Web 结果均不能摘要化丢失。
-fn canonical_session_tool_result(
+pub(super) fn canonical_session_tool_result(
     result: &ToolResult,
     context_effect: Option<serde_json::Value>,
 ) -> CanonicalSessionToolResult {
@@ -3101,11 +2641,11 @@ fn canonical_session_tool_result(
     }
 }
 
-fn canonical_session_tool_arguments(arguments: &serde_json::Value) -> serde_json::Value {
+pub(super) fn canonical_session_tool_arguments(arguments: &serde_json::Value) -> serde_json::Value {
     sanitize_private_session_value(arguments)
 }
 
-fn sanitize_private_session_value(value: &serde_json::Value) -> serde_json::Value {
+pub(super) fn sanitize_private_session_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(values) => serde_json::Value::Object(
             values
@@ -3130,7 +2670,7 @@ fn sanitize_private_session_value(value: &serde_json::Value) -> serde_json::Valu
     }
 }
 
-fn is_private_session_secret_field(field: &str) -> bool {
+pub(super) fn is_private_session_secret_field(field: &str) -> bool {
     let normalized = field
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -3162,7 +2702,7 @@ fn is_private_session_secret_field(field: &str) -> bool {
     )
 }
 
-fn redact_private_session_text(value: &str) -> String {
+pub(super) fn redact_private_session_text(value: &str) -> String {
     let mut redacted = redact_url_secret_components(value);
     for marker in [
         "authorization:",
@@ -3198,7 +2738,7 @@ fn redact_private_session_text(value: &str) -> String {
     redacted
 }
 
-fn redact_url_secret_components(value: &str) -> String {
+pub(super) fn redact_url_secret_components(value: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(value) else {
         return value.to_string();
     };
@@ -3229,7 +2769,11 @@ fn redact_url_secret_components(value: &str) -> String {
     url.to_string()
 }
 
-fn redact_ascii_value_after_marker(value: &str, marker: &str, stop_on_whitespace: bool) -> String {
+pub(super) fn redact_ascii_value_after_marker(
+    value: &str,
+    marker: &str,
+    stop_on_whitespace: bool,
+) -> String {
     let mut output = value.to_string();
     let marker_lower = marker.to_ascii_lowercase();
     let mut search_from = 0usize;
@@ -3261,7 +2805,7 @@ fn redact_ascii_value_after_marker(value: &str, marker: &str, stop_on_whitespace
     output
 }
 
-async fn emit_and_record_tool_call(
+pub(super) async fn emit_and_record_tool_call(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,
@@ -3328,7 +2872,7 @@ async fn emit_and_record_tool_call(
     Ok(())
 }
 
-async fn emit_and_record_tool_result(
+pub(super) async fn emit_and_record_tool_result(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,

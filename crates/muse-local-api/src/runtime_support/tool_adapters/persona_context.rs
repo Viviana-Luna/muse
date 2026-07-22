@@ -1,4 +1,8 @@
-fn tool_model_info(turn: &TurnContext) -> ToolResult {
+//! Persona、模型、流式回复与上下文用量工具支持。
+
+use super::*;
+
+pub(in crate::runtime_support) fn tool_model_info(turn: &TurnContext) -> ToolResult {
     let provider = turn.model_provider.clone();
     let model = turn.model_name.clone();
     ToolResult {
@@ -13,7 +17,7 @@ fn tool_model_info(turn: &TurnContext) -> ToolResult {
         })),
     }
 }
-async fn tool_persona_info(state: &Arc<AppState>) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_persona_info(state: &Arc<AppState>) -> ToolResult {
     let persona = {
         let personas = state.personas.lock().await;
         personas.active_persona().cloned()
@@ -28,7 +32,10 @@ async fn tool_persona_info(state: &Arc<AppState>) -> ToolResult {
     }
 }
 
-async fn tool_persona_switch(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_persona_switch(
+    state: &Arc<AppState>,
+    call: &ToolCall,
+) -> ToolResult {
     let Some(persona_id) = tool_arg_string(&call.arguments, "persona_id") else {
         return tool_failed(
             "persona_switch 缺少 persona_id 参数。",
@@ -58,7 +65,10 @@ async fn tool_persona_switch(state: &Arc<AppState>, call: &ToolCall) -> ToolResu
     }
 }
 
-fn tool_failed(message: impl Into<String>, reason: &str) -> ToolResult {
+pub(in crate::runtime_support) fn tool_failed(
+    message: impl Into<String>,
+    reason: &str,
+) -> ToolResult {
     ToolResult {
         status: ToolResultStatus::Failed,
         content: message.into(),
@@ -66,7 +76,7 @@ fn tool_failed(message: impl Into<String>, reason: &str) -> ToolResult {
     }
 }
 
-fn tool_result_reason(result: &ToolResult) -> Option<&str> {
+pub(in crate::runtime_support) fn tool_result_reason(result: &ToolResult) -> Option<&str> {
     result
         .structured
         .as_ref()
@@ -74,7 +84,7 @@ fn tool_result_reason(result: &ToolResult) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
-async fn stream_provider_reply(
+pub(in crate::runtime_support) async fn stream_provider_reply(
     state: &Arc<AppState>,
     provider: &Arc<dyn muse_core::model::provider::ChatModelProvider>,
     emitter: &RuntimeEventEmitter,
@@ -299,7 +309,10 @@ async fn stream_provider_reply(
     ))
 }
 
-fn push_assistant_model_item(items: &mut Vec<RuntimeModelItem>, content: &mut String) {
+pub(in crate::runtime_support) fn push_assistant_model_item(
+    items: &mut Vec<RuntimeModelItem>,
+    content: &mut String,
+) {
     if content.is_empty() {
         return;
     }
@@ -309,7 +322,7 @@ fn push_assistant_model_item(items: &mut Vec<RuntimeModelItem>, content: &mut St
     });
 }
 
-fn streamed_turn_with_reasoning(
+pub(in crate::runtime_support) fn streamed_turn_with_reasoning(
     mut items: Vec<RuntimeModelItem>,
     reasoning_content: String,
     usage: Option<ProviderTokenUsage>,
@@ -352,19 +365,21 @@ fn streamed_turn_with_reasoning(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RuntimeContextProfile {
-    context_window: u64,
-    reserved_output_tokens: u64,
+pub(in crate::runtime_support) struct RuntimeContextProfile {
+    pub(in crate::runtime_support) context_window: u64,
+    pub(in crate::runtime_support) reserved_output_tokens: u64,
 }
 
-fn runtime_context_profile(turn: &TurnContext) -> RuntimeContextProfile {
+pub(in crate::runtime_support) fn runtime_context_profile(
+    turn: &TurnContext,
+) -> RuntimeContextProfile {
     RuntimeContextProfile {
         context_window: turn.model_context_window.max(1),
         reserved_output_tokens: u64::from(turn.model_max_output_tokens.max(1)),
     }
 }
 
-fn estimate_text_tokens(text: &str) -> u64 {
+pub(in crate::runtime_support) fn estimate_text_tokens(text: &str) -> u64 {
     let mut ascii_chars = 0_u64;
     let mut non_ascii_chars = 0_u64;
     for ch in text.chars() {
@@ -384,13 +399,13 @@ fn estimate_text_tokens(text: &str) -> u64 {
         .max(1)
 }
 
-fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
+pub(in crate::runtime_support) fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
     serde_json::to_string(value)
         .map(|text| estimate_text_tokens(&text))
         .unwrap_or(0)
 }
 
-fn push_estimated_context_segment(
+pub(in crate::runtime_support) fn push_estimated_context_segment(
     segments: &mut BTreeMap<(String, String, bool, bool), RuntimeContextSegment>,
     kind: &str,
     label: &str,
@@ -418,7 +433,9 @@ fn push_estimated_context_segment(
         });
 }
 
-fn split_system_prompt_for_segments(turn: &TurnContext) -> (Option<String>, String) {
+pub(in crate::runtime_support) fn split_system_prompt_for_segments(
+    turn: &TurnContext,
+) -> (Option<String>, String) {
     let prompt = turn.system_prompt.trim();
     if prompt.is_empty() {
         return (None, String::new());
@@ -438,7 +455,7 @@ fn split_system_prompt_for_segments(turn: &TurnContext) -> (Option<String>, Stri
     (Some(prompt.to_string()), String::new())
 }
 
-fn tool_context_segment_kind(
+pub(in crate::runtime_support) fn tool_context_segment_kind(
     tool_name: Option<&str>,
     content: &str,
 ) -> (&'static str, &'static str, bool) {
@@ -455,7 +472,7 @@ fn tool_context_segment_kind(
     }
 }
 
-fn runtime_context_segments_from_conversation(
+pub(in crate::runtime_support) fn runtime_context_segments_from_conversation(
     turn: &TurnContext,
     conversation: &Conversation,
 ) -> Vec<RuntimeContextSegment> {
@@ -558,7 +575,7 @@ fn runtime_context_segments_from_conversation(
     segments.into_values().collect()
 }
 
-fn build_runtime_context_snapshot(
+pub(in crate::runtime_support) fn build_runtime_context_snapshot(
     turn: &TurnContext,
     conversation: &Conversation,
     profile: RuntimeContextProfile,
@@ -599,7 +616,7 @@ fn build_runtime_context_snapshot(
     }
 }
 
-fn estimate_streamed_turn_output_tokens(turn: &StreamedTurn) -> u64 {
+pub(in crate::runtime_support) fn estimate_streamed_turn_output_tokens(turn: &StreamedTurn) -> u64 {
     turn.items.iter().fold(0_u64, |total, item| match item {
         RuntimeModelItem::AssistantMessage {
             content,
@@ -627,7 +644,7 @@ fn estimate_streamed_turn_output_tokens(turn: &StreamedTurn) -> u64 {
     })
 }
 
-async fn emit_and_record_runtime_usage(
+pub(in crate::runtime_support) async fn emit_and_record_runtime_usage(
     _state: &Arc<AppState>,
     emitter: &RuntimeEventEmitter,
     turn: &TurnContext,
@@ -669,7 +686,10 @@ async fn emit_and_record_runtime_usage(
     let _ = emitter.emit(RuntimeEvent::TokenUsage { usage }).await;
 }
 
-async fn emit_json_event(tx: &RuntimeSseSender, payload: serde_json::Value) -> Result<(), ()> {
+pub(in crate::runtime_support) async fn emit_json_event(
+    tx: &RuntimeSseSender,
+    payload: serde_json::Value,
+) -> Result<(), ()> {
     tx.send(Ok(
         axum::response::sse::Event::default().data(payload.to_string())
     ))
@@ -678,7 +698,7 @@ async fn emit_json_event(tx: &RuntimeSseSender, payload: serde_json::Value) -> R
 }
 
 #[cfg(test)]
-fn chat_status_payload(
+pub(in crate::runtime_support) fn chat_status_payload(
     phase: &str,
     message: &str,
     detail: Option<&str>,
@@ -693,7 +713,7 @@ fn chat_status_payload(
     })
 }
 
-fn runtime_tool_call_event(
+pub(in crate::runtime_support) fn runtime_tool_call_event(
     call_id: &str,
     name: &str,
     arguments: &serde_json::Value,
@@ -711,7 +731,7 @@ fn runtime_tool_call_event(
     })
 }
 
-fn runtime_tool_result_event(
+pub(in crate::runtime_support) fn runtime_tool_result_event(
     call_id: &str,
     name: &str,
     success: bool,
@@ -727,7 +747,7 @@ fn runtime_tool_result_event(
     })
 }
 
-fn runtime_command_output_delta_event(
+pub(in crate::runtime_support) fn runtime_command_output_delta_event(
     call_id: &str,
     name: &str,
     stream: &str,
@@ -741,7 +761,7 @@ fn runtime_command_output_delta_event(
     })
 }
 
-fn runtime_approval_pending_event(
+pub(in crate::runtime_support) fn runtime_approval_pending_event(
     approval_id: &str,
     call_id: &str,
     tool_name: &str,
@@ -761,7 +781,7 @@ fn runtime_approval_pending_event(
     })
 }
 
-fn runtime_approval_resolved_event(
+pub(in crate::runtime_support) fn runtime_approval_resolved_event(
     approval_id: &str,
     approved: bool,
     reason: Option<&str>,
@@ -773,7 +793,7 @@ fn runtime_approval_resolved_event(
     })
 }
 
-fn runtime_user_question_pending_event(
+pub(in crate::runtime_support) fn runtime_user_question_pending_event(
     request_id: &str,
     call_id: &str,
     tool_name: &str,
@@ -791,7 +811,7 @@ fn runtime_user_question_pending_event(
     })
 }
 
-fn runtime_user_question_resolved_event(
+pub(in crate::runtime_support) fn runtime_user_question_resolved_event(
     request_id: &str,
     answered: bool,
     reason: Option<&str>,
@@ -803,7 +823,7 @@ fn runtime_user_question_resolved_event(
     })
 }
 
-fn runtime_speech_started_event(
+pub(in crate::runtime_support) fn runtime_speech_started_event(
     call_id: &str,
     text: &str,
     voice_id: Option<&str>,
@@ -815,7 +835,7 @@ fn runtime_speech_started_event(
     })
 }
 
-async fn resolve_persona_visual_pack(
+pub(in crate::runtime_support) async fn resolve_persona_visual_pack(
     state: &Arc<AppState>,
     persona: &Persona,
 ) -> Option<VisualPack> {
@@ -823,7 +843,7 @@ async fn resolve_persona_visual_pack(
     resolve_persona_visual_pack_from_store(&visual_packs, persona)
 }
 
-fn build_persona_visual_pack_from_patch(
+pub(in crate::runtime_support) fn build_persona_visual_pack_from_patch(
     visual_packs: &muse_core::domain::persona::visual::store::VisualPackStore,
     persona: &mut Persona,
     patch: Option<PersonaVisualPackPatch>,
@@ -920,13 +940,15 @@ fn build_persona_visual_pack_from_patch(
     Some(visual_pack)
 }
 
-fn trim_optional_patch_value(value: Option<String>) -> Option<String> {
+pub(in crate::runtime_support) fn trim_optional_patch_value(
+    value: Option<String>,
+) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_portrait_frame(value: Option<&str>) -> String {
+pub(in crate::runtime_support) fn normalize_portrait_frame(value: Option<&str>) -> String {
     match value.unwrap_or_default() {
         "square" => "square".to_string(),
         "wide" => "wide".to_string(),
@@ -935,7 +957,7 @@ fn normalize_portrait_frame(value: Option<&str>) -> String {
     }
 }
 
-fn normalize_theme_mode(value: Option<&str>) -> String {
+pub(in crate::runtime_support) fn normalize_theme_mode(value: Option<&str>) -> String {
     match value.unwrap_or_default() {
         "dark" => "dark".to_string(),
         "light" => "light".to_string(),
@@ -943,22 +965,22 @@ fn normalize_theme_mode(value: Option<&str>) -> String {
     }
 }
 
-fn normalize_portrait_fit(value: Option<&str>) -> String {
+pub(in crate::runtime_support) fn normalize_portrait_fit(value: Option<&str>) -> String {
     match value.unwrap_or_default() {
         "contain" => "contain".to_string(),
         _ => "cover".to_string(),
     }
 }
 
-fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+pub(in crate::runtime_support) fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     value.min(max).max(min)
 }
 
-fn clamp_u16(value: u16, min: u16, max: u16) -> u16 {
+pub(in crate::runtime_support) fn clamp_u16(value: u16, min: u16, max: u16) -> u16 {
     value.min(max).max(min)
 }
 
-fn resolve_persona_visual_pack_from_store(
+pub(in crate::runtime_support) fn resolve_persona_visual_pack_from_store(
     visual_packs: &muse_core::domain::persona::visual::store::VisualPackStore,
     persona: &Persona,
 ) -> Option<VisualPack> {

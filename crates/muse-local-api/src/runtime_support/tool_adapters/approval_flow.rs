@@ -1,17 +1,22 @@
-struct ToolApprovalRequest<'a> {
-    tx: Option<&'a RuntimeSseSender>,
-    turn: &'a TurnContext,
-    call: &'a ToolCall,
-    risk: &'a str,
-    summary: String,
-    cancel_token: &'a RuntimeTurnCancel,
-    provider: &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
-    conversation: &'a Conversation,
-    approvals_reviewer: ApprovalsReviewer,
-    policy_revision: u64,
+//! 工具审批等待、自动审查与结果持久化流程。
+
+use super::*;
+
+pub(in crate::runtime_support) struct ToolApprovalRequest<'a> {
+    pub(in crate::runtime_support) tx: Option<&'a RuntimeSseSender>,
+    pub(in crate::runtime_support) turn: &'a TurnContext,
+    pub(in crate::runtime_support) call: &'a ToolCall,
+    pub(in crate::runtime_support) risk: &'a str,
+    pub(in crate::runtime_support) summary: String,
+    pub(in crate::runtime_support) cancel_token: &'a RuntimeTurnCancel,
+    pub(in crate::runtime_support) provider:
+        &'a Arc<dyn muse_core::model::provider::ChatModelProvider>,
+    pub(in crate::runtime_support) conversation: &'a Conversation,
+    pub(in crate::runtime_support) approvals_reviewer: ApprovalsReviewer,
+    pub(in crate::runtime_support) policy_revision: u64,
 }
 
-async fn wait_for_tool_approval(
+pub(in crate::runtime_support) async fn wait_for_tool_approval(
     state: &Arc<AppState>,
     request: ToolApprovalRequest<'_>,
 ) -> Result<(bool, String), ()> {
@@ -170,11 +175,7 @@ async fn wait_for_tool_approval(
             .map_err(|_| ())?;
             emit_json_event(
                 tx,
-                runtime_approval_resolved_event(
-                    &approval_id,
-                    true,
-                    Some("auto_review_allowed"),
-                ),
+                runtime_approval_resolved_event(&approval_id, true, Some("auto_review_allowed")),
             )
             .await?;
             return Ok((true, "auto_review_allowed".to_string()));
@@ -183,7 +184,10 @@ async fn wait_for_tool_approval(
             outcome.failure_reason(),
             Some("cancelled" | "client_disconnected")
         ) {
-            return Ok((false, outcome.failure_reason().unwrap_or("cancelled").to_string()));
+            return Ok((
+                false,
+                outcome.failure_reason().unwrap_or("cancelled").to_string(),
+            ));
         }
         manual_summary = format!(
             "AUTO 审查未放行：{}\n你可以仅针对下面这一项动作进行人工确认。\n{}",

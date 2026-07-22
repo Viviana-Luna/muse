@@ -438,7 +438,7 @@ fn finish_runtime_idle_lease(
         .map_err(|error| internal_error(error.to_string()))
 }
 
-pub(super) fn current_runtime_mode_state(state: &Arc<AppState>) -> RuntimeModeState {
+pub(crate) fn current_runtime_mode_state(state: &Arc<AppState>) -> RuntimeModeState {
     state.runtime_service.runtime_mode().unwrap_or_default()
 }
 
@@ -477,7 +477,7 @@ fn parse_runtime_mode_state(
     }
 }
 
-pub(super) fn runtime_mode_response(mode_state: RuntimeModeState) -> RuntimeModeResponse {
+pub(crate) fn runtime_mode_response(mode_state: RuntimeModeState) -> RuntimeModeResponse {
     RuntimeModeResponse {
         mode: mode_state.mode.as_str().to_string(),
         focus_phase: mode_state.focus_phase.as_str().to_string(),
@@ -486,7 +486,7 @@ pub(super) fn runtime_mode_response(mode_state: RuntimeModeState) -> RuntimeMode
     }
 }
 
-pub(super) async fn current_runtime_todos(state: &Arc<AppState>) -> Vec<RuntimeTodoItem> {
+pub(crate) async fn current_runtime_todos(state: &Arc<AppState>) -> Vec<RuntimeTodoItem> {
     state.runtime_service.runtime_todos().await
 }
 
@@ -1907,20 +1907,26 @@ async fn rollback_runtime_turn(
     message
 }
 
-include!("api/runtime_assets_voice.rs");
-include!("api/chat_sessions_models.rs");
-include!("api/runtime_policy.rs");
-include!("api/personas_stream.rs");
-include!("api/persona_session_binding.rs");
-include!("api/mcp_management.rs");
-include!("tools/approval_review.rs");
-include!("tools/approval_flow.rs");
-include!("tools/registry.rs");
-include!("tools/interaction.rs");
-include!("tools/files.rs");
-include!("tools/command.rs");
-include!("tools/network.rs");
-include!("tools/mcp.rs");
-include!("tools/session.rs");
-include!("tools/persona_context.rs");
-include!("tests.rs");
+mod runtime;
+pub(crate) use runtime::*;
+mod voice;
+pub(crate) use voice::*;
+mod chat;
+pub(crate) use chat::*;
+mod sessions;
+pub(crate) use sessions::*;
+mod models;
+pub(crate) use models::*;
+mod runtime_policy;
+pub(crate) use runtime_policy::*;
+mod personas;
+pub(crate) use personas::*;
+mod streaming;
+pub(crate) use streaming::*;
+mod persona_sessions;
+pub(crate) use persona_sessions::*;
+mod tool_adapters;
+use tool_adapters::*;
+
+#[cfg(test)]
+mod tests;

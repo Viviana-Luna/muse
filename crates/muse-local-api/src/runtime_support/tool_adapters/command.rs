@@ -1,4 +1,8 @@
-async fn tool_command_run(
+//! 命令执行、进程终止与公开 HTTPS 校验适配。
+
+use super::*;
+
+pub(in crate::runtime_support) async fn tool_command_run(
     policy: &FrozenExecutionPolicy,
     call: &ToolCall,
     tx: Option<&RuntimeSseSender>,
@@ -65,7 +69,8 @@ async fn tool_command_run(
         }
     };
     let child_pid = child.id();
-    let process_tree_guard = match muse_core::process_supervision::ProcessTreeGuard::attach(&child) {
+    let process_tree_guard = match muse_core::process_supervision::ProcessTreeGuard::attach(&child)
+    {
         Ok(guard) => guard,
         Err(error) => {
             // 此时 PowerShell 仍处于 CREATE_SUSPENDED，失败必须先回收再返回，不能降级裸跑。
@@ -186,18 +191,18 @@ async fn tool_command_run(
     }
 }
 
-enum CommandRunOutcome {
+pub(in crate::runtime_support) enum CommandRunOutcome {
     Finished(std::io::Result<ExitStatus>),
     Timeout(CommandTerminationResult),
     Cancelled(CommandTerminationResult),
 }
 
-struct CommandTerminationResult {
+pub(in crate::runtime_support) struct CommandTerminationResult {
     status: Option<ExitStatus>,
     error: Option<String>,
 }
 
-fn command_output_from_join(
+pub(in crate::runtime_support) fn command_output_from_join(
     result: Result<std::io::Result<ExitStatus>, tokio::task::JoinError>,
 ) -> std::io::Result<ExitStatus> {
     match result {
@@ -206,7 +211,7 @@ fn command_output_from_join(
     }
 }
 
-fn spawn_command_output_reader<R>(
+pub(in crate::runtime_support) fn spawn_command_output_reader<R>(
     stream: &'static str,
     reader: Option<R>,
     tx: Option<RuntimeSseSender>,
@@ -239,7 +244,7 @@ where
     }
 }
 
-async fn read_command_output_stream<R>(
+pub(in crate::runtime_support) async fn read_command_output_stream<R>(
     stream: &'static str,
     mut reader: R,
     tx: Option<RuntimeSseSender>,
@@ -314,7 +319,7 @@ where
     }
 }
 
-async fn join_command_output_reader(
+pub(in crate::runtime_support) async fn join_command_output_reader(
     mut handle: tokio::task::JoinHandle<CommandStreamCapture>,
     deadline: tokio::time::Instant,
     stream: &'static str,
@@ -334,7 +339,7 @@ async fn join_command_output_reader(
     }
 }
 
-async fn terminate_command_process(
+pub(in crate::runtime_support) async fn terminate_command_process(
     child_pid: Option<u32>,
     process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
     wait_handle: &mut tokio::task::JoinHandle<std::io::Result<ExitStatus>>,
@@ -378,7 +383,7 @@ async fn terminate_command_process(
 }
 
 #[cfg(unix)]
-async fn cleanup_finished_command_group(
+pub(in crate::runtime_support) async fn cleanup_finished_command_group(
     child_pid: Option<u32>,
     process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
 ) {
@@ -415,24 +420,26 @@ async fn cleanup_finished_command_group(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CommandTerminationSignal {
+pub(in crate::runtime_support) enum CommandTerminationSignal {
     Terminate,
     Kill,
 }
 
-fn terminate_command_process_once(
+pub(in crate::runtime_support) fn terminate_command_process_once(
     child_pid: Option<u32>,
     process_tree_guard: &muse_core::process_supervision::ProcessTreeGuard,
     signal: CommandTerminationSignal,
     notes: &mut Vec<String>,
 ) {
     let _ = child_pid;
-    if let Err(error) = process_tree_guard.terminate(matches!(signal, CommandTerminationSignal::Kill)) {
+    if let Err(error) =
+        process_tree_guard.terminate(matches!(signal, CommandTerminationSignal::Kill))
+    {
         notes.push(error);
     }
 }
 
-fn command_termination_result_from_join(
+pub(in crate::runtime_support) fn command_termination_result_from_join(
     result: Result<std::io::Result<ExitStatus>, tokio::task::JoinError>,
     mut notes: Vec<String>,
 ) -> CommandTerminationResult {
@@ -455,7 +462,7 @@ fn command_termination_result_from_join(
     }
 }
 
-fn command_output_tool_result(
+pub(in crate::runtime_support) fn command_output_tool_result(
     cwd: &StdPath,
     command: &str,
     timeout_ms: u64,
@@ -489,7 +496,9 @@ fn command_output_tool_result(
     }
 }
 
-fn command_stream_reader_error_text(capture: &CommandStreamCapture) -> String {
+pub(in crate::runtime_support) fn command_stream_reader_error_text(
+    capture: &CommandStreamCapture,
+) -> String {
     capture
         .reader_error
         .as_ref()
@@ -497,7 +506,9 @@ fn command_stream_reader_error_text(capture: &CommandStreamCapture) -> String {
         .unwrap_or_default()
 }
 
-fn command_stream_capture_json(capture: &CommandStreamCapture) -> serde_json::Value {
+pub(in crate::runtime_support) fn command_stream_capture_json(
+    capture: &CommandStreamCapture,
+) -> serde_json::Value {
     serde_json::json!({
         "total_bytes": capture.total_bytes,
         "summary_bytes": capture.summary.len(),
@@ -512,7 +523,7 @@ fn command_stream_capture_json(capture: &CommandStreamCapture) -> serde_json::Va
     })
 }
 
-struct CommandTerminationToolResult<'a> {
+pub(in crate::runtime_support) struct CommandTerminationToolResult<'a> {
     cwd: &'a StdPath,
     command: &'a str,
     timeout_ms: u64,
@@ -523,7 +534,9 @@ struct CommandTerminationToolResult<'a> {
     stderr: CommandStreamCapture,
 }
 
-fn command_terminated_tool_result(input: CommandTerminationToolResult<'_>) -> ToolResult {
+pub(in crate::runtime_support) fn command_terminated_tool_result(
+    input: CommandTerminationToolResult<'_>,
+) -> ToolResult {
     let CommandTerminationToolResult {
         cwd,
         command,
@@ -568,28 +581,30 @@ fn command_terminated_tool_result(input: CommandTerminationToolResult<'_>) -> To
     }
 }
 
-const WEB_RESPONSE_MAX_BYTES: usize = 1_000_000;
-const WEB_FETCH_TIMEOUT_SECS: u64 = 20;
-const WEB_FETCH_MAX_REDIRECTS: usize = 3;
+pub(in crate::runtime_support) const WEB_RESPONSE_MAX_BYTES: usize = 1_000_000;
+pub(in crate::runtime_support) const WEB_FETCH_TIMEOUT_SECS: u64 = 20;
+pub(in crate::runtime_support) const WEB_FETCH_MAX_REDIRECTS: usize = 3;
 
 #[derive(Clone)]
-struct ValidatedPublicHttpsUrl {
-    url: reqwest::Url,
+pub(in crate::runtime_support) struct ValidatedPublicHttpsUrl {
+    pub(in crate::runtime_support) url: reqwest::Url,
     /// 域名解析结果固定到本次请求客户端，避免校验后再次解析造成 DNS rebinding。
-    pinned_host: Option<(String, std::net::SocketAddr)>,
+    pub(in crate::runtime_support) pinned_host: Option<(String, std::net::SocketAddr)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RestrictedHttpsProxyPolicy {
+pub(in crate::runtime_support) enum RestrictedHttpsProxyPolicy {
     /// 受限网络请求必须绕过系统和环境代理，确保连接使用本地校验的 DNS pin。
     Disabled,
 }
 
-const RESTRICTED_HTTPS_PROXY_POLICY: RestrictedHttpsProxyPolicy =
+pub(in crate::runtime_support) const RESTRICTED_HTTPS_PROXY_POLICY: RestrictedHttpsProxyPolicy =
     RestrictedHttpsProxyPolicy::Disabled;
 
 /// 只允许访问公开 HTTPS 地址，避免网页工具被用于访问本机、内网或云元数据服务。
-async fn validate_public_https_url(value: &str) -> Result<ValidatedPublicHttpsUrl, String> {
+pub(in crate::runtime_support) async fn validate_public_https_url(
+    value: &str,
+) -> Result<ValidatedPublicHttpsUrl, String> {
     let url = reqwest::Url::parse(value).map_err(|err| format!("URL 格式无效：{err}"))?;
     if url.scheme() != "https" {
         return Err("网页访问只允许 HTTPS 地址。".to_string());
@@ -633,7 +648,7 @@ async fn validate_public_https_url(value: &str) -> Result<ValidatedPublicHttpsUr
     Ok(ValidatedPublicHttpsUrl { url, pinned_host })
 }
 
-fn build_pinned_https_client(
+pub(in crate::runtime_support) fn build_pinned_https_client(
     target: &ValidatedPublicHttpsUrl,
     timeout: Duration,
 ) -> Result<reqwest::Client, String> {
@@ -654,7 +669,7 @@ fn build_pinned_https_client(
 }
 
 /// 判断 IP 是否属于不应由模型驱动网络工具访问的地址范围。
-fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+pub(in crate::runtime_support) fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -697,7 +712,9 @@ fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
 }
 
 /// 读取受限大小的文本响应，防止分块响应绕过 Content-Length 检查。
-async fn read_bounded_web_response(response: reqwest::Response) -> Result<String, String> {
+pub(in crate::runtime_support) async fn read_bounded_web_response(
+    response: reqwest::Response,
+) -> Result<String, String> {
     if response
         .content_length()
         .is_some_and(|length| length > WEB_RESPONSE_MAX_BYTES as u64)

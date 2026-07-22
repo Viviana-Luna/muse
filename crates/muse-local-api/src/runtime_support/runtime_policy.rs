@@ -1,11 +1,12 @@
-const MAX_TURN_SKILL_CATALOG_ITEMS: usize = 64;
-const MAX_TURN_SKILL_DESCRIPTION_CHARS: usize = 512;
-const MAX_TURN_SKILL_CATALOG_CHARS: usize = 12_000;
+//! 单回合 Skill、工具与语音策略冻结实现。
 
-fn skill_policy_allows(
-    policy: &muse_core::domain::persona::SkillPolicy,
-    name: &str,
-) -> bool {
+use super::*;
+
+pub(super) const MAX_TURN_SKILL_CATALOG_ITEMS: usize = 64;
+pub(super) const MAX_TURN_SKILL_DESCRIPTION_CHARS: usize = 512;
+pub(super) const MAX_TURN_SKILL_CATALOG_CHARS: usize = 12_000;
+
+fn skill_policy_allows(policy: &muse_core::domain::persona::SkillPolicy, name: &str) -> bool {
     match policy.mode {
         muse_core::domain::persona::ResourcePolicyMode::Inherit => true,
         muse_core::domain::persona::ResourcePolicyMode::Disabled => false,
@@ -28,10 +29,13 @@ fn bounded_skill_description(value: &str) -> String {
     truncated
 }
 
-fn freeze_skill_catalog(
+pub(super) fn freeze_skill_catalog(
     summaries: Vec<muse_core::domain::skill::SkillSummary>,
     policy: &muse_core::domain::persona::SkillPolicy,
-) -> (Vec<muse_core::domain::turn::RuntimeSkillCatalogEntry>, usize) {
+) -> (
+    Vec<muse_core::domain::turn::RuntimeSkillCatalogEntry>,
+    usize,
+) {
     let mut entries = Vec::new();
     let mut used_chars = 0usize;
     let mut omitted = 0usize;
@@ -58,7 +62,7 @@ fn freeze_skill_catalog(
     (entries, omitted)
 }
 
-fn append_frozen_skill_catalog(
+pub(super) fn append_frozen_skill_catalog(
     system_prompt: &mut String,
     entries: &[muse_core::domain::turn::RuntimeSkillCatalogEntry],
     omitted: usize,
@@ -79,7 +83,7 @@ fn append_frozen_skill_catalog(
     }
 }
 
-fn effective_runtime_skill_catalog(
+pub(super) fn effective_runtime_skill_catalog(
     data_dir: &StdPath,
     preferences: &muse_core::domain::skill::SkillPreferences,
     policy: &muse_core::domain::persona::SkillPolicy,
@@ -87,32 +91,31 @@ fn effective_runtime_skill_catalog(
     Vec<muse_core::domain::turn::RuntimeSkillCatalogEntry>,
     usize,
 ) {
-    let user_skills =
-        match muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
-            .catalog_snapshot(preferences)
-        {
-            Ok(snapshot) => {
-                if snapshot.omitted_diagnostic_count > 0 {
-                    tracing::warn!(
-                        omitted_count = snapshot.omitted_diagnostic_count,
-                        "Skill 目录诊断超过本地预算，其余异常项已省略"
-                    );
-                }
-                for diagnostic in snapshot.diagnostics {
-                    tracing::warn!(
-                        skill_name = %diagnostic.name,
-                        code = %diagnostic.code,
-                        message = %diagnostic.message,
-                        "Skill 目录项损坏，已从当前 Turn 目录隔离"
-                    );
-                }
-                snapshot.skills
+    let user_skills = match muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
+        .catalog_snapshot(preferences)
+    {
+        Ok(snapshot) => {
+            if snapshot.omitted_diagnostic_count > 0 {
+                tracing::warn!(
+                    omitted_count = snapshot.omitted_diagnostic_count,
+                    "Skill 目录诊断超过本地预算，其余异常项已省略"
+                );
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "扫描 Skill 目录失败，当前 Turn 使用空目录");
-                Vec::new()
+            for diagnostic in snapshot.diagnostics {
+                tracing::warn!(
+                    skill_name = %diagnostic.name,
+                    code = %diagnostic.code,
+                    message = %diagnostic.message,
+                    "Skill 目录项损坏，已从当前 Turn 目录隔离"
+                );
             }
-        };
+            snapshot.skills
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "扫描 Skill 目录失败，当前 Turn 使用空目录");
+            Vec::new()
+        }
+    };
     let user_skill_names = user_skills
         .iter()
         .map(|skill| skill.name.clone())
@@ -152,7 +155,7 @@ pub(crate) async fn handle_runtime_skills(
     }))
 }
 
-async fn frozen_runtime_skill_catalog(
+pub(super) async fn frozen_runtime_skill_catalog(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
 ) -> (
@@ -176,7 +179,7 @@ async fn frozen_runtime_skill_catalog(
     )
 }
 
-fn selected_builtin_skill_required_tools(
+pub(super) fn selected_builtin_skill_required_tools(
     catalog: &[muse_core::domain::turn::RuntimeSkillCatalogEntry],
     selected_skill: Option<&str>,
 ) -> Vec<String> {
@@ -194,7 +197,7 @@ fn selected_builtin_skill_required_tools(
         .unwrap_or_default()
 }
 
-fn grant_selected_skill_required_tools(
+pub(super) fn grant_selected_skill_required_tools(
     state: &Arc<AppState>,
     active_persona: Option<&Persona>,
     definitions: &mut Vec<ToolDef>,
@@ -242,7 +245,7 @@ fn grant_selected_skill_required_tools(
     Ok(granted)
 }
 
-fn visible_tool_definitions_for_turn(
+pub(super) fn visible_tool_definitions_for_turn(
     full_definitions: &[ToolDef],
     preset: ToolPreset,
     skill_tool_ids: &[String],
@@ -250,10 +253,7 @@ fn visible_tool_definitions_for_turn(
     let mut visible =
         ToolRegistry::filter_definitions_for_preset(full_definitions.to_vec(), preset);
     for name in skill_tool_ids {
-        if visible
-            .iter()
-            .any(|definition| definition.name == *name)
-        {
+        if visible.iter().any(|definition| definition.name == *name) {
             continue;
         }
         if let Some(definition) = full_definitions
@@ -270,7 +270,7 @@ fn visible_tool_definitions_for_turn(
     visible
 }
 
-fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
+pub(super) fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
     let preset = ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::FocusBuild);
     let Some(definition) = turn
         .tool_definitions
@@ -300,20 +300,20 @@ fn runtime_tool_allowed(turn: &TurnContext, name: &str) -> bool {
 }
 
 /// 在回合入口冻结角色、模型、工具、Skill 与 MCP 的公共运行事实。
-struct FrozenTurnSkillCatalog<'a> {
-    entries: &'a [muse_core::domain::turn::RuntimeSkillCatalogEntry],
-    omitted_count: usize,
+pub(super) struct FrozenTurnSkillCatalog<'a> {
+    pub(super) entries: &'a [muse_core::domain::turn::RuntimeSkillCatalogEntry],
+    pub(super) omitted_count: usize,
 }
 
-struct FrozenTurnToolCatalog<'a> {
-    definitions: &'a [ToolDef],
-    mcp: Option<&'a mcp::McpToolCatalog>,
-    skills: Option<FrozenTurnSkillCatalog<'a>>,
+pub(super) struct FrozenTurnToolCatalog<'a> {
+    pub(super) definitions: &'a [ToolDef],
+    pub(super) mcp: Option<&'a mcp::McpToolCatalog>,
+    pub(super) skills: Option<FrozenTurnSkillCatalog<'a>>,
 }
 
-struct FrozenTurnRuntime {
-    context: TurnContext,
-    provider: Arc<dyn muse_core::model::provider::ChatModelProvider>,
+pub(super) struct FrozenTurnRuntime {
+    pub(super) context: TurnContext,
+    pub(super) provider: Arc<dyn muse_core::model::provider::ChatModelProvider>,
 }
 
 struct FrozenChatSelection {
@@ -416,7 +416,7 @@ fn resolve_turn_voice(tts: &TtsConfig, active_persona: Option<&Persona>) -> Froz
     }
 }
 
-async fn build_turn_context(
+pub(super) async fn build_turn_context(
     state: &Arc<AppState>,
     conversation_id: String,
     turn_id: String,
@@ -456,12 +456,11 @@ async fn build_turn_context(
         muse_core::model::provider::factory::create_provider(&chat.config).map(Arc::from)
     };
     let (chat, provider, model_source, model_fallback, model_fallback_reason) =
-        if let Some(preferred) = active_persona.and_then(|persona| persona.preferred_model_ref.as_ref())
+        if let Some(preferred) =
+            active_persona.and_then(|persona| persona.preferred_model_ref.as_ref())
         {
-            match profiles.resolve_chat_model_reference(
-                &preferred.provider_id,
-                &preferred.model_id,
-            ) {
+            match profiles.resolve_chat_model_reference(&preferred.provider_id, &preferred.model_id)
+            {
                 Ok(chat) => {
                     let chat = FrozenChatSelection::from_resolved(chat);
                     let provider: Arc<dyn muse_core::model::provider::ChatModelProvider> =
@@ -491,13 +490,7 @@ async fn build_turn_context(
         } else {
             let chat = global_chat();
             let provider = global_provider_for(&chat)?;
-            (
-                chat,
-                provider,
-                "global_active".to_string(),
-                false,
-                None,
-            )
+            (chat, provider, "global_active".to_string(), false, None)
         };
     let voice = resolve_turn_voice(&tts, active_persona);
     let created_at = chrono::Utc::now().to_rfc3339();
@@ -629,12 +622,11 @@ async fn build_turn_context(
 }
 
 /// 内置项优先占用冻结目录预算；用户同名项在相同位置遮蔽内置版本。
-fn merge_builtin_skill_summaries(
+pub(super) fn merge_builtin_skill_summaries(
     mut user_skills: Vec<muse_core::domain::skill::SkillSummary>,
 ) -> Vec<muse_core::domain::skill::SkillSummary> {
-    let mut merged = Vec::with_capacity(
-        user_skills.len() + muse_core::domain::skill::builtin_skills().len(),
-    );
+    let mut merged =
+        Vec::with_capacity(user_skills.len() + muse_core::domain::skill::builtin_skills().len());
     for builtin in muse_core::domain::skill::builtin_skills() {
         if let Some(index) = user_skills
             .iter()

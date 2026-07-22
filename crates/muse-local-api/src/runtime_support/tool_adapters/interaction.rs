@@ -1,4 +1,8 @@
-async fn tool_send_user_message(
+//! 用户交互、Skill 与任务协作工具适配。
+
+use super::*;
+
+pub(in crate::runtime_support) async fn tool_send_user_message(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,
@@ -95,7 +99,11 @@ async fn tool_send_user_message(
     }
 }
 
-async fn tool_skill(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_skill(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
     let workspace = match workspace_root() {
         Ok(w) => w,
         Err(e) => return tool_failed(format!("无法定位工作区目录：{e}"), "workspace_error"),
@@ -122,7 +130,7 @@ async fn tool_skill(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) 
     .await
 }
 
-async fn activate_selected_skill(
+pub(in crate::runtime_support) async fn activate_selected_skill(
     state: &Arc<AppState>,
     turn: &TurnContext,
     skill_name: &str,
@@ -135,7 +143,10 @@ async fn activate_selected_skill(
     };
     let result = tool_skill(state, turn, &call).await;
     if !result.status.is_success() {
-        return Err(format!("无法激活已选择的 Skill `{skill_name}`：{}", result.content));
+        return Err(format!(
+            "无法激活已选择的 Skill `{skill_name}`：{}",
+            result.content
+        ));
     }
     let structured = result
         .structured
@@ -157,9 +168,10 @@ async fn activate_selected_skill(
             "已选择的 Skill `{skill_name}` 与实际载入项 `{loaded_name}` 不一致，已拒绝开始本轮。"
         ));
     }
-    let (_, content) = result.content.split_once("\n\n").ok_or_else(|| {
-        format!("Skill `{skill_name}` 未返回可注入的完整指引，已拒绝开始本轮。")
-    })?;
+    let (_, content) = result
+        .content
+        .split_once("\n\n")
+        .ok_or_else(|| format!("Skill `{skill_name}` 未返回可注入的完整指引，已拒绝开始本轮。"))?;
     let prompt = format!(
         "\n\n【用户显式选择的 Skill：`{skill_name}`】用户已在本轮输入区明确选择此 Skill。必须优先遵循下列指引完成当前请求；若它与系统、安全或运行时约束冲突，以上位约束为准。\n\n{content}"
     );
@@ -174,7 +186,7 @@ async fn activate_selected_skill(
     ))
 }
 
-fn create_skill_draft_from_call(
+pub(in crate::runtime_support) fn create_skill_draft_from_call(
     call: &ToolCall,
 ) -> Result<muse_core::domain::skill::SkillDraft, ToolResult> {
     let name = call
@@ -185,10 +197,7 @@ fn create_skill_draft_from_call(
         .trim()
         .to_string();
     if name.is_empty() {
-        return Err(tool_failed(
-            "create_skill 缺少 name 参数。",
-            "missing_name",
-        ));
+        return Err(tool_failed("create_skill 缺少 name 参数。", "missing_name"));
     }
     if let Err(error) = muse_core::domain::skill::validate_skill_name(&name) {
         return Err(tool_failed(error.to_string(), "skill_invalid"));
@@ -255,7 +264,7 @@ fn create_skill_draft_from_call(
     })
 }
 
-async fn tool_create_skill(
+pub(in crate::runtime_support) async fn tool_create_skill(
     state: &Arc<AppState>,
     turn: &TurnContext,
     call: &ToolCall,
@@ -286,10 +295,8 @@ async fn tool_create_skill(
 
     let record = {
         let mut config = state.user_config.lock().await;
-        match muse_core::domain::skill::SkillStore::from_data_dir(
-            state.runtime_service.data_dir(),
-        )
-        .create(draft, &mut config)
+        match muse_core::domain::skill::SkillStore::from_data_dir(state.runtime_service.data_dir())
+            .create(draft, &mut config)
         {
             Ok(record) => record,
             Err(error) => {
@@ -332,7 +339,7 @@ async fn tool_create_skill(
 }
 
 #[cfg(test)]
-async fn tool_skill_from_workspace(
+pub(in crate::runtime_support) async fn tool_skill_from_workspace(
     turn: &TurnContext,
     call: &ToolCall,
     workspace: &StdPath,
@@ -340,7 +347,7 @@ async fn tool_skill_from_workspace(
     tool_skill_from_workspace_with_user(turn, call, workspace, None).await
 }
 
-async fn tool_skill_from_workspace_with_user(
+pub(in crate::runtime_support) async fn tool_skill_from_workspace_with_user(
     turn: &TurnContext,
     call: &ToolCall,
     workspace: &StdPath,
@@ -382,9 +389,8 @@ async fn tool_skill_from_workspace_with_user(
         muse_core::domain::persona::ResourcePolicyMode::AllowList => {}
     }
 
-    let user_store = user_skill_context.map(|(data_dir, _)| {
-        muse_core::domain::skill::SkillStore::from_data_dir(data_dir)
-    });
+    let user_store = user_skill_context
+        .map(|(data_dir, _)| muse_core::domain::skill::SkillStore::from_data_dir(data_dir));
     let frozen_catalog_entry = turn
         .runtime_policy
         .skill_catalog
@@ -406,13 +412,14 @@ async fn tool_skill_from_workspace_with_user(
         }
         Some(Ok(_)) if frozen_catalog_required && frozen_catalog_entry.is_none() => {
             return tool_failed(
-                format!("Skill `{skill_name}` 不在当前 Turn 冻结目录中。若它是本轮对话中新建的，无需重试，下一轮对话起自动生效；否则不要猜测目录之外的 Skill 名称。"),
+                format!(
+                    "Skill `{skill_name}` 不在当前 Turn 冻结目录中。若它是本轮对话中新建的，无需重试，下一轮对话起自动生效；否则不要猜测目录之外的 Skill 名称。"
+                ),
                 "skill_catalog_denied",
             );
         }
         Some(Ok(ref skill))
-            if frozen_catalog_entry
-                .is_some_and(|entry| entry.revision != skill.revision) =>
+            if frozen_catalog_entry.is_some_and(|entry| entry.revision != skill.revision) =>
         {
             return tool_failed(
                 format!("Skill `{skill_name}` 已在当前 Turn 开始后变更，请发起新请求后重试。"),
@@ -458,7 +465,9 @@ async fn tool_skill_from_workspace_with_user(
     if let Some(builtin) = builtin {
         if frozen_catalog_required && frozen_catalog_entry.is_none() {
             return tool_failed(
-                format!("内置 Skill `{skill_name}` 不在当前 Turn 冻结目录中，不要猜测目录之外的 Skill 名称。"),
+                format!(
+                    "内置 Skill `{skill_name}` 不在当前 Turn 冻结目录中，不要猜测目录之外的 Skill 名称。"
+                ),
                 "skill_catalog_denied",
             );
         }
@@ -471,7 +480,10 @@ async fn tool_skill_from_workspace_with_user(
         let content_hash = content_hash_hex(builtin.content.as_bytes());
         return ToolResult {
             status: ToolResultStatus::Success,
-            content: format!("已成功载入内置 Skill `{skill_name}` 指引：\n\n{}", builtin.content),
+            content: format!(
+                "已成功载入内置 Skill `{skill_name}` 指引：\n\n{}",
+                builtin.content
+            ),
             structured: Some(serde_json::json!({
                 "skill_name": builtin.name,
                 "description": builtin.description,
@@ -509,9 +521,7 @@ async fn tool_skill_from_workspace_with_user(
     }
 
     let mut available_skills = user_skill_context
-        .and_then(|(_, preferences)| {
-            user_store.as_ref().map(|store| store.list(preferences))
-        })
+        .and_then(|(_, preferences)| user_store.as_ref().map(|store| store.list(preferences)))
         .and_then(Result::ok)
         .map(|skills| {
             skills
@@ -573,7 +583,7 @@ async fn tool_skill_from_workspace_with_user(
 }
 
 /// 安全读取旧工作区 Skill：任一层符号链接或 canonical 根逃逸都直接拒绝。
-async fn read_compatibility_skill(
+pub(in crate::runtime_support) async fn read_compatibility_skill(
     root: &StdPath,
     skill_name: &str,
 ) -> Result<Option<String>, ToolResult> {
@@ -683,11 +693,15 @@ async fn read_compatibility_skill(
     Ok(Some(content))
 }
 
-fn valid_skill_name(skill_name: &str) -> bool {
+pub(in crate::runtime_support) fn valid_skill_name(skill_name: &str) -> bool {
     muse_core::domain::skill::validate_skill_name(skill_name).is_ok()
 }
 
-async fn tool_agent(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_agent(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
     let request = match parse_agent_task_request(&call.arguments) {
         Ok(request) => request,
         Err(result) => return result,
@@ -769,7 +783,11 @@ async fn tool_agent(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) 
     }
 }
 
-async fn tool_task_stop(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_task_stop(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
     let reason = call
         .arguments
         .get("reason")
@@ -811,7 +829,7 @@ async fn tool_task_stop(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCa
     }
 }
 
-async fn tool_ask_user_question(
+pub(in crate::runtime_support) async fn tool_ask_user_question(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,
@@ -865,7 +883,11 @@ async fn tool_ask_user_question(
     }
 }
 
-async fn tool_todo_write(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_todo_write(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
     let request = match parse_todo_write_request(&call.arguments) {
         Ok(request) => request,
         Err(result) => return result,
@@ -925,7 +947,7 @@ async fn tool_todo_write(state: &Arc<AppState>, turn: &TurnContext, call: &ToolC
     }
 }
 
-async fn tool_enter_plan_mode(
+pub(in crate::runtime_support) async fn tool_enter_plan_mode(
     state: &Arc<AppState>,
     turn: &TurnContext,
     call: &ToolCall,
@@ -974,7 +996,7 @@ async fn tool_enter_plan_mode(
     }
 }
 
-async fn tool_exit_plan_mode(
+pub(in crate::runtime_support) async fn tool_exit_plan_mode(
     state: &Arc<AppState>,
     tx: Option<&RuntimeSseSender>,
     turn: &TurnContext,
@@ -1148,11 +1170,9 @@ async fn tool_exit_plan_mode(
         content: if confirmed {
             "用户已确认计划，已回到专注工作预设。请按计划继续执行。".to_string()
         } else if cancelled {
-            "用户取消了计划，已保持在计划态。请停止执行该计划，等待用户下一步指示。"
-                .to_string()
+            "用户取消了计划，已保持在计划态。请停止执行该计划，等待用户下一步指示。".to_string()
         } else {
-            "用户要求继续调整计划，已保持在计划态。请根据反馈修改计划后再提交确认。"
-                .to_string()
+            "用户要求继续调整计划，已保持在计划态。请根据反馈修改计划后再提交确认。".to_string()
         },
         structured: Some(serde_json::json!({
             "confirmed": confirmed,
@@ -1163,7 +1183,11 @@ async fn tool_exit_plan_mode(
     }
 }
 
-async fn tool_tts_speak(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_tts_speak(
+    state: &Arc<AppState>,
+    turn: &TurnContext,
+    call: &ToolCall,
+) -> ToolResult {
     for forbidden in ["voice_id", "voice_name", "speaker"] {
         if call.arguments.get(forbidden).is_some() {
             return ToolResult {
@@ -1218,7 +1242,7 @@ async fn tool_tts_speak(state: &Arc<AppState>, turn: &TurnContext, call: &ToolCa
     }
 }
 
-fn tool_voice_current(turn: &TurnContext) -> ToolResult {
+pub(in crate::runtime_support) fn tool_voice_current(turn: &TurnContext) -> ToolResult {
     let voice_id = turn.active_voice_id.as_deref();
     let tts_available = voice_id.is_some();
     let content = if let Some(voice_id) = voice_id {

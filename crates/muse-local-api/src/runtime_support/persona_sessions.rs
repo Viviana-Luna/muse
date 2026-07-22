@@ -1,3 +1,7 @@
+//! Persona 与运行时会话绑定适配。
+
+use super::*;
+
 /// 返回删除角色会影响的历史会话和工作区状态。
 pub(crate) async fn handle_persona_deletion_impact(
     Path(id): Path<String>,
@@ -115,9 +119,7 @@ pub(crate) async fn handle_activate_persona(
             )
             .await
             .map_err(internal_error)?;
-            return Err(internal_error(format!(
-                "恢复会话审批模式失败：{error}"
-            )));
+            return Err(internal_error(format!("恢复会话审批模式失败：{error}")));
         }
         true
     } else {
@@ -131,7 +133,7 @@ pub(crate) async fn handle_activate_persona(
     Ok(Json(response))
 }
 
-async fn rollback_persona_runtime_transition(
+pub(super) async fn rollback_persona_runtime_transition(
     state: &Arc<AppState>,
     previous_store: PersonaStore,
     previous_conversation: Conversation,

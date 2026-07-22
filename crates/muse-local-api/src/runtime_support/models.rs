@@ -1,757 +1,6 @@
-/// 处理非流式聊天请求。
-pub(crate) async fn handle_chat(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let selected_skill = normalize_selected_skill(req.selected_skill)?;
-    let runtime = ConversationRuntime::new(state.clone(), false);
-    let prepared = {
-        let _transition = state.persona_runtime_transition_gate.lock().await;
-        let active_persona = require_active_persona_http(&state).await?;
-        runtime
-            .occupy_user_turn(active_persona)
-            .map_err(runtime_turn_prepare_error_response)?
-    };
-    Ok(match runtime
-        .run_prepared_user_turn(
-            req.message,
-            selected_skill,
-            RuntimeEventEmitter::collect_only(),
-            prepared,
-        )
-        .await
-    {
-        Ok(outcome) => Json(ChatResponse {
-            reply: outcome.reply,
-        }),
-        Err(err) => Json(ChatResponse { reply: err }),
-    })
-}
+//! 模型、提供器和模型配置 HTTP 适配。
 
-/// 处理流式聊天请求。
-pub(crate) async fn handle_chat_stream(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<ChatStreamRequest>,
-) -> Result<
-    Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>,
-    (StatusCode, Json<ErrorResponse>),
-> {
-    let selected_skill = normalize_selected_skill(request.selected_skill.clone())?;
-    let client_request_id = request.client_request_id.trim();
-    if client_request_id.is_empty()
-        || client_request_id.len() > 128
-        || !client_request_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(bad_request(
-            "client_request_id 必须是 1 到 128 位字母、数字、连字符或下划线。",
-        ));
-    }
-    let client_request_id = client_request_id.to_string();
-    let runtime = ConversationRuntime::new(state.clone(), request.voice_enabled.unwrap_or(false));
-    let prepared = {
-        // 角色事实、会话 ID、turn 占位与幂等登记必须在同一 transition gate 内提交。
-        let _transition = state.persona_runtime_transition_gate.lock().await;
-        let active_persona = require_active_persona_http(&state).await?;
-        let conversation_id = request.conversation_id.trim();
-        if conversation_id.is_empty() || conversation_id != active_conversation_id(&state) {
-            return Err(decision_conflict(
-                "聊天请求的 conversation_id 已过期，请先同步运行时状态。".to_string(),
-            ));
-        }
-        if state
-            .chat_request_ids
-            .lock()
-            .await
-            .contains(&client_request_id)
-        {
-            return Err(decision_conflict(format!(
-                "聊天请求 `{client_request_id}` 已受理，不会重复创建回合。"
-            )));
-        }
-        let prepared = runtime
-            .occupy_user_turn(active_persona)
-            .map_err(runtime_turn_prepare_error_response)?;
-        let mut request_ids = state.chat_request_ids.lock().await;
-        match request_ids.accept(&client_request_id) {
-            Ok(()) => {}
-            Err(ChatRequestRegistryError::Duplicate) => {
-                return Err(decision_conflict(format!(
-                    "聊天请求 `{client_request_id}` 已受理，不会重复创建回合。"
-                )));
-            }
-            Err(ChatRequestRegistryError::CapacityExceeded) => {
-                return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(ErrorResponse {
-                        error: "聊天请求幂等登记表已满，请等待已有请求超过保护期限后重试。"
-                            .to_string(),
-                    }),
-                ));
-            }
-            Err(ChatRequestRegistryError::Persistence(error)) => {
-                return Err(internal_error(error));
-            }
-        }
-        drop(request_ids);
-        prepared
-    };
-    let (tx, rx) =
-        mpsc::channel::<Result<axum::response::sse::Event, std::convert::Infallible>>(64);
-    let request_state = state.clone();
-    let message = request.message;
-    let emitter = RuntimeEventEmitter::stream(tx.clone());
-    tokio::spawn(async move {
-        if !emitter.is_closed() {
-            let _ = runtime
-                .run_prepared_user_turn(message, selected_skill, emitter.clone(), prepared)
-                .await;
-        }
-        if let Err(error) = request_state
-            .chat_request_ids
-            .lock()
-            .await
-            .mark_terminal(&client_request_id)
-        {
-            tracing::error!(
-                target: "muse::runtime",
-                error = %error,
-                "持久化聊天请求终态失败"
-            );
-        }
-    });
-
-    Ok(
-        Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx)).keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        ),
-    )
-}
-
-fn normalize_selected_skill(
-    selected_skill: Option<String>,
-) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
-    let Some(skill_name) = selected_skill else {
-        return Ok(None);
-    };
-    let skill_name = skill_name.trim().to_string();
-    muse_core::domain::skill::validate_skill_name(&skill_name)
-        .map_err(|error| bad_request(&error.to_string()))?;
-    Ok(Some(skill_name))
-}
-
-/// 明确拒绝旧版 GET 流式聊天，避免查询字符串触发有副作用的用户轮次。
-pub(crate) async fn handle_chat_stream_get_not_allowed() -> Response {
-    let mut response = (
-        StatusCode::METHOD_NOT_ALLOWED,
-        Json(ErrorResponse {
-            error: "流式聊天只接受 POST JSON 请求。".to_string(),
-        }),
-    )
-        .into_response();
-    response
-        .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("POST"));
-    response
-}
-
-/// 返回经过鉴权的本地运行时健康状态。
-pub(crate) async fn handle_runtime_health(
-    Extension(security): Extension<Arc<LocalApiSecurity>>,
-) -> Json<RuntimeHealthResponse> {
-    Json(security.health())
-}
-
-/// 为浏览器 WebSocket 握手签发短期单次票据。
-pub(crate) async fn handle_runtime_ws_ticket(
-    Extension(security): Extension<Arc<LocalApiSecurity>>,
-) -> Response {
-    match security.issue_ws_ticket().await {
-        Ok(ticket) => Json::<WsTicketResponse>(ticket).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: error.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct HistoryQuery {
-    pub(crate) conversation_id: Option<String>,
-}
-
-/// 查询当前会话历史。
-pub(crate) async fn handle_history(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<HistoryQuery>,
-) -> Json<HistoryResponse> {
-    if let Some(ref cid) = query.conversation_id {
-        let active_cid = active_conversation_id(&state);
-        if cid != &active_cid {
-            if let Ok(content) = read_runtime_transcript_for_conversation(&state, cid).await {
-                let system_prompt = current_runtime_system_prompt(&state).await;
-                let (conv, _stats) = replay_runtime_transcript_lines(
-                    system_prompt,
-                    state.config.agent.max_history,
-                    &content,
-                    cid,
-                    None,
-                );
-                return Json(HistoryResponse {
-                    messages: conv
-                        .api_messages()
-                        .iter()
-                        .filter(|message| {
-                            message.role != Role::System
-                                && message.role != Role::Tool
-                                && message.tool_call_id.is_none()
-                        })
-                        .cloned()
-                        .collect(),
-                });
-            } else {
-                return Json(HistoryResponse {
-                    messages: Vec::new(),
-                });
-            }
-        }
-    }
-
-    let conv = state.runtime_service.lock_conversation().await;
-    Json(HistoryResponse {
-        messages: conv
-            .api_messages()
-            .iter()
-            .filter(|message| {
-                message.role != Role::System
-                    && message.role != Role::Tool
-                    && message.tool_call_id.is_none()
-            })
-            .cloned()
-            .collect(),
-    })
-}
-
-/// 查询运行时会话列表。
-pub(crate) async fn handle_runtime_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<RuntimeSessionListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let payload = runtime_session_list_payload(&state)
-        .await
-        .map_err(internal_error)?;
-    let active_conversation_id = active_conversation_id(&state);
-    Ok(Json(RuntimeSessionListResponse {
-        active_conversation_id: active_conversation_id.clone(),
-        status: if payload.exists {
-            "当前存在 runtime transcript。".to_string()
-        } else {
-            "当前尚未写入 runtime transcript。".to_string()
-        },
-        sessions: runtime_session_list_for_active(payload.sessions, &active_conversation_id),
-    }))
-}
-
-/// 将会话元数据作为完整快照事件追加到 Session v3，并同步可重建索引。
-pub(crate) async fn handle_runtime_session_metadata_patch(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-    Json(patch): Json<RuntimeSessionMetadataPatch>,
-) -> Result<Json<RuntimeSessionMetadataResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_runtime_session(&state, &conversation_id).await?;
-    if patch.title.is_none() && patch.archived.is_none() {
-        return Err(bad_request("至少需要提交 title 或 archived。"));
-    }
-    let repository = state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
-    let metadata = repository
-        .update_metadata(&conversation_id, patch.title, patch.archived)
-        .await
-        .map_err(|error| match error {
-            muse_runtime::session_metadata::SessionRepositoryError::InvalidInput(message) => {
-                bad_request(&message)
-            }
-            muse_runtime::session_metadata::SessionRepositoryError::InvalidData(message) => (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse { error: message }),
-            ),
-            other => internal_error(other.to_string()),
-        })?;
-    let persona_status = {
-        let personas = state.personas.lock().await;
-        if personas.get(&metadata.persona_id).is_some() {
-            "bound"
-        } else {
-            "missing"
-        }
-    };
-    Ok(Json(RuntimeSessionMetadataResponse {
-        conversation_id,
-        persona_id: metadata.persona_id,
-        persona_name_snapshot: metadata.persona_name_snapshot,
-        persona_version_snapshot: metadata.persona_version_snapshot,
-        persona_status: persona_status.to_string(),
-        title: metadata.title,
-        archived: metadata.archived,
-        source_conversation_id: metadata.source_conversation_id,
-        updated_at: metadata.updated_at,
-        revision: metadata.revision,
-    }))
-}
-
-/// 导出可公开 transcript，不包含秘密、内部路径和工具原始外置结果。
-pub(crate) async fn handle_runtime_session_export(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Result<Json<RuntimeSessionExportResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let events = runtime_session_events(&state, &conversation_id).await?;
-    let (conversation, _) = replay_runtime_transcript_lines(
-        "Muse 会话导出".to_string(),
-        state.config.agent.max_history,
-        &session_events_as_jsonl(&events),
-        &conversation_id,
-        None,
-    );
-    let messages = conversation
-        .messages
-        .iter()
-        .filter_map(|message| match message.role {
-            Role::User => Some(RuntimeSessionExportMessage {
-                role: "user".to_string(),
-                content: message.content.clone(),
-            }),
-            Role::Assistant => Some(RuntimeSessionExportMessage {
-                role: "assistant".to_string(),
-                content: message.content.clone(),
-            }),
-            Role::System | Role::Tool => None,
-        })
-        .collect();
-    let item = state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .metadata(&conversation_id)
-        .await
-        .map_err(session_metadata_read_error)?;
-    let metadata = item.ok_or_else(|| internal_error("会话缺少 v2 Persona metadata。".to_string()))?;
-    let persona_exists = {
-        let personas = state.personas.lock().await;
-        personas.get(&metadata.persona_id).is_some()
-    };
-    Ok(Json(RuntimeSessionExportResponse {
-        schema_version: "muse-session-export/v1".to_string(),
-        conversation_id,
-        persona_id: metadata.persona_id,
-        persona_name_snapshot: metadata.persona_name_snapshot,
-        persona_version_snapshot: metadata.persona_version_snapshot,
-        persona_status: if persona_exists { "bound" } else { "missing" }.to_string(),
-        title: metadata.title,
-        archived: metadata.archived,
-        source_conversation_id: metadata.source_conversation_id,
-        exported_at: chrono::Utc::now().to_rfc3339(),
-        messages,
-    }))
-}
-
-/// 返回 Context Inspector 所需的上下文与冻结运行策略。
-pub(crate) async fn handle_runtime_session_context(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Result<Json<RuntimeSessionContextResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let events = runtime_session_events(&state, &conversation_id).await?;
-    let runtime_policy_snapshot = events
-        .iter()
-        .rev()
-        .find(|event| event.kind == "runtime_policy_snapshot")
-        .and_then(|event| event.payload.get("snapshot"))
-        .cloned();
-    let usage = RuntimeUsageStore::load_from_dir(state.runtime_service.data_dir())
-        .map_err(|error| internal_error(error.to_string()))?;
-    let context_snapshot = usage
-        .latest_context_snapshot(&conversation_id)
-        .map_err(|error| internal_error(error.to_string()))?;
-    Ok(Json(RuntimeSessionContextResponse {
-        conversation_id,
-        context_snapshot,
-        runtime_policy_snapshot,
-        status: "会话上下文与运行策略已读取。".to_string(),
-    }))
-}
-
-/// 兼容单独读取冻结运行策略的只读接口。
-pub(crate) async fn handle_runtime_session_runtime_profile(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let events = runtime_session_events(&state, &conversation_id).await?;
-    let snapshot = events
-        .iter()
-        .rev()
-        .find(|event| event.kind == "runtime_policy_snapshot")
-        .and_then(|event| event.payload.get("snapshot"))
-        .cloned();
-    Ok(Json(serde_json::json!({
-        "conversation_id": conversation_id,
-        "snapshot": snapshot,
-        "status": "冻结运行策略已读取。"
-    })))
-}
-
-async fn runtime_session_events(
-    state: &Arc<AppState>,
-    conversation_id: &str,
-) -> Result<Vec<muse_runtime::session::SessionEventV3>, (StatusCode, Json<ErrorResponse>)> {
-    if conversation_id.trim().is_empty() {
-        return Err(bad_request("会话 ID 不能为空。"));
-    }
-    let store = state
-        .runtime_service
-        .session_store()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
-    let events = store
-        .events_for_conversation(conversation_id)
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
-    if events.is_empty() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "session_not_found：会话不存在。".to_string(),
-            }),
-        ));
-    }
-    Ok(events)
-}
-
-async fn require_runtime_session(
-    state: &Arc<AppState>,
-    conversation_id: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    runtime_session_events(state, conversation_id).await.map(|_| ())
-}
-
-fn session_metadata_read_error(
-    error: muse_runtime::session_metadata::SessionRepositoryError,
-) -> (StatusCode, Json<ErrorResponse>) {
-    match error {
-        muse_runtime::session_metadata::SessionRepositoryError::InvalidInput(message) => {
-            bad_request(&message)
-        }
-        muse_runtime::session_metadata::SessionRepositoryError::InvalidData(message) => (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: if message.starts_with("session_persona_unbound") {
-                    message
-                } else {
-                    format!("session_persona_unbound：{message}")
-                },
-            }),
-        ),
-        other => internal_error(other.to_string()),
-    }
-}
-
-/// 恢复指定运行时会话。
-pub(crate) async fn handle_runtime_session_resume(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Result<Json<RuntimeSessionResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "resume_session")?;
-    let repository = state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
-    let metadata = repository
-        .metadata(&conversation_id)
-        .await
-        .map_err(session_metadata_read_error)?
-        .ok_or_else(|| bad_request("会话缺少 v2 Persona metadata。"))?;
-    let (persona, previous_personas) = {
-        let mut personas = state.personas.lock().await;
-        let previous = personas.clone();
-        let persona = personas.get(&metadata.persona_id).cloned().ok_or_else(|| (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse { error: "session_persona_missing：会话所属角色已删除，只能查看或导出。".to_string() }),
-        ))?;
-        personas.set_active(&persona.id).map_err(persona_store_error_response)?;
-        personas.save().map_err(persona_store_error_response)?;
-        (persona, previous)
-    };
-    let previous_conversation = state.runtime_service.lock_conversation().await.clone();
-    let previous_todos = state.runtime_service.runtime_todos().await;
-    let previous_conversation_id = active_conversation_id(&state);
-    let runtime = ConversationRuntime::new(state.clone(), false);
-    let outcome = match runtime
-        .submit(
-            RuntimeOp::ResumeSession {
-                conversation_id: conversation_id.clone(),
-            },
-            RuntimeEventEmitter::collect_only(),
-        )
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            rollback_persona_runtime_transition(
-                &state,
-                previous_personas,
-                previous_conversation,
-                previous_todos,
-                previous_conversation_id,
-            )
-            .await
-            .map_err(internal_error)?;
-            let _ = finish_runtime_idle_lease(idle_lease);
-            return Err(bad_request(&error));
-        }
-    };
-    let restored_messages = {
-        let conv = state.runtime_service.lock_conversation().await;
-        conv.messages
-            .iter()
-            .filter(|message| message.role != Role::System)
-            .count()
-    };
-    if let Err(error) = repository.set_workspace_state(&persona.id, &conversation_id) {
-        rollback_persona_runtime_transition(
-            &state,
-            previous_personas,
-            previous_conversation,
-            previous_todos,
-            previous_conversation_id,
-        )
-        .await
-        .map_err(internal_error)?;
-        return Err(internal_error(error.to_string()));
-    }
-    if let Err(error) = restore_active_approval_mode(&state, &conversation_id).await {
-        rollback_persona_runtime_transition(
-            &state,
-            previous_personas,
-            previous_conversation,
-            previous_todos,
-            previous_conversation_id,
-        )
-        .await
-        .map_err(internal_error)?;
-        return Err(internal_error(error));
-    }
-    finish_runtime_idle_lease(idle_lease)?;
-    state.runtime_service.touch();
-
-    Ok(Json(RuntimeSessionResumeResponse {
-        conversation_id,
-        persona_id: metadata.persona_id,
-        persona_name_snapshot: metadata.persona_name_snapshot,
-        persona_version_snapshot: metadata.persona_version_snapshot,
-        persona_status: "bound".to_string(),
-        restored_messages,
-        status: outcome.reply,
-    }))
-}
-
-/// 从指定运行时会话分叉出新会话。
-pub(crate) async fn handle_runtime_session_fork(
-    State(state): State<Arc<AppState>>,
-    Path(source_conversation_id): Path<String>,
-    Json(req): Json<RuntimeSessionForkRequest>,
-) -> Result<Json<RuntimeSessionForkResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    let idle_lease = acquire_runtime_idle_lease(&state, "fork_session")?;
-    let repository = state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
-    let source_metadata = repository
-        .metadata(&source_conversation_id)
-        .await
-        .map_err(session_metadata_read_error)?
-        .ok_or_else(|| bad_request("来源会话缺少 v2 Persona metadata。"))?;
-    let source_approval_mode = repository
-        .approval_mode_for_resume(&source_conversation_id)
-        .await
-        .map_err(session_metadata_read_error)?;
-    let target_persona_id = req
-        .target_persona_id
-        .clone()
-        .unwrap_or_else(|| source_metadata.persona_id.clone());
-    let (target_persona, previous_personas) = {
-        let mut personas = state.personas.lock().await;
-        let previous = personas.clone();
-        let persona = personas.get(&target_persona_id).cloned().ok_or_else(|| (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: format!("目标角色 `{target_persona_id}` 不存在。") }),
-        ))?;
-        personas.set_active(&target_persona_id).map_err(persona_store_error_response)?;
-        personas.save().map_err(persona_store_error_response)?;
-        (persona, previous)
-    };
-    let previous_conversation = state.runtime_service.lock_conversation().await.clone();
-    let previous_todos = state.runtime_service.runtime_todos().await;
-    let previous_conversation_id = active_conversation_id(&state);
-    let runtime = ConversationRuntime::new(state.clone(), false);
-    let outcome = match runtime
-        .submit(
-            RuntimeOp::ForkSession {
-                source_conversation_id: source_conversation_id.clone(),
-                before_user_message_index: req.before_user_message_index,
-            },
-            RuntimeEventEmitter::collect_only(),
-        )
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            rollback_persona_runtime_transition(
-                &state,
-                previous_personas,
-                previous_conversation,
-                previous_todos,
-                previous_conversation_id,
-            )
-            .await
-            .map_err(internal_error)?;
-            let _ = finish_runtime_idle_lease(idle_lease);
-            return Err(bad_request(&error));
-        }
-    };
-    let conversation_id = active_conversation_id(&state);
-    let restored_messages = {
-        let conv = state.runtime_service.lock_conversation().await;
-        conv.messages
-            .iter()
-            .filter(|message| message.role != Role::System)
-            .count()
-    };
-    let metadata = repository
-        .metadata(&conversation_id)
-        .await
-        .map_err(session_metadata_read_error)?
-        .ok_or_else(|| internal_error("分叉会话缺少 v2 Persona metadata。".to_string()))?;
-    if let Err(error) = repository.set_workspace_state(&target_persona.id, &conversation_id) {
-        rollback_persona_runtime_transition(
-            &state,
-            previous_personas,
-            previous_conversation,
-            previous_todos,
-            previous_conversation_id,
-        )
-        .await
-        .map_err(internal_error)?;
-        return Err(internal_error(error.to_string()));
-    }
-    let inherited_approval_mode = repository
-        .update_approval_mode(&conversation_id, source_approval_mode.preset)
-        .await
-        .map_err(session_metadata_read_error)?;
-    set_active_approval_mode(
-        &state,
-        inherited_approval_mode.preset,
-        inherited_approval_mode.revision,
-    )
-    .map_err(internal_error)?;
-    finish_runtime_idle_lease(idle_lease)?;
-    state.runtime_service.touch();
-
-    Ok(Json(RuntimeSessionForkResponse {
-        conversation_id,
-        persona_id: metadata.persona_id,
-        persona_name_snapshot: metadata.persona_name_snapshot,
-        persona_version_snapshot: metadata.persona_version_snapshot,
-        persona_status: "bound".to_string(),
-        source_conversation_id,
-        before_user_message_index: req.before_user_message_index,
-        restored_messages,
-        status: outcome.reply,
-    }))
-}
-
-/// 删除指定运行时会话。
-pub(crate) async fn handle_runtime_session_delete(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<String>,
-) -> Result<Json<RuntimeSessionDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    require_active_persona_http(&state).await?;
-    if conversation_id.trim().is_empty() {
-        return Err(bad_request("会话 ID 不能为空。"));
-    }
-    let idle_lease = acquire_runtime_idle_lease(&state, "delete_session")?;
-    let delete_result = delete_runtime_transcript_for_conversation(&state, &conversation_id)
-        .await
-        .map_err(|err| internal_error(format!("删除会话 transcript 失败：{err}")))?;
-    if delete_result.deleted_records == 0 && delete_result.deleted_files == 0 {
-        return Err(bad_request("会话不存在或没有可删除的 transcript。"));
-    }
-    let mut active_after_delete = active_conversation_id(&state);
-    if active_after_delete == conversation_id {
-        let system_prompt = current_runtime_system_prompt(&state).await;
-        let mut conv = state.runtime_service.lock_conversation().await;
-        *conv = muse_core::domain::conversation::Conversation::new(
-            system_prompt,
-            state.config.agent.max_history,
-        );
-        drop(conv);
-        replace_runtime_todos(&state, Vec::new()).await;
-        active_after_delete = next_runtime_session_id();
-        set_active_conversation_id(&state, &active_after_delete).map_err(internal_error)?;
-        initialize_new_session_approval_mode(&state, &active_after_delete)
-            .await
-            .map_err(internal_error)?;
-    }
-    finish_runtime_idle_lease(idle_lease)?;
-    state.runtime_service.touch();
-
-    Ok(Json(RuntimeSessionDeleteResponse {
-        conversation_id,
-        active_conversation_id: active_after_delete,
-        deleted_records: delete_result.deleted_records,
-        deleted_files: delete_result.deleted_files,
-        status: "会话已删除。".to_string(),
-    }))
-}
-
-/// 重置当前会话。
-pub(crate) async fn handle_reset(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let _transition = state.persona_runtime_transition_gate.lock().await;
-    require_active_persona_http(&state).await?;
-    let idle_lease = acquire_runtime_idle_lease(&state, "reset_session")?;
-    let system_prompt = current_runtime_system_prompt(&state).await;
-    let mut conv = state.runtime_service.lock_conversation().await;
-    *conv = muse_core::domain::conversation::Conversation::new(
-        system_prompt,
-        state.config.agent.max_history,
-    );
-    drop(conv);
-    replace_runtime_todos(&state, Vec::new()).await;
-    let conversation_id = next_runtime_session_id();
-    let _ = set_active_conversation_id(&state, &conversation_id);
-    initialize_new_session_approval_mode(&state, &conversation_id)
-        .await
-        .map_err(internal_error)?;
-    finish_runtime_idle_lease(idle_lease)?;
-    state.runtime_service.touch();
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "conversation_id": conversation_id,
-    })))
-}
+use super::*;
 
 /// 查询当前聊天模型概要。
 pub(crate) async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
@@ -860,8 +109,8 @@ async fn refresh_model_config_from_disk(
         (changed, store.config().clone())
     };
     if changed {
-        *state.provider.lock().await = build_chat_provider(&models.chat)
-            .map_err(|error| bad_request(&error.to_string()))?;
+        *state.provider.lock().await =
+            build_chat_provider(&models.chat).map_err(|error| bad_request(&error.to_string()))?;
         rebuild_tts_provider_from_state(state).await;
         rebuild_speech_provider_from_state(state).await;
     }
@@ -945,10 +194,8 @@ pub(crate) async fn handle_put_provider_state(
     State(state): State<Arc<AppState>>,
     Path(provider_id): Path<String>,
     Json(request): Json<ProviderStateUpdateRequest>,
-) -> Result<
-    Json<muse_core::model::catalog::ModelProviderCatalog>,
-    (StatusCode, Json<ErrorResponse>),
-> {
+) -> Result<Json<muse_core::model::catalog::ModelProviderCatalog>, (StatusCode, Json<ErrorResponse>)>
+{
     let _transition = state.model_configuration_transition_gate.lock().await;
     let (provider, active_config) = {
         let mut store = state.model_config.lock().await;
@@ -1168,9 +415,7 @@ async fn probe_provider_chat(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse {
-                error: format!(
-                    "provider_protocol_error：供应商在成功响应中返回错误对象{detail}。"
-                ),
+                error: format!("provider_protocol_error：供应商在成功响应中返回错误对象{detail}。"),
             }),
         ));
     }
@@ -1189,8 +434,14 @@ async fn probe_provider_chat(
 fn safe_provider_error_detail(payload: &serde_json::Value) -> Option<String> {
     let error = payload.get("error").unwrap_or(payload);
     let labels = [
-        ("type", error.get("type").and_then(serde_json::Value::as_str)),
-        ("code", error.get("code").and_then(serde_json::Value::as_str)),
+        (
+            "type",
+            error.get("type").and_then(serde_json::Value::as_str),
+        ),
+        (
+            "code",
+            error.get("code").and_then(serde_json::Value::as_str),
+        ),
     ]
     .into_iter()
     .filter_map(|(name, value)| {
@@ -1401,10 +652,10 @@ async fn stored_api_key_for_provider(
     }
     match purpose {
         "chat" => (cfg.chat().provider == provider_id)
-                .then(|| cfg.chat().api_key.as_ref())
-                .flatten()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            .then(|| cfg.chat().api_key.as_ref())
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         "audio_understanding" => cfg
             .audio_understanding()
             .api_key
@@ -1421,8 +672,7 @@ async fn fetch_provider_models(
     api_base: &str,
     model_list_url: &str,
     api_key: Option<&str>,
-) -> Result<Vec<muse_core::model::catalog::ModelCatalogItem>, (StatusCode, Json<ErrorResponse>)>
-{
+) -> Result<Vec<muse_core::model::catalog::ModelCatalogItem>, (StatusCode, Json<ErrorResponse>)> {
     let url = model_list_url.trim().to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -1467,8 +717,7 @@ async fn fetch_provider_models(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse {
-                error: "provider_auth_failed：提供商拒绝了当前凭据，请检查 API Key。"
-                    .to_string(),
+                error: "provider_auth_failed：提供商拒绝了当前凭据，请检查 API Key。".to_string(),
             }),
         ));
     }
@@ -1503,8 +752,7 @@ async fn fetch_provider_models(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse {
-                error: "provider_protocol_error：提供商返回中没有识别到模型列表。"
-                    .to_string(),
+                error: "provider_protocol_error：提供商返回中没有识别到模型列表。".to_string(),
             }),
         ));
     }
@@ -1714,13 +962,10 @@ pub(crate) async fn handle_put_web_search_config(
     match request.action {
         SecretUpdateAction::Keep => {}
         SecretUpdateAction::Replace => {
-            if let Err(error) = state
-                .secrets
-                .set_verified(
-                    "web-search.exa",
-                    replacement.as_deref().expect("replace 已解析非空密钥"),
-                )
-            {
+            if let Err(error) = state.secrets.set_verified(
+                "web-search.exa",
+                replacement.as_deref().expect("replace 已解析非空密钥"),
+            ) {
                 return Err(web_search_secret_update_error(
                     &state,
                     previous.as_deref(),
@@ -1781,9 +1026,9 @@ fn web_search_secret_update_error(
 ) -> (StatusCode, Json<ErrorResponse>) {
     match restore_web_search_secret(state, previous) {
         Ok(()) => internal_error(format!("{message}，原凭据状态已恢复。")),
-        Err(rollback_error) => internal_error(format!(
-            "{message}，且原凭据状态恢复失败：{rollback_error}"
-        )),
+        Err(rollback_error) => {
+            internal_error(format!("{message}，且原凭据状态恢复失败：{rollback_error}"))
+        }
     }
 }
 
@@ -1791,7 +1036,7 @@ struct ResolvedSettingSecretUpdate {
     runtime_value: Option<String>,
 }
 
-fn normalize_chat_max_tokens(provider: &str, requested: u32) -> u32 {
+pub(super) fn normalize_chat_max_tokens(provider: &str, requested: u32) -> u32 {
     provider_profile_for_identity(provider, "")
         .map(|profile| requested.clamp(1, profile.model_defaults.default_max_output_tokens))
         .unwrap_or(requested)
@@ -1820,21 +1065,22 @@ pub(crate) async fn handle_put_models_config(
         let existing = store.config().clone();
 
         let requested_chat_provider = chat_req.provider.trim().to_ascii_lowercase();
-        let supported_chat_profile =
-            provider_profile_for_identity(&requested_chat_provider, "");
+        let supported_chat_profile = provider_profile_for_identity(&requested_chat_provider, "");
         let legacy_chat_unchanged = requested_chat_provider
             == existing.chat.provider.trim().to_ascii_lowercase()
             && chat_req.api_base == existing.chat.api_base
             && chat_req.model == existing.chat.model
-            && chat_req.max_tokens.unwrap_or(existing.chat.max_tokens)
-                == existing.chat.max_tokens
+            && chat_req.max_tokens.unwrap_or(existing.chat.max_tokens) == existing.chat.max_tokens
             && chat_req.temperature.unwrap_or(existing.chat.temperature)
                 == existing.chat.temperature
             && normalize_model_api_protocol(
                 chat_req.api_protocol.clone(),
                 &existing.chat.api_protocol,
             ) == existing.chat.api_protocol
-            && chat_req.api_key.as_deref().is_none_or(|value| value.is_empty())
+            && chat_req
+                .api_key
+                .as_deref()
+                .is_none_or(|value| value.is_empty())
             && chat_req.api_key_update.action == SecretUpdateAction::Keep;
         if !requested_chat_provider.is_empty()
             && supported_chat_profile.is_none()
@@ -1847,13 +1093,12 @@ pub(crate) async fn handle_put_models_config(
         let normalized_chat_api_base = supported_chat_profile
             .map(|profile| profile.default_api_base.to_string())
             .unwrap_or_else(|| chat_req.api_base.clone());
-        let normalized_chat_provider = if supported_chat_profile.is_some()
-            || requested_chat_provider.is_empty()
-        {
-            requested_chat_provider
-        } else {
-            existing.chat.provider.clone()
-        };
+        let normalized_chat_provider =
+            if supported_chat_profile.is_some() || requested_chat_provider.is_empty() {
+                requested_chat_provider
+            } else {
+                existing.chat.provider.clone()
+            };
 
         let chat_secret = resolve_setting_secret_update(
             &chat_req.api_key_update,
@@ -1951,20 +1196,22 @@ pub(crate) async fn handle_put_models_config(
             mcp_servers: BTreeMap::new(),
             secret_bindings: Default::default(),
         };
-        let saved = store.update_models_config(new_config).map_err(|error| match error {
-            muse_core::app::preferences::MuseConfigStoreError::Validation(diagnostic) => {
-                bad_request(&diagnostic.message)
-            }
-            muse_core::app::preferences::MuseConfigStoreError::Conflict(diagnostic) => (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("{}：{}", diagnostic.code, diagnostic.message),
-                }),
-            ),
-            _ => internal_error(
-                "保存 config.toml 失败，请检查文件权限和磁盘状态。".to_string(),
-            ),
-        })?;
+        let saved = store
+            .update_models_config(new_config)
+            .map_err(|error| match error {
+                muse_core::app::preferences::MuseConfigStoreError::Validation(diagnostic) => {
+                    bad_request(&diagnostic.message)
+                }
+                muse_core::app::preferences::MuseConfigStoreError::Conflict(diagnostic) => (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!("{}：{}", diagnostic.code, diagnostic.message),
+                    }),
+                ),
+                _ => {
+                    internal_error("保存 config.toml 失败，请检查文件权限和磁盘状态。".to_string())
+                }
+            })?;
         let new_provider =
             build_chat_provider(&saved.chat).map_err(|err| bad_request(&err.to_string()))?;
         (saved, new_provider)
@@ -2091,7 +1338,7 @@ fn resolve_setting_secret_update(
     }
 }
 
-async fn resolve_tts_request_context(
+pub(super) async fn resolve_tts_request_context(
     state: &Arc<AppState>,
     requested_voice_id: Option<&str>,
 ) -> Result<TtsRequestContext, (StatusCode, Json<ErrorResponse>)> {

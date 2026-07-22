@@ -1,4 +1,8 @@
-async fn tool_session_list(state: &Arc<AppState>) -> ToolResult {
+//! 会话查询、外置结果读取与上下文压缩工具适配。
+
+use super::*;
+
+pub(in crate::runtime_support) async fn tool_session_list(state: &Arc<AppState>) -> ToolResult {
     let payload = match runtime_session_list_payload(state).await {
         Ok(payload) => payload,
         Err(error) => return tool_failed(error, "session_index_unavailable"),
@@ -13,7 +17,10 @@ async fn tool_session_list(state: &Arc<AppState>) -> ToolResult {
         structured: Some(serde_json::json!({ "sessions": payload.sessions })),
     }
 }
-async fn tool_session_read(state: &Arc<AppState>, call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_session_read(
+    state: &Arc<AppState>,
+    call: &ToolCall,
+) -> ToolResult {
     let conversation_id = tool_arg_string(&call.arguments, "conversation_id")
         .unwrap_or_else(|| DEFAULT_CONVERSATION_ID.to_string());
     match read_runtime_transcript_for_conversation(state, &conversation_id).await {
@@ -34,7 +41,7 @@ async fn tool_session_read(state: &Arc<AppState>, call: &ToolCall) -> ToolResult
     }
 }
 
-async fn tool_result_read(call: &ToolCall) -> ToolResult {
+pub(in crate::runtime_support) async fn tool_result_read(call: &ToolCall) -> ToolResult {
     let Some(result_id) = tool_arg_string(&call.arguments, "result_id") else {
         return tool_failed(
             "tool_result_read 缺少 result_id 参数。",
@@ -143,7 +150,10 @@ async fn tool_result_read(call: &ToolCall) -> ToolResult {
     }
 }
 
-fn runtime_default_session_list(path: &StdPath, exists: bool) -> Vec<serde_json::Value> {
+pub(in crate::runtime_support) fn runtime_default_session_list(
+    path: &StdPath,
+    exists: bool,
+) -> Vec<serde_json::Value> {
     let _ = path;
     vec![serde_json::json!({
         "conversation_id": DEFAULT_CONVERSATION_ID,
@@ -156,7 +166,7 @@ fn runtime_default_session_list(path: &StdPath, exists: bool) -> Vec<serde_json:
     })]
 }
 
-fn is_empty_legacy_default_session(
+pub(in crate::runtime_support) fn is_empty_legacy_default_session(
     session: &serde_json::Value,
     active_conversation_id: &str,
 ) -> bool {
@@ -183,7 +193,7 @@ fn is_empty_legacy_default_session(
             == 0
 }
 
-fn runtime_session_list_for_active(
+pub(in crate::runtime_support) fn runtime_session_list_for_active(
     sessions: Vec<serde_json::Value>,
     active_conversation_id: &str,
 ) -> Vec<serde_json::Value> {
@@ -212,7 +222,9 @@ fn runtime_session_list_for_active(
     rows
 }
 
-fn compact_source_line(message: &muse_core::domain::conversation::Message) -> String {
+pub(in crate::runtime_support) fn compact_source_line(
+    message: &muse_core::domain::conversation::Message,
+) -> String {
     let role = message.role.to_string();
     if let Some(tool_name) = message.tool_name.as_deref()
         && message.tool_call_id.is_some()
@@ -228,7 +240,9 @@ fn compact_source_line(message: &muse_core::domain::conversation::Message) -> St
     format!("{}: {}", role, truncate_text(&message.content, 800))
 }
 
-fn build_rule_compact_summary(messages: &[muse_core::domain::conversation::Message]) -> String {
+pub(in crate::runtime_support) fn build_rule_compact_summary(
+    messages: &[muse_core::domain::conversation::Message],
+) -> String {
     let body = messages
         .iter()
         .filter(|message| message.role != Role::System)
@@ -245,7 +259,9 @@ fn build_rule_compact_summary(messages: &[muse_core::domain::conversation::Messa
     }
 }
 
-fn build_compact_prompt(messages: &[muse_core::domain::conversation::Message]) -> String {
+pub(in crate::runtime_support) fn build_compact_prompt(
+    messages: &[muse_core::domain::conversation::Message],
+) -> String {
     let transcript = messages
         .iter()
         .filter(|message| message.role != Role::System)
@@ -262,7 +278,7 @@ fn build_compact_prompt(messages: &[muse_core::domain::conversation::Message]) -
     )
 }
 
-async fn generate_model_compact_summary(
+pub(in crate::runtime_support) async fn generate_model_compact_summary(
     provider: &Arc<dyn muse_core::model::provider::ChatModelProvider>,
     messages: &[muse_core::domain::conversation::Message],
 ) -> Result<String, String> {
@@ -283,7 +299,10 @@ async fn generate_model_compact_summary(
     }
 }
 
-fn compact_conversation_in_place(conversation: &mut Conversation, summary: &str) -> usize {
+pub(in crate::runtime_support) fn compact_conversation_in_place(
+    conversation: &mut Conversation,
+    summary: &str,
+) -> usize {
     let original_messages = conversation.messages.clone();
     let system_message = original_messages
         .iter()
@@ -309,7 +328,10 @@ fn compact_conversation_in_place(conversation: &mut Conversation, summary: &str)
     conversation.messages.len()
 }
 
-fn apply_session_compaction_result(conversation: &mut Conversation, result: &ToolResult) {
+pub(in crate::runtime_support) fn apply_session_compaction_result(
+    conversation: &mut Conversation,
+    result: &ToolResult,
+) {
     let Some(summary) = result
         .structured
         .as_ref()
@@ -321,7 +343,7 @@ fn apply_session_compaction_result(conversation: &mut Conversation, result: &Too
     compact_conversation_in_place(conversation, summary);
 }
 
-async fn tool_session_compact(
+pub(in crate::runtime_support) async fn tool_session_compact(
     state: &Arc<AppState>,
     provider: &Arc<dyn muse_core::model::provider::ChatModelProvider>,
     conversation: &Conversation,
