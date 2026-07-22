@@ -1,16 +1,14 @@
 //! 路由组装模块，负责挂载本地 API、中间件和运行时状态。
 
-use axum::{Extension, Router, extract::DefaultBodyLimit};
+use axum::{Extension, Router};
 use std::sync::Arc;
 
+use crate::api;
 use crate::handlers;
 use crate::middleware::access_log::log_api_request;
 use crate::security::{LocalApiSecurity, enforce_local_api_security};
-use crate::state::{AppState, build_app_state};
+use crate::state::build_app_state;
 use muse_core::config::Config;
-
-const PERSONA_ASSET_UPLOAD_BODY_LIMIT_BYTES: usize = 6 * 1024 * 1024;
-const SPEECH_UPLOAD_BODY_LIMIT_BYTES: usize = 25 * 1024 * 1024 + 64 * 1024;
 
 /// 使用调用方已经绑定的实际地址和安全上下文构建路由。
 ///
@@ -23,7 +21,7 @@ pub async fn build_router_with_security(
     handlers::initialize_active_persona_session(&state)
         .await
         .map_err(std::io::Error::other)?;
-    let protected_api = api_routes()
+    let protected_api = api::routes()
         .layer(Extension(security.clone()))
         .layer(axum::middleware::from_fn_with_state(
             security,
@@ -34,230 +32,9 @@ pub async fn build_router_with_security(
     Ok(Router::new().nest("/api", protected_api).with_state(state))
 }
 
-fn api_routes() -> Router<Arc<AppState>> {
-    use axum::routing::{get, post, put};
-
-    Router::new()
-        .route("/chat", post(handlers::handle_chat))
-        .route(
-            "/chat/stream",
-            post(handlers::handle_chat_stream).get(handlers::handle_chat_stream_get_not_allowed),
-        )
-        .route("/runtime/health", get(handlers::handle_runtime_health))
-        .route("/runtime/state", get(handlers::handle_runtime_state))
-        .route("/runtime/skills", get(handlers::handle_runtime_skills))
-        .route(
-            "/runtime/ws-ticket",
-            post(handlers::handle_runtime_ws_ticket),
-        )
-        .route(
-            "/runtime/approvals/{id}/approve",
-            post(handlers::handle_runtime_approval_approve),
-        )
-        .route(
-            "/runtime/approvals/{id}/reject",
-            post(handlers::handle_runtime_approval_reject),
-        )
-        .route(
-            "/runtime/approvals/{id}/cancel",
-            post(handlers::handle_runtime_approval_cancel),
-        )
-        .route(
-            "/runtime/user-questions/{id}/answer",
-            post(handlers::handle_runtime_user_question_answer),
-        )
-        .route(
-            "/runtime/user-questions/{id}/cancel",
-            post(handlers::handle_runtime_user_question_cancel),
-        )
-        .route(
-            "/runtime/turns/{id}/cancel",
-            post(handlers::handle_runtime_turn_cancel),
-        )
-        .route(
-            "/runtime/mode",
-            get(handlers::handle_runtime_mode).put(handlers::handle_runtime_mode_update),
-        )
-        .route(
-            "/runtime/approval-mode",
-            get(handlers::handle_runtime_approval_mode)
-                .put(handlers::handle_runtime_approval_mode_update),
-        )
-        .route("/runtime/todos", get(handlers::handle_runtime_todos))
-        .route(
-            "/runtime/token-usage",
-            get(handlers::handle_runtime_token_usage),
-        )
-        .route(
-            "/runtime/context-snapshot",
-            get(handlers::handle_runtime_context_snapshot),
-        )
-        .route(
-            "/runtime/workspaces",
-            get(handlers::handle_runtime_workspaces)
-                .put(handlers::handle_runtime_workspace_policy_update),
-        )
-        .route(
-            "/preferences/appearance",
-            get(handlers::handle_get_appearance_preferences)
-                .put(handlers::handle_put_appearance_preferences),
-        )
-        .route(
-            "/diagnostics/connectivity",
-            get(handlers::handle_diagnostics_connectivity),
-        )
-        .route(
-            "/assets/upload",
-            post(handlers::handle_upload_asset)
-                .layer(DefaultBodyLimit::max(PERSONA_ASSET_UPLOAD_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/assets/uploaded/{filename}",
-            get(handlers::handle_uploaded_asset).delete(handlers::handle_discard_uploaded_asset),
-        )
-        .route("/runtime/sessions", get(handlers::handle_runtime_sessions))
-        .route(
-            "/runtime/sessions/{id}",
-            axum::routing::patch(handlers::handle_runtime_session_metadata_patch)
-                .delete(handlers::handle_runtime_session_delete),
-        )
-        .route(
-            "/runtime/sessions/{id}/export",
-            get(handlers::handle_runtime_session_export),
-        )
-        .route(
-            "/runtime/sessions/{id}/context",
-            get(handlers::handle_runtime_session_context),
-        )
-        .route(
-            "/runtime/sessions/{id}/runtime-profile",
-            get(handlers::handle_runtime_session_runtime_profile),
-        )
-        .route(
-            "/runtime/sessions/{id}/resume",
-            post(handlers::handle_runtime_session_resume),
-        )
-        .route(
-            "/runtime/sessions/{id}/fork",
-            post(handlers::handle_runtime_session_fork),
-        )
-        .route(
-            "/personas",
-            get(handlers::handle_personas).post(handlers::handle_create_persona),
-        )
-        .route(
-            "/personas/import",
-            post(handlers::handle_import_persona_card),
-        )
-        .route("/personas/active", get(handlers::handle_active_persona))
-        .route(
-            "/personas/{id}",
-            get(handlers::handle_get_persona)
-                .put(handlers::handle_update_persona)
-                .delete(handlers::handle_delete_persona),
-        )
-        .route(
-            "/personas/{id}/card",
-            get(handlers::handle_export_persona_card),
-        )
-        .route(
-            "/personas/{id}/deletion-impact",
-            get(handlers::handle_persona_deletion_impact),
-        )
-        .route(
-            "/personas/{id}/activate",
-            post(handlers::handle_activate_persona),
-        )
-        .route("/ws", get(handlers::handle_ws))
-        .route("/tools", get(handlers::handle_tools))
-        .route(
-            "/skills",
-            get(handlers::handle_skills).post(handlers::handle_create_skill),
-        )
-        .route(
-            "/skills/{name}",
-            get(handlers::handle_get_skill)
-                .put(handlers::handle_update_skill)
-                .delete(handlers::handle_delete_skill),
-        )
-        .route(
-            "/mcp/servers",
-            get(handlers::handle_mcp_servers).post(handlers::handle_create_mcp_server),
-        )
-        .route(
-            "/mcp/servers/test-draft",
-            post(handlers::handle_test_mcp_draft),
-        )
-        .route(
-            "/mcp/servers/{name}",
-            get(handlers::handle_get_mcp_server)
-                .put(handlers::handle_update_mcp_server)
-                .delete(handlers::handle_delete_mcp_server),
-        )
-        .route(
-            "/mcp/servers/{name}/test",
-            post(handlers::handle_test_mcp_server),
-        )
-        .route(
-            "/mcp/servers/{name}/refresh",
-            post(handlers::handle_refresh_mcp_server),
-        )
-        .route(
-            "/mcp/servers/{name}/tools",
-            get(handlers::handle_mcp_server_tools),
-        )
-        .route(
-            "/mcp/servers/{name}/resources",
-            get(handlers::handle_mcp_server_resources),
-        )
-        .route("/history", get(handlers::handle_history))
-        .route("/reset", post(handlers::handle_reset))
-        .route("/models", get(handlers::handle_models))
-        .route("/models/catalog", get(handlers::handle_models_catalog))
-        .route(
-            "/models/catalog/models",
-            post(handlers::handle_create_catalog_model)
-                .put(handlers::handle_update_catalog_model)
-                .delete(handlers::handle_delete_catalog_model),
-        )
-        .route(
-            "/models/catalog/fetch",
-            post(handlers::handle_fetch_model_catalog),
-        )
-        .route(
-            "/models/providers/{id}/credential",
-            put(handlers::handle_put_provider_credential),
-        )
-        .route(
-            "/models/providers/{id}/state",
-            put(handlers::handle_put_provider_state),
-        )
-        .route(
-            "/models/active",
-            put(handlers::handle_put_active_chat_model),
-        )
-        .route(
-            "/models/provider-balance",
-            post(handlers::handle_provider_balance),
-        )
-        .route("/tts", post(handlers::handle_tts_runtime_route))
-        .route(
-            "/speech/transcribe",
-            post(handlers::handle_speech_transcribe)
-                .layer(DefaultBodyLimit::max(SPEECH_UPLOAD_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/voice/capabilities",
-            get(handlers::handle_voice_capabilities),
-        )
-        .route(
-            "/models/config",
-            get(handlers::handle_get_models_config).put(handlers::handle_put_models_config),
-        )
-        .route(
-            "/web-search/config",
-            get(handlers::handle_get_web_search_config).put(handlers::handle_put_web_search_config),
-        )
+#[cfg(test)]
+fn api_routes() -> api::ApiRouter {
+    api::routes()
 }
 
 #[cfg(test)]
