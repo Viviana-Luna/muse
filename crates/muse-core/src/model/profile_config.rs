@@ -277,10 +277,7 @@ impl ProviderProfileConfig {
             }
             .to_string(),
             api_key_configured: self.api_key_configured(),
-            credential_diagnostic: None,
             api_key: self.api_key.clone().unwrap_or_default(),
-            credential_account: String::new(),
-            credential_identity: String::new(),
         }
     }
 }
@@ -352,8 +349,6 @@ impl ModelProfileConfig {
             voice_input: VoiceInputConfig {
                 mode: self.active_models.voice_input_mode.clone(),
             },
-            mcp_servers: BTreeMap::new(),
-            secret_bindings: Default::default(),
         }
     }
 

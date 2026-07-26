@@ -102,7 +102,7 @@ export function WebSearchPanel({
               )}
             </div>
             <span className="field-hint">
-              点击“保存全部更改”后才会写入系统凭据库；切回免费搜索不会删除已保存密钥。
+              点击“保存全部更改”后才会写入受保护的 config.toml；切回免费搜索不会删除已保存密钥。
             </span>
           </label>
         )}

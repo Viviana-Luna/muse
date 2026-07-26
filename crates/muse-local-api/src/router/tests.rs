@@ -721,7 +721,6 @@ fn build_test_state_with_persona(
     ));
     Arc::new(AppState {
         config: Config::default(),
-        secrets: muse_core::app::secret::PlatformSecretStore::new("Muse-router-test"),
         provider: Mutex::new(Some(Arc::new(ScriptedChatProvider {
             calls: AtomicUsize::new(0),
         }))),
@@ -1342,7 +1341,7 @@ async fn asset_rollback_deletes_only_unreferenced_uploaded_asset() {
 }
 
 #[tokio::test]
-async fn mcp_management_writes_config_toml_without_touching_legacy_field() {
+async fn mcp_management_uses_config_toml_as_the_only_fact_source() {
     let config_dir = unique_temp_dir("mcp-config-toml");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -1481,16 +1480,6 @@ async fn mcp_management_writes_config_toml_without_touching_legacy_field() {
     assert_eq!(list_json[0]["status"], "failed");
     assert_eq!(list_json[0]["tested_revision"], list_json[0]["revision"]);
     assert!(list_json[0]["last_error"]["code"].as_str().is_some());
-    assert!(
-        state
-            .model_config
-            .lock()
-            .await
-            .config()
-            .mcp_servers
-            .is_empty(),
-        "管理 API 不得继续写回旧 models/config.json 字段"
-    );
     let config_store = state.user_config.lock().await;
     assert!(config_store.mcp_profiles().mcp_servers.contains_key("docs"));
     assert!(
@@ -1504,7 +1493,6 @@ async fn mcp_management_writes_config_toml_without_touching_legacy_field() {
     assert!(persisted.contains("[mcp_servers.docs]"));
     assert!(persisted.contains("command = \"docs-mcp\""));
     assert!(persisted.contains("DOCS_TOKEN = \"router-mcp-secret\""));
-    assert!(!config_dir.join("mcp").join("servers.json").exists());
     drop(config_store);
     let _ = std::fs::remove_dir_all(config_dir);
 }

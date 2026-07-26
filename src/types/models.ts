@@ -32,14 +32,6 @@ export interface ModelProviderCatalog {
   connection_validation: 'model_list' | 'chat_request' | 'chat_probe' | string;
   status: 'supported' | 'legacy_unsupported' | string;
   api_key_configured: boolean;
-  credential_diagnostic?: ModelCredentialDiagnostic;
-}
-
-// 旧客户端兼容诊断；Provider Profile 运行时不返回密钥或凭据引用。
-export interface ModelCredentialDiagnostic {
-  code: string;
-  field_path: string;
-  message: string;
 }
 
 // 模型目录创建与编辑表单。供应商和模型 ID 在编辑时不可变。
@@ -71,7 +63,6 @@ export interface ProviderCredentialResponse {
   provider_id: string;
   api_key_configured: boolean;
   status: string;
-  credential_diagnostic?: ModelCredentialDiagnostic;
 }
 
 // 模型目录条目。

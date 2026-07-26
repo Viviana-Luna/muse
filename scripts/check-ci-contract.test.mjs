@@ -14,7 +14,7 @@ function read(relativePath) {
 function rustFiles(relativeDirectory) {
   const directory = path.join(repoRoot, relativeDirectory);
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const relative = path.join(relativeDirectory, entry.name);
+    const relative = path.join(relativeDirectory, entry.name).replaceAll('\\', '/');
     if (entry.isDirectory()) return rustFiles(relative);
     return entry.isFile() && entry.name.endsWith('.rs') ? [relative] : [];
   });

@@ -107,7 +107,7 @@ impl PersonaStore {
             active_persona_id: self.active_persona_id.clone(),
         };
         let content = serde_json::to_string_pretty(&persisted)?;
-        crate::model::config::store::atomic_write_synced(&self.storage_path, content.as_bytes())?;
+        crate::app::storage::atomic_write_synced(&self.storage_path, content.as_bytes())?;
         Ok(())
     }
 

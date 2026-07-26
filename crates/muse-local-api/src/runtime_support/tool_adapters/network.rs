@@ -152,24 +152,13 @@ pub(in crate::runtime_support) async fn tool_web_search(
         return tool_failed("web_search 缺少 query 参数。", "missing_query");
     };
     let (provider, api_key) = {
-        // 配置切换和凭据发布共用同一 transition gate，单次调用只观察完整快照。
+        // 配置切换和密钥发布共用同一 transition gate，单次调用只观察完整快照。
         let _transition = state.model_configuration_transition_gate.lock().await;
-        let provider = state
-            .user_config
-            .lock()
-            .await
-            .web_search_preferences()
-            .provider;
+        let config = state.user_config.lock().await;
+        let preferences = config.web_search_preferences();
+        let provider = preferences.provider;
         let api_key = if provider == WebSearchProvider::ExaApi {
-            match state.secrets.get_optional("web-search.exa") {
-                Ok(value) => value,
-                Err(err) => {
-                    return tool_failed(
-                        format!("无法读取网页搜索凭据：{err}"),
-                        "secret_store_failed",
-                    );
-                }
-            }
+            preferences.api_key.clone()
         } else {
             None
         };

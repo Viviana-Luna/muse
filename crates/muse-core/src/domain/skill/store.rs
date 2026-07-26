@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::preferences::{MuseConfigStore, MuseConfigStoreError};
-use crate::model::config::store::atomic_write_synced;
+use crate::app::storage::atomic_write_synced;
 
 use super::config::SkillPreferences;
 
@@ -16,7 +16,6 @@ use super::config::SkillPreferences;
 pub const MAX_SKILL_DOCUMENT_BYTES: usize = 128 * 1024;
 const MAX_SKILL_CATALOG_DIAGNOSTICS: usize = 64;
 const MAX_SKILL_DIAGNOSTIC_MESSAGE_CHARS: usize = 512;
-const LEGACY_ENABLED_MIGRATION_MARKER: &str = ".muse-migrations/skill-frontmatter-enabled-v1";
 const INVALID_NAME_MESSAGE: &str =
     "Skill 名称必须为 1-64 个小写字母、数字或单连字符组合，格式如 `git-release`。";
 
@@ -513,113 +512,12 @@ impl SkillStore {
     }
 }
 
-/// 把合法旧 Skill 的 `enabled` 迁入 `config.toml`，验证后再移除旧 frontmatter 字段。
-pub fn migrate_legacy_skill_enabled(
-    data_dir: impl AsRef<Path>,
-    config: &mut MuseConfigStore,
-) -> Result<(), SkillStoreError> {
-    let data_dir = data_dir.as_ref();
-    let marker = data_dir.join(LEGACY_ENABLED_MIGRATION_MARKER);
-    if marker.is_file() {
-        return Ok(());
-    }
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent).map_err(io_error)?;
-    }
-    let store = SkillStore::from_data_dir(data_dir);
-    store.ensure_root()?;
-    let mut migrations = Vec::new();
-    for entry in fs::read_dir(&store.root).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || validate_skill_name(&name).is_err() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        let path = entry.path().join("SKILL.md");
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&path).map_err(io_error)?;
-        let Ok(text) = String::from_utf8(bytes.clone()) else {
-            continue;
-        };
-        let Ok(parsed) = parse_skill_document(&text) else {
-            continue;
-        };
-        if parsed.name != name {
-            continue;
-        }
-        if let Some(enabled) = parsed.legacy_enabled {
-            migrations.push((name, enabled, path, bytes, remove_legacy_enabled(&text)?));
-        }
-    }
-
-    let config_backup = config.clone();
-    let mut preferences = config.skill_preferences().clone();
-    for (name, enabled, _, _, _) in &migrations {
-        preferences.set_enabled(name, *enabled);
-    }
-    if !migrations.is_empty() {
-        config
-            .update_skill_preferences(preferences.clone())
-            .map_err(SkillStoreError::from_config)?;
-        let reloaded = match MuseConfigStore::load_from_dir(data_dir) {
-            Ok(reloaded) => reloaded,
-            Err(error) => {
-                config
-                    .restore_snapshot(&config_backup)
-                    .map_err(SkillStoreError::from_config)?;
-                return Err(SkillStoreError::from_config(error));
-            }
-        };
-        if reloaded.skill_preferences() != &preferences {
-            config
-                .restore_snapshot(&config_backup)
-                .map_err(SkillStoreError::from_config)?;
-            return Err(SkillStoreError::new(
-                SkillStoreErrorKind::Io,
-                "Skill 启停配置回读校验失败。",
-            ));
-        }
-    }
-
-    let mut written: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-    for (_, _, path, original, migrated) in &migrations {
-        if let Err(error) = atomic_write_synced(path, migrated.as_bytes()) {
-            for (written_path, written_original) in written.iter().rev() {
-                let _ = atomic_write_synced(written_path, written_original);
-            }
-            if !migrations.is_empty() {
-                let _ = config.restore_snapshot(&config_backup);
-            }
-            return Err(io_error(error));
-        }
-        written.push((path.clone(), original.clone()));
-    }
-
-    if let Err(error) = atomic_write_synced(&marker, b"skill-frontmatter-enabled-v1\n") {
-        for (path, original) in written.iter().rev() {
-            let _ = atomic_write_synced(path, original);
-        }
-        if !migrations.is_empty() {
-            let _ = config.restore_snapshot(&config_backup);
-        }
-        return Err(io_error(error));
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
 pub(crate) struct ParsedSkillDocument {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) content: String,
     frontmatter_lines: Vec<String>,
-    legacy_enabled: Option<bool>,
 }
 
 fn validate_draft(mut draft: SkillDraft) -> Result<SkillDraft, SkillStoreError> {
@@ -702,7 +600,6 @@ fn render_updated_skill_document(
         match top_level_key(line) {
             Some("name") => lines.push(format!("name: {name}")),
             Some("description") => lines.push(format!("description: {description}")),
-            Some("enabled") => {}
             _ => lines.push(line.clone()),
         }
     }
@@ -732,7 +629,6 @@ pub(crate) fn parse_skill_document(text: &str) -> Result<ParsedSkillDocument, Sk
     };
     let mut name = None;
     let mut description = None;
-    let mut legacy_enabled = None;
     let frontmatter_lines = frontmatter.lines().map(str::to_string).collect::<Vec<_>>();
     for line in &frontmatter_lines {
         let trimmed = line.trim();
@@ -752,15 +648,6 @@ pub(crate) fn parse_skill_document(text: &str) -> Result<ParsedSkillDocument, Sk
                 parse_yaml_string(value, "description")?,
                 "description",
             )?,
-            "enabled" => {
-                let parsed = value.trim().parse::<bool>().map_err(|_| {
-                    SkillStoreError::new(
-                        SkillStoreErrorKind::Invalid,
-                        "旧 Skill enabled 必须是 true 或 false。",
-                    )
-                })?;
-                set_once(&mut legacy_enabled, parsed, "enabled")?;
-            }
             // 标准可选字段和未来扩展字段均由页面原样保留，不在 Muse 中解释。
             _ => {}
         }
@@ -784,7 +671,6 @@ pub(crate) fn parse_skill_document(text: &str) -> Result<ParsedSkillDocument, Sk
         description,
         content,
         frontmatter_lines,
-        legacy_enabled,
     })
 }
 
@@ -839,24 +725,6 @@ fn yaml_string(value: &str) -> Result<String, SkillStoreError> {
             format!("Skill frontmatter 序列化失败：{error}"),
         )
     })
-}
-
-fn remove_legacy_enabled(text: &str) -> Result<String, SkillStoreError> {
-    let parsed = parse_skill_document(text)?;
-    let mut output = Vec::new();
-    for line in parsed.frontmatter_lines {
-        if top_level_key(&line) != Some("enabled") {
-            output.push(line);
-        }
-    }
-    Ok(format!(
-        "---\n{}\n---\n{}",
-        output.join("\n"),
-        text.replace("\r\n", "\n")
-            .split_once("\n---\n")
-            .expect("已解析 frontmatter")
-            .1
-    ))
 }
 
 fn validate_document_size(bytes: &[u8]) -> Result<(), SkillStoreError> {
@@ -1275,47 +1143,6 @@ mod tests {
             original
         );
         assert!(!root.join("skills/rollback-target").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn migrates_legacy_enabled_after_toml_verification() {
-        let root = temp_dir();
-        fs::create_dir_all(root.join("skills/legacy-skill")).unwrap();
-        fs::write(
-            root.join("skills/legacy-skill/SKILL.md"),
-            "---\nname: legacy-skill\ndescription: 旧技能\nenabled: false\nlicense: MIT\n---\n正文\n",
-        )
-        .unwrap();
-        let mut config = config(&root);
-        migrate_legacy_skill_enabled(&root, &mut config).unwrap();
-        let saved = fs::read_to_string(root.join("skills/legacy-skill/SKILL.md")).unwrap();
-        assert!(!saved.contains("enabled:"));
-        assert!(saved.contains("license: MIT"));
-        assert!(!config.skill_preferences().enabled_for("legacy-skill"));
-        assert!(root.join(LEGACY_ENABLED_MIGRATION_MARKER).is_file());
-        migrate_legacy_skill_enabled(&root, &mut config).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn migration_skips_malformed_skill_but_runtime_returns_diagnostic() {
-        let root = temp_dir();
-        fs::create_dir_all(root.join("skills/malformed-skill")).unwrap();
-        fs::write(
-            root.join("skills/malformed-skill/SKILL.md"),
-            "---\nname: malformed-skill\nenabled: false\n---\n正文\n",
-        )
-        .unwrap();
-        let mut config = config(&root);
-        migrate_legacy_skill_enabled(&root, &mut config)
-            .expect("损坏 Skill 不应阻止应用完成启动迁移");
-        let store = SkillStore::from_data_dir(&root);
-        let snapshot = store.catalog_snapshot(config.skill_preferences()).unwrap();
-        assert!(snapshot.skills.is_empty());
-        assert_eq!(snapshot.diagnostics.len(), 1);
-        assert_eq!(snapshot.diagnostics[0].code, "skill_invalid");
-        assert!(snapshot.diagnostics[0].message.contains("缺少 description"));
         fs::remove_dir_all(root).unwrap();
     }
 

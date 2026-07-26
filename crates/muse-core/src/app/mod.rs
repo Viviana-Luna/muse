@@ -5,7 +5,6 @@ pub mod log_storage;
 pub mod memory_safety;
 pub mod memory_storage;
 pub mod preferences;
-pub mod secret;
 pub mod storage;
 #[cfg(windows)]
 pub(crate) mod windows_acl;

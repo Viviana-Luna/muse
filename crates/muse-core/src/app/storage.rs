@@ -65,18 +65,6 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
         sql: "",
     },
     RuntimeMigration {
-        version: 2,
-        name: "provider_profiles_to_config_toml",
-        // 调用方必须先原子发布并回读 Provider Profile，再打开数据库触发本迁移。
-        // Provider、模型列表、端点和凭据都不再允许在 SQLite 中保留平行副本。
-        sql: r#"
-            DROP TABLE IF EXISTS model_capabilities;
-            DROP TABLE IF EXISTS catalog_meta;
-            DROP TABLE IF EXISTS models;
-            DROP TABLE IF EXISTS providers;
-        "#,
-    },
-    RuntimeMigration {
         version: 3,
         name: "session_v3_rebuildable_index",
         // 会话正文与元数据事实只存在于 Session v3 JSONL。这里仅保存列表查询所需的
@@ -538,8 +526,7 @@ pub(crate) fn open_initialized_runtime_database(
 
 /// 在 SQLite 打开数据库前建立统一的私有目录与文件边界。
 ///
-/// 旧模型目录迁移需要先读取已退场的业务表，不能提前运行统一 migration；该入口让它
-/// 仍与正式运行时连接共享相同的路径和权限检查。
+/// 在 SQLite 打开前建立统一的私有路径和权限边界。
 pub fn prepare_runtime_database_path(path: &Path) -> Result<(), std::io::Error> {
     let parent = path
         .parent()
@@ -1202,7 +1189,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 9);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",

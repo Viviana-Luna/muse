@@ -2,8 +2,6 @@
 
 mod client;
 pub mod config;
-pub mod migration;
-mod store;
 
 pub use client::{McpClientManager, McpConnectionDiagnostic, McpNegotiatedSession};
 pub use config::{McpApprovalPolicy, McpProfileConfig, McpRuntimeSnapshot, McpServerProfile};

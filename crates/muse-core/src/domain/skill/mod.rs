@@ -15,7 +15,7 @@ pub use config::{SkillConfigOverride, SkillPreferences, skill_document_path};
 pub use store::{
     MAX_SKILL_DOCUMENT_BYTES, SkillCatalogDiagnostic, SkillCatalogSnapshot, SkillDraft,
     SkillRecord, SkillStore, SkillStoreError, SkillStoreErrorKind, SkillSummary,
-    migrate_legacy_skill_enabled, validate_skill_name,
+    validate_skill_name,
 };
 
 /// 技能来源。

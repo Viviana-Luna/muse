@@ -1,10 +1,8 @@
 //! 网页共享状态模块，集中持有模型、会话、资源、角色、音色和运行底座状态。
 
 use muse_core::app::preferences::MuseConfigStore;
-use muse_core::app::secret::PlatformSecretStore;
 use muse_core::config::Config;
 use muse_core::domain::conversation::Conversation;
-use muse_core::domain::mcp::migration::migrate_mcp_profiles;
 use muse_core::domain::memory::{
     MemoryDeletionAuthority, MemoryRepository, MemoryRetriever, MemorySensitivityPolicy,
 };
@@ -12,10 +10,8 @@ use muse_core::domain::persona::Persona;
 use muse_core::domain::persona::character::store::{PersonaStore, PersonaStoreError};
 use muse_core::domain::persona::visual::store::VisualPackStore;
 use muse_core::domain::runtime::RuntimeModeState;
-use muse_core::domain::skill::migrate_legacy_skill_enabled;
 use muse_core::domain::tool::{ToolDef, ToolRegistry, builtin};
-use muse_core::model::config::{LlmConfig, ModelConfigStore, SpeechRecognitionConfig, TtsConfig};
-use muse_core::model::migration::migrate_model_profiles;
+use muse_core::model::config::{LlmConfig, SpeechRecognitionConfig, TtsConfig};
 use muse_core::model::provider::{ChatModelError, ChatModelProvider, factory};
 use muse_core::speech::{SpeechRecognitionProvider, TtsProvider};
 use muse_runtime::{FrozenExecutionPolicy, service::RuntimeService};
@@ -361,8 +357,6 @@ pub(crate) fn next_runtime_session_id() -> String {
 /// 网页适配层共享状态，所有处理器都通过它访问运行时对象。
 pub struct AppState {
     pub config: Config,
-    /// 系统凭据库仅承载联网搜索凭据和启动期旧配置迁移；稳态模型与 MCP API Key 均归入 config.toml。
-    pub secrets: PlatformSecretStore,
     /// 聊天主模型 provider；未配置真实模型时为空。
     /// 读端 `lock().await.clone()` 拿到共享指针后立即放锁，不阻塞并发。
     pub provider: Mutex<Option<Arc<dyn ChatModelProvider>>>,
@@ -594,23 +588,7 @@ fn build_runtime_mode_context(mode_state: RuntimeModeState) -> String {
 /// 构建网页适配层共享状态，并完成运行时配置、资源和角色展示初始化。
 pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::error::Error>> {
     let data_dir = Config::config_dir();
-    let mut user_config = MuseConfigStore::load_from_dir(&data_dir)?;
-    let mut legacy_model_config = ModelConfigStore::load_from_dir(&data_dir)?;
-    let secrets = PlatformSecretStore::new("Muse");
-    migrate_model_profiles(
-        &data_dir,
-        &mut user_config,
-        &mut legacy_model_config,
-        &secrets,
-    )?;
-    migrate_mcp_profiles(
-        &data_dir,
-        &mut user_config,
-        legacy_model_config.mcp_servers(),
-        &secrets,
-    )?;
-    migrate_legacy_skill_enabled(&data_dir, &mut user_config)?;
-    // Provider Profile 已发布后才允许数据库 migration 删除旧 providers/models 表。
+    let user_config = MuseConfigStore::load_from_dir(&data_dir)?;
     let _ = muse_core::app::storage::open_runtime_database(&data_dir)?;
     let provider = build_chat_provider(user_config.chat())?;
     let tts_provider = build_tts_provider(user_config.tts());
@@ -634,7 +612,6 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
     install_memory_services(memory_management);
     Ok(Arc::new(AppState {
         config,
-        secrets,
         provider: Mutex::new(provider),
         tts_provider: Mutex::new(tts_provider),
         speech_recognition_provider: Mutex::new(speech_recognition_provider),

@@ -1,101 +1,6 @@
-//! 运行时模型配置模块，定义聊天、语音合成、语音识别、音频理解和 MCP 服务配置。
-
-pub mod store;
-
-use std::collections::BTreeMap;
+//! 运行时模型配置模块，定义聊天、语音合成、语音识别和音频理解配置。
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-pub use store::{ModelConfigStore, ModelConfigStoreError};
-
-/// 模型密钥所属的运行配置段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelSecretSlot {
-    Chat,
-    Tts,
-    Asr,
-    AudioUnderstanding,
-}
-
-impl ModelSecretSlot {
-    /// 返回该配置段允许使用的系统凭据 account 前缀。
-    pub fn account_prefix(self) -> &'static str {
-        match self {
-            Self::Chat => "model.chat.v2.",
-            Self::Tts => "model.tts.v2.",
-            Self::Asr => "model.asr.v2.",
-            Self::AudioUnderstanding => "model.audio-understanding.v2.",
-        }
-    }
-
-    /// 返回升级前使用的固定 account，仅用于一次性复制迁移。
-    pub fn legacy_account(self) -> &'static str {
-        match self {
-            Self::Chat => "model.chat",
-            Self::Tts => "model.tts",
-            Self::Asr => "model.asr",
-            Self::AudioUnderstanding => "model.audio-understanding",
-        }
-    }
-}
-
-/// 配置文件中的非敏感凭据引用。
-///
-/// `account` 每次替换密钥时都会生成新值。配置仅在对应密钥已经完整写入系统
-/// 凭据库后原子切换到该引用，因此崩溃只能留下整组旧引用或整组新引用。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ModelSecretBinding {
-    pub account: String,
-    pub identity: String,
-}
-
-/// 三类模型密钥当前引用及等待幂等清理的旧 account。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ModelSecretBindings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chat: Option<ModelSecretBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tts: Option<ModelSecretBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asr: Option<ModelSecretBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_understanding: Option<ModelSecretBinding>,
-    /// 已分配但尚未由配置正式引用的 account，用于启动时清理切换前崩溃现场。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_accounts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired_accounts: Vec<String>,
-}
-
-impl ModelSecretBindings {
-    pub fn is_empty(&self) -> bool {
-        self.chat.is_none()
-            && self.tts.is_none()
-            && self.asr.is_none()
-            && self.audio_understanding.is_none()
-            && self.pending_accounts.is_empty()
-            && self.retired_accounts.is_empty()
-    }
-
-    pub fn get(&self, slot: ModelSecretSlot) -> Option<&ModelSecretBinding> {
-        match slot {
-            ModelSecretSlot::Chat => self.chat.as_ref(),
-            ModelSecretSlot::Tts => self.tts.as_ref(),
-            ModelSecretSlot::Asr => self.asr.as_ref(),
-            ModelSecretSlot::AudioUnderstanding => self.audio_understanding.as_ref(),
-        }
-    }
-
-    pub fn set(&mut self, slot: ModelSecretSlot, binding: Option<ModelSecretBinding>) {
-        match slot {
-            ModelSecretSlot::Chat => self.chat = binding,
-            ModelSecretSlot::Tts => self.tts = binding,
-            ModelSecretSlot::Asr => self.asr = binding,
-            ModelSecretSlot::AudioUnderstanding => self.audio_understanding = binding,
-        }
-    }
-}
 
 const TTS_PROVIDER_OPENAI_SPEECH: &str = "openai_audio_speech";
 
@@ -111,7 +16,7 @@ pub struct LlmConfig {
     /// 接口基础地址（如 https://api.openai.com/v1）。
     #[serde(default)]
     pub api_base: String,
-    /// 接口密钥；新运行时由 `config.toml` Provider Profile 解析，旧 JSON 仅供迁移。
+    /// 接口密钥，由受保护的 `config.toml` Provider Profile 解析。
     #[serde(default)]
     pub api_key: Option<String>,
     /// 旧配置兼容字段；当前运行时固定使用 `chat_completions`。
@@ -367,7 +272,7 @@ fn default_voice_input_mode() -> String {
     "speech_text".to_string()
 }
 
-/// 运行时生效配置的聚合容器，供 Store 持有与持久化。
+/// 运行时生效配置的聚合容器，由当前 `config.toml` 解析生成。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelsConfig {
     /// 聊天主模型配置。
@@ -385,11 +290,4 @@ pub struct ModelsConfig {
     /// 语音输入策略配置。
     #[serde(default)]
     pub voice_input: VoiceInputConfig,
-    /// 旧版外部 MCP 服务配置，仅作为首次迁移到 `config.toml` 的来源。
-    /// 新运行时和管理 API 不再更新该字段，保证兼容周期内原值不变。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub mcp_servers: BTreeMap<String, Value>,
-    /// 系统凭据库中的非敏感、带配置身份约束的引用。
-    #[serde(default, skip_serializing_if = "ModelSecretBindings::is_empty")]
-    pub secret_bindings: ModelSecretBindings,
 }

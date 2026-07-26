@@ -42,10 +42,7 @@ pub fn model_catalog_error_response(
         muse_core::model::catalog::ModelCatalogError::Config(
             muse_core::app::preferences::MuseConfigStoreError::Validation(_),
         ) => StatusCode::BAD_REQUEST,
-        muse_core::model::catalog::ModelCatalogError::Io(_)
-        | muse_core::model::catalog::ModelCatalogError::Sqlite(_)
-        | muse_core::model::catalog::ModelCatalogError::Storage(_)
-        | muse_core::model::catalog::ModelCatalogError::Config(_) => {
+        muse_core::model::catalog::ModelCatalogError::Config(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };

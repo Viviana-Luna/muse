@@ -40,7 +40,7 @@ impl From<muse_core::app::preferences::MuseConfigSnapshot> for AppearancePrefere
 
 /// `GET /api/web-search/config` 响应：联网搜索后端与凭据配置状态。
 /// 仅返回是否已配置，绝不返回 Exa API Key 或其掩码。
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct WebSearchConfigResponse {
     pub provider: WebSearchProvider,
     pub api_key_configured: bool,

@@ -90,9 +90,9 @@ Windows 测试包输出到 `target/release/bundle/`；macOS Universal 测试包�
 export MUSE_DATA_DIR=/your/local/muse-data
 ```
 
-未设置时，桌面应用使用当前用户主目录下的 `~/.muse`。用户配置保存在带 `schema_version` 的 `config.toml`；外观、输入、恢复、动效和更新偏好、完整 Provider Profile、MCP Server Profile 以及 Skill 启停覆盖都在该文件中。Provider Profile 把供应商、Base URL、明文 API Key、模型列表、能力和默认参数放在一起；MCP Server Profile 把 transport、命令或 URL、普通环境变量或 Header、明文 API Key、超时与工具过滤放在一起。文件使用当前用户专属权限、耐久原子写入和外部修改冲突检测，不应上传、共享或提交。Skill 正文及其 `scripts/`、`references/`、`assets/` 保留在 `skills/<skill-name>/`，名称只允许小写字母、数字和单连字符。完整会话以及标题、归档、分叉和 revision 等元数据统一记录为 Session v3 JSONL 事件；`runtime/muse.sqlite` 只保存核心结构化状态和可从 JSONL 重建的会话列表索引，并通过 SQLite Backup API 创建一致性备份。Token usage 与 Context snapshot 等可清理运行日志独立保存在 `logs/runtime-usage.sqlite`，不参与核心库备份或恢复。新版本不读取或生成 `sessions/metadata.json`。`models/config.json` 与 `mcp/servers.json` 只作为既有配置域的幂等迁移来源原样保留且停止写入。
+未设置时，桌面应用使用当前用户主目录下的 `~/.muse`。用户配置保存在带 `schema_version` 的 `config.toml`；外观、输入、恢复、动效和更新偏好、完整 Provider Profile、MCP Server Profile、Skill 启停覆盖以及 Exa 联网搜索配置都在该文件中。Provider Profile 把供应商、Base URL、明文 API Key、模型列表、能力和默认参数放在一起；MCP Server Profile 把 transport、命令或 URL、普通环境变量或 Header、明文 API Key、超时与工具过滤放在一起；Exa API Key 与搜索后端同样原子保存。文件使用当前用户专属权限、耐久原子写入和外部修改冲突检测，不应上传、共享或提交。Skill 正文及其 `scripts/`、`references/`、`assets/` 保留在 `skills/<skill-name>/`，名称只允许小写字母、数字和单连字符。完整会话以及标题、归档、分叉和 revision 等元数据统一记录为 Session v3 JSONL 事件；`runtime/muse.sqlite` 只保存核心结构化状态和可从 JSONL 重建的会话列表索引，并通过 SQLite Backup API 创建一致性备份。Token usage 与 Context snapshot 等可清理运行日志独立保存在 `logs/runtime-usage.sqlite`，不参与核心库备份或恢复。新版本不读取或生成 `sessions/metadata.json`，也不读取旧 `models/config.json`、`mcp/servers.json` 或系统凭据库。
 
-数据目录由进程排他锁保护；桌面重复启动由官方单实例插件唤醒并聚焦既有窗口。首次启动若 `~/.muse` 为空且启动目录是经过项目标识校验的仓库根目录，Muse 会把旧 `.agent-vp-data` 的配置、模型、角色和会话完整复制到 `~/.muse`；crate 子目录或任意 CWD 中的同名目录不会被采用，原目录保持不变。详见 [升级与数据迁移](docs/upgrade.md)。
+数据目录由进程排他锁保护；桌面重复启动由官方单实例插件唤醒并聚焦既有窗口。首次启动若 `~/.muse` 为空且启动目录是经过项目标识校验的仓库根目录，Muse 会把旧 `.agent-vp-data` 的角色、会话和普通资源复制到 `~/.muse`，但排除旧模型文件与旧模型/MCP 配置；crate 子目录或任意 CWD 中的同名目录不会被采用，原目录保持不变。详见 [升级与数据迁移](docs/upgrade.md)。
 
 ## 旧语音模型文件
 
@@ -121,7 +121,7 @@ Rust 依赖从应用壳向内单向指向 `src-tauri → muse-local-api → muse
 
 ## 质量检查
 
-日常开发先运行受影响模块的 focused 测试；合并前运行默认 Rust 门禁和完整前端门禁。需要 Keychain、监听端口或真实供应商桩服务时，再显式运行平台专项测试。
+日常开发先运行受影响模块的 focused 测试；合并前运行默认 Rust 门禁和完整前端门禁。需要监听端口、Windows ACL 或真实供应商桩服务时，再显式运行平台专项测试。
 
 ```bash
 # Rust focused 示例

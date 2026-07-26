@@ -67,8 +67,6 @@ pub struct ProviderCredentialResponse {
     pub provider_id: String,
     pub api_key_configured: bool,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential_diagnostic: Option<muse_core::model::catalog::ModelCredentialDiagnostic>,
 }
 
 /// 供应商启停请求。缺少字段会由 JSON 反序列化拒绝，避免把不完整请求误当作开启。

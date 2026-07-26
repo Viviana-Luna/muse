@@ -134,10 +134,28 @@ impl WebSearchProvider {
     }
 }
 
-/// 联网搜索非敏感偏好；API Key 始终由系统凭据库承载。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 联网搜索配置；API Key 仅允许落入受保护的 `config.toml`。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebSearchPreferences {
     pub provider: WebSearchProvider,
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for WebSearchPreferences {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSearchPreferences")
+            .field("provider", &self.provider)
+            .field(
+                "api_key_configured",
+                &self
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            )
+            .finish()
+    }
 }
 
 /// 当前已实现的用户级声明式配置。
@@ -315,26 +333,8 @@ impl MuseConfigStore {
         &self.storage_path
     }
 
-    /// Provider Profile 是否已经真实发布到 TOML；内存默认值不能冒充迁移完成。
-    pub fn has_published_model_profiles(&self) -> bool {
-        self.document
-            .get("providers")
-            .is_some_and(Item::is_table_like)
-            && self
-                .document
-                .get("active_models")
-                .is_some_and(Item::is_table_like)
-    }
-
     pub fn model_profiles(&self) -> &ModelProfileConfig {
         &self.config.model_profiles
-    }
-
-    /// MCP Server Profile 是否已经真实发布到 TOML。
-    pub fn has_published_mcp_profiles(&self) -> bool {
-        self.document
-            .get("mcp_servers")
-            .is_some_and(Item::is_table_like)
     }
 
     pub fn mcp_profiles(&self) -> &McpProfileConfig {
@@ -362,7 +362,7 @@ impl MuseConfigStore {
         &self.config.web_search
     }
 
-    /// 原子发布联网搜索非敏感偏好；API Key 由调用方单独写入系统凭据库。
+    /// 原子发布联网搜索后端和 API Key，避免跨事实源回滚。
     pub fn update_web_search_preferences(
         &mut self,
         preferences: WebSearchPreferences,
@@ -371,7 +371,7 @@ impl MuseConfigStore {
         self.commit_web_search_preferences(preferences)
     }
 
-    /// Skill 管理与迁移共用的原子启停配置发布入口。
+    /// Skill 管理使用的原子启停配置发布入口。
     pub fn update_skill_preferences(
         &mut self,
         preferences: SkillPreferences,
@@ -387,7 +387,7 @@ impl MuseConfigStore {
         self.commit_skill_preferences(preferences)
     }
 
-    /// MCP 管理 API 和迁移器共用的原子发布入口。
+    /// MCP 管理 API 使用的原子发布入口。
     pub fn update_mcp_profiles(
         &mut self,
         profiles: McpProfileConfig,
@@ -397,21 +397,6 @@ impl MuseConfigStore {
             validation("config_mcp_profiles_invalid", "mcp_servers", &message)
         })?;
         self.commit_mcp_profiles(profiles)
-    }
-
-    pub fn publish_migrated_mcp_profiles(
-        &mut self,
-        profiles: McpProfileConfig,
-    ) -> Result<(), MuseConfigStoreError> {
-        self.update_mcp_profiles(profiles)
-    }
-
-    /// Provider Profile 是否通过强类型解析；迁移器据此阻止损坏配置触发旧凭据清理。
-    pub fn model_profiles_are_valid(&self) -> bool {
-        !self
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "config_model_profiles_invalid")
     }
 
     /// 重新读取手工修改后的配置；返回是否观察到外部 revision 变化。
@@ -583,15 +568,6 @@ impl MuseConfigStore {
         self.commit_model_profiles(next)
             .map_err(ModelCatalogError::Config)?;
         Ok(self.runtime_models.clone())
-    }
-
-    /// 首次模型迁移使用；调用方完成旧源读取和凭据回读后一次发布完整配置。
-    pub fn publish_migrated_model_profiles(
-        &mut self,
-        profiles: ModelProfileConfig,
-    ) -> Result<(), MuseConfigStoreError> {
-        self.reject_external_modification()?;
-        self.commit_model_profiles(profiles)
     }
 
     fn commit_model_profiles(
@@ -899,6 +875,28 @@ fn decode_document(
         } else {
             WebSearchProvider::ExaFreeMcp
         };
+        config.web_search.api_key = match table.get("api_key") {
+            Some(item) => match item.as_str() {
+                Some(value) if !value.trim().is_empty() => Some(value.to_string()),
+                Some(_) => {
+                    diagnostics.push(diagnostic(
+                        "config_value_invalid",
+                        "web_search.api_key",
+                        "配置字段 `web_search.api_key` 不能为空，当前视为未配置。",
+                    ));
+                    None
+                }
+                None => {
+                    diagnostics.push(diagnostic(
+                        "config_type_invalid",
+                        "web_search.api_key",
+                        "配置字段 `web_search.api_key` 必须是字符串，当前视为未配置。",
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
     } else if document
         .get("web_search")
         .is_some_and(|item| !item.is_table())
@@ -951,7 +949,7 @@ fn collect_unknown_fields(document: &DocumentMut, diagnostics: &mut Vec<ConfigDi
         ("conversation", &["send_key", "restore_last_session"][..]),
         ("voice", &["auto_play", "input_language"][..]),
         ("updates", &["check_on_startup"][..]),
-        ("web_search", &["provider"][..]),
+        ("web_search", &["provider", "api_key"][..]),
         ("skills", &["config"][..]),
     ] {
         let Some(table) = document.get(section).and_then(Item::as_table) else {
@@ -1498,6 +1496,19 @@ fn write_web_search_preferences(
         "provider",
         Value::from(preferences.provider.as_str()),
     );
+    match preferences
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(api_key) => {
+            set_value_preserving_decor(table, "api_key", Value::from(api_key));
+        }
+        None => {
+            table.remove("api_key");
+        }
+    }
     Ok(())
 }
 
@@ -1553,7 +1564,6 @@ mod tests {
         let store = MuseConfigStore::load_from_dir(&root).expect("应创建默认配置");
         let content = std::fs::read_to_string(root.join("config.toml")).expect("应读取默认配置");
         assert!(content.contains("schema_version = 1"));
-        assert!(!store.has_published_model_profiles());
         assert_eq!(store.snapshot().config.appearance.background_blur, 18);
         assert_eq!(
             store.web_search_preferences().provider,
@@ -1590,8 +1600,8 @@ input_language = "zh"
 check_on_startup = true
 "#,
         )
-        .expect("应写入旧版配置");
-        let mut store = MuseConfigStore::load_from_dir(&root).expect("应加载旧版配置");
+        .expect("应写入缺少联网搜索段的手工配置");
+        let mut store = MuseConfigStore::load_from_dir(&root).expect("应加载手工配置");
         assert_eq!(
             store.web_search_preferences().provider,
             WebSearchProvider::ExaFreeMcp
@@ -1607,16 +1617,28 @@ check_on_startup = true
         store
             .update_web_search_preferences(WebSearchPreferences {
                 provider: WebSearchProvider::ExaApi,
+                api_key: Some("exa-plain-api-key".to_string()),
             })
             .expect("应保存 API 模式");
         let content = std::fs::read_to_string(root.join("config.toml")).expect("应读取配置");
         assert!(content.contains("[web_search]"));
         assert!(content.contains("provider = \"exa_api\""));
+        assert!(content.contains("api_key = \"exa-plain-api-key\""));
+        assert!(!format!("{:?}", store.snapshot()).contains("exa-plain-api-key"));
+        assert!(
+            !serde_json::to_string(&store.snapshot())
+                .expect("公开快照应可序列化")
+                .contains("exa-plain-api-key")
+        );
 
         let reloaded = MuseConfigStore::load_from_dir(&root).expect("应重新加载配置");
         assert_eq!(
             reloaded.web_search_preferences().provider,
             WebSearchProvider::ExaApi
+        );
+        assert_eq!(
+            reloaded.web_search_preferences().api_key.as_deref(),
+            Some("exa-plain-api-key")
         );
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }

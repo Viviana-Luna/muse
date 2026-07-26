@@ -1,6 +1,6 @@
 import type { SecretUpdate } from './secrets';
 
-// 联网搜索配置只暴露提供器和凭据是否存在，真实密钥始终留在系统凭据库。
+// 联网搜索接口只暴露提供器和凭据是否存在，真实密钥仅保存在受保护的 config.toml。
 
 export type WebSearchProvider = 'exa_free_mcp' | 'exa_api';
 

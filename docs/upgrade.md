@@ -27,7 +27,7 @@
 未设置 `MUSE_DATA_DIR` 时，桌面首次启动仅在当前目录同时包含 workspace、`src-tauri`（或旧 `muse-core`、`persona-core`）和根前端项目标识时，才把该目录识别为仓库根并检查 `.agent-vp-data`。只有 `~/.muse` 为空时才会执行迁移：
 
 1. 拒绝包含符号链接或特殊文件的 legacy 目录，防止复制到目录边界之外。
-2. 在目标目录旁创建临时 staging，并逐文件复制配置、角色、会话和普通资源；`model-files` 与 `models/assets.json` 明确排除。
+2. 在目标目录旁创建临时 staging，并逐文件复制角色、会话和普通资源；`model-files`、`models/assets.json`、`models/config.json` 与 `mcp/servers.json` 明确排除。
 3. 校验每个复制文件的字节数并同步落盘。
 4. 写入迁移标记后原子提交 staging；标记会记录是否发现并排除了旧模型文件。
 5. 全程不覆盖非空目标，也不删除、移动或修改原 `.agent-vp-data`。
@@ -38,23 +38,13 @@
 
 当前开发分支不复制 `model-files` 或 `models/assets.json`，也不读取、校验或改写其中内容。旧文件只保留在原 `.agent-vp-data`；语音能力改为 OpenAI-compatible API 后，这些文件不再属于运行时依赖。
 
-### 模型 Provider Profile 迁移
+### 当前配置格式边界
 
-首次启动会把旧 `models/config.json`、SQLite 模型目录和旧系统凭据 account 合并为 `config.toml` 中的完整 Provider Profile。迁移顺序固定为：读取旧源与系统凭据、原子写入 TOML、从磁盘回读校验、清理旧模型凭据、发布迁移标记，随后由统一 SQLite migration 删除旧 Provider 和模型表。中断后可幂等重试；TOML 未回读成功前不会清理旧凭据。
+Muse 尚未形成需要兼容的真实用户基线，因此当前版本只读取受保护的 `<数据目录>/config.toml`。Provider、MCP、Skill 启停和 Exa 联网搜索必须使用当前格式；程序不会读取旧 `models/config.json`、旧 SQLite 配置表、`mcp/servers.json`、Skill frontmatter `enabled` 或 Keychain/Credential Manager，也不会为这些旧配置创建迁移标记。旧配置文件仍留在原 `.agent-vp-data`，不会被复制到新数据目录。
 
-迁移后的模型 API Key 以明文写在当前用户专属权限的 `config.toml` 中，与 Provider、Base URL、模型列表和参数放在一起。旧 `models/config.json` 在本开发版本内原样保留但停止写入；迁移标记发布后运行时不再回退读取。不要上传、共享或提交 `config.toml`。
+`config.toml` 中的 API Key 是受当前用户专属权限保护的明文配置，不得上传、共享或提交。管理 API、日志、诊断、SQLite、Session 和前端持久状态都不会返回或复制秘密。首个真实用户支持基线确定后，未来升级兼容只从该基线向后设计。
 
-### MCP Server Profile 迁移
-
-首次启动会优先读取旧 `mcp/servers.json`，不存在时再读取旧 `models/config.json.mcp_servers`，并把 Server、transport、普通参数以及旧系统凭据或环境引用解析出的 API Key 合并为 `config.toml` 中的 `mcp_servers`。迁移顺序固定为：读取旧源与旧凭据、原子写入 TOML、从磁盘回读并进行语义一致性检查、幂等清理旧 MCP 凭据、发布迁移标记。清理或标记发布中断后可重试，TOML 未回读成功前不会删除旧凭据。
-
-旧 `mcp/servers.json` 在本开发版本内原样保留但停止写入；迁移完成后，管理 API、工具发现、资源读取和工具调用只使用共享 `config.toml` Store 冻结出的不可变快照，不再回退读取旧 JSON、系统凭据库或进程环境变量。MCP 工具目录、健康状态和连接结果仅保存在进程内存中。
-
-### Agent Skills 标准化迁移
-
-首次启动会扫描合法的 `<数据目录>/skills/<skill-name>/SKILL.md`。旧 frontmatter 若包含布尔 `enabled`，Muse 会先把状态原子写入 `config.toml` 的 `[[skills.config]]` 并从磁盘回读验证，再从原文移除 `enabled` 并发布幂等迁移标记；任一步失败都会保留或恢复迁移前状态。
-
-Skill 名称现在必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`、长度为 1–64，且目录名必须与 frontmatter `name` 一致。非标准目录不会自动改名，也不会被加载；请在确认引用关系后手工整理。页面更新和重命名会保留 `license`、`compatibility`、`metadata`、未知 frontmatter 以及 `scripts/`、`references/`、`assets/` 等辅助内容。
+Skill 名称必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`、长度为 1–64，且目录名必须与 frontmatter `name` 一致。非标准目录不会自动改名，也不会被加载；请在确认引用关系后手工整理。页面更新和重命名会保留 `license`、`compatibility`、`metadata`、未知 frontmatter 以及 `scripts/`、`references/`、`assets/` 等辅助内容；启停状态只来自 `config.toml`。
 
 ## 会话存储 v3
 
@@ -91,7 +81,7 @@ Skill 名称现在必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`、长度为 1–64，�
 
 - 桌面应用能从任意当前工作目录打开，不依赖源码或根目录 `dist`。
 - `runtime_bootstrap.protocol_version` 为 `muse-local-api/v1`，health 的 `instance_id` 与本次 Bootstrap 一致。
-- 角色、会话、模型配置和语音设置可读取。
+- 角色、会话和当前 `config.toml` 中的模型、MCP、Skill、Exa 与语音设置可读取。
 - legacy 原目录仍存在且内容未被迁移过程改写。
 - `~/.muse` 中没有因本次升级新建 `model-files` 或模型资产清单；旧模型仍留在 legacy 原目录。
 - `sessions/store.json` 已指向有效 generation；若有坏记录，能在 quarantine 中找到且原始备份仍在。

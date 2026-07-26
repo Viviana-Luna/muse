@@ -814,7 +814,14 @@ fn copy_legacy_tree_filtered(
         let relative = source_path
             .strip_prefix(legacy_root)
             .map_err(|error| DataDirError::new(format!("无法解析 legacy 相对路径：{error}")))?;
-        if relative.starts_with("model-files") || relative == Path::new("models/assets.json") {
+        if relative.starts_with("model-files")
+            || matches!(
+                relative,
+                path if path == Path::new("models/assets.json")
+                    || path == Path::new("models/config.json")
+                    || path == Path::new("mcp/servers.json")
+            )
+        {
             continue;
         }
         let destination_path = destination.join(entry.file_name());
@@ -1087,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_copies_user_data_but_excludes_retired_model_files() {
+    fn migration_copies_user_data_but_excludes_retired_model_and_config_files() {
         let root = unique_temp_root("legacy-copy");
         let legacy = root.join("workspace/.agent-vp-data");
         let target = root.join("home/.muse");
@@ -1123,20 +1130,15 @@ mod tests {
                 "last_error_kind": "network"
             }]
         });
-        let config = json!({
-            "speech_recognition": {
-                "profiles": [
-                    {"id": "valid", "model_path": "model-files/asr/whisper/ggml-small.bin"},
-                    {"id": "missing", "model_path": "model-files/asr/whisper/missing.bin"}
-                ]
-            }
-        });
         write_json(&legacy.join("models/assets.json"), &assets);
-        write_json(&legacy.join("models/config.json"), &config);
+        write_json(&legacy.join("models/config.json"), &json!({"chat": {}}));
+        write_json(&legacy.join("mcp/servers.json"), &json!({"servers": {}}));
         let original_assets =
             std::fs::read(legacy.join("models/assets.json")).expect("应能读取原资产清单");
         let original_config =
             std::fs::read(legacy.join("models/config.json")).expect("应能读取原模型配置");
+        let original_mcp =
+            std::fs::read(legacy.join("mcp/servers.json")).expect("应能读取原 MCP 配置");
         std::fs::create_dir_all(&target).expect("应能预先创建空目标目录");
 
         let report = Config::migrate_legacy_workspace_data(&target, &legacy)
@@ -1168,18 +1170,8 @@ mod tests {
         }
         assert!(target.join(LEGACY_MIGRATION_MARKER).is_file());
 
-        let migrated_config: Value = serde_json::from_slice(
-            &std::fs::read(target.join("models/config.json")).expect("应能读取迁移后的模型配置"),
-        )
-        .expect("迁移后的模型配置应为 JSON");
-        assert_eq!(
-            migrated_config["speech_recognition"]["profiles"][0]["model_path"],
-            "model-files/asr/whisper/ggml-small.bin"
-        );
-        assert_eq!(
-            migrated_config["speech_recognition"]["profiles"][1]["model_path"],
-            "model-files/asr/whisper/missing.bin"
-        );
+        assert!(!target.join("models/config.json").exists());
+        assert!(!target.join("mcp/servers.json").exists());
         assert_eq!(
             std::fs::read(legacy.join("models/assets.json")).expect("原资产清单应保留"),
             original_assets
@@ -1187,6 +1179,10 @@ mod tests {
         assert_eq!(
             std::fs::read(legacy.join("models/config.json")).expect("原模型配置应保留"),
             original_config
+        );
+        assert_eq!(
+            std::fs::read(legacy.join("mcp/servers.json")).expect("原 MCP 配置应保留"),
+            original_mcp
         );
 
         std::fs::remove_dir_all(root).expect("应能清理测试临时目录");

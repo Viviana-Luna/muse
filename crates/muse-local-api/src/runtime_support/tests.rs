@@ -681,7 +681,6 @@ fn build_test_state(config_dir: &Path) -> Arc<AppState> {
     ));
     Arc::new(AppState {
         config: Config::default(),
-        secrets: muse_core::app::secret::PlatformSecretStore::new("Muse-test"),
         provider: tokio::sync::Mutex::new(None),
         tts_provider: tokio::sync::Mutex::new(None),
         speech_recognition_provider: tokio::sync::Mutex::new(None),
@@ -937,6 +936,100 @@ async fn execute_runtime_tool_pre_handler_memory_failures_keep_exact_contract() 
         assert_generic_failure(&result, "preset_denied");
     }
 
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn web_search_secret_uses_only_protected_config_toml() {
+    use crate::dto::{SecretUpdateAction, WebSearchConfigUpdate};
+    use muse_core::app::preferences::WebSearchProvider;
+
+    let config_dir = unique_temp_dir("web-search-config-toml");
+    let state = build_test_state(&config_dir);
+    let initial = super::handle_get_web_search_config(State(state.clone()))
+        .await
+        .expect("应读取默认联网搜索配置")
+        .0;
+    assert_eq!(initial.provider, WebSearchProvider::ExaFreeMcp);
+    assert!(!initial.api_key_configured);
+
+    let first_secret = "exa-config-secret-first";
+    let saved = super::handle_put_web_search_config(
+        State(state.clone()),
+        Json(WebSearchConfigUpdate {
+            provider: WebSearchProvider::ExaApi,
+            action: SecretUpdateAction::Replace,
+            value: Some(first_secret.to_string()),
+        }),
+    )
+    .await
+    .expect("应把 Exa API Key 保存到 config.toml")
+    .0;
+    assert_eq!(saved.provider, WebSearchProvider::ExaApi);
+    assert!(saved.api_key_configured);
+    let public_json = serde_json::to_string(&saved).expect("响应应可序列化");
+    assert!(!public_json.contains(first_secret));
+    let config_path = config_dir.join("config.toml");
+    let first_content = std::fs::read_to_string(&config_path).expect("应读取 config.toml");
+    assert!(first_content.contains(first_secret));
+
+    let kept = super::handle_put_web_search_config(
+        State(state.clone()),
+        Json(WebSearchConfigUpdate {
+            provider: WebSearchProvider::ExaFreeMcp,
+            action: SecretUpdateAction::Keep,
+            value: None,
+        }),
+    )
+    .await
+    .expect("切换免费搜索时应保留已保存密钥")
+    .0;
+    assert!(kept.api_key_configured);
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .expect("应回读保留后的配置")
+            .contains(first_secret)
+    );
+
+    let deleted = super::handle_put_web_search_config(
+        State(state.clone()),
+        Json(WebSearchConfigUpdate {
+            provider: WebSearchProvider::ExaFreeMcp,
+            action: SecretUpdateAction::Delete,
+            value: None,
+        }),
+    )
+    .await
+    .expect("应从 config.toml 删除 Exa API Key")
+    .0;
+    assert!(!deleted.api_key_configured);
+    let deleted_content = std::fs::read_to_string(&config_path).expect("应回读删除后的配置");
+    assert!(!deleted_content.contains(first_secret));
+    assert!(!deleted_content.contains("api_key ="));
+    let reloaded = muse_core::app::preferences::MuseConfigStore::load_from_dir(&config_dir)
+        .expect("重启加载应使用同一 config.toml");
+    assert!(reloaded.web_search_preferences().api_key.is_none());
+
+    let external_content = deleted_content.replace(
+        "provider = \"exa_free_mcp\"",
+        "provider = \"exa_free_mcp\"\nmanual_extension = true",
+    );
+    std::fs::write(&config_path, &external_content).expect("应模拟手工编辑配置");
+    let conflict_secret = "must-not-overwrite-manual-config";
+    let conflict = super::handle_put_web_search_config(
+        State(state),
+        Json(WebSearchConfigUpdate {
+            provider: WebSearchProvider::ExaApi,
+            action: SecretUpdateAction::Replace,
+            value: Some(conflict_secret.to_string()),
+        }),
+    )
+    .await
+    .expect_err("陈旧页面不得覆盖手工修改");
+    assert_eq!(conflict.0, axum::http::StatusCode::CONFLICT);
+    let persisted = std::fs::read_to_string(&config_path).expect("应保留手工配置");
+    assert_eq!(persisted, external_content);
+    assert!(!persisted.contains(conflict_secret));
     let _ = std::fs::remove_dir_all(config_dir);
 }
 
@@ -6262,15 +6355,15 @@ async fn active_model_switch_requires_the_target_provider_credential_locally() {
     let state = build_test_state(&config_dir);
     {
         let mut store = state.model_config.lock().await;
-        let mut profiles = muse_core::model::profile_config::ModelProfileConfig::default();
-        profiles
-            .providers
-            .get_mut("volcengine_agent_plan")
-            .expect("应有内置供应商")
-            .enabled = true;
         store
-            .publish_migrated_model_profiles(profiles)
-            .expect("应注入缺少凭据的启用状态");
+            .update_provider_api_key("volcengine_agent_plan", Some("temporary-key".to_string()))
+            .expect("应暂存测试凭据");
+        store
+            .update_provider_enabled("volcengine_agent_plan", true)
+            .expect("应启用测试供应商");
+        store
+            .update_provider_api_key("volcengine_agent_plan", None)
+            .expect("应删除测试凭据并保留启用状态");
         store
             .ensure_runtime_model("volcengine_agent_plan", "glm-5.2")
             .expect("补录测试模型");
@@ -7212,7 +7305,6 @@ fn resolves_visual_pack_for_persona() {
     ));
     let state = AppState {
         config: Config::default(),
-        secrets: muse_core::app::secret::PlatformSecretStore::new("Muse-test"),
         provider: tokio::sync::Mutex::new(None),
         tts_provider: tokio::sync::Mutex::new(None),
         speech_recognition_provider: tokio::sync::Mutex::new(None),

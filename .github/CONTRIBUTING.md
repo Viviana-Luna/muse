@@ -117,7 +117,7 @@ npm run test
 npm run build
 ```
 
-前端只运行行为测试时使用 `npm run test:frontend`。Keychain、本地监听端口和供应商桩服务属于平台专项测试，使用：
+前端只运行行为测试时使用 `npm run test:frontend`。本地监听端口、Windows ACL 和供应商桩服务属于平台专项测试，使用：
 
 ```bash
 cargo test --workspace --all-targets --locked --features live-tests

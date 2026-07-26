@@ -87,9 +87,9 @@ Session v3 transcript 是不可变运行事件的事实源；标题、归档状�
 
 模型配置以完整 Provider Profile 写入 `config.toml`：`providers.<id>` 同时保存供应商类型、Base URL、明文 `api_key`、模型列表地址和 `models.<id>` 参数；`active_models` 只引用当前活动的 Provider 与模型。页面保存和手工编辑使用同一文件，不再把模型 Provider、模型列表或 API Key 写入 SQLite、系统凭据库或浏览器持久状态。
 
-MCP Server Profile 同样写入 `config.toml` 的 `mcp_servers.<name>`。`stdio` 只接受 `command`、`args`、`cwd`、`env` 和 `secret_env`；`streamable_http` 只接受 `url`、`headers` 和 `secret_headers`。Bearer Token 固定写入 `secret_headers.Authorization`。管理 API 的旧 `environment_name` 字段仅作为可选输入兼容项，实际字段名以 `target` 为准，不再保存环境引用或 Secret Reference。GET 只返回普通字段、秘密字段名和 `configured`，不会返回 `secret_env` 或 `secret_headers` 的值。
+MCP Server Profile 同样写入 `config.toml` 的 `mcp_servers.<name>`。`stdio` 只接受 `command`、`args`、`cwd`、`env` 和 `secret_env`；`streamable_http` 只接受 `url`、`headers` 和 `secret_headers`。Bearer Token 固定写入 `secret_headers.Authorization`。管理 API 的秘密字段名只接受 `target`；废弃的 `environment_name` 会作为未知字段被拒绝，不再保存环境引用或 Secret Reference。GET 只返回普通字段、秘密字段名和 `configured`，不会返回 `secret_env` 或 `secret_headers` 的值。
 
-`config.toml` 使用当前用户专属权限和耐久原子替换，但其中的模型和 MCP API Key 都是明文配置，因此不得上传、共享或提交。模型 GET、MCP GET、目录响应、诊断、日志和会话不返回 Key 或掩码。联网搜索凭据仍使用系统凭据库；模型和 MCP 的稳态读取不再访问系统凭据库或回退读取进程环境变量。
+`config.toml` 使用当前用户专属权限和耐久原子替换，但其中的模型、MCP 与 Exa API Key 都是明文配置，因此不得上传、共享或提交。模型 GET、MCP GET、联网搜索 GET、目录响应、诊断、日志和会话不返回 Key 或掩码。运行时不访问系统凭据库，也不回退读取旧 JSON、旧 SQLite 配置表或进程环境变量。
 
 ## Agent Skills
 

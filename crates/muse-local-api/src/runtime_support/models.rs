@@ -145,7 +145,6 @@ pub(crate) async fn handle_put_provider_credential(
                 "供应商凭据未配置。"
             }
             .to_string(),
-            credential_diagnostic: None,
         }));
     }
     let next_secret = match request.action {
@@ -185,7 +184,6 @@ pub(crate) async fn handle_put_provider_credential(
             "供应商凭据已删除。"
         }
         .to_string(),
-        credential_diagnostic: None,
     }))
 }
 
@@ -901,24 +899,17 @@ pub(crate) async fn handle_get_web_search_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<WebSearchConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _transition = state.model_configuration_transition_gate.lock().await;
-    let provider = state
-        .user_config
-        .lock()
-        .await
-        .web_search_preferences()
-        .provider;
-    let api_key_configured = state
-        .secrets
-        .get_optional("web-search.exa")
-        .map_err(|err| internal_error(err.to_string()))?
-        .is_some();
+    let config = state.user_config.lock().await;
+    let preferences = config.web_search_preferences();
+    let provider = preferences.provider;
+    let api_key_configured = config_has_api_key(preferences.api_key.as_deref());
     Ok(Json(WebSearchConfigResponse {
         provider,
         api_key_configured,
     }))
 }
 
-/// 原子更新 Exa 搜索后端与密钥；配置发布失败时恢复原凭据。
+/// 在单一 `config.toml` 事务中原子更新 Exa 搜索后端与密钥。
 pub(crate) async fn handle_put_web_search_config(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WebSearchConfigUpdate>,
@@ -926,10 +917,8 @@ pub(crate) async fn handle_put_web_search_config(
     use muse_core::app::preferences::{WebSearchPreferences, WebSearchProvider};
 
     let _transition = state.model_configuration_transition_gate.lock().await;
-    let previous = state
-        .secrets
-        .get_optional("web-search.exa")
-        .map_err(|err| internal_error(err.to_string()))?;
+    let mut config = state.user_config.lock().await;
+    let previous = config.web_search_preferences().api_key.clone();
     let replacement = match request.action {
         SecretUpdateAction::Keep => {
             if request.value.is_some() {
@@ -959,49 +948,12 @@ pub(crate) async fn handle_put_web_search_config(
         ));
     }
 
-    match request.action {
-        SecretUpdateAction::Keep => {}
-        SecretUpdateAction::Replace => {
-            if let Err(error) = state.secrets.set_verified(
-                "web-search.exa",
-                replacement.as_deref().expect("replace 已解析非空密钥"),
-            ) {
-                return Err(web_search_secret_update_error(
-                    &state,
-                    previous.as_deref(),
-                    format!("替换联网搜索凭据失败：{error}"),
-                ));
-            }
-        }
-        SecretUpdateAction::Delete => {
-            if let Err(error) = state.secrets.delete("web-search.exa") {
-                return Err(web_search_secret_update_error(
-                    &state,
-                    previous.as_deref(),
-                    format!("删除联网搜索凭据失败：{error}"),
-                ));
-            }
-        }
-    }
-
-    let update_result = state
-        .user_config
-        .lock()
-        .await
+    config
         .update_web_search_preferences(WebSearchPreferences {
             provider: request.provider,
-        });
-    if let Err(error) = update_result {
-        let rollback = restore_web_search_secret(&state, previous.as_deref());
-        if let Err(rollback_error) = rollback {
-            return Err(internal_error(format!(
-                "保存联网搜索后端失败，且原凭据回滚失败：{error}；{rollback_error}"
-            )));
-        }
-        return Err(internal_error(format!(
-            "保存联网搜索后端失败，原凭据已恢复：{error}"
-        )));
-    }
+            api_key: replacement.clone(),
+        })
+        .map_err(web_search_config_error)?;
 
     Ok(Json(WebSearchConfigResponse {
         provider: request.provider,
@@ -1009,26 +961,22 @@ pub(crate) async fn handle_put_web_search_config(
     }))
 }
 
-fn restore_web_search_secret(
-    state: &AppState,
-    previous: Option<&str>,
-) -> Result<(), muse_core::app::secret::SecretStoreError> {
-    match previous {
-        Some(previous) => state.secrets.set_verified("web-search.exa", previous),
-        None => state.secrets.delete("web-search.exa"),
-    }
-}
-
-fn web_search_secret_update_error(
-    state: &AppState,
-    previous: Option<&str>,
-    message: String,
+fn web_search_config_error(
+    error: muse_core::app::preferences::MuseConfigStoreError,
 ) -> (StatusCode, Json<ErrorResponse>) {
-    match restore_web_search_secret(state, previous) {
-        Ok(()) => internal_error(format!("{message}，原凭据状态已恢复。")),
-        Err(rollback_error) => {
-            internal_error(format!("{message}，且原凭据状态恢复失败：{rollback_error}"))
+    use muse_core::app::preferences::MuseConfigStoreError;
+
+    match error {
+        MuseConfigStoreError::Conflict(diagnostic) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("{}：{}", diagnostic.code, diagnostic.message),
+            }),
+        ),
+        MuseConfigStoreError::Validation(diagnostic) => {
+            bad_request(&format!("{}：{}", diagnostic.code, diagnostic.message))
         }
+        other => internal_error(format!("保存联网搜索配置失败：{other}")),
     }
 }
 
@@ -1193,8 +1141,6 @@ pub(crate) async fn handle_put_models_config(
             speech_recognition,
             audio_understanding,
             voice_input,
-            mcp_servers: BTreeMap::new(),
-            secret_bindings: Default::default(),
         };
         let saved = store
             .update_models_config(new_config)
