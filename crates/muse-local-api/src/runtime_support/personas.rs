@@ -450,6 +450,9 @@ pub(crate) async fn handle_delete_persona(
         }
         if visual_pack_changed && let Err(error) = visual_pack_candidate.save() {
             if let Err(rollback_error) = previous_personas.save() {
+                // 原子写回失败会保留删除提交后的 personas.json；内存也必须立即
+                // 跟随这个持久事实，禁止在等待下次启动收敛期间继续使用幽灵角色。
+                *personas = persona_candidate;
                 return Err(internal_error(format!(
                     "删除角色时保存展示包失败：{error}；角色定义回滚也失败：{rollback_error}。\
                      已保留恢复记录，下次启动将按 personas.json 事实继续收敛"
@@ -469,6 +472,15 @@ pub(crate) async fn handle_delete_persona(
                 .flatten();
             let persona_rollback_error = previous_personas.save().err();
             if visual_rollback_error.is_some() || persona_rollback_error.is_some() {
+                // 每个原子写回失败时，磁盘仍保持删除阶段已发布的 candidate。
+                // 分别对齐内存事实，避免 API 返回失败后继续暴露磁盘中已删除的角色，
+                // 或继续引用磁盘中已经移除的展示包。
+                if visual_rollback_error.is_some() {
+                    *visual_packs = visual_pack_candidate;
+                }
+                if persona_rollback_error.is_some() {
+                    *personas = persona_candidate;
+                }
                 return Err(internal_error(format!(
                     "删除角色时清理 SQLite 失败：{error}；文件回滚未全部完成\
                      （展示包：{}；角色定义：{}）。已保留恢复记录，下次启动将按 personas.json 事实继续收敛",
