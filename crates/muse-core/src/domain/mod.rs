@@ -6,6 +6,7 @@
 
 pub mod conversation;
 pub mod mcp;
+pub mod memory;
 pub mod persona;
 pub mod protocol;
 pub mod runtime;
