@@ -419,6 +419,19 @@ fn inspect_history_database(
                         | "persona_workspace_state"
                         | "persona_state_event"
                         | "persona_state_projection"
+                        | "memory_authority_anchor"
+                        | "memory_entry"
+                        | "memory_revision"
+                        | "memory_revision_source"
+                        | "memory_committed_batch"
+                        | "memory_committed_operation"
+                        | "memory_management_operation"
+                        | "memory_search_projection"
+                        | "memory_fts"
+                        | "memory_fts_data"
+                        | "memory_fts_idx"
+                        | "memory_fts_docsize"
+                        | "memory_fts_config"
                 ))
             || table.starts_with("sqlite_");
         if !known {
@@ -1071,12 +1084,35 @@ mod tests {
         assert_eq!(log_tables, 0, "核心备份不得夹带高频日志");
         drop(backup);
 
-        let restored_dir = unique_temp_dir();
-        std::fs::create_dir_all(restored_dir.join("runtime")).expect("应创建恢复目录");
-        std::fs::copy(&backup_path, restored_dir.join("runtime/muse.sqlite"))
-            .expect("应恢复核心备份");
+        let isolated_restore_dir = unique_temp_dir();
+        std::fs::create_dir_all(isolated_restore_dir.join("runtime")).expect("应创建恢复目录");
+        std::fs::copy(
+            &backup_path,
+            isolated_restore_dir.join("runtime/muse.sqlite"),
+        )
+        .expect("应复制仅含 runtime 的备份");
+        let error = crate::storage::open_runtime_database(&isolated_restore_dir)
+            .expect_err("缺失当前删除权威的独立目录不得开放带 anchor 的 runtime 备份");
+        assert!(
+            matches!(error, crate::storage::RuntimeStorageError::Integrity(_)),
+            "缺失删除权威必须为 Integrity，实际为：{error}"
+        );
+        std::fs::remove_dir_all(isolated_restore_dir).expect("应清理独立恢复测试目录");
+
+        for sidecar in [
+            dir.join("runtime/muse.sqlite-wal"),
+            dir.join("runtime/muse.sqlite-shm"),
+        ] {
+            if let Err(error) = std::fs::remove_file(&sidecar)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                panic!("应清理同安装恢复前的 SQLite sidecar：{error}");
+            }
+        }
+        std::fs::copy(&backup_path, dir.join("runtime/muse.sqlite"))
+            .expect("应在保留当前删除权威的同一安装恢复核心备份");
         let (_, restored) =
-            crate::storage::open_runtime_database(&restored_dir).expect("恢复库应通过统一校验");
+            crate::storage::open_runtime_database(&dir).expect("同安装恢复应通过统一校验");
         let restored_value: String = restored
             .query_row(
                 "SELECT summary FROM session_index WHERE conversation_id = 'core-probe'",
@@ -1086,11 +1122,10 @@ mod tests {
             .expect("恢复库应包含核心状态");
         assert_eq!(restored_value, "核心状态");
         assert!(
-            !restored_dir.join("logs/runtime-usage.sqlite").exists(),
-            "恢复核心备份不得创建或恢复日志库"
+            dir.join("logs/runtime-usage.sqlite").exists(),
+            "同安装恢复核心备份不得回滚或删除独立日志库"
         );
         drop(restored);
-        std::fs::remove_dir_all(restored_dir).expect("应清理恢复测试目录");
 
         let before_clear =
             inspect_runtime_history_evidence_read_only(&dir).expect("应读取历史证据");

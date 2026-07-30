@@ -116,13 +116,25 @@ impl MemoryRetrievalRequest {
 }
 
 /// 已通过第一层敏感门并暂存在当前 Turn 内存中的变更。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MemoryStagedMutation {
     params: MemoryMutateParams,
     binding: MemoryRuntimeBinding,
     assigned_memory_id: MemoryId,
     assigned_revision_id: MemoryRevisionId,
     staging_policy_version: String,
+}
+
+impl std::fmt::Debug for MemoryStagedMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryStagedMutation")
+            .field("operation", &self.params.operation())
+            .field("assigned_memory_id", &self.assigned_memory_id)
+            .field("assigned_revision_id", &self.assigned_revision_id)
+            .field("candidate_body", &"[已去敏]")
+            .finish()
+    }
 }
 
 impl MemoryStagedMutation {
@@ -328,7 +340,7 @@ pub struct MemoryMutationTransition {
 ///
 /// 封套只能接收 `MemoryStagedMutation`，因此未通过第一层敏感门的提议无法进入
 /// Repository 批量提交端口。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MemoryCommitEnvelope {
     idempotency_key: String,
     scope: MemoryPersonaScope,
@@ -336,6 +348,20 @@ pub struct MemoryCommitEnvelope {
     turn_id: String,
     committed_at: String,
     mutations: Vec<MemoryStagedMutation>,
+}
+
+impl std::fmt::Debug for MemoryCommitEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryCommitEnvelope")
+            .field("idempotency_key", &self.idempotency_key)
+            .field("scope", &self.scope)
+            .field("conversation_id", &self.conversation_id)
+            .field("turn_id", &self.turn_id)
+            .field("mutation_count", &self.mutations.len())
+            .field("candidate_bodies", &"[已去敏]")
+            .finish()
+    }
 }
 
 impl MemoryCommitEnvelope {

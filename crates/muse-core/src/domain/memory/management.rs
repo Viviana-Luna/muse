@@ -106,7 +106,7 @@ impl MemoryManagementBinding {
 ///
 /// 管理页只需要手工新增和纠正。重要程度调整由独立类型承载，纠正内容时会保留
 /// 当前 entry 的重要程度。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MemoryManagementContentParams {
     Create {
         category: MemoryCategory,
@@ -123,6 +123,20 @@ pub enum MemoryManagementContentParams {
         event_time: Option<String>,
         change_reason: String,
     },
+}
+
+impl std::fmt::Debug for MemoryManagementContentParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryManagementContentParams")
+            .field("operation", &self.operation())
+            .field("category", &self.category())
+            .field("importance", &self.importance())
+            .field("has_event_time", &self.event_time().is_some())
+            .field("content", &"[已去敏]")
+            .field("change_reason", &"[已去敏]")
+            .finish()
+    }
 }
 
 impl MemoryManagementContentParams {

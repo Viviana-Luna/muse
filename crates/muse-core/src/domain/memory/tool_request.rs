@@ -95,7 +95,7 @@ impl MemoryQueryParams {
 /// 模型可传的 `memory_mutate` 参数。
 ///
 /// 使用带标签枚举确保 create 无法携带旧标识，update/correct 则必须携带并发 revision。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemoryMutateParams {
     Create {
@@ -123,6 +123,20 @@ pub enum MemoryMutateParams {
         event_time: Option<String>,
         change_reason: String,
     },
+}
+
+impl fmt::Debug for MemoryMutateParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryMutateParams")
+            .field("operation", &self.operation())
+            .field("category", &self.category())
+            .field("importance", &self.importance())
+            .field("has_event_time", &self.event_time().is_some())
+            .field("content", &"[已去敏]")
+            .field("change_reason", &"[已去敏]")
+            .finish()
+    }
 }
 
 impl MemoryMutateParams {

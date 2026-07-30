@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod log_storage;
+pub mod memory_storage;
 pub mod preferences;
 pub mod secret;
 pub mod storage;

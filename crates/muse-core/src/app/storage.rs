@@ -13,7 +13,7 @@ const RUNTIME_DATABASE_FILE: &str = "muse.sqlite";
 const LEGACY_RUNTIME_DATABASE_FILE: &str = "agent-vp.sqlite";
 const RUNTIME_DATABASE_DIR: &str = "runtime";
 const RUNTIME_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 7;
+const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 8;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 统一运行时数据库初始化、连接或迁移错误。
@@ -195,6 +195,245 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
             );
         "#,
     },
+    RuntimeMigration {
+        version: 8,
+        name: "persona_long_term_memory_storage",
+        // 记忆正文与全部可重建投影归入统一 runtime SQLite；删除权威位于独立
+        // 恢复域，不在本 migration 中建表。所有业务键都包含 persona_id，
+        // current 指针与 revision 使用延迟外键保证一次事务内原子切换。
+        sql: r#"
+            CREATE TABLE memory_authority_anchor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                authority_id TEXT NOT NULL,
+                initialized_at TEXT NOT NULL,
+                last_applied_revision INTEGER NOT NULL DEFAULT 0
+                    CHECK (last_applied_revision >= 0)
+            );
+
+            CREATE TABLE memory_entry (
+                persona_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (
+                    category IN (
+                        'user_fact', 'user_preference', 'shared_experience',
+                        'commitment', 'story_state'
+                    )
+                ),
+                current_revision_id TEXT NOT NULL,
+                importance TEXT NOT NULL CHECK (importance IN ('low', 'normal', 'high')),
+                freshness_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'deleted')),
+                PRIMARY KEY(persona_id, memory_id),
+                UNIQUE(persona_id, memory_id, current_revision_id),
+                FOREIGN KEY(persona_id, memory_id, current_revision_id)
+                    REFERENCES memory_revision(persona_id, memory_id, revision_id)
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+            CREATE INDEX memory_entry_persona_state_freshness
+                ON memory_entry(persona_id, state, freshness_at DESC, memory_id ASC);
+
+            CREATE TABLE memory_revision (
+                row_id INTEGER PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                derivation_key BLOB NOT NULL CHECK (length(derivation_key) = 32),
+                event_time TEXT,
+                recorded_at TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_to TEXT,
+                change_type TEXT NOT NULL CHECK (
+                    change_type IN ('create', 'update', 'correct')
+                ),
+                change_reason TEXT NOT NULL,
+                safety_policy_version TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('current', 'superseded', 'corrected')
+                ),
+                UNIQUE(persona_id, memory_id, revision_id),
+                FOREIGN KEY(persona_id, memory_id)
+                    REFERENCES memory_entry(persona_id, memory_id)
+                    ON DELETE CASCADE
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+            CREATE INDEX memory_revision_persona_memory_state
+                ON memory_revision(persona_id, memory_id, state, valid_from DESC);
+            CREATE INDEX memory_revision_persona_derivation
+                ON memory_revision(persona_id, derivation_key);
+
+            CREATE TABLE memory_revision_source (
+                persona_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
+                source_kind TEXT NOT NULL CHECK (
+                    source_kind IN (
+                        'direct_user_message', 'user_confirmation',
+                        'deterministic_local_event', 'persona_management'
+                    )
+                ),
+                conversation_id TEXT,
+                turn_id TEXT,
+                action_id TEXT,
+                authorized_at TEXT,
+                PRIMARY KEY(persona_id, memory_id, revision_id, source_ordinal),
+                FOREIGN KEY(persona_id, memory_id, revision_id)
+                    REFERENCES memory_revision(persona_id, memory_id, revision_id)
+                    ON DELETE CASCADE,
+                CHECK (
+                    (
+                        source_kind IN (
+                            'direct_user_message', 'user_confirmation',
+                            'deterministic_local_event'
+                        )
+                        AND conversation_id IS NOT NULL
+                        AND turn_id IS NOT NULL
+                        AND action_id IS NULL
+                        AND authorized_at IS NULL
+                    )
+                    OR (
+                        source_kind = 'persona_management'
+                        AND conversation_id IS NULL
+                        AND turn_id IS NULL
+                        AND action_id IS NOT NULL
+                        AND authorized_at IS NOT NULL
+                    )
+                )
+            );
+            CREATE INDEX memory_revision_source_persona_turn
+                ON memory_revision_source(persona_id, conversation_id, turn_id);
+
+            CREATE TABLE memory_committed_batch (
+                persona_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                envelope_digest BLOB NOT NULL CHECK (length(envelope_digest) = 32),
+                durable_at TEXT NOT NULL,
+                PRIMARY KEY(persona_id, idempotency_key),
+                UNIQUE(persona_id, conversation_id, turn_id)
+            );
+            CREATE TABLE memory_committed_operation (
+                persona_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                operation_ordinal INTEGER NOT NULL CHECK (operation_ordinal >= 0),
+                operation_id TEXT NOT NULL,
+                change_type TEXT NOT NULL CHECK (
+                    change_type IN ('create', 'update', 'correct')
+                ),
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                PRIMARY KEY(persona_id, idempotency_key, operation_ordinal),
+                UNIQUE(persona_id, operation_id),
+                FOREIGN KEY(persona_id, idempotency_key)
+                    REFERENCES memory_committed_batch(persona_id, idempotency_key)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE memory_management_operation (
+                persona_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK (
+                    operation_kind IN ('content', 'importance')
+                ),
+                mutation_digest BLOB NOT NULL CHECK (length(mutation_digest) = 32),
+                change_type TEXT CHECK (
+                    change_type IS NULL OR change_type IN ('create', 'correct')
+                ),
+                memory_id TEXT NOT NULL,
+                revision_id TEXT,
+                previous_importance TEXT CHECK (
+                    previous_importance IS NULL
+                    OR previous_importance IN ('low', 'normal', 'high')
+                ),
+                importance TEXT CHECK (
+                    importance IS NULL OR importance IN ('low', 'normal', 'high')
+                ),
+                durable_at TEXT NOT NULL,
+                PRIMARY KEY(persona_id, operation_id),
+                CHECK (
+                    (
+                        operation_kind = 'content'
+                        AND change_type IS NOT NULL
+                        AND revision_id IS NOT NULL
+                        AND previous_importance IS NULL
+                        AND importance IS NULL
+                    )
+                    OR (
+                        operation_kind = 'importance'
+                        AND change_type IS NULL
+                        AND revision_id IS NULL
+                        AND previous_importance IS NOT NULL
+                        AND importance IS NOT NULL
+                    )
+                )
+            );
+
+            CREATE TABLE memory_search_projection (
+                row_id INTEGER PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                category TEXT NOT NULL CHECK (
+                    category IN (
+                        'user_fact', 'user_preference', 'shared_experience',
+                        'commitment', 'story_state'
+                    )
+                ),
+                UNIQUE(persona_id, memory_id),
+                FOREIGN KEY(persona_id, memory_id, revision_id)
+                    REFERENCES memory_revision(persona_id, memory_id, revision_id)
+                    ON DELETE CASCADE
+            );
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                persona_id UNINDEXED,
+                memory_id UNINDEXED,
+                revision_id UNINDEXED,
+                content,
+                category,
+                content = 'memory_search_projection',
+                content_rowid = 'row_id',
+                tokenize = 'trigram'
+            );
+            INSERT INTO memory_fts(memory_fts, rank) VALUES('secure-delete', 1);
+            CREATE TRIGGER memory_search_projection_insert
+            AFTER INSERT ON memory_search_projection BEGIN
+                INSERT INTO memory_fts(
+                    rowid, persona_id, memory_id, revision_id, content, category
+                ) VALUES(
+                    new.row_id, new.persona_id, new.memory_id, new.revision_id,
+                    new.content, new.category
+                );
+            END;
+            CREATE TRIGGER memory_search_projection_delete
+            AFTER DELETE ON memory_search_projection BEGIN
+                INSERT INTO memory_fts(
+                    memory_fts, rowid, persona_id, memory_id, revision_id, content, category
+                ) VALUES(
+                    'delete', old.row_id, old.persona_id, old.memory_id, old.revision_id,
+                    old.content, old.category
+                );
+            END;
+            CREATE TRIGGER memory_search_projection_update
+            AFTER UPDATE ON memory_search_projection BEGIN
+                INSERT INTO memory_fts(
+                    memory_fts, rowid, persona_id, memory_id, revision_id, content, category
+                ) VALUES(
+                    'delete', old.row_id, old.persona_id, old.memory_id, old.revision_id,
+                    old.content, old.category
+                );
+                INSERT INTO memory_fts(
+                    rowid, persona_id, memory_id, revision_id, content, category
+                ) VALUES(
+                    new.row_id, new.persona_id, new.memory_id, new.revision_id,
+                    new.content, new.category
+                );
+            END;
+        "#,
+    },
 ];
 
 /// 打开指定数据目录的统一运行时库，并完成连接配置与显式 migration。
@@ -214,7 +453,23 @@ pub fn open_runtime_database_at_path(path: &Path) -> Result<Connection, RuntimeS
     // 让随后生成的辅助文件继承同等级的私有访问边界。
     restrict_sensitive_file_permissions(path)?;
     configure_runtime_connection(&connection)?;
-    run_runtime_migrations(&mut connection)?;
+    run_runtime_migrations(&mut connection, path)?;
+    crate::app::memory_storage::reconcile_runtime_memory(&mut connection, path)?;
+    Ok(connection)
+}
+
+/// 已完成 migration 与恢复协调的记忆 Repository 使用的轻量连接入口。
+///
+/// Repository 在持有删除权威事务时不能递归触发恢复；构造 Repository 时已经通过
+/// 正式入口完成迁移、anchor 校验和权威重放，后续同一实例只复用统一连接参数。
+pub(crate) fn open_initialized_runtime_database(
+    base_dir: impl AsRef<Path>,
+) -> Result<Connection, RuntimeStorageError> {
+    let path = runtime_database_path(base_dir);
+    prepare_runtime_database_path(&path)?;
+    let connection = Connection::open(&path)?;
+    restrict_sensitive_file_permissions(&path)?;
+    configure_runtime_connection(&connection)?;
     Ok(connection)
 }
 
@@ -236,10 +491,14 @@ fn configure_runtime_connection(connection: &Connection) -> Result<(), rusqlite:
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.pragma_update(None, "secure_delete", "ON")?;
     Ok(())
 }
 
-fn run_runtime_migrations(connection: &mut Connection) -> Result<(), RuntimeStorageError> {
+fn run_runtime_migrations(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), RuntimeStorageError> {
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -261,6 +520,28 @@ fn run_runtime_migrations(connection: &mut Connection) -> Result<(), RuntimeStor
             "数据库 migration 版本 {version} 高于当前程序支持的 {LATEST_RUNTIME_SCHEMA_MIGRATION}"
         )));
     }
+    if newest.is_some_and(|version| version >= 8) {
+        validate_memory_authority_anchor(connection, database_path)?;
+    }
+
+    // migration 8 的删除权威准备必须先于任何主库 IMMEDIATE 事务完成：权威初始化
+    // 会对权威库 BEGIN IMMEDIATE，全局锁序固定为 authority -> main，主库事务内
+    // 再触权威库会形成反向 main -> authority 边。anchor 播种仍留在 migration 8
+    // 的主库事务内，与 schema 变更保持原子。
+    let pending_authority_anchor = if newest.is_none_or(|version| version < 8) {
+        let base_dir = runtime_database_base_dir(database_path)?;
+        Some(
+            crate::app::memory_storage::prepare_authority_for_migration(base_dir).map_err(
+                |_| {
+                    RuntimeStorageError::Integrity(
+                        "记忆删除权威不可用，已拒绝执行 migration 8".to_string(),
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
 
     for migration in RUNTIME_MIGRATIONS {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -282,6 +563,23 @@ fn run_runtime_migrations(connection: &mut Connection) -> Result<(), RuntimeStor
             continue;
         }
         transaction.execute_batch(migration.sql)?;
+        if migration.version == 8 {
+            let anchor = pending_authority_anchor.as_ref().ok_or_else(|| {
+                RuntimeStorageError::Integrity(
+                    "记忆删除权威不可用，已拒绝执行 migration 8".to_string(),
+                )
+            })?;
+            transaction.execute(
+                "INSERT INTO memory_authority_anchor(
+                    singleton, authority_id, initialized_at, last_applied_revision
+                 ) VALUES(1, ?1, ?2, ?3)",
+                rusqlite::params![
+                    anchor.authority_id,
+                    anchor.initialized_at,
+                    anchor.last_applied_revision
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO schema_migrations(version, name, applied_at)
              VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -291,6 +589,49 @@ fn run_runtime_migrations(connection: &mut Connection) -> Result<(), RuntimeStor
         transaction.commit()?;
     }
     validate_runtime_schema_shape(connection)?;
+    validate_memory_authority_anchor(connection, database_path)?;
+    Ok(())
+}
+
+fn runtime_database_base_dir(database_path: &Path) -> Result<&Path, RuntimeStorageError> {
+    database_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            RuntimeStorageError::Integrity("运行时数据库路径无法定位记忆删除权威恢复域".to_string())
+        })
+}
+
+fn validate_memory_authority_anchor(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), RuntimeStorageError> {
+    let anchor = connection
+        .query_row(
+            "SELECT authority_id, initialized_at, last_applied_revision
+             FROM memory_authority_anchor
+             WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(crate::app::memory_storage::AuthorityAnchor {
+                    authority_id: row.get(0)?,
+                    initialized_at: row.get(1)?,
+                    last_applied_revision: row.get(2)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            RuntimeStorageError::Integrity(
+                "migration 8 已存在，但记忆删除权威 anchor 缺失".to_string(),
+            )
+        })?;
+    let base_dir = runtime_database_base_dir(database_path)?;
+    crate::app::memory_storage::open_authority_for_anchor(base_dir, &anchor).map_err(|_| {
+        RuntimeStorageError::Integrity(
+            "记忆删除权威与 runtime anchor 不匹配，已拒绝开放数据库".to_string(),
+        )
+    })?;
     Ok(())
 }
 
@@ -494,7 +835,7 @@ pub fn backup_runtime_database(
     result
 }
 
-fn create_unique_temporary_path(destination: &Path) -> Result<PathBuf, std::io::Error> {
+pub(crate) fn create_unique_temporary_path(destination: &Path) -> Result<PathBuf, std::io::Error> {
     let parent = destination
         .parent()
         .ok_or_else(|| std::io::Error::other("临时数据库路径缺少父目录"))?;
@@ -581,7 +922,7 @@ pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<(), std:
 
 #[cfg(unix)]
 fn sync_parent_directory(parent: &Path) {
-    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+    if let Err(error) = sync_parent_directory_required(parent) {
         tracing::warn!(
             path = %parent.display(),
             %error,
@@ -592,6 +933,17 @@ fn sync_parent_directory(parent: &Path) {
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &Path) {}
+
+/// 隐私权威等前向单调事实必须把父目录同步失败视为提交失败。
+#[cfg(unix)]
+pub(crate) fn sync_parent_directory_required(parent: &Path) -> Result<(), std::io::Error> {
+    File::open(parent).and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_directory_required(_parent: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
 
 /// 运行时统一 SQLite 数据库路径。
 ///
@@ -738,7 +1090,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("应记录最新 migration");
-        assert_eq!(migration, (7, "persona_emotion_state_mvp".to_string()));
+        assert_eq!(
+            migration,
+            (8, "persona_long_term_memory_storage".to_string())
+        );
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -760,10 +1115,14 @@ mod tests {
         let synchronous: i64 = connection
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .expect("应读取同步级别");
+        let secure_delete: i64 = connection
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+            .expect("应读取安全删除配置");
         assert_eq!(foreign_keys, 1);
         assert_eq!(busy_timeout, 5_000);
         assert_eq!(journal_mode, "wal");
         assert_eq!(synchronous, 1);
+        assert_eq!(secure_delete, 1);
         drop(connection);
 
         let (_, reopened) = super::open_runtime_database(&root).expect("重复启动应保持幂等");
@@ -772,7 +1131,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",
@@ -858,7 +1217,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取最新 migration");
-        assert_eq!(latest, 7);
+        assert_eq!(latest, 8);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
