@@ -8,6 +8,7 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   tone?: 'default' | 'danger';
+  confirmDisabled?: boolean;
   onConfirm: () => void;
 }
 
@@ -18,6 +19,7 @@ export function ConfirmDialog({
   confirmLabel = '确认',
   cancelLabel = '取消',
   tone = 'default',
+  confirmDisabled = false,
   onConfirm
 }: ConfirmDialogProps) {
   return (
@@ -41,6 +43,7 @@ export function ConfirmDialog({
               <button
                 type="button"
                 className={tone === 'danger' ? 'danger' : 'accent'}
+                disabled={confirmDisabled}
                 onClick={onConfirm}
               >
                 {confirmLabel}

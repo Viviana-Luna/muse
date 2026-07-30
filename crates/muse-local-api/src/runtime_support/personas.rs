@@ -2,6 +2,21 @@
 
 use super::*;
 
+const PERSONA_DELETION_RECOVERY_SCHEMA_VERSION: &str = "muse-persona-deletion-recovery/v1";
+const PERSONA_DELETION_RECOVERY_FILE: &str = "persona-deletion-recovery.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersonaDeletionRecoveryFile {
+    schema_version: String,
+    pending: Option<PendingPersonaDeletion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingPersonaDeletion {
+    persona_id: String,
+    previous_visual_pack: Option<VisualPack>,
+}
+
 /// 查询角色列表。
 pub(crate) async fn handle_personas(
     State(state): State<Arc<AppState>>,
@@ -89,6 +104,7 @@ pub(crate) async fn handle_get_persona(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PersonaDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _transition = state.persona_runtime_transition_gate.lock().await;
     let personas = state.personas.lock().await;
     let Some(persona) = personas.get(&id).cloned() else {
         return Err((
@@ -373,7 +389,14 @@ pub(crate) async fn handle_delete_persona(
 ) -> Result<Json<PersonaMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let _transition = state.persona_runtime_transition_gate.lock().await;
     let idle_lease = acquire_runtime_idle_lease(&state, "delete_persona")?;
-    let (deleted_active, deleted_persona) = {
+    ensure_persona_deletion_recovery_slot_available(state.runtime_service.data_dir())
+        .map_err(internal_error)?;
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
+    let (deleted_active, deleted_persona, stale_asset_candidates) = {
         let mut personas = state.personas.lock().await;
         let deleted_active = personas.active_persona_id() == Some(id.as_str());
         let deleted_persona = personas.get(&id).cloned().ok_or_else(|| {
@@ -384,7 +407,13 @@ pub(crate) async fn handle_delete_persona(
                 }),
             )
         })?;
-        if !personas.delete(&id) {
+        let mut visual_packs = state.visual_packs.lock().await;
+        let previous_personas = personas.clone();
+        let previous_visual_packs = visual_packs.clone();
+        let mut persona_candidate = previous_personas.clone();
+        let mut visual_pack_candidate = previous_visual_packs.clone();
+
+        if !persona_candidate.delete(&id) {
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
@@ -393,39 +422,81 @@ pub(crate) async fn handle_delete_persona(
             ));
         }
 
-        personas.save().map_err(persona_store_error_response)?;
-        (deleted_active, deleted_persona)
-    };
+        let (stale_asset_candidates, previous_generated_visual_pack) =
+            remove_unreferenced_generated_visual_pack(
+                &id,
+                &persona_candidate,
+                &mut visual_pack_candidate,
+            );
+        let visual_pack_changed = previous_generated_visual_pack.is_some();
+        persist_persona_deletion_recovery(
+            state.runtime_service.data_dir(),
+            Some(PendingPersonaDeletion {
+                persona_id: id.clone(),
+                previous_visual_pack: previous_generated_visual_pack,
+            }),
+        )
+        .map_err(internal_error)?;
 
-    let stale_asset_candidates = {
-        let mut visual_packs = state.visual_packs.lock().await;
-        let mut candidate = visual_packs.clone();
-        let generated_visual_pack_id = format!("visual-{id}");
-        let paths = candidate
-            .get(&generated_visual_pack_id)
-            .map(visual_pack_paths)
-            .unwrap_or_default();
-        if candidate.delete(&generated_visual_pack_id) {
-            match candidate.save() {
-                Ok(()) => *visual_packs = candidate,
-                Err(error) => tracing::warn!(
-                    target: "muse::persona_assets",
-                    persona_id = %id,
-                    error = %error,
-                    "角色已删除，但展示包清理失败；保留展示包等待后续诊断"
-                ),
-            }
+        // Persona 定义是删除提交点：进程若在后续清理间退出，启动同步会按
+        // “Persona 已缺失”继续收敛 VisualPack 与 SQLite 派生状态。
+        if let Err(error) = persona_candidate.save() {
+            clear_persona_deletion_recovery_best_effort(
+                state.runtime_service.data_dir(),
+                &id,
+                "角色定义尚未提交",
+            );
+            return Err(persona_store_error_response(error));
         }
-        paths
+        if visual_pack_changed && let Err(error) = visual_pack_candidate.save() {
+            if let Err(rollback_error) = previous_personas.save() {
+                return Err(internal_error(format!(
+                    "删除角色时保存展示包失败：{error}；角色定义回滚也失败：{rollback_error}。\
+                     已保留恢复记录，下次启动将按 personas.json 事实继续收敛"
+                )));
+            }
+            clear_persona_deletion_recovery_best_effort(
+                state.runtime_service.data_dir(),
+                &id,
+                "展示包保存失败且角色定义已恢复",
+            );
+            return Err(visual_pack_store_error_response(error));
+        }
+
+        if let Err(error) = repository.delete_persona_runtime_state(&id).await {
+            let visual_rollback_error = visual_pack_changed
+                .then(|| previous_visual_packs.save().err())
+                .flatten();
+            let persona_rollback_error = previous_personas.save().err();
+            if visual_rollback_error.is_some() || persona_rollback_error.is_some() {
+                return Err(internal_error(format!(
+                    "删除角色时清理 SQLite 失败：{error}；文件回滚未全部完成\
+                     （展示包：{}；角色定义：{}）。已保留恢复记录，下次启动将按 personas.json 事实继续收敛",
+                    rollback_status(visual_rollback_error.as_ref()),
+                    rollback_status(persona_rollback_error.as_ref()),
+                )));
+            }
+            clear_persona_deletion_recovery_best_effort(
+                state.runtime_service.data_dir(),
+                &id,
+                "SQLite 清理失败且角色文件已恢复",
+            );
+            return Err(internal_error(format!(
+                "删除角色时清理 SQLite 失败，角色定义与展示包已恢复：{error}"
+            )));
+        }
+
+        *visual_packs = visual_pack_candidate;
+        *personas = persona_candidate;
+        (deleted_active, deleted_persona, stale_asset_candidates)
     };
+    clear_persona_deletion_recovery_best_effort(
+        state.runtime_service.data_dir(),
+        &id,
+        "Persona 删除已完成",
+    );
+
     cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
-    state
-        .runtime_service
-        .session_repository()
-        .await
-        .map_err(|error| internal_error(error.to_string()))?
-        .clear_workspace_state(&id)
-        .map_err(|error| internal_error(error.to_string()))?;
 
     if deleted_active {
         reset_conversation_for_active_persona(&state).await;
@@ -435,6 +506,186 @@ pub(crate) async fn handle_delete_persona(
     Ok(Json(
         persona_mutation_response(&state, deleted_persona, deleted_active).await,
     ))
+}
+
+fn remove_unreferenced_generated_visual_pack(
+    persona_id: &str,
+    personas: &PersonaStore,
+    visual_packs: &mut VisualPackStore,
+) -> (Vec<String>, Option<VisualPack>) {
+    let visual_pack_id = format!("visual-{persona_id}");
+    if personas
+        .personas()
+        .iter()
+        .any(|persona| persona.default_visual_pack_id == visual_pack_id)
+    {
+        return (Vec::new(), None);
+    }
+    let previous_visual_pack = visual_packs.get(&visual_pack_id).cloned();
+    let paths = previous_visual_pack
+        .as_ref()
+        .map(visual_pack_paths)
+        .unwrap_or_default();
+    if previous_visual_pack.is_some() {
+        visual_packs.delete(&visual_pack_id);
+    }
+    (paths, previous_visual_pack)
+}
+
+fn persona_deletion_recovery_path(data_dir: &StdPath) -> PathBuf {
+    data_dir
+        .join("runtime")
+        .join(PERSONA_DELETION_RECOVERY_FILE)
+}
+
+fn persist_persona_deletion_recovery(
+    data_dir: &StdPath,
+    pending: Option<PendingPersonaDeletion>,
+) -> Result<(), String> {
+    let path = persona_deletion_recovery_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let content = serde_json::to_vec_pretty(&PersonaDeletionRecoveryFile {
+        schema_version: PERSONA_DELETION_RECOVERY_SCHEMA_VERSION.to_string(),
+        pending,
+    })
+    .map_err(|error| error.to_string())?;
+    muse_core::app::storage::atomic_write_synced(&path, &content).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn persist_persona_deletion_recovery_for_test(
+    data_dir: &StdPath,
+    persona_id: &str,
+    previous_visual_pack: Option<VisualPack>,
+) -> Result<(), String> {
+    persist_persona_deletion_recovery(
+        data_dir,
+        Some(PendingPersonaDeletion {
+            persona_id: persona_id.to_string(),
+            previous_visual_pack,
+        }),
+    )
+}
+
+fn load_persona_deletion_recovery(
+    data_dir: &StdPath,
+) -> Result<Option<PendingPersonaDeletion>, String> {
+    let path = persona_deletion_recovery_path(data_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let recovery: PersonaDeletionRecoveryFile =
+        serde_json::from_slice(&content).map_err(|error| error.to_string())?;
+    if recovery.schema_version != PERSONA_DELETION_RECOVERY_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持的 Persona 删除恢复记录版本 `{}`",
+            recovery.schema_version
+        ));
+    }
+    Ok(recovery.pending)
+}
+
+fn ensure_persona_deletion_recovery_slot_available(data_dir: &StdPath) -> Result<(), String> {
+    match load_persona_deletion_recovery(data_dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(pending)) => Err(format!(
+            "上次 Persona `{}` 删除恢复尚未完成，请重启应用完成收敛后再删除其他角色",
+            pending.persona_id
+        )),
+        Err(error) => Err(format!(
+            "无法核对 Persona 删除恢复记录，已禁止开始新的删除：{error}"
+        )),
+    }
+}
+
+fn clear_persona_deletion_recovery_best_effort(data_dir: &StdPath, persona_id: &str, reason: &str) {
+    if let Err(error) = persist_persona_deletion_recovery(data_dir, None) {
+        tracing::warn!(
+            target: "muse::persona_delete",
+            %persona_id,
+            %reason,
+            %error,
+            "Persona 删除恢复记录暂未清除，将在下次启动幂等核对"
+        );
+    }
+}
+
+fn rollback_status(error: Option<&impl std::fmt::Display>) -> String {
+    error.map_or_else(
+        || "成功或无需恢复".to_string(),
+        |error| format!("失败：{error}"),
+    )
+}
+
+/// 启动时只处理删除恢复记录明确指向的展示包，避免按命名前缀误删未引用的用户数据。
+/// 展示包属于可选资产；恢复失败会保留记录供下次启动重试，但不得阻断应用启动。
+pub(super) async fn reconcile_pending_persona_deletion(state: &Arc<AppState>) {
+    let pending = match load_persona_deletion_recovery(state.runtime_service.data_dir()) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                target: "muse::persona_delete",
+                %error,
+                "读取 Persona 删除恢复记录失败，跳过可选展示包收敛"
+            );
+            return;
+        }
+    };
+    let reconciliation = async {
+        let personas = state.personas.lock().await;
+        let persona_exists = personas.get(&pending.persona_id).is_some();
+        let mut visual_packs = state.visual_packs.lock().await;
+        let mut candidate = visual_packs.clone();
+        let mut stale_asset_candidates = Vec::new();
+        let mut changed = false;
+        if let Some(previous_visual_pack) = pending.previous_visual_pack.as_ref() {
+            if persona_exists {
+                if candidate.get(&previous_visual_pack.id).is_none() {
+                    candidate
+                        .upsert(previous_visual_pack.clone())
+                        .map_err(|error| error.to_string())?;
+                    changed = true;
+                }
+            } else {
+                let still_referenced = personas
+                    .personas()
+                    .iter()
+                    .any(|persona| persona.default_visual_pack_id == previous_visual_pack.id);
+                if !still_referenced && candidate.delete(&previous_visual_pack.id) {
+                    stale_asset_candidates.extend(visual_pack_paths(previous_visual_pack));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            candidate.save().map_err(|error| error.to_string())?;
+            *visual_packs = candidate;
+        }
+        Ok::<_, String>(stale_asset_candidates)
+    }
+    .await;
+    let stale_asset_candidates = match reconciliation {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(
+                target: "muse::persona_delete",
+                persona_id = %pending.persona_id,
+                %error,
+                "启动收敛 Persona 可选展示包失败，保留恢复记录等待下次重试"
+            );
+            return;
+        }
+    };
+    clear_persona_deletion_recovery_best_effort(
+        state.runtime_service.data_dir(),
+        &pending.persona_id,
+        "启动已完成展示包收敛",
+    );
+    cleanup_unreferenced_uploaded_assets(state, stale_asset_candidates).await;
 }
 
 pub(super) async fn persona_mutation_response(

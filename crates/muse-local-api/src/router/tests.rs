@@ -1553,6 +1553,23 @@ async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
         std::env::set_var("MUSE_DATA_DIR", &config_dir);
     }
     let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        let mut persona = personas
+            .get("router-test-persona")
+            .cloned()
+            .expect("待删除角色应存在");
+        persona.default_visual_pack_id = "visual-router-test-persona".to_string();
+        personas.update(persona).expect("应更新待删除角色展示包");
+        personas.save().expect("应保存待删除角色");
+    }
+    {
+        let mut visual_packs = state.visual_packs.lock().await;
+        visual_packs
+            .upsert(test_visual_pack("visual-router-test-persona", "#d8596f"))
+            .expect("应创建待删除角色展示包");
+        visual_packs.save().expect("应保存待删除角色展示包");
+    }
     let repository = state
         .runtime_service
         .session_repository()
@@ -1576,15 +1593,29 @@ async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
         )
         .await
         .expect("应写入用户事件");
-    repository
+    let committed = repository
         .append_event(
             "deleted-persona-chat",
             Some("turn-deleted-persona".to_string()),
             "turn_committed",
-            serde_json::json!({"outcome": "committed"}),
+            serde_json::json!({
+                "outcome": "committed",
+                "persona_effects": {
+                    "schema_version": "muse-persona-effects/v1",
+                    "persona_id": "router-test-persona",
+                    "emotion": {
+                        "emotion": "happy",
+                        "intensity": 70,
+                        "reason_code": "positive_interaction"
+                    }
+                }
+            }),
         )
         .await
         .expect("应写入提交事件");
+    repository
+        .project_committed_persona_state(&committed)
+        .expect("应写入待删除角色状态投影");
     repository
         .set_workspace_state("router-test-persona", "deleted-persona-chat")
         .expect("应写入待删除角色工作区状态");
@@ -1622,6 +1653,28 @@ async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
             .workspace_state_exists("router-test-persona")
             .expect("删除后应清理角色工作区状态")
     );
+    assert!(
+        state
+            .visual_packs
+            .lock()
+            .await
+            .get("visual-router-test-persona")
+            .is_none(),
+        "删除后不得遗留角色生成的展示包"
+    );
+    let (_, connection) = muse_core::app::storage::open_runtime_database(&config_dir)
+        .expect("应打开删除后的运行时数据库");
+    for table in ["persona_state_event", "persona_state_projection"] {
+        let count: i64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE persona_id = 'router-test-persona'"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("应核对删除后的 Persona 状态");
+        assert_eq!(count, 0, "{table} 不得遗留已删除 Persona");
+    }
+    drop(connection);
 
     let export = app
         .clone()
@@ -1657,6 +1710,176 @@ async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
         resume_payload["error"]
             .as_str()
             .is_some_and(|error| error.starts_with("session_persona_missing"))
+    );
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn visual_pack_write_failure_rolls_back_persona_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = unique_temp_dir("delete-persona-visual-pack-failure");
+    let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        let mut persona = personas
+            .get("router-test-persona")
+            .cloned()
+            .expect("待删除角色应存在");
+        persona.default_visual_pack_id = "visual-router-test-persona".to_string();
+        personas.update(persona).expect("应更新待删除角色");
+        personas.save().expect("应保存待删除角色");
+    }
+    {
+        let mut visual_packs = state.visual_packs.lock().await;
+        visual_packs
+            .upsert(test_visual_pack("visual-router-test-persona", "#d8596f"))
+            .expect("应创建待删除角色展示包");
+        visual_packs.save().expect("应保存待删除角色展示包");
+    }
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .expect("应打开会话仓储");
+    repository
+        .set_workspace_state("router-test-persona", "default")
+        .expect("应写入待删除工作区状态");
+    let visual_pack_dir = config_dir.join("visual_packs");
+    std::fs::set_permissions(&visual_pack_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("应注入展示包目录只读故障");
+    let app = api_routes().with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应构造角色删除请求"),
+        )
+        .await
+        .expect("删除请求应返回失败响应");
+    std::fs::set_permissions(&visual_pack_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("应恢复展示包目录权限");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        state
+            .personas
+            .lock()
+            .await
+            .get("router-test-persona")
+            .is_some(),
+        "展示包写入失败时内存角色不得消失"
+    );
+    assert!(
+        PersonaStore::load_from_dir(&config_dir)
+            .expect("应重载角色存储")
+            .get("router-test-persona")
+            .is_some(),
+        "展示包写入失败时 personas.json 必须回滚"
+    );
+    assert!(
+        VisualPackStore::load_from_dir(&config_dir)
+            .expect("应重载展示包存储")
+            .get("visual-router-test-persona")
+            .is_some(),
+        "展示包写入失败时原展示包必须保留"
+    );
+    assert!(
+        repository
+            .workspace_state_exists("router-test-persona")
+            .expect("应读取回滚后的工作区状态"),
+        "展示包写入失败不得提前清理 SQLite"
+    );
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn sqlite_cleanup_failure_rolls_back_persona_and_visual_pack() {
+    let config_dir = unique_temp_dir("delete-persona-sqlite-failure");
+    let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        let mut persona = personas
+            .get("router-test-persona")
+            .cloned()
+            .expect("待删除角色应存在");
+        persona.default_visual_pack_id = "visual-router-test-persona".to_string();
+        personas.update(persona).expect("应更新待删除角色");
+        personas.save().expect("应保存待删除角色");
+    }
+    {
+        let mut visual_packs = state.visual_packs.lock().await;
+        visual_packs
+            .upsert(test_visual_pack("visual-router-test-persona", "#d8596f"))
+            .expect("应创建待删除角色展示包");
+        visual_packs.save().expect("应保存待删除角色展示包");
+    }
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .expect("应打开会话仓储");
+    repository
+        .set_workspace_state("router-test-persona", "default")
+        .expect("应写入待删除工作区状态");
+    let (_, connection) = muse_core::app::storage::open_runtime_database(&config_dir)
+        .expect("应打开故障注入前数据库");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("应截断故障注入前 WAL");
+    drop(connection);
+    let database_path = config_dir.join("runtime/muse.sqlite");
+    let database_backup = config_dir.join("runtime/muse.sqlite.test-backup");
+    std::fs::rename(&database_path, &database_backup).expect("应暂存运行时数据库");
+    std::fs::create_dir(&database_path).expect("应注入 SQLite 非普通文件故障");
+    let app = api_routes().with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应构造角色删除请求"),
+        )
+        .await
+        .expect("删除请求应返回失败响应");
+    std::fs::remove_dir(&database_path).expect("应移除 SQLite 故障占位目录");
+    std::fs::rename(&database_backup, &database_path).expect("应恢复运行时数据库");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        state
+            .personas
+            .lock()
+            .await
+            .get("router-test-persona")
+            .is_some(),
+        "SQLite 清理失败时内存角色不得消失"
+    );
+    assert!(
+        PersonaStore::load_from_dir(&config_dir)
+            .expect("应重载角色存储")
+            .get("router-test-persona")
+            .is_some(),
+        "SQLite 清理失败时 personas.json 必须回滚"
+    );
+    assert!(
+        VisualPackStore::load_from_dir(&config_dir)
+            .expect("应重载展示包存储")
+            .get("visual-router-test-persona")
+            .is_some(),
+        "SQLite 清理失败时展示包必须回滚"
+    );
+    assert!(
+        repository
+            .workspace_state_exists("router-test-persona")
+            .expect("应读取回滚后的工作区状态"),
+        "SQLite 事务失败时工作区状态必须保持"
     );
     let _ = std::fs::remove_dir_all(config_dir);
 }
@@ -2062,6 +2285,189 @@ async fn startup_restores_active_persona_workspace_session() {
             .messages
             .iter()
             .any(|message| message.content == "启动后继续")
+    );
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() {
+    let config_dir = unique_temp_dir("startup-finish-persona-deletion");
+    let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        let mut deleted_persona = test_persona("deleted-persona");
+        deleted_persona.default_visual_pack_id = "visual-deleted-persona".to_string();
+        personas
+            .create(deleted_persona)
+            .expect("应创建待模拟中断删除的 Persona");
+        personas.save().expect("应保存待模拟中断删除的 Persona");
+    }
+    let deleted_visual_pack = test_visual_pack("visual-deleted-persona", "#d8596f");
+    {
+        let mut visual_packs = state.visual_packs.lock().await;
+        visual_packs
+            .upsert(deleted_visual_pack.clone())
+            .expect("应创建中断删除遗留的展示包");
+        visual_packs
+            .upsert(test_visual_pack("visual-user-unreferenced", "#112233"))
+            .expect("应创建不属于删除恢复记录的未引用展示包");
+        visual_packs.save().expect("应保存中断删除遗留的展示包");
+    }
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .expect("应能打开会话仓储");
+    repository
+        .ensure_persona_binding(
+            "deleted-persona-chat",
+            "deleted-persona",
+            "已删除角色",
+            "1.0.0",
+        )
+        .await
+        .expect("应保留已删除角色的 Session 绑定");
+    let committed = repository
+        .append_event(
+            "deleted-persona-chat",
+            Some("turn-deleted-persona".to_string()),
+            "turn_committed",
+            serde_json::json!({
+                "persona_effects": {
+                    "schema_version": "muse-persona-effects/v1",
+                    "persona_id": "deleted-persona",
+                    "emotion": {
+                        "emotion": "happy",
+                        "intensity": 70,
+                        "reason_code": "positive_interaction"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("应写入已删除角色的 Session 事实");
+    repository
+        .project_committed_persona_state(&committed)
+        .expect("应模拟中断删除前的状态投影");
+    repository
+        .set_workspace_state("deleted-persona", "deleted-persona-chat")
+        .expect("应模拟中断删除前的工作区状态");
+    crate::runtime_support::persist_persona_deletion_recovery_for_test(
+        &config_dir,
+        "deleted-persona",
+        Some(deleted_visual_pack),
+    )
+    .expect("应写入删除提交前的恢复记录");
+    {
+        let mut personas = state.personas.lock().await;
+        assert!(personas.delete("deleted-persona"));
+        personas.save().expect("应模拟 Persona 定义已经提交删除");
+    }
+
+    crate::runtime_support::initialize_active_persona_session(&state)
+        .await
+        .expect("启动应收敛中断的 Persona 删除");
+
+    assert!(
+        state
+            .visual_packs
+            .lock()
+            .await
+            .get("visual-deleted-persona")
+            .is_none(),
+        "启动后不得遗留孤立的生成展示包"
+    );
+    assert!(
+        state
+            .visual_packs
+            .lock()
+            .await
+            .get("visual-user-unreferenced")
+            .is_some(),
+        "启动收敛不得按 visual- 前缀误删恢复记录之外的展示包"
+    );
+    assert!(
+        !repository
+            .workspace_state_exists("deleted-persona")
+            .expect("应读取启动后的工作区状态"),
+        "启动后不得遗留已删除 Persona 的工作区状态"
+    );
+    let (_, connection) = muse_core::app::storage::open_runtime_database(&config_dir)
+        .expect("应打开启动后的运行时数据库");
+    for table in ["persona_state_event", "persona_state_projection"] {
+        let count: i64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE persona_id = 'deleted-persona'"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("应核对启动后的 Persona 状态");
+        assert_eq!(count, 0, "启动后 {table} 不得复活已删除 Persona");
+    }
+    assert!(
+        repository
+            .list_sessions()
+            .await
+            .expect("启动后应保留关联 Session")
+            .iter()
+            .any(|session| session.conversation_id == "deleted-persona-chat"),
+        "关联 Session 必须继续作为只读历史保留"
+    );
+    drop(connection);
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn optional_visual_recovery_failure_does_not_block_startup_and_retries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = unique_temp_dir("startup-optional-visual-retry");
+    let state = build_test_state(&config_dir);
+    let deleted_visual_pack = test_visual_pack("visual-deleted-persona", "#d8596f");
+    {
+        let mut visual_packs = state.visual_packs.lock().await;
+        visual_packs
+            .upsert(deleted_visual_pack.clone())
+            .expect("应创建中断删除遗留的展示包");
+        visual_packs.save().expect("应保存中断删除遗留的展示包");
+    }
+    crate::runtime_support::persist_persona_deletion_recovery_for_test(
+        &config_dir,
+        "deleted-persona",
+        Some(deleted_visual_pack),
+    )
+    .expect("应写入待重试的删除恢复记录");
+    let visual_pack_dir = config_dir.join("visual_packs");
+    std::fs::set_permissions(&visual_pack_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("应注入可选展示包恢复写入故障");
+
+    crate::runtime_support::initialize_active_persona_session(&state)
+        .await
+        .expect("可选展示包恢复失败不得阻断启动");
+    assert!(
+        state
+            .visual_packs
+            .lock()
+            .await
+            .get("visual-deleted-persona")
+            .is_some(),
+        "写入故障期间应保留展示包等待重试"
+    );
+
+    std::fs::set_permissions(&visual_pack_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("应恢复展示包目录权限");
+    crate::runtime_support::initialize_active_persona_session(&state)
+        .await
+        .expect("下次启动应重试可选展示包恢复");
+    assert!(
+        state
+            .visual_packs
+            .lock()
+            .await
+            .get("visual-deleted-persona")
+            .is_none(),
+        "故障解除后应完成展示包收敛"
     );
     let _ = std::fs::remove_dir_all(config_dir);
 }

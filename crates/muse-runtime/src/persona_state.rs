@@ -1,5 +1,6 @@
 //! Persona 私有运行状态的 SQLite event/projection 与 Session v3 补投影。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -286,6 +287,30 @@ impl PersonaStateStore {
         let mut recovered = 0usize;
         for event in events {
             if self.project_committed_event(&event)? {
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// 只补投影当前仍存在的 Persona，避免已删除角色的只读 Session
+    /// 在应用重启或状态读取时重新生成 SQLite 运行状态。
+    pub async fn recover_from_session_store_for_personas(
+        &self,
+        store: &SessionStore,
+        persona_ids: &HashSet<String>,
+    ) -> Result<usize, PersonaStateError> {
+        let events = store.aggregate_events().await?;
+        let mut recovered = 0usize;
+        for event in events {
+            let matches_existing_persona = event.kind == "turn_committed"
+                && event
+                    .payload
+                    .get("persona_effects")
+                    .and_then(|value| value.get("persona_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|persona_id| persona_ids.contains(persona_id));
+            if matches_existing_persona && self.project_committed_event(&event)? {
                 recovered = recovered.saturating_add(1);
             }
         }

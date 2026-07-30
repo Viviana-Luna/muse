@@ -95,7 +95,7 @@ impl VisualPackStore {
             visual_packs: self.visual_packs.clone(),
         };
         let content = serde_json::to_string_pretty(&persisted)?;
-        std::fs::write(&self.storage_path, content)?;
+        crate::app::storage::atomic_write_synced(&self.storage_path, content.as_bytes())?;
         Ok(())
     }
 

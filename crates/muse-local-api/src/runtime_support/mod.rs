@@ -45,7 +45,7 @@ use muse_core::domain::mcp;
 use muse_core::domain::persona::Persona;
 use muse_core::domain::persona::character::card::PersonaCard;
 use muse_core::domain::persona::character::store::{PersonaStore, PersonaStoreError};
-use muse_core::domain::persona::visual::VisualPack;
+use muse_core::domain::persona::visual::{VisualPack, store::VisualPackStore};
 use muse_core::domain::protocol::{RuntimeEvent, RuntimeOp};
 use muse_core::domain::runtime::{RuntimeModeState, RuntimeTodoItem, ToolPreset};
 use muse_core::domain::tool::{

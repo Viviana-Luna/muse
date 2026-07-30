@@ -11,10 +11,23 @@ function setup() {
     onExportLight: vi.fn(),
     onDelete: vi.fn()
   };
-  render(<PersonaActionsMenu name="爱丽丝" busy={false} {...callbacks} />);
+  const loadDeletionImpact = vi.fn().mockResolvedValue({
+    persona_id: 'alice',
+    associated_session_count: 0,
+    workspace_state_exists: false
+  });
+  render(
+    <PersonaActionsMenu
+      name="爱丽丝"
+      busy={false}
+      {...callbacks}
+      loadDeletionImpact={loadDeletionImpact}
+    />
+  );
   return {
     trigger: screen.getByRole('button', { name: '爱丽丝的更多操作' }),
-    callbacks
+    callbacks,
+    loadDeletionImpact
   };
 }
 
@@ -87,7 +100,9 @@ describe('PersonaActionsMenu', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: '删除角色' }));
 
     const dialog = await screen.findByRole('alertdialog', { name: '删除角色“爱丽丝”？' });
-    fireEvent.click(screen.getByRole('button', { name: '删除角色' }));
+    const confirm = screen.getByRole('button', { name: '删除角色' });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
     expect(callbacks.onDelete).toHaveBeenCalledOnce();
     await waitFor(() => expect(dialog).not.toBeInTheDocument());
   });
@@ -115,5 +130,32 @@ describe('PersonaActionsMenu', () => {
 
     expect(loadDeletionImpact).toHaveBeenCalledOnce();
     expect(await screen.findByText(/3 个关联会话会保留为只读历史/)).toBeVisible();
+  });
+
+  it('删除影响获取失败时禁止继续删除', async () => {
+    const onDelete = vi.fn();
+    const loadDeletionImpact = vi.fn().mockRejectedValue(new Error('注入影响查询失败'));
+    render(
+      <PersonaActionsMenu
+        name="爱丽丝"
+        busy={false}
+        onEdit={vi.fn()}
+        onCopy={vi.fn()}
+        onExportFull={vi.fn()}
+        onExportLight={vi.fn()}
+        onDelete={onDelete}
+        loadDeletionImpact={loadDeletionImpact}
+      />
+    );
+    fireEvent.click(screen.getByRole('button', { name: '爱丽丝的更多操作' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '删除角色' }));
+
+    expect(
+      await screen.findByText('无法核对删除影响，已禁止继续删除，请关闭后重试。')
+    ).toBeVisible();
+    const confirm = screen.getByRole('button', { name: '删除角色' });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(confirm);
+    expect(onDelete).not.toHaveBeenCalled();
   });
 });

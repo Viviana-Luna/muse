@@ -118,7 +118,7 @@ impl RuntimeService {
     pub async fn session_repository(&self) -> Result<&SessionRepository, SessionRepositoryError> {
         self.session_repository
             .get_or_try_init(|| async {
-                let (repository, _) = SessionRepository::open(&self.data_dir).await?;
+                let (repository, _) = SessionRepository::open_for_runtime(&self.data_dir).await?;
                 self.coordinator.touch();
                 Ok(repository)
             })

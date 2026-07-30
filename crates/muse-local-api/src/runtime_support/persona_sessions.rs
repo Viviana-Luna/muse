@@ -164,21 +164,33 @@ pub(crate) async fn initialize_active_persona_session(state: &Arc<AppState>) -> 
         .runtime_service
         .acquire_idle_lease("startup_persona_session_restore")
         .map_err(|error| format!("启动恢复无法取得空闲租约：{error}"))?;
-    let active_persona = {
+    let (active_persona, persona_ids) = {
         let personas = state.personas.lock().await;
-        personas.active_persona().cloned()
-    };
-    let Some(active_persona) = active_persona else {
-        idle_lease
-            .finish()
-            .map_err(|error| format!("启动恢复释放空闲租约失败：{error}"))?;
-        return Ok(());
+        (
+            personas.active_persona().cloned(),
+            personas
+                .personas()
+                .iter()
+                .map(|persona| persona.id.clone())
+                .collect(),
+        )
     };
     let repository = state
         .runtime_service
         .session_repository()
         .await
         .map_err(|error| error.to_string())?;
+    reconcile_pending_persona_deletion(state).await;
+    repository
+        .synchronize_persona_runtime_states(&persona_ids)
+        .await
+        .map_err(|error| format!("启动同步 Persona 运行状态失败：{error}"))?;
+    let Some(active_persona) = active_persona else {
+        idle_lease
+            .finish()
+            .map_err(|error| format!("启动恢复释放空闲租约失败：{error}"))?;
+        return Ok(());
+    };
     let preferred = repository
         .preferred_conversation_for_persona(&active_persona.id)
         .await

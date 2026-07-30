@@ -28,6 +28,8 @@ export function PersonaActionsMenu({
   const [open, setOpen] = useState(false);
   const [deletionImpact, setDeletionImpact] = useState<PersonaDeletionImpactResponse | null>(null);
   const [impactLoading, setImpactLoading] = useState(false);
+  const [impactError, setImpactError] = useState<string | null>(null);
+  const impactRequestRef = useRef(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
@@ -119,13 +121,17 @@ export function PersonaActionsMenu({
             description={
               impactLoading
                 ? '正在核对关联会话…'
+                : impactError
+                  ? impactError
                 : deletionImpact
                   ? `角色配置将被删除；${deletionImpact.associated_session_count} 个关联会话会保留为只读历史。此操作无法撤销。`
-                  : '角色配置将从本地存储中删除；关联会话会保留为只读历史。此操作无法撤销。'
+                  : '尚未核对删除影响，当前禁止继续删除。'
             }
             confirmLabel="删除角色"
             tone="danger"
+            confirmDisabled={busy || impactLoading || deletionImpact === null}
             onConfirm={() => {
+              if (busy || impactLoading || deletionImpact === null) return;
               setOpen(false);
               onDelete();
             }}
@@ -136,13 +142,31 @@ export function PersonaActionsMenu({
               className="danger"
               disabled={busy}
               onClick={() => {
-                if (!loadDeletionImpact) return;
-                setImpactLoading(true);
+                const requestId = impactRequestRef.current + 1;
+                impactRequestRef.current = requestId;
                 setDeletionImpact(null);
+                setImpactError(null);
+                if (!loadDeletionImpact) {
+                  setImpactError('无法核对删除影响，已禁止继续删除。');
+                  return;
+                }
+                setImpactLoading(true);
                 void loadDeletionImpact()
-                  .then(setDeletionImpact)
-                  .catch(() => setDeletionImpact(null))
-                  .finally(() => setImpactLoading(false));
+                  .then((impact) => {
+                    if (impactRequestRef.current === requestId) {
+                      setDeletionImpact(impact);
+                    }
+                  })
+                  .catch(() => {
+                    if (impactRequestRef.current === requestId) {
+                      setImpactError('无法核对删除影响，已禁止继续删除，请关闭后重试。');
+                    }
+                  })
+                  .finally(() => {
+                    if (impactRequestRef.current === requestId) {
+                      setImpactLoading(false);
+                    }
+                  });
               }}
             >
               <Trash2 aria-hidden="true" />

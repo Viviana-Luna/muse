@@ -1,11 +1,11 @@
 //! Session v3 JSONL 会话事实与可重建 SQLite 查询索引。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use muse_core::app::storage::{RuntimeStorageError, open_runtime_database};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -105,6 +105,13 @@ pub struct SessionListItem {
     pub archived: bool,
     pub metadata_updated_at: Option<String>,
     pub metadata_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersonaRuntimeStateDeletion {
+    pub workspace_state_rows: usize,
+    pub state_event_rows: usize,
+    pub state_projection_rows: usize,
 }
 
 struct MetadataSnapshot {
@@ -215,6 +222,19 @@ impl SessionRepository {
     pub async fn open(
         data_dir: impl AsRef<Path>,
     ) -> Result<(Self, SessionMigrationReport), SessionRepositoryError> {
+        Self::open_internal(data_dir, true).await
+    }
+
+    pub(crate) async fn open_for_runtime(
+        data_dir: impl AsRef<Path>,
+    ) -> Result<(Self, SessionMigrationReport), SessionRepositoryError> {
+        Self::open_internal(data_dir, false).await
+    }
+
+    async fn open_internal(
+        data_dir: impl AsRef<Path>,
+        recover_all_persona_states: bool,
+    ) -> Result<(Self, SessionMigrationReport), SessionRepositoryError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let (store, report) = SessionStore::open(&data_dir).await?;
         let repository = Self {
@@ -225,7 +245,7 @@ impl SessionRepository {
         if let Err(error) = repository.ensure_index_current().await {
             tracing::warn!(%error, "会话仓储已打开，SQLite 索引将在列表访问时重试重建");
         }
-        if let Err(error) = repository.recover_persona_state().await {
+        if recover_all_persona_states && let Err(error) = repository.recover_persona_state().await {
             tracing::warn!(%error, "Persona 状态补投影失败，将在下次读取时重试");
         }
         Ok((repository, report))
@@ -243,6 +263,51 @@ impl SessionRepository {
             .await?)
     }
 
+    /// 启动时只恢复仍存在的 Persona，并在同一 SQLite 事务内清除
+    /// 已删除 Persona 的工作区、事件和投影残留。
+    pub async fn synchronize_persona_runtime_states(
+        &self,
+        persona_ids: &HashSet<String>,
+    ) -> Result<usize, SessionRepositoryError> {
+        let _guard = self.index_gate.lock().await;
+        let recovered = PersonaStateStore::new(&self.data_dir)
+            .recover_from_session_store_for_personas(&self.store, persona_ids)
+            .await?;
+        let (_, mut connection) = open_runtime_database(&self.data_dir)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_persona_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT persona_id FROM persona_workspace_state
+                 UNION
+                 SELECT persona_id FROM persona_state_event
+                 UNION
+                 SELECT persona_id FROM persona_state_projection",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|persona_id| !persona_ids.contains(persona_id))
+                .collect::<Vec<_>>()
+        };
+        for persona_id in stale_persona_ids {
+            transaction.execute(
+                "DELETE FROM persona_workspace_state WHERE persona_id = ?1",
+                [&persona_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM persona_state_event WHERE persona_id = ?1",
+                [&persona_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM persona_state_projection WHERE persona_id = ?1",
+                [&persona_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(recovered)
+    }
+
     /// 投影刚刚可靠写入的 committed event。失败时 canonical commit 已经成立，
     /// 调用方不得追加冲突的 aborted 终态。
     pub fn project_committed_persona_state(
@@ -257,7 +322,11 @@ impl SessionRepository {
         &self,
         persona_id: &str,
     ) -> Result<Option<PersonaStateProjection>, SessionRepositoryError> {
-        self.recover_persona_state().await?;
+        let _guard = self.index_gate.lock().await;
+        let persona_ids = HashSet::from([persona_id.to_string()]);
+        PersonaStateStore::new(&self.data_dir)
+            .recover_from_session_store_for_personas(&self.store, &persona_ids)
+            .await?;
         Ok(PersonaStateStore::new(&self.data_dir).projection(persona_id)?)
     }
 
@@ -589,6 +658,35 @@ impl SessionRepository {
             [persona_id],
         )?;
         Ok(())
+    }
+
+    /// 原子清理 Persona 的全部 SQLite 派生状态；Session JSONL 保持原样，
+    /// 继续作为只读历史与导出事实源。
+    pub async fn delete_persona_runtime_state(
+        &self,
+        persona_id: &str,
+    ) -> Result<PersonaRuntimeStateDeletion, SessionRepositoryError> {
+        let _guard = self.index_gate.lock().await;
+        let (_, mut connection) = open_runtime_database(&self.data_dir)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let workspace_state_rows = transaction.execute(
+            "DELETE FROM persona_workspace_state WHERE persona_id = ?1",
+            [persona_id],
+        )?;
+        let state_event_rows = transaction.execute(
+            "DELETE FROM persona_state_event WHERE persona_id = ?1",
+            [persona_id],
+        )?;
+        let state_projection_rows = transaction.execute(
+            "DELETE FROM persona_state_projection WHERE persona_id = ?1",
+            [persona_id],
+        )?;
+        transaction.commit()?;
+        Ok(PersonaRuntimeStateDeletion {
+            workspace_state_rows,
+            state_event_rows,
+            state_projection_rows,
+        })
     }
 
     pub async fn delete_conversation(
@@ -1101,6 +1199,8 @@ fn validate_conversation_id(value: &str) -> Result<(), SessionRepositoryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1556,6 +1656,99 @@ mod tests {
                 .expect("应回退最近会话")
                 .as_deref(),
             Some("newer-chat")
+        );
+    }
+
+    #[tokio::test]
+    async fn persona_runtime_state_deletion_is_atomic_and_session_history_remains() {
+        let temp = tempdir().expect("应创建测试目录");
+        let (repository, _) = SessionRepository::open_for_runtime(temp.path())
+            .await
+            .expect("应打开运行时仓储");
+        bind(&repository, "persona-delete-chat").await;
+        let committed = repository
+            .append_event(
+                "persona-delete-chat",
+                Some("turn-persona-delete".to_string()),
+                "turn_committed",
+                json!({
+                    "persona_effects": {
+                        "schema_version": "muse-persona-effects/v1",
+                        "persona_id": "persona-a",
+                        "emotion": {
+                            "emotion": "happy",
+                            "intensity": 60,
+                            "reason_code": "positive_interaction"
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("应写入 Persona 状态 canonical 事件");
+        repository
+            .project_committed_persona_state(&committed)
+            .expect("应投影 Persona 状态");
+        repository
+            .set_workspace_state("persona-a", "persona-delete-chat")
+            .expect("应写入 Persona 工作区状态");
+
+        let deleted = repository
+            .delete_persona_runtime_state("persona-a")
+            .await
+            .expect("应原子清理 Persona 运行状态");
+
+        assert_eq!(deleted.workspace_state_rows, 1);
+        assert_eq!(deleted.state_event_rows, 1);
+        assert_eq!(deleted.state_projection_rows, 1);
+        let (_, connection) =
+            muse_core::app::storage::open_runtime_database(temp.path()).expect("应打开测试数据库");
+        for table in [
+            "persona_workspace_state",
+            "persona_state_event",
+            "persona_state_projection",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("应读取 Persona 状态表");
+            assert_eq!(count, 0, "{table} 不得遗留已删除 Persona");
+        }
+        assert_eq!(
+            repository
+                .list_sessions()
+                .await
+                .expect("应保留关联 Session")
+                .len(),
+            1
+        );
+
+        drop(connection);
+        drop(repository);
+        let (reopened, _) = SessionRepository::open_for_runtime(temp.path())
+            .await
+            .expect("应模拟产品重启打开仓储");
+        reopened
+            .synchronize_persona_runtime_states(&HashSet::new())
+            .await
+            .expect("启动同步应忽略已删除 Persona 的 canonical 状态");
+        let (_, connection) =
+            muse_core::app::storage::open_runtime_database(temp.path()).expect("应重开测试数据库");
+        for table in ["persona_state_event", "persona_state_projection"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("应读取重启后的 Persona 状态表");
+            assert_eq!(count, 0, "重启后 {table} 不得从只读 Session 复活");
+        }
+        assert_eq!(
+            reopened
+                .list_sessions()
+                .await
+                .expect("重启后应保留关联 Session")
+                .len(),
+            1
         );
     }
 }
