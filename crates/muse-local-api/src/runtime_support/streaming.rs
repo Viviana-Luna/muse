@@ -1,6 +1,9 @@
 //! WebSocket、流式协议和运行时共享辅助。
 
 use super::*;
+use muse_core::domain::memory::{
+    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
+};
 
 /// 建立情绪广播 WebSocket 连接。
 pub(crate) async fn handle_ws(
@@ -1022,22 +1025,31 @@ pub(super) fn replay_runtime_transcript_record(
                 return false;
             };
             let canonical_result = payload.get("canonical_result").unwrap_or(payload);
-            let result = ToolResult {
-                status: ToolResultStatus::from_success(
-                    canonical_result
-                        .get("success")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(true),
-                ),
-                content: canonical_result
-                    .get("content")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                structured: canonical_result
-                    .get("structured")
-                    .filter(|value| !value.is_null())
-                    .cloned(),
+            let success = canonical_result
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let result = if is_memory_session_redacted_tool(&tool_name) {
+                // 去正文收据只保证 Tool Call/Result 配对合法；恢复上下文只保留
+                // 无正文占位，绝不重新执行旧记忆 Tool。
+                ToolResult {
+                    status: ToolResultStatus::from_success(success),
+                    content: MEMORY_SESSION_REPLAY_PLACEHOLDER.to_string(),
+                    structured: None,
+                }
+            } else {
+                ToolResult {
+                    status: ToolResultStatus::from_success(success),
+                    content: canonical_result
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    structured: canonical_result
+                        .get("structured")
+                        .filter(|value| !value.is_null())
+                        .cloned(),
+                }
             };
             let content = tool_result_content_for_model(&tool_name, &result);
             conv.add_tool_result_with_status(call_id, tool_name, content, !result.is_success());
@@ -1057,6 +1069,15 @@ pub(super) fn replay_runtime_transcript_record(
 }
 
 pub(super) fn replay_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
+    // 记忆 Tool 的 canonical 参数是去正文收据，不是模型原始调用参数；与旧治理
+    // 版本的 redacted 摘要一样降级为协议合法空对象，恢复后绝不重新执行。
+    if payload
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_memory_session_redacted_tool)
+    {
+        return serde_json::json!({});
+    }
     if let Some(arguments) = payload.get("canonical_arguments") {
         return arguments.clone();
     }
@@ -2648,6 +2669,258 @@ pub(super) fn canonical_session_tool_arguments(arguments: &serde_json::Value) ->
     sanitize_private_session_value(arguments)
 }
 
+/// 判断工具名是否属于 F1 冻结的三个记忆 Tool。
+///
+/// 记忆 Tool 的原始参数与结果在任何 Session 事件、运行日志、诊断或前端事件
+/// 记录前必须完成专用去正文转换，不能等通用记录器写入后再补删。
+pub(super) fn is_memory_session_redacted_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        MEMORY_QUERY_TOOL_NAME | MEMORY_MUTATE_TOOL_NAME | MEMORY_DELETE_TOOL_NAME
+    )
+}
+
+/// 恢复记忆 Tool 结果时使用的协议合法占位文本，保证配对合法但不携带任何正文。
+pub(super) const MEMORY_SESSION_REPLAY_PLACEHOLDER: &str =
+    "[记忆工具收据：正文已按 Session 去正文契约移除，恢复时不会重新执行]";
+
+fn memory_receipt_string_field(source: &serde_json::Value, key: &str) -> Option<String> {
+    source
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn memory_receipt_insert_string(receipt: &mut serde_json::Value, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        receipt[key] = serde_json::Value::String(value);
+    }
+}
+
+/// 记忆 Tool 调用的 canonical 去正文收据。
+///
+/// 只保留调用语义与稳定标识：query 原文、整理后 content、change_reason、
+/// 敏感检测输入、游标值和排序分数一律不进入 Session。
+pub(super) fn memory_session_call_receipt(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match tool_name {
+        MEMORY_QUERY_TOOL_NAME => {
+            // 查询类型只描述调用形态，便于审计区分新查询、按 ID 查询和游标续查；
+            // 游标值属于不透明定位符，按契约不落盘。
+            let query_kind = if arguments
+                .get("cursor")
+                .is_some_and(|value| !value.is_null())
+            {
+                "cursor_continue"
+            } else if memory_receipt_string_field(arguments, "memory_id").is_some() {
+                "by_id"
+            } else {
+                "search"
+            };
+            let mut receipt = serde_json::json!({
+                "memory_receipt": MEMORY_QUERY_TOOL_NAME,
+                "query_kind": query_kind,
+                "include_history": arguments
+                    .get("include_history")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            });
+            memory_receipt_insert_string(
+                &mut receipt,
+                "memory_id",
+                memory_receipt_string_field(arguments, "memory_id"),
+            );
+            Some(receipt)
+        }
+        MEMORY_MUTATE_TOOL_NAME => {
+            let mut receipt = serde_json::json!({
+                "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
+                "operation": memory_receipt_string_field(arguments, "operation"),
+            });
+            memory_receipt_insert_string(
+                &mut receipt,
+                "memory_id",
+                memory_receipt_string_field(arguments, "memory_id"),
+            );
+            memory_receipt_insert_string(
+                &mut receipt,
+                "expected_revision_id",
+                memory_receipt_string_field(arguments, "expected_revision_id"),
+            );
+            Some(receipt)
+        }
+        MEMORY_DELETE_TOOL_NAME => {
+            let mut receipt = serde_json::json!({
+                "memory_receipt": MEMORY_DELETE_TOOL_NAME,
+                "scope": memory_receipt_string_field(arguments, "scope"),
+            });
+            memory_receipt_insert_string(
+                &mut receipt,
+                "memory_id",
+                memory_receipt_string_field(arguments, "memory_id"),
+            );
+            Some(receipt)
+        }
+        _ => None,
+    }
+}
+
+/// 记忆 Tool 结果的 canonical 去正文收据：content 是固定模板的无正文文本，
+/// structured 只含白名单字段。
+pub(super) struct MemorySessionResultReceipt {
+    pub(super) content: String,
+    pub(super) structured: serde_json::Value,
+}
+
+/// 提取可能的结构化收据来源：优先 structured；Tool adapter 也可能把收据
+/// 序列化为文本正文，此时把 content 按 JSON 对象解析。
+fn memory_session_result_source(result: &ToolResult) -> Option<serde_json::Value> {
+    if let Some(structured) = &result.structured
+        && structured.is_object()
+    {
+        return Some(structured.clone());
+    }
+    serde_json::from_str::<serde_json::Value>(&result.content)
+        .ok()
+        .filter(|value| value.is_object())
+}
+
+pub(super) fn memory_session_result_receipt(
+    tool_name: &str,
+    result: &ToolResult,
+) -> Option<MemorySessionResultReceipt> {
+    if !is_memory_session_redacted_tool(tool_name) {
+        return None;
+    }
+    let source = memory_session_result_source(result);
+    if !result.is_success() {
+        // 失败只保留稳定安全错误码；错误正文可能携带敏感检测输入，不落盘。
+        let error_code = source
+            .as_ref()
+            .and_then(|source| {
+                memory_receipt_string_field(source, "error_code")
+                    .or_else(|| memory_receipt_string_field(source, "code"))
+            })
+            .filter(|code| code.starts_with("memory_"));
+        let mut receipt = serde_json::json!({
+            "memory_receipt": format!("{tool_name}_result"),
+            "state": "error",
+        });
+        memory_receipt_insert_string(&mut receipt, "error_code", error_code.clone());
+        let content = match error_code {
+            Some(code) => format!("记忆工具调用失败：{code}。"),
+            None => "记忆工具调用失败。".to_string(),
+        };
+        return Some(MemorySessionResultReceipt {
+            content,
+            structured: receipt,
+        });
+    }
+    match tool_name {
+        MEMORY_QUERY_TOOL_NAME => {
+            let items = source
+                .as_ref()
+                .and_then(|source| source.get("items"))
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let memory_ids = items
+                .iter()
+                .filter_map(|item| memory_receipt_string_field(item, "memory_id"))
+                .collect::<Vec<_>>();
+            let revision_ids = items
+                .iter()
+                .filter_map(|item| memory_receipt_string_field(item, "revision_id"))
+                .collect::<Vec<_>>();
+            // 只记录是否还有后续页；游标值本身不落盘。
+            let has_more = source
+                .as_ref()
+                .and_then(|source| source.get("has_more"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| {
+                    source.as_ref().is_some_and(|source| {
+                        source
+                            .get("next_cursor")
+                            .is_some_and(|value| !value.is_null())
+                    })
+                });
+            let receipt = serde_json::json!({
+                "memory_receipt": "memory_query_result",
+                "state": "completed",
+                "returned_count": items.len(),
+                "memory_ids": memory_ids,
+                "revision_ids": revision_ids,
+                "has_more": has_more,
+            });
+            Some(MemorySessionResultReceipt {
+                content: format!("记忆查询收据：返回 {} 条记忆。", items.len()),
+                structured: receipt,
+            })
+        }
+        MEMORY_MUTATE_TOOL_NAME => {
+            let operation = source
+                .as_ref()
+                .and_then(|source| memory_receipt_string_field(source, "operation"));
+            let state = source
+                .as_ref()
+                .and_then(|source| memory_receipt_string_field(source, "state"));
+            let mut receipt = serde_json::json!({
+                "memory_receipt": "memory_mutate_result",
+                "operation": operation,
+                "state": state,
+            });
+            memory_receipt_insert_string(
+                &mut receipt,
+                "memory_id",
+                source
+                    .as_ref()
+                    .and_then(|source| memory_receipt_string_field(source, "memory_id")),
+            );
+            memory_receipt_insert_string(
+                &mut receipt,
+                "revision_id",
+                source
+                    .as_ref()
+                    .and_then(|source| memory_receipt_string_field(source, "revision_id")),
+            );
+            Some(MemorySessionResultReceipt {
+                content: format!(
+                    "记忆变更收据：operation={}，状态 {}。",
+                    operation.as_deref().unwrap_or("unknown"),
+                    state.as_deref().unwrap_or("unknown")
+                ),
+                structured: receipt,
+            })
+        }
+        MEMORY_DELETE_TOOL_NAME => {
+            let deleted_count = source
+                .as_ref()
+                .and_then(|source| source.get("deleted_memory_count"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let mut receipt = serde_json::json!({
+                "memory_receipt": "memory_delete_result",
+                "state": "deleted",
+                "deleted_memory_count": deleted_count,
+            });
+            memory_receipt_insert_string(
+                &mut receipt,
+                "deletion_id",
+                source
+                    .as_ref()
+                    .and_then(|source| memory_receipt_string_field(source, "deletion_id")),
+            );
+            Some(MemorySessionResultReceipt {
+                content: format!("记忆删除收据：已彻底删除 {deleted_count} 条记忆。"),
+                structured: receipt,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn sanitize_private_session_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(values) => serde_json::Value::Object(
@@ -2825,13 +3098,16 @@ pub(super) async fn emit_and_record_tool_call(
         .mcp_tool_policies
         .iter()
         .find(|entry| entry.name == call.name);
+    // 记忆 Tool 必须先完成专用去正文转换，再进入任何前端事件或 Session 记录。
+    let memory_call_receipt = memory_session_call_receipt(&call.name, &call.arguments);
+    let emitted_arguments = memory_call_receipt.as_ref().unwrap_or(&call.arguments);
     if let Some(tx) = tx {
         emit_json_event(
             tx,
             runtime_tool_call_event(
                 &call.call_id,
                 &call.name,
-                &call.arguments,
+                emitted_arguments,
                 risk,
                 policy.requires_approval,
                 policy.interrupt_behavior,
@@ -2863,7 +3139,9 @@ pub(super) async fn emit_and_record_tool_call(
             "concurrency_safe": policy.concurrency_safe,
             "interrupt_behavior": policy.interrupt_behavior.as_str(),
             "safety_notes": safety_notes,
-            "canonical_arguments": canonical_session_tool_arguments(&call.arguments),
+            "canonical_arguments": memory_call_receipt
+                .clone()
+                .unwrap_or_else(|| canonical_session_tool_arguments(&call.arguments)),
             "argument_audit": tool_request_audit_metadata(&call.arguments),
         }),
     )
@@ -2883,15 +3161,25 @@ pub(super) async fn emit_and_record_tool_result(
     result: &ToolResult,
 ) -> Result<ToolResult, String> {
     let recorded_result = maybe_externalize_tool_result(turn, call, result).await;
+    // 记忆 Tool 的去正文收据先于前端事件与 Session 记录生成；返回给工具循环的
+    // recorded_result 保持完整，供当前 Turn 私有工作副本继续推理。
+    let memory_result_receipt = memory_session_result_receipt(&call.name, &recorded_result);
     if let Some(tx) = tx {
+        let (emitted_content, emitted_structured) = match &memory_result_receipt {
+            Some(receipt) => (receipt.content.as_str(), Some(&receipt.structured)),
+            None => (
+                recorded_result.content.as_str(),
+                recorded_result.structured.as_ref(),
+            ),
+        };
         emit_json_event(
             tx,
             runtime_tool_result_event(
                 &call.call_id,
                 &call.name,
                 recorded_result.is_success(),
-                &recorded_result.content,
-                recorded_result.structured.as_ref(),
+                emitted_content,
+                emitted_structured,
             ),
         )
         .await
@@ -2901,6 +3189,20 @@ pub(super) async fn emit_and_record_tool_result(
         .and_then(|handler| handler.context_effect(result))
         .map(|effect| effect.to_json());
     let canonical_result = canonical_session_tool_result(&recorded_result, context_effect);
+    let (canonical_content, canonical_structured, canonical_context_effect) =
+        match &memory_result_receipt {
+            // 记忆 Tool 不落 context_effect：其负载不在去正文白名单内。
+            Some(receipt) => (
+                receipt.content.clone(),
+                Some(receipt.structured.clone()),
+                None,
+            ),
+            None => (
+                canonical_result.content,
+                canonical_result.structured,
+                canonical_result.context_effect,
+            ),
+        };
     append_required_turn_event(
         state,
         "tool_result",
@@ -2911,8 +3213,8 @@ pub(super) async fn emit_and_record_tool_result(
             "tool": call.name.clone(),
             "canonical_result": {
                 "success": recorded_result.is_success(),
-                "content": canonical_result.content,
-                "structured": canonical_result.structured,
+                "content": canonical_content,
+                "structured": canonical_structured,
             },
             "result_audit": {
                 "success": recorded_result.is_success(),
@@ -2922,7 +3224,7 @@ pub(super) async fn emit_and_record_tool_result(
                     .is_some_and(|value| value.get("tool_result_ref").is_some()),
                 "audit_note": "该字段仅供审计展示，不得用于模型会话恢复。",
             },
-            "context_effect": canonical_result.context_effect,
+            "context_effect": canonical_context_effect,
         }),
     )
     .await

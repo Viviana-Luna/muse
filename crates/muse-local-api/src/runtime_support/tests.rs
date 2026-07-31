@@ -3479,6 +3479,239 @@ async fn canonical_tool_events_survive_store_reopen_with_equivalent_provider_fra
     let _ = std::fs::remove_dir_all(config_dir);
 }
 
+async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholders() {
+    let config_dir = unique_temp_dir("memory-session-redaction");
+    let state = build_test_state(&config_dir);
+    let turn = test_turn_context("turn-memory-redaction");
+    let conversation_id = turn.conversation_id.clone();
+    let turn_id = turn.turn_id.clone();
+
+    // memory_query：query 原文、游标、排序分数与记忆正文都不得落盘。
+    let query_call = test_tool_call(
+        "memory_query",
+        serde_json::json!({
+            "query": "用户的早餐习惯是什么",
+            "limit": 5,
+            "cursor": "opaque-cursor-token-001",
+            "include_history": false,
+        }),
+    );
+    super::emit_and_record_tool_call(
+        &state,
+        None,
+        &turn,
+        &query_call,
+        "low",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let query_result = ToolResult::success(
+        "找到 1 条记忆：用户更喜欢在晚上吃第一顿饭",
+        Some(serde_json::json!({
+            "items": [{
+                "memory_id": "mem-001",
+                "revision_id": "rev-001",
+                "category": "user_preference",
+                "content": "用户更喜欢在晚上吃第一顿饭",
+                "importance": "high",
+                "score": 0.87,
+                "change_reason": "用户在当前对话中更新了自己的用餐习惯"
+            }],
+            "has_more": true,
+            "next_cursor": "opaque-cursor-token-002"
+        })),
+    );
+    let returned =
+        super::emit_and_record_tool_result(&state, None, &turn, &query_call, &query_result)
+            .await
+            .unwrap();
+    // 返回给工具循环的结果保持完整，供当前 Turn 私有工作副本继续推理。
+    assert_eq!(returned.content, query_result.content);
+
+    // memory_mutate：整理后 content、change_reason 与敏感检测输入不得落盘。
+    let mutate_call = test_tool_call(
+        "memory_mutate",
+        serde_json::json!({
+            "operation": "create",
+            "category": "user_preference",
+            "content": "用户更喜欢在晚上吃第一顿饭",
+            "importance": "high",
+            "change_reason": "用户在当前对话中更新了自己的用餐习惯"
+        }),
+    );
+    super::emit_and_record_tool_call(
+        &state,
+        None,
+        &turn,
+        &mutate_call,
+        "low",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let mutate_result = ToolResult::success(
+        "已接受，等待本轮提交：用户更喜欢在晚上吃第一顿饭",
+        Some(serde_json::json!({
+            "operation": "create",
+            "memory_id": "mem-001",
+            "revision_id": "rev-002",
+            "state": "staged"
+        })),
+    );
+    super::emit_and_record_tool_result(&state, None, &turn, &mutate_call, &mutate_result)
+        .await
+        .unwrap();
+
+    // memory_delete：只保留删除范围、不可逆结果与安全错误码。
+    let delete_call = test_tool_call(
+        "memory_delete",
+        serde_json::json!({
+            "scope": "memory",
+            "memory_id": "mem-001"
+        }),
+    );
+    super::emit_and_record_tool_call(
+        &state,
+        None,
+        &turn,
+        &delete_call,
+        "high",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let delete_result = ToolResult::success(
+        "已彻底删除：用户更喜欢在晚上吃第一顿饭",
+        Some(serde_json::json!({
+            "deletion_id": "del-001",
+            "deleted_memory_count": 1,
+            "completed_at": "2026-07-30T08:00:00Z"
+        })),
+    );
+    super::emit_and_record_tool_result(&state, None, &turn, &delete_call, &delete_result)
+        .await
+        .unwrap();
+
+    // 非记忆工具对照：既有 canonical transcript 行为零回归。
+    let command_call = test_tool_call(
+        "command_run",
+        serde_json::json!({
+            "command": "cargo test --workspace",
+            "cwd": "/workspace/project"
+        }),
+    );
+    super::emit_and_record_tool_call(
+        &state,
+        None,
+        &turn,
+        &command_call,
+        "medium",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let command_result = ToolResult::success(
+        "build completed",
+        Some(serde_json::json!({ "stdout": "build completed", "status": 0 })),
+    );
+    super::emit_and_record_tool_result(&state, None, &turn, &command_call, &command_result)
+        .await
+        .unwrap();
+
+    super::append_transcript_record(
+        &state,
+        "turn_committed",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "outcome": "committed",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // generation 回读：从会话存储导出 Session JSONL 并做全文扫描。
+    let store = state
+        .runtime_service
+        .session_store()
+        .await
+        .expect("应能打开会话存储");
+    let events = store
+        .events_for_conversation(&conversation_id)
+        .await
+        .unwrap();
+    let transcript = super::session_events_as_jsonl(&events);
+    for forbidden in [
+        "用户的早餐习惯",
+        "用户更喜欢在晚上吃第一顿饭",
+        "用户在当前对话中更新了自己的用餐习惯",
+        "opaque-cursor-token",
+        "0.87",
+    ] {
+        assert!(
+            !transcript.contains(forbidden),
+            "Session JSONL 不得包含 `{forbidden}`"
+        );
+    }
+    // 去正文收据的白名单字段应保留。
+    assert!(transcript.contains("mem-001"));
+    assert!(transcript.contains("rev-001"));
+    assert!(transcript.contains("\"returned_count\":1"));
+    assert!(transcript.contains("\"state\":\"staged\""));
+    assert!(transcript.contains("\"deleted_memory_count\":1"));
+    // 非记忆工具的 canonical 内容与结果保持完整。
+    assert!(transcript.contains("cargo test --workspace"));
+    assert!(transcript.contains("build completed"));
+
+    // 恢复：配对合法、记忆 Tool 降级为协议合法占位、绝不重新执行。
+    let (replayed, _) = super::replay_runtime_transcript_lines(
+        "系统提示".to_string(),
+        20,
+        &transcript,
+        &conversation_id,
+        None,
+    );
+    assert!(replayed.validate_tool_protocol().is_ok());
+    for message in &replayed.messages {
+        let Some(tool_name) = message.tool_name.as_deref() else {
+            continue;
+        };
+        if !super::is_memory_session_redacted_tool(tool_name) {
+            continue;
+        }
+        if let Some(arguments) = &message.tool_arguments {
+            assert_eq!(
+                *arguments,
+                serde_json::json!({}),
+                "记忆 Tool 恢复后参数必须降级为空对象占位"
+            );
+        }
+    }
+    let replayed_text = serde_json::to_string(&replayed.messages).unwrap();
+    for forbidden in [
+        "用户的早餐习惯",
+        "用户更喜欢在晚上吃第一顿饭",
+        "用户在当前对话中更新了自己的用餐习惯",
+        "opaque-cursor-token",
+    ] {
+        assert!(
+            !replayed_text.contains(forbidden),
+            "恢复后的上下文不得包含 `{forbidden}`"
+        );
+    }
+    assert!(replayed_text.contains(super::MEMORY_SESSION_REPLAY_PLACEHOLDER));
+    // 非记忆工具恢复后内容保持完整。
+    assert!(replayed_text.contains("cargo test --workspace"));
+    assert!(replayed_text.contains("build completed"));
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
 fn replay_compatibly_treats_legacy_argument_audit_as_unknown_arguments() {
     let content = [
         serde_json::json!({
@@ -3544,6 +3777,255 @@ fn replay_compatibly_treats_legacy_argument_audit_as_unknown_arguments() {
     );
     assert!(conversation.messages[2].content.contains("旧版命令摘要"));
     assert!(conversation.validate_tool_protocol().is_ok());
+}
+
+fn memory_session_receipts_keep_only_whitelisted_fields() {
+    // memory_query 调用收据：游标续查形态，不落 query 原文与游标值。
+    let receipt = super::memory_session_call_receipt(
+        "memory_query",
+        &serde_json::json!({
+            "query": "用户的早餐习惯",
+            "limit": 5,
+            "cursor": "opaque-cursor-token",
+            "include_history": true
+        }),
+    )
+    .expect("memory_query 应生成调用收据");
+    assert_eq!(receipt["query_kind"], "cursor_continue");
+    assert_eq!(receipt["include_history"], true);
+    assert!(receipt.get("query").is_none());
+    assert!(receipt.get("cursor").is_none());
+    assert!(receipt.get("limit").is_none());
+    // 按 ID 查询形态保留 memory_id。
+    let receipt = super::memory_session_call_receipt(
+        "memory_query",
+        &serde_json::json!({ "query": "按 ID", "memory_id": "mem-9" }),
+    )
+    .unwrap();
+    assert_eq!(receipt["query_kind"], "by_id");
+    assert_eq!(receipt["memory_id"], "mem-9");
+
+    // memory_mutate 调用收据：只保留 operation 与稳定标识。
+    let receipt = super::memory_session_call_receipt(
+        "memory_mutate",
+        &serde_json::json!({
+            "operation": "update",
+            "memory_id": "mem-1",
+            "expected_revision_id": "rev-1",
+            "category": "user_fact",
+            "content": "整理后的记忆正文",
+            "importance": "high",
+            "change_reason": "变化原因正文"
+        }),
+    )
+    .expect("memory_mutate 应生成调用收据");
+    assert_eq!(receipt["operation"], "update");
+    assert_eq!(receipt["memory_id"], "mem-1");
+    assert_eq!(receipt["expected_revision_id"], "rev-1");
+    for dropped in ["content", "change_reason", "category", "importance"] {
+        assert!(receipt.get(dropped).is_none(), "收据不得保留 {dropped}");
+    }
+
+    // memory_delete 调用收据：只保留删除范围与目标标识。
+    let receipt = super::memory_session_call_receipt(
+        "memory_delete",
+        &serde_json::json!({ "scope": "persona_all" }),
+    )
+    .expect("memory_delete 应生成调用收据");
+    assert_eq!(receipt["scope"], "persona_all");
+    assert!(receipt.get("memory_id").is_none());
+
+    // memory_query 结果收据：只保留数量、稳定 ID 与状态。
+    let query_result = ToolResult::success(
+        "查询完成",
+        Some(serde_json::json!({
+            "items": [{
+                "memory_id": "mem-1",
+                "revision_id": "rev-1",
+                "content": "记忆正文",
+                "score": 0.95,
+                "change_reason": "原因正文"
+            }],
+            "has_more": true,
+            "next_cursor": "opaque-cursor-token"
+        })),
+    );
+    let receipt = super::memory_session_result_receipt("memory_query", &query_result).unwrap();
+    assert_eq!(receipt.structured["returned_count"], 1);
+    assert_eq!(receipt.structured["memory_ids"][0], "mem-1");
+    assert_eq!(receipt.structured["revision_ids"][0], "rev-1");
+    assert_eq!(receipt.structured["has_more"], true);
+    let receipt_text = format!("{}{}", receipt.content, receipt.structured);
+    for forbidden in ["记忆正文", "原因正文", "0.95", "opaque-cursor-token"] {
+        assert!(
+            !receipt_text.contains(forbidden),
+            "结果收据不得包含 `{forbidden}`"
+        );
+    }
+
+    // 失败结果：只保留稳定安全错误码，错误正文中的敏感检测输入不落盘。
+    let failed = ToolResult {
+        status: ToolResultStatus::from_success(false),
+        content: "敏感检测拒绝：用户身份证号 110101199001011234".to_string(),
+        structured: Some(serde_json::json!({
+            "error_code": "memory_sensitive_content_rejected",
+            "detail": "用户身份证号 110101199001011234"
+        })),
+    };
+    let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
+    assert_eq!(receipt.structured["state"], "error");
+    assert_eq!(
+        receipt.structured["error_code"],
+        "memory_sensitive_content_rejected"
+    );
+    let receipt_text = format!("{}{}", receipt.content, receipt.structured);
+    assert!(!receipt_text.contains("110101199001011234"));
+
+    // 非记忆工具不进入记忆去正文路径。
+    assert!(super::memory_session_call_receipt("command_run", &serde_json::json!({})).is_none());
+    assert!(super::memory_session_result_receipt("command_run", &query_result).is_none());
+}
+
+fn memory_session_replay_skips_uncommitted_turns_and_degrades_receipts() {
+    let content = [
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "tool_call",
+            "turn_id": "turn-mem-committed",
+            "conversation_id": "session-mem",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-committed",
+                "call_id": "call-mem-query",
+                "tool": "memory_query",
+                "canonical_arguments": {
+                    "memory_receipt": "memory_query",
+                    "query_kind": "search",
+                    "include_history": false
+                }
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "tool_result",
+            "turn_id": "turn-mem-committed",
+            "conversation_id": "session-mem",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-committed",
+                "call_id": "call-mem-query",
+                "tool": "memory_query",
+                "canonical_result": {
+                    "success": true,
+                    "content": "记忆查询收据：返回 1 条记忆。",
+                    "structured": {
+                        "memory_receipt": "memory_query_result",
+                        "state": "completed",
+                        "returned_count": 1,
+                        "memory_ids": ["mem-1"],
+                        "revision_ids": ["rev-1"],
+                        "has_more": false
+                    }
+                }
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "turn_committed",
+            "turn_id": "turn-mem-committed",
+            "conversation_id": "session-mem",
+            "turn_outcome": "committed",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-committed",
+                "outcome": "committed"
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "tool_call",
+            "turn_id": "turn-mem-aborted",
+            "conversation_id": "session-mem",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-aborted",
+                "call_id": "call-mem-mutate",
+                "tool": "memory_mutate",
+                "canonical_arguments": {
+                    "memory_receipt": "memory_mutate",
+                    "operation": "create"
+                }
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "tool_result",
+            "turn_id": "turn-mem-aborted",
+            "conversation_id": "session-mem",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-aborted",
+                "call_id": "call-mem-mutate",
+                "tool": "memory_mutate",
+                "canonical_result": {
+                    "success": true,
+                    "content": "记忆变更收据：不应恢复的正文。",
+                    "structured": null
+                }
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
+            "kind": "turn_aborted",
+            "turn_id": "turn-mem-aborted",
+            "conversation_id": "session-mem",
+            "turn_outcome": "aborted",
+            "payload": {
+                "conversation_id": "session-mem",
+                "turn_id": "turn-mem-aborted",
+                "outcome": "aborted"
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n");
+
+    let (conversation, _) = super::replay_runtime_transcript_lines(
+        "系统提示".to_string(),
+        20,
+        &content,
+        "session-mem",
+        None,
+    );
+
+    assert!(conversation.validate_tool_protocol().is_ok());
+    // committed Turn 的记忆 Tool 降级为协议合法占位，绝不重新执行。
+    assert_eq!(
+        conversation.messages[1].tool_arguments,
+        Some(serde_json::json!({}))
+    );
+    assert_eq!(
+        conversation.messages[1].tool_name.as_deref(),
+        Some("memory_query")
+    );
+    assert_eq!(
+        conversation.messages[2].content,
+        super::MEMORY_SESSION_REPLAY_PLACEHOLDER
+    );
+    // 未 committed Turn 的记忆事件沿用既有跳过重放语义。
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .all(|message| message.tool_name.as_deref() != Some("memory_mutate"))
+    );
+    let replayed_text = serde_json::to_string(&conversation.messages).unwrap();
+    assert!(!replayed_text.contains("不应恢复的正文"));
 }
 
 fn runtime_transcript_replay_restores_a_fork_snapshot_once() {
@@ -5849,6 +6331,24 @@ fn aggregated_sync_test_cases() {
     }
     {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            memory_session_receipts_keep_only_whitelisted_fields,
+        ))
+        .is_err()
+        {
+            failures.push("memory_session_receipts_keep_only_whitelisted_fields");
+        }
+    }
+    {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            memory_session_replay_skips_uncommitted_turns_and_degrades_receipts,
+        ))
+        .is_err()
+        {
+            failures.push("memory_session_replay_skips_uncommitted_turns_and_degrades_receipts");
+        }
+    }
+    {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             runtime_transcript_replay_restores_a_fork_snapshot_once,
         ))
         .is_err()
@@ -6379,6 +6879,18 @@ async fn aggregated_async_test_cases() {
         {
             failures
                 .push("canonical_tool_events_survive_store_reopen_with_equivalent_provider_frames");
+        }
+    }
+    {
+        if std::panic::AssertUnwindSafe(
+            memory_tool_events_are_redacted_before_session_and_replay_as_placeholders(),
+        )
+        .catch_unwind()
+        .await
+        .is_err()
+        {
+            failures
+                .push("memory_tool_events_are_redacted_before_session_and_replay_as_placeholders");
         }
     }
     #[cfg(feature = "live-tests")]
