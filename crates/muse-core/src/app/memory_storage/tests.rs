@@ -787,14 +787,63 @@ fn migration_九只升级空_revision库并对旧历史_fail_closed() {
     );
     drop(repository);
     downgrade_runtime_to_v8_without_attribute_snapshots(populated.path());
-    let error =
-        open_runtime_database(populated.path()).expect_err("有历史的 v8 库必须 fail closed");
-    assert!(
-        error
-            .to_string()
-            .contains("缺少 category/importance 历史快照"),
-        "应明确拒绝伪造历史属性快照：{error}"
-    );
+    for attempt in 1..=2 {
+        let error = open_runtime_database(populated.path())
+            .expect_err("有历史的 v8 库每次打开都必须 fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("缺少 category/importance 历史快照"),
+            "第 {attempt} 次打开应稳定拒绝伪造历史属性快照：{error}"
+        );
+
+        let verifier = Connection::open(populated.path().join("runtime/muse.sqlite"))
+            .expect("失败后应可只读核对旧库");
+        let latest: i64 = verifier
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("应读取失败后的 schema 版本");
+        assert_eq!(latest, 8, "失败后不得记录 migration 9");
+        let columns = verifier
+            .prepare("PRAGMA table_info(memory_revision)")
+            .expect("应准备失败后的 revision 列检查")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("应查询失败后的 revision 列")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("应收集失败后的 revision 列");
+        assert!(!columns.iter().any(|column| column == "category"));
+        assert!(!columns.iter().any(|column| column == "importance"));
+        let revision: (String, String, String, String, String, String) = verifier
+            .query_row(
+                "SELECT persona_id, memory_id, revision_id, content, change_reason, state
+                 FROM memory_revision",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("失败后原 revision 应完整保留");
+        assert_eq!(
+            revision,
+            (
+                scope.persona_id().to_string(),
+                "migration-v9-memory".to_string(),
+                "migration-v9-revision".to_string(),
+                "旧库历史属性无法可靠反推".to_string(),
+                "测试创建".to_string(),
+                "current".to_string(),
+            ),
+            "第 {attempt} 次失败后不得改写原 revision"
+        );
+    }
 }
 
 #[test]

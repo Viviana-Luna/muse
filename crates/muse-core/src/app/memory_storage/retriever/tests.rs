@@ -13,6 +13,7 @@ use rusqlite::{TransactionBehavior, params};
 
 use super::*;
 use crate::app::memory_storage::MAX_REVISION_HISTORY_PAGE_SIZE;
+use crate::app::memory_storage::repository::MAX_ACTIVE_MEMORY_COUNT_ROWS;
 use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryEntry, MemoryEntryState,
@@ -2622,12 +2623,85 @@ fn active_memory_count_is_persona_scoped_and_revision_stable() {
             .expect("Persona B 计数应成功"),
         1
     );
+    delete_memory(&repository, &scope_a, "m-count-a-3");
+    assert_eq!(
+        repository
+            .active_memory_count(&scope_a)
+            .expect("删除后 Persona A 计数应成功"),
+        2,
+        "canonical 删除必须立即减少有效记忆计数"
+    );
     assert_eq!(
         repository
             .active_memory_count(&scope("count-persona-empty"))
             .expect("空 Persona 计数应成功"),
         0
     );
+}
+
+#[test]
+fn active_memory_count_rejects_over_limit_before_materializing_revisions() {
+    let directory = TestDirectory::new("active-count-limit");
+    let repository = open_repository(&directory);
+    let scope = scope("count-limit-persona");
+    let mut connection = repository.open_connection().expect("应打开计数夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启计数夹具事务");
+    for index in 0..=MAX_ACTIVE_MEMORY_COUNT_ROWS {
+        let memory_id = format!("m-count-limit-{index:04}");
+        let revision_id = format!("r-count-limit-{index:04}");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, NULL, 'create',
+                          '计数上限夹具', '测试策略-v1', 'current',
+                          'user_fact', 'normal')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    format!("第 {index} 条计数正文不得在超量时物化"),
+                    vec![(index % 251) as u8; 32],
+                    T1,
+                ],
+            )
+            .expect("应插入计数 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'user_confirmation',
+                          'count-limit-conversation', ?4, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    format!("count-limit-turn-{index:04}"),
+                ],
+            )
+            .expect("应插入计数 revision source");
+        transaction
+            .execute(
+                "INSERT INTO memory_entry(
+                    persona_id, memory_id, category, current_revision_id,
+                    importance, freshness_at, created_at, state
+                 ) VALUES(?1, ?2, 'user_fact', ?3, 'normal', ?4, ?4, 'active')",
+                params![scope.persona_id(), memory_id, revision_id, T1],
+            )
+            .expect("应插入计数 memory entry");
+    }
+    transaction.commit().expect("计数夹具应原子提交");
+    drop(connection);
+
+    let error = repository
+        .active_memory_count(&scope)
+        .expect_err("超量计数不得扫描并物化全部 revision");
+    assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
 }
 
 #[test]
