@@ -2061,6 +2061,9 @@ mod persona_sessions;
 pub(crate) use persona_sessions::*;
 mod memory_turn;
 pub(crate) use memory_turn::*;
+mod memories;
+pub(crate) use memories::*;
+pub use memories::{MemoryManagementAudit, MemoryServices, install_memory_services};
 mod tool_adapters;
 use tool_adapters::*;
 

@@ -3948,3 +3948,914 @@ async fn persona_asset_upload_accepts_files_above_axum_default_body_limit() {
         .count();
     assert_eq!(uploaded_entries, 1);
 }
+
+// ---- Persona 长期记忆管理路由契约 ----
+
+use crate::runtime_support::{
+    MemoryManagementAudit, MemoryServices, clear_memory_services_for_test, install_memory_services,
+    memory_services_test_guard,
+};
+use muse_core::app::memory_storage::SqliteMemoryRepository;
+use muse_core::domain::memory::{
+    MemoryCategory, MemoryChangeType, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
+    MemoryManagementAuthorization, MemoryManagementBinding, MemoryManagementContentMutation,
+    MemoryManagementContentParams, MemoryPersonaScope, MemoryQueryItem, MemoryQueryPageReceipt,
+    MemoryRepository, MemoryRetrievalRequest, MemoryRetriever, MemoryRevision, MemoryRevisionId,
+    MemoryRevisionState, MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest,
+    MemorySourceEvidence,
+};
+
+/// 测试用敏感策略：两个门阶段一律允许，策略版本固定。
+struct AllowAllMemorySensitivity;
+
+impl MemorySensitivityPolicy for AllowAllMemorySensitivity {
+    fn assess(&self, request: MemorySensitivityRequest<'_>) -> MemorySafetyAssessment {
+        MemorySafetyAssessment::Allowed {
+            stage: request.stage,
+            policy_version: "test-policy/v1".to_string(),
+        }
+    }
+}
+
+struct StubMemoryRetriever {
+    items: Vec<MemoryQueryItem>,
+}
+
+impl MemoryRetriever for StubMemoryRetriever {
+    fn retrieve(
+        &self,
+        _request: &MemoryRetrievalRequest,
+    ) -> Result<MemoryQueryPageReceipt, MemoryError> {
+        Ok(MemoryQueryPageReceipt::new(self.items.clone(), None))
+    }
+}
+
+struct StubMemoryAudit {
+    count: u64,
+    revisions: Vec<MemoryRevision>,
+}
+
+impl MemoryManagementAudit for StubMemoryAudit {
+    fn revision_history(
+        &self,
+        _scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        if self
+            .revisions
+            .iter()
+            .any(|revision| &revision.memory_id == memory_id)
+        {
+            Ok(self.revisions.clone())
+        } else {
+            Err(MemoryError::new(MemoryErrorCode::MemoryNotFound))
+        }
+    }
+
+    fn active_memory_count(&self, _scope: &MemoryPersonaScope) -> Result<u64, MemoryError> {
+        Ok(self.count)
+    }
+}
+
+fn install_test_memory_services(
+    repository: SqliteMemoryRepository,
+    retriever_items: Vec<MemoryQueryItem>,
+    audit: StubMemoryAudit,
+) -> Arc<SqliteMemoryRepository> {
+    let repository = Arc::new(repository);
+    install_memory_services(MemoryServices {
+        repository: Arc::clone(&repository),
+        retriever: Arc::new(StubMemoryRetriever {
+            items: retriever_items,
+        }),
+        sensitivity: Arc::new(AllowAllMemorySensitivity),
+        audit: Arc::new(audit),
+    });
+    repository
+}
+
+fn open_test_memory_repository(dir: &Path) -> SqliteMemoryRepository {
+    SqliteMemoryRepository::open(dir).expect("应能打开测试记忆 Repository")
+}
+
+/// 直接经 Repository 端口写入种子记忆，不旁路直写表。
+fn seed_test_memory(
+    repository: &SqliteMemoryRepository,
+    persona_id: &str,
+    content: &str,
+) -> (MemoryId, MemoryRevisionId) {
+    static SEED_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEED_SEQ.fetch_add(1, Ordering::SeqCst);
+    let now = chrono::Utc::now().to_rfc3339();
+    let scope = MemoryPersonaScope::new(persona_id).expect("应能绑定测试 scope");
+    let authorization = MemoryManagementAuthorization::from_runtime(
+        scope,
+        format!("test-action-{seq}"),
+        now.clone(),
+    )
+    .expect("应能创建测试管理授权");
+    let binding = MemoryManagementBinding::bind(
+        authorization,
+        format!("test-op-{seq}"),
+        now.clone(),
+        now.clone(),
+        now,
+    )
+    .expect("应能创建测试管理绑定");
+    let memory_id = MemoryId(format!("memory-seed-{seq}"));
+    let revision_id = MemoryRevisionId(format!("memory-seed-{seq}-rev"));
+    let mutation = MemoryManagementContentMutation::bind(
+        MemoryManagementContentParams::Create {
+            category: MemoryCategory::UserFact,
+            content: content.to_string(),
+            importance: MemoryImportance::Normal,
+            event_time: None,
+            change_reason: "测试种子记忆".to_string(),
+        },
+        binding,
+        memory_id.clone(),
+        revision_id.clone(),
+        &AllowAllMemorySensitivity,
+    )
+    .expect("应能绑定测试管理变更");
+    repository
+        .apply_management_content_mutation(&mutation, &AllowAllMemorySensitivity)
+        .expect("应能写入测试种子记忆");
+    (memory_id, revision_id)
+}
+
+fn memory_scope(persona_id: &str) -> MemoryPersonaScope {
+    MemoryPersonaScope::new(persona_id).expect("应能绑定测试 scope")
+}
+
+fn stub_query_item(
+    memory_id: &str,
+    category: MemoryCategory,
+    importance: MemoryImportance,
+) -> MemoryQueryItem {
+    MemoryQueryItem {
+        memory_id: MemoryId(memory_id.to_string()),
+        revision_id: MemoryRevisionId(format!("{memory_id}-rev")),
+        category,
+        content: format!("{memory_id} 的测试内容"),
+        importance,
+        event_time: None,
+        recorded_at: "2026-07-30T00:00:00+00:00".to_string(),
+        valid_from: "2026-07-30T00:00:00+00:00".to_string(),
+        valid_to: None,
+        change_type: MemoryChangeType::Create,
+        change_reason: "测试".to_string(),
+    }
+}
+
+fn stub_audit_revision(memory_id: &MemoryId, state: MemoryRevisionState) -> MemoryRevision {
+    MemoryRevision {
+        revision_id: MemoryRevisionId(format!("{}-{state:?}-rev", memory_id.0)),
+        memory_id: memory_id.clone(),
+        content: "历史测试内容".to_string(),
+        event_time: None,
+        recorded_at: "2026-07-30T00:00:00+00:00".to_string(),
+        valid_from: "2026-07-30T00:00:00+00:00".to_string(),
+        valid_to: None,
+        change_type: MemoryChangeType::Correct,
+        change_reason: "测试纠正".to_string(),
+        source: MemorySourceEvidence::PersonaManagement {
+            action_id: "test-action-history".to_string(),
+            authorized_at: "2026-07-30T00:00:00+00:00".to_string(),
+        },
+        safety_policy_version: "test-policy/v1".to_string(),
+        state,
+    }
+}
+
+#[tokio::test]
+async fn persona_memory_routes_return_stable_503_when_unwired() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-unwired");
+    let app = api_routes().with_state(build_test_state(&config_dir));
+
+    let cases: Vec<(&str, String, Option<serde_json::Value>)> = vec![
+        (
+            "GET",
+            "/personas/router-test-persona/memories?query=用户".to_string(),
+            None,
+        ),
+        (
+            "GET",
+            "/personas/router-test-persona/memories/memory-x".to_string(),
+            None,
+        ),
+        (
+            "GET",
+            "/personas/router-test-persona/memories/memory-x/history".to_string(),
+            None,
+        ),
+        (
+            "POST",
+            "/personas/router-test-persona/memories".to_string(),
+            Some(serde_json::json!({
+                "category": "user_fact",
+                "content": "用户喜欢喝绿茶",
+                "importance": "normal",
+                "change_reason": "用户明确告知"
+            })),
+        ),
+        (
+            "POST",
+            "/personas/router-test-persona/memories/memory-x/correct".to_string(),
+            Some(serde_json::json!({
+                "expected_revision_id": "rev-x",
+                "category": "user_fact",
+                "content": "用户喜欢喝红茶",
+                "change_reason": "用户纠正"
+            })),
+        ),
+        (
+            "POST",
+            "/personas/router-test-persona/memories/memory-x/importance".to_string(),
+            Some(serde_json::json!({
+                "expected_revision_id": "rev-x",
+                "expected_importance": "normal",
+                "importance": "high"
+            })),
+        ),
+        (
+            "DELETE",
+            "/personas/router-test-persona/memories/memory-x".to_string(),
+            None,
+        ),
+        (
+            "DELETE",
+            "/personas/router-test-persona/memories".to_string(),
+            None,
+        ),
+    ];
+    for (method, uri, body) in cases {
+        let builder = Request::builder().method(method).uri(&uri);
+        let request = match body {
+            Some(payload) => builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("应能构造记忆管理请求"),
+            None => builder.body(Body::empty()).expect("应能构造记忆管理请求"),
+        };
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|_| panic!("{method} {uri} 应返回响应"));
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {uri} 未接线应返回 503"
+        );
+        let payload = response_json(response).await;
+        assert_flat_api_error(&payload);
+        assert_eq!(
+            payload["code"], "memory_repository_unavailable",
+            "{method} {uri} 未接线应返回 memory_repository_unavailable"
+        );
+    }
+
+    // 未接线时删除影响的 memory_count 为 null，前端保持确认按钮禁用。
+    let impact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/deletion-impact")
+                .body(Body::empty())
+                .expect("应能构造删除影响查询"),
+        )
+        .await
+        .expect("删除影响查询应返回响应");
+    assert_eq!(impact.status(), StatusCode::OK);
+    let impact_payload = response_json(impact).await;
+    assert!(impact_payload["memory_count"].is_null());
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-roundtrip");
+    let memory_dir = unique_temp_dir("memory-roundtrip-store");
+    let repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 0,
+            revisions: Vec::new(),
+        },
+    );
+    let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        personas
+            .create(test_persona("persona-b"))
+            .expect("应能创建第二个测试角色");
+        personas.save().expect("应能保存第二个测试角色");
+    }
+    let app = api_routes().with_state(state);
+
+    // 手工新增：201 + durable 收据；scope 只能来自路径。
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/personas/router-test-persona/memories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝绿茶",
+                        "importance": "normal",
+                        "change_reason": "用户明确告知偏好",
+                        "operation_id": "client-op-create-1"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造手工新增请求"),
+        )
+        .await
+        .expect("手工新增应返回响应");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created_payload = response_json(created).await;
+    assert_eq!(created_payload["operation"], "create");
+    assert_eq!(created_payload["state"], "durable");
+    let memory_id = created_payload["memory_id"]
+        .as_str()
+        .expect("新增收据应带 memory_id")
+        .to_string();
+    let revision_id = created_payload["revision_id"]
+        .as_str()
+        .expect("新增收据应带 revision_id")
+        .to_string();
+
+    // 相同 operation_id 的重放被 Repository 稳定拒绝，绝不产生重复记忆。
+    let replayed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/personas/router-test-persona/memories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝绿茶",
+                        "importance": "normal",
+                        "change_reason": "用户明确告知偏好",
+                        "operation_id": "client-op-create-1"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造重放新增请求"),
+        )
+        .await
+        .expect("重放新增应返回响应");
+    assert_eq!(replayed.status(), StatusCode::BAD_REQUEST);
+    let replay_payload = response_json(replayed).await;
+    assert_flat_api_error(&replay_payload);
+    assert_eq!(replay_payload["code"], "memory_invalid_request");
+
+    // 详情：管理来源没有对话跳转索引。
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}"
+                ))
+                .body(Body::empty())
+                .expect("应能构造记忆详情请求"),
+        )
+        .await
+        .expect("记忆详情应返回响应");
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail_payload = response_json(detail).await;
+    assert_eq!(detail_payload["entry"]["category"], "user_preference");
+    assert_eq!(
+        detail_payload["current_revision"]["content"],
+        "用户喜欢在晚上喝绿茶"
+    );
+    assert!(detail_payload["source_conversation_id"].is_null());
+    assert!(detail_payload["source_turn_id"].is_null());
+    assert!(
+        detail_payload["current_revision"].get("source").is_none(),
+        "详情不得暴露领域来源证据中的管理操作元数据"
+    );
+
+    // 跨 Persona 访问同一 memory_id 一律 404，scope 不随客户端切换。
+    let cross = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/personas/persona-b/memories/{memory_id}"))
+                .body(Body::empty())
+                .expect("应能构造跨角色访问请求"),
+        )
+        .await
+        .expect("跨角色访问应返回响应");
+    assert_eq!(cross.status(), StatusCode::NOT_FOUND);
+    let cross_payload = response_json(cross).await;
+    assert_flat_api_error(&cross_payload);
+    assert_eq!(cross_payload["code"], "memory_not_found");
+
+    // 陈旧 revision 的纠正返回 409 memory_revision_conflict。
+    let stale_correct = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}/correct"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision_id": "rev-stale",
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝红茶",
+                        "change_reason": "用户纠正偏好"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造陈旧纠正请求"),
+        )
+        .await
+        .expect("陈旧纠正应返回响应");
+    assert_eq!(stale_correct.status(), StatusCode::CONFLICT);
+    let stale_payload = response_json(stale_correct).await;
+    assert_flat_api_error(&stale_payload);
+    assert_eq!(stale_payload["code"], "memory_revision_conflict");
+
+    // 正确 revision 的纠正成功；重放同一旧 revision 再次 409，不会重复生效。
+    let corrected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}/correct"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision_id": revision_id,
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝红茶",
+                        "change_reason": "用户纠正偏好"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造纠正请求"),
+        )
+        .await
+        .expect("纠正应返回响应");
+    assert_eq!(corrected.status(), StatusCode::OK);
+    let corrected_payload = response_json(corrected).await;
+    assert_eq!(corrected_payload["operation"], "correct");
+    assert_eq!(corrected_payload["state"], "durable");
+    let corrected_revision_id = corrected_payload["revision_id"]
+        .as_str()
+        .expect("纠正收据应带新 revision_id")
+        .to_string();
+    assert_ne!(corrected_revision_id, revision_id);
+
+    // 重要程度：相同目标值被领域拒绝（409），不同目标值成功且不产生新 revision。
+    let same_importance = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}/importance"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision_id": corrected_revision_id,
+                        "expected_importance": "normal",
+                        "importance": "normal"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造相同重要程度请求"),
+        )
+        .await
+        .expect("相同重要程度应返回响应");
+    assert_eq!(same_importance.status(), StatusCode::CONFLICT);
+    let same_payload = response_json(same_importance).await;
+    assert_flat_api_error(&same_payload);
+    assert_eq!(same_payload["code"], "memory_invalid_state_transition");
+
+    let adjusted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}/importance"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision_id": corrected_revision_id,
+                        "expected_importance": "normal",
+                        "importance": "high"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造重要程度调整请求"),
+        )
+        .await
+        .expect("重要程度调整应返回响应");
+    assert_eq!(adjusted.status(), StatusCode::OK);
+    let adjusted_payload = response_json(adjusted).await;
+    assert_eq!(adjusted_payload["previous_importance"], "normal");
+    assert_eq!(adjusted_payload["importance"], "high");
+    assert!(
+        adjusted_payload.get("revision_id").is_none(),
+        "重要程度调整不得创建内容 revision"
+    );
+
+    // 删除单条：durable 后详情 404。
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/personas/router-test-persona/memories/{memory_id}"
+                ))
+                .body(Body::empty())
+                .expect("应能构造单条删除请求"),
+        )
+        .await
+        .expect("单条删除应返回响应");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_payload = response_json(deleted).await;
+    assert_eq!(deleted_payload["deleted_memory_count"], 1);
+    assert!(
+        repository
+            .current(
+                &memory_scope("router-test-persona"),
+                &MemoryId(memory_id.clone())
+            )
+            .expect("删除后读取不应失败")
+            .is_none(),
+        "删除后记忆不得再可读"
+    );
+
+    // 空 Persona 全清返回成功且条数为零。
+    let cleared = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona/memories")
+                .body(Body::empty())
+                .expect("应能构造全清请求"),
+        )
+        .await
+        .expect("全清应返回响应");
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared_payload = response_json(cleared).await;
+    assert_eq!(cleared_payload["deleted_memory_count"], 0);
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[tokio::test]
+async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-list");
+    let memory_dir = unique_temp_dir("memory-list-store");
+    install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        vec![
+            stub_query_item("memory-a", MemoryCategory::UserFact, MemoryImportance::High),
+            stub_query_item(
+                "memory-b",
+                MemoryCategory::UserPreference,
+                MemoryImportance::Low,
+            ),
+        ],
+        StubMemoryAudit {
+            count: 2,
+            revisions: Vec::new(),
+        },
+    );
+    let app = api_routes().with_state(build_test_state(&config_dir));
+
+    // 空白 query 违反检索契约，返回稳定 400。
+    let blank = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?query=%20")
+                .body(Body::empty())
+                .expect("应能构造空白检索请求"),
+        )
+        .await
+        .expect("空白检索应返回响应");
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    let blank_payload = response_json(blank).await;
+    assert_flat_api_error(&blank_payload);
+    assert_eq!(blank_payload["code"], "memory_invalid_request");
+
+    // category 与 importance 为页内过滤。
+    let filtered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?query=用户&category=user_preference")
+                .body(Body::empty())
+                .expect("应能构造过滤检索请求"),
+        )
+        .await
+        .expect("过滤检索应返回响应");
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_payload = response_json(filtered).await;
+    let items = filtered_payload["items"]
+        .as_array()
+        .expect("检索响应应带 items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["memory_id"], "memory-b");
+
+    let filtered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?query=用户&importance=high")
+                .body(Body::empty())
+                .expect("应能构造重要程度过滤请求"),
+        )
+        .await
+        .expect("重要程度过滤应返回响应");
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_payload = response_json(filtered).await;
+    let items = filtered_payload["items"]
+        .as_array()
+        .expect("检索响应应带 items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["memory_id"], "memory-a");
+    assert_eq!(filtered_payload["has_more"], false);
+
+    // 非法游标返回稳定 memory_cursor_invalid。
+    let bad_cursor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?query=用户&cursor=%E4%B8%AD%E6%96%87")
+                .body(Body::empty())
+                .expect("应能构造非法游标请求"),
+        )
+        .await
+        .expect("非法游标应返回响应");
+    assert_eq!(bad_cursor.status(), StatusCode::BAD_REQUEST);
+    let cursor_payload = response_json(bad_cursor).await;
+    assert_flat_api_error(&cursor_payload);
+    assert_eq!(cursor_payload["code"], "memory_cursor_invalid");
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[tokio::test]
+async fn persona_memory_history_and_deletion_impact_use_audit_port() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-history");
+    let memory_dir = unique_temp_dir("memory-history-store");
+    let known_memory_id = MemoryId("memory-known".to_string());
+    install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 3,
+            revisions: vec![
+                stub_audit_revision(&known_memory_id, MemoryRevisionState::Corrected),
+                stub_audit_revision(&known_memory_id, MemoryRevisionState::Current),
+            ],
+        },
+    );
+    let app = api_routes().with_state(build_test_state(&config_dir));
+
+    // corrected 审计条目只允许管理历史入口读取。
+    let history = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories/memory-known/history")
+                .body(Body::empty())
+                .expect("应能构造历史查询请求"),
+        )
+        .await
+        .expect("历史查询应返回响应");
+    assert_eq!(history.status(), StatusCode::OK);
+    let history_payload = response_json(history).await;
+    let revisions = history_payload["revisions"]
+        .as_array()
+        .expect("历史响应应带 revisions");
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[0]["state"], "corrected");
+    assert!(
+        revisions
+            .iter()
+            .all(|revision| revision.get("source").is_none()),
+        "历史入口只能返回 conversation_id/turn_id 来源索引，不得暴露领域 source"
+    );
+    assert!(
+        revisions
+            .iter()
+            .all(|revision| revision["source_conversation_id"].is_null()
+                && revision["source_turn_id"].is_null()),
+        "Persona 管理来源不应伪造对话跳转索引"
+    );
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories/memory-missing/history")
+                .body(Body::empty())
+                .expect("应能构造未知记忆历史请求"),
+        )
+        .await
+        .expect("未知记忆历史应返回响应");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_payload = response_json(missing).await;
+    assert_flat_api_error(&missing_payload);
+    assert_eq!(missing_payload["code"], "memory_not_found");
+
+    // 已接线时删除影响返回真实记忆条数。
+    let impact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/deletion-impact")
+                .body(Body::empty())
+                .expect("应能构造删除影响查询"),
+        )
+        .await
+        .expect("删除影响查询应返回响应");
+    assert_eq!(impact.status(), StatusCode::OK);
+    let impact_payload = response_json(impact).await;
+    assert_eq!(impact_payload["memory_count"], 3);
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[tokio::test]
+async fn delete_persona_removes_memories_before_commit_point() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-persona-delete");
+    let memory_dir = unique_temp_dir("memory-persona-delete-store");
+    let repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 1,
+            revisions: Vec::new(),
+        },
+    );
+    let (memory_id, _) = seed_test_memory(&repository, "router-test-persona", "用户喜欢喝绿茶");
+    let app = api_routes().with_state(build_test_state(&config_dir));
+
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应能构造角色删除请求"),
+        )
+        .await
+        .expect("角色删除应返回响应");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(
+        repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("角色删除后读取不应失败")
+            .is_none(),
+        "角色删除必须同时清除该 Persona 的记忆"
+    );
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[tokio::test]
+async fn delete_persona_aborts_without_orphan_when_memory_deletion_fails() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-persona-delete-fail");
+    let memory_dir = unique_temp_dir("memory-persona-delete-fail-store");
+    let repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 1,
+            revisions: Vec::new(),
+        },
+    );
+    seed_test_memory(&repository, "router-test-persona", "用户喜欢喝绿茶");
+    drop(repository);
+    // 注入确定性失败：移除整个记忆存储目录，删除权威与主库写入必失败。
+    std::fs::remove_dir_all(&memory_dir).expect("应能移除测试记忆目录");
+
+    let app = api_routes().with_state(build_test_state(&config_dir));
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应能构造角色删除请求"),
+        )
+        .await
+        .expect("角色删除应返回响应");
+    assert_eq!(
+        deleted.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "记忆删除失败时整个角色删除不得提交"
+    );
+    let payload = response_json(deleted).await;
+    assert_flat_api_error(&payload);
+    assert_eq!(payload["code"], "memory_deletion_authority_unavailable");
+
+    // 孤儿态检查：角色定义必须保持完整可读。
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应能构造角色详情请求"),
+        )
+        .await
+        .expect("角色详情应返回响应");
+    assert_eq!(
+        detail.status(),
+        StatusCode::OK,
+        "记忆删除失败时角色 JSON 不得被删除"
+    );
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[test]
+fn local_api_docs_cover_memory_routes_and_stable_codes() {
+    // docs/local-api.md 是路由与错误码的公开契约，必须与本切片实现保持一致。
+    let docs = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/local-api.md"
+    ))
+    .expect("应能读取本地 API 文档");
+    for route in [
+        "GET /api/personas/{id}/memories",
+        "GET /api/personas/{id}/memories/{memory_id}",
+        "GET /api/personas/{id}/memories/{memory_id}/history",
+        "POST /api/personas/{id}/memories",
+        "POST /api/personas/{id}/memories/{memory_id}/correct",
+        "POST /api/personas/{id}/memories/{memory_id}/importance",
+        "DELETE /api/personas/{id}/memories/{memory_id}",
+        "DELETE /api/personas/{id}/memories",
+    ] {
+        assert!(docs.contains(route), "文档缺少记忆路由 `{route}`");
+    }
+    for code in [
+        "memory_invalid_request",
+        "memory_invalid_state_transition",
+        "memory_not_found",
+        "memory_revision_conflict",
+        "memory_persona_scope_mismatch",
+        "memory_source_ineligible",
+        "memory_sensitive_content_rejected",
+        "memory_sensitivity_unavailable",
+        "memory_cursor_invalid",
+        "memory_cursor_expired",
+        "memory_query_rejected",
+        "memory_query_budget_exceeded",
+        "memory_delete_confirmation_required",
+        "memory_deletion_authority_unavailable",
+        "memory_deletion_incomplete",
+        "memory_repository_unavailable",
+    ] {
+        assert!(docs.contains(code), "文档缺少记忆稳定码 `{code}`");
+    }
+    assert!(
+        docs.contains("memory_count"),
+        "文档缺少删除影响 memory_count 字段"
+    );
+}

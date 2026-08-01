@@ -27,6 +27,8 @@ pub mod runtime {
 }
 
 pub use router::build_router_with_security;
+// 记忆服务接缝对接线方（临时集成分支启动流程）公开。
+pub use runtime_support::{MemoryManagementAudit, MemoryServices, install_memory_services};
 pub use security::{LocalApiBootstrap, LocalApiSecurity, LocalApiSecurityOptions};
 pub use startup::migration::{
     LegacyDefaultPersonaMigrationOutcome, migrate_pristine_legacy_default_persona,

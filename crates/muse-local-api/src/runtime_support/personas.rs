@@ -413,6 +413,13 @@ pub(crate) async fn handle_delete_persona(
         let mut persona_candidate = previous_personas.clone();
         let mut visual_pack_candidate = previous_visual_packs.clone();
 
+        // 记忆删除必须先于 Persona JSON 提交点完成：失败时角色定义保持完整，
+        // 绝不出现 Persona JSON 已删而记忆仍在的孤儿态。已删记忆由独立删除
+        // 权威保证不可复活；后续阶段失败导致角色文件回滚时，记忆不随回滚恢复。
+        if let Some(services) = memory_services() {
+            delete_all_persona_memories(&services, &id).map_err(memory_error_response)?;
+        }
+
         if !persona_candidate.delete(&id) {
             return Err((
                 StatusCode::NOT_FOUND,

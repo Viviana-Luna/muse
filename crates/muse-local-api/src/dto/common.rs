@@ -85,6 +85,14 @@ fn busy_error_details(message: &str) -> Option<(String, &'static str)> {
 }
 
 fn public_api_error_message(message: &str) -> &str {
+    // 记忆管理错误的稳定码前缀一律不暴露给客户端 message。
+    for code in MEMORY_STABLE_ERROR_CODES {
+        if let Some(rest) = message.strip_prefix(code)
+            && let Some(public) = rest.strip_prefix("：")
+        {
+            return public;
+        }
+    }
     for prefix in [
         "persona_required：",
         "provider_api_key_required：",
@@ -110,7 +118,33 @@ fn public_api_error_message(message: &str) -> &str {
     message
 }
 
+/// 与 `MemoryErrorCode` 一一对应的 16 个记忆稳定错误码。
+const MEMORY_STABLE_ERROR_CODES: [&str; 16] = [
+    "memory_invalid_request",
+    "memory_invalid_state_transition",
+    "memory_not_found",
+    "memory_revision_conflict",
+    "memory_persona_scope_mismatch",
+    "memory_source_ineligible",
+    "memory_sensitive_content_rejected",
+    "memory_sensitivity_unavailable",
+    "memory_cursor_invalid",
+    "memory_cursor_expired",
+    "memory_query_rejected",
+    "memory_query_budget_exceeded",
+    "memory_delete_confirmation_required",
+    "memory_deletion_authority_unavailable",
+    "memory_deletion_incomplete",
+    "memory_repository_unavailable",
+];
+
 fn infer_api_error_code(message: &str) -> &'static str {
+    // 记忆稳定码必须在“不存在/必须”等通用回退之前匹配，避免被宽松子串吞掉。
+    for code in MEMORY_STABLE_ERROR_CODES {
+        if message.starts_with(code) {
+            return code;
+        }
+    }
     if message.starts_with("persona_required") {
         "persona_required"
     } else if message.starts_with("provider_api_key_required") {
@@ -173,6 +207,65 @@ fn infer_api_error_code(message: &str) -> &'static str {
 #[cfg(test)]
 mod api_error_tests {
     use super::ErrorResponse;
+
+    #[test]
+    fn memory_stable_codes_map_one_to_one_and_strip_prefix() {
+        // 与 MemoryErrorCode 的 16 个变体一一对应；顺序无关，关键是全覆盖。
+        for (code, message) in [
+            ("memory_invalid_request", "记忆请求参数无效。"),
+            ("memory_invalid_state_transition", "记忆状态转换无效。"),
+            ("memory_not_found", "指定记忆不存在。"),
+            (
+                "memory_revision_conflict",
+                "记忆 revision 已变化，请刷新后重试。",
+            ),
+            ("memory_persona_scope_mismatch", "记忆不属于当前 Persona。"),
+            ("memory_source_ineligible", "当前来源不具备形成记忆的资格。"),
+            (
+                "memory_sensitive_content_rejected",
+                "该内容不允许进入长期记忆。",
+            ),
+            (
+                "memory_sensitivity_unavailable",
+                "敏感判定不可用，已拒绝持久化。",
+            ),
+            ("memory_cursor_invalid", "记忆查询游标无效。"),
+            ("memory_cursor_expired", "记忆查询游标已过期。"),
+            ("memory_query_rejected", "记忆查询不满足检索要求。"),
+            ("memory_query_budget_exceeded", "本轮记忆查询预算已用尽。"),
+            (
+                "memory_delete_confirmation_required",
+                "删除记忆前需要专用用户确认。",
+            ),
+            (
+                "memory_deletion_authority_unavailable",
+                "记忆删除权威不可用。",
+            ),
+            ("memory_deletion_incomplete", "记忆删除未完整完成。"),
+            (
+                "memory_repository_unavailable",
+                "记忆 Repository 当前不可用。",
+            ),
+        ] {
+            let value = serde_json::to_value(ErrorResponse {
+                error: format!("{code}：{message}"),
+            })
+            .expect("记忆错误应能序列化");
+            assert_eq!(value["code"], code, "{code} 应映射为同名稳定码");
+            assert_eq!(value["message"], message, "{code} 不应暴露内部码前缀");
+        }
+        assert_eq!(super::MEMORY_STABLE_ERROR_CODES.len(), 16);
+    }
+
+    #[test]
+    fn memory_not_found_code_wins_over_generic_fallback() {
+        // “不存在”通用回退不得吞掉记忆稳定码。
+        let value = serde_json::to_value(ErrorResponse {
+            error: "memory_not_found：指定记忆不存在。".to_string(),
+        })
+        .expect("记忆错误应能序列化");
+        assert_eq!(value["code"], "memory_not_found");
+    }
 
     #[test]
     fn runtime_busy_error_includes_turn_and_phase() {

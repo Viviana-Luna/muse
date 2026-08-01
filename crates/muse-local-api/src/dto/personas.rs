@@ -121,6 +121,8 @@ pub struct PersonaDeletionImpactResponse {
     pub persona_id: String,
     pub associated_session_count: usize,
     pub workspace_state_exists: bool,
+    /// 记忆服务未接线或计数不可用时为 `null`；前端必须保持确认按钮禁用。
+    pub memory_count: Option<u64>,
 }
 
 /// 角色变更响应体。

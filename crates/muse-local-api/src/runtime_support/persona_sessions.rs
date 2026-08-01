@@ -23,6 +23,14 @@ pub(crate) async fn handle_persona_deletion_impact(
         .session_repository()
         .await
         .map_err(|error| internal_error(error.to_string()))?;
+    // 记忆计数只在已接线时给出；未接线返回 null 保持保守语义（前端确认按钮禁用），
+    // 计数失败则整体报错，绝不伪造零值诱导用户确认。
+    let memory_count = match memory_services() {
+        Some(services) => {
+            Some(persona_memory_count(&services, &id).map_err(memory_error_response)?)
+        }
+        None => None,
+    };
     Ok(Json(PersonaDeletionImpactResponse {
         persona_id: id.clone(),
         associated_session_count: repository
@@ -32,6 +40,7 @@ pub(crate) async fn handle_persona_deletion_impact(
         workspace_state_exists: repository
             .workspace_state_exists(&id)
             .map_err(|error| internal_error(error.to_string()))?,
+        memory_count,
     }))
 }
 

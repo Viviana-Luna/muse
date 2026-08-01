@@ -5,6 +5,7 @@ mod chat;
 mod diagnostics;
 pub(crate) mod error;
 mod mcp;
+mod memories;
 mod models;
 mod personas;
 pub(crate) mod preferences;
@@ -34,6 +35,7 @@ pub(crate) fn routes() -> ApiRouter {
         .merge(tools::routes())
         .merge(skills::routes())
         .merge(mcp::routes())
+        .merge(memories::routes())
         .merge(models::routes())
         .merge(voice::routes())
 }
