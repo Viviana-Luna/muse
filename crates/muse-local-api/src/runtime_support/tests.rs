@@ -10,6 +10,9 @@ use crate::state::{AppState, build_runtime_system_prompt};
 use axum::{Json, extract::State};
 use muse_core::config::{AgentConfig, CharacterConfig, Config, ServerConfig};
 use muse_core::domain::conversation::{Conversation, Message, Role};
+use muse_core::domain::memory::{
+    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME, MemoryErrorCode,
+};
 use muse_core::domain::persona::character::store::PersonaStore;
 use muse_core::domain::persona::visual::VisualPack;
 use muse_core::domain::persona::visual::store::VisualPackStore;
@@ -548,6 +551,178 @@ fn build_test_state(config_dir: &Path) -> Arc<AppState> {
         emotion_tx: tokio::sync::broadcast::channel(1).0,
         memory: None,
     })
+}
+
+struct PreHandlerToolHarness<'a> {
+    state: &'a Arc<AppState>,
+    turn: &'a TurnContext,
+    provider: &'a Arc<dyn ChatModelProvider>,
+    frozen_mcp_catalog: &'a muse_core::domain::mcp::McpToolCatalog,
+    cancel_token: &'a super::RuntimeTurnCancel,
+    conversation: &'a Conversation,
+    memory_turn: &'a super::MemoryTurnState,
+}
+
+impl PreHandlerToolHarness<'_> {
+    async fn execute(
+        &self,
+        snapshot: &muse_runtime::TurnSnapshot,
+        request_capability_epoch: u64,
+        call_id: &str,
+        tool_name: &str,
+    ) -> ToolResult {
+        super::execute_runtime_tool(
+            self.state,
+            None,
+            super::RuntimeToolExecutionContext {
+                snapshot,
+                frozen_mcp_catalog: self.frozen_mcp_catalog,
+                provider: self.provider,
+                request_capability_epoch,
+                turn: self.turn,
+                cancel_token: self.cancel_token,
+                conversation: self.conversation,
+                memory_turn: self.memory_turn,
+            },
+            ToolCall {
+                call_id: call_id.to_string(),
+                name: tool_name.to_string(),
+                arguments: serde_json::json!({}),
+                source: ToolCallSource::Native,
+            },
+        )
+        .await
+        .expect("pre-handler 失败仍应可靠记录 ToolResult")
+    }
+}
+
+fn assert_exact_memory_failure(result: &ToolResult, expected_code: MemoryErrorCode) {
+    assert_eq!(result.status, ToolResultStatus::Failed);
+    let structured = result
+        .structured
+        .as_ref()
+        .expect("记忆失败必须包含稳定结构");
+    assert_eq!(
+        structured,
+        &serde_json::json!({ "error_code": expected_code })
+    );
+    assert_eq!(structured.as_object().map(serde_json::Map::len), Some(1));
+}
+
+#[tokio::test]
+async fn execute_runtime_tool_pre_handler_memory_failures_keep_exact_contract() {
+    let config_dir = unique_temp_dir("memory-pre-handler-contract");
+    let state = build_test_state(&config_dir);
+    let provider: Arc<dyn ChatModelProvider> = Arc::new(PendingHandshakeProvider {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    let frozen_mcp_catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
+        config_dir.join("config.toml"),
+    );
+    let (_coordinator, _lease, cancel_token) = test_cancel_token("turn-memory-pre-handler");
+    let turn = test_turn_context("turn-memory-pre-handler");
+    let mut conversation = Conversation::new(turn.system_prompt.clone(), 10);
+    conversation.add_user_message("我喜欢红茶".to_string());
+    let memory_turn = super::MemoryTurnState::new(
+        1,
+        turn.conversation_id.clone(),
+        turn.turn_id.clone(),
+        "我喜欢红茶",
+    );
+    let harness = PreHandlerToolHarness {
+        state: &state,
+        turn: &turn,
+        provider: &provider,
+        frozen_mcp_catalog: &frozen_mcp_catalog,
+        cancel_token: &cancel_token,
+        conversation: &conversation,
+        memory_turn: &memory_turn,
+    };
+    let mut registry = ToolRegistry::new();
+    builtin::register_all(&mut registry);
+    let definitions = registry.list_definitions();
+    let definition = |name: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("内建目录应包含 {name}"))
+    };
+
+    let stale_snapshot =
+        muse_runtime::TurnSnapshot::new(turn.clone(), vec![definition(MEMORY_QUERY_TOOL_NAME)]);
+    let stale = harness
+        .execute(
+            &stale_snapshot,
+            stale_snapshot.capability_epoch() + 1,
+            "call-memory-stale",
+            MEMORY_QUERY_TOOL_NAME,
+        )
+        .await;
+    assert_exact_memory_failure(&stale, MemoryErrorCode::QueryRejected);
+
+    let mut hidden_snapshot =
+        muse_runtime::TurnSnapshot::new(turn.clone(), vec![definition(MEMORY_MUTATE_TOOL_NAME)]);
+    let hidden_epoch = hidden_snapshot
+        .replace_visible_tool_definitions(Vec::new())
+        .expect("应能隐藏冻结工具");
+    let hidden = harness
+        .execute(
+            &hidden_snapshot,
+            hidden_epoch,
+            "call-memory-hidden",
+            MEMORY_MUTATE_TOOL_NAME,
+        )
+        .await;
+    assert_exact_memory_failure(&hidden, MemoryErrorCode::InvalidRequest);
+
+    let missing_snapshot = muse_runtime::TurnSnapshot::new(turn.clone(), Vec::new());
+    let missing = harness
+        .execute(
+            &missing_snapshot,
+            missing_snapshot.capability_epoch(),
+            "call-memory-missing",
+            MEMORY_DELETE_TOOL_NAME,
+        )
+        .await;
+    assert_exact_memory_failure(&missing, MemoryErrorCode::InvalidRequest);
+
+    let mut disabled_definition = definition(MEMORY_QUERY_TOOL_NAME);
+    disabled_definition.available = false;
+    disabled_definition.disabled_reason = Some("测试禁用".to_string());
+    let disabled_snapshot =
+        muse_runtime::TurnSnapshot::new(turn.clone(), vec![disabled_definition]);
+    let disabled = harness
+        .execute(
+            &disabled_snapshot,
+            disabled_snapshot.capability_epoch(),
+            "call-memory-disabled",
+            MEMORY_QUERY_TOOL_NAME,
+        )
+        .await;
+    assert_exact_memory_failure(&disabled, MemoryErrorCode::QueryRejected);
+
+    let generic_snapshot =
+        muse_runtime::TurnSnapshot::new(turn.clone(), vec![definition("file_read")]);
+    let generic = harness
+        .execute(
+            &generic_snapshot,
+            generic_snapshot.capability_epoch() + 1,
+            "call-file-stale",
+            "file_read",
+        )
+        .await;
+    assert_eq!(
+        generic
+            .structured
+            .as_ref()
+            .and_then(|structured| structured.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("stale_or_hidden_capability")
+    );
+
+    let _ = std::fs::remove_dir_all(config_dir);
 }
 
 async fn configure_test_chat(state: &Arc<AppState>) {

@@ -534,7 +534,7 @@ fn contains_financial_payment(text: &str) -> bool {
         .any(|key| keyword_followed_by_digit_run(text, key, 3, 24))
 }
 
-/// 精确住址与实时位置：高精度坐标对，门牌号伴随编号，或住址类关键词伴随具体尾文。
+/// 精确住址与实时位置：高精度坐标对、结构化门牌地址，或明确的住址/定位字段。
 fn contains_precise_location(canonical: &str, compact: &str) -> bool {
     if contains_precise_coordinates(canonical) {
         return true;
@@ -545,36 +545,19 @@ fn contains_precise_location(canonical: &str, compact: &str) -> bool {
     if contains_street_house_number(canonical, compact) {
         return true;
     }
-    const LOCATION_KEYS: [&str; 10] = [
+    const LOCATION_KEYS: [&str; 8] = [
         "详细住址",
         "家庭住址",
         "居住地址",
         "收货地址",
-        "家住",
-        "现居",
         "实时位置",
         "定位到",
         "经纬度",
         "gps坐标",
     ];
-    if LOCATION_KEYS
+    LOCATION_KEYS
         .iter()
         .any(|key| keyword_with_meaningful_tail(compact, key, 4))
-    {
-        return true;
-    }
-    let has_region = ["省", "市", "区", "县"]
-        .iter()
-        .filter(|key| compact.contains(*key))
-        .count()
-        >= 2;
-    let has_street = ["路", "街", "巷", "小区", "大厦", "号楼"]
-        .iter()
-        .any(|key| compact.contains(key));
-    let has_unit = ["号", "栋", "单元", "室"]
-        .iter()
-        .any(|key| keyword_followed_by_digit_run(compact, key, 1, 12));
-    has_region && has_street && has_unit
 }
 
 /// 私人联系方式：手机号、国际号码、邮箱地址，或联系方式关键词伴随号码。
@@ -837,13 +820,13 @@ fn has_assignment_key_boundary(text: &str, key: &str, key_start: usize) -> bool 
             .is_none_or(|character| !character.is_ascii_alphanumeric())
 }
 
-/// 识别中文道路/街道或英文 Street/Road 等标记附近的门牌数字。
+/// 识别结构化中文门牌地址，或英文 Street/Road 等标记附近的门牌数字。
+///
+/// 中文规则只接受“道路/住宅标记紧邻编号与门牌单位”，或“至少两级位置链之后
+/// 出现编号与门牌单位”。数字必须与 `号`、`号楼`、`栋`、`幢`、`单元`、`室`
+/// 直接组成结构，不能在道路词之后开一个任意字符窗口寻找数字。
 fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
-    const CJK_STREET_MARKERS: [&str; 7] = ["路", "街", "大道", "巷", "弄", "胡同", "公路"];
-    if CJK_STREET_MARKERS
-        .iter()
-        .any(|marker| keyword_followed_by_digit_run(compact, marker, 1, 16))
-    {
+    if contains_structured_cjk_address(compact) {
         return true;
     }
 
@@ -862,6 +845,140 @@ fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
             !candidate.is_empty() && candidate.bytes().all(|byte| byte.is_ascii_digit())
         }) {
             return true;
+        }
+    }
+    false
+}
+
+fn contains_structured_cjk_address(text: &str) -> bool {
+    const ADDRESS_MARKERS: [&str; 20] = [
+        "住宅小区",
+        "商业大厦",
+        "工业园区",
+        "科技园区",
+        "大道",
+        "胡同",
+        "公路",
+        "街道",
+        "小区",
+        "社区",
+        "花园",
+        "家园",
+        "大厦",
+        "公寓",
+        "园区",
+        "里弄",
+        "路",
+        "街",
+        "巷",
+        "弄",
+    ];
+
+    for number_start in cjk_address_number_starts(text) {
+        let number_end = text[number_start..]
+            .char_indices()
+            .take_while(|(_, character)| is_cjk_address_number(*character))
+            .last()
+            .map(|(index, character)| number_start + index + character.len_utf8())
+            .unwrap_or(number_start);
+        if number_end == number_start || !starts_with_cjk_house_unit(&text[number_end..]) {
+            continue;
+        }
+
+        let prefix = &text[..number_start];
+        if ADDRESS_MARKERS
+            .iter()
+            .any(|marker| prefix.ends_with(marker))
+            || contains_cjk_location_chain(prefix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn cjk_address_number_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut previous_was_number = false;
+    for (index, character) in text.char_indices() {
+        let is_number = is_cjk_address_number(character);
+        if is_number && !previous_was_number {
+            starts.push(index);
+        }
+        previous_was_number = is_number;
+    }
+    starts
+}
+
+fn is_cjk_address_number(character: char) -> bool {
+    character.is_ascii_digit()
+        || matches!(
+            character,
+            '零' | '〇'
+                | '一'
+                | '二'
+                | '两'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '千'
+                | '万'
+                | '壹'
+                | '贰'
+                | '叁'
+                | '肆'
+                | '伍'
+                | '陆'
+                | '柒'
+                | '捌'
+                | '玖'
+                | '拾'
+                | '佰'
+                | '仟'
+        )
+}
+
+fn starts_with_cjk_house_unit(value: &str) -> bool {
+    const HOUSE_UNITS: [&str; 6] = ["号楼", "单元", "号", "栋", "幢", "室"];
+    HOUSE_UNITS.iter().any(|unit| value.starts_with(unit))
+}
+
+fn contains_cjk_location_chain(prefix: &str) -> bool {
+    const LOCATION_COMPONENTS: [&str; 12] = [
+        "自治区",
+        "自治州",
+        "特别行政区",
+        "街道",
+        "省",
+        "市",
+        "区",
+        "县",
+        "旗",
+        "镇",
+        "乡",
+        "村",
+    ];
+    let mut components = 0_usize;
+    let mut cursor = 0_usize;
+    while cursor < prefix.len() {
+        let tail = &prefix[cursor..];
+        if let Some(component) = LOCATION_COMPONENTS
+            .iter()
+            .find(|component| tail.starts_with(**component))
+        {
+            components += 1;
+            if components >= 2 {
+                return true;
+            }
+            cursor += component.len();
+        } else {
+            cursor += tail.chars().next().map(char::len_utf8).unwrap_or(1);
         }
     }
     false
@@ -1170,6 +1287,10 @@ mod tests {
         assert_rejected("家庭住址：朝阳区幸福里小区 3 号楼 2 单元 501");
         assert_rejected("实时位置分享给你了，在北门");
         assert_rejected("我家在幸福路 88 号");
+        assert_rejected("我住在北京市朝阳区幸福小区3号楼");
+        assert_rejected("我住在北京市朝阳区幸福小区三号楼二单元五〇一室");
+        assert_rejected("我住在幸福路八十八号");
+        assert_rejected("我住在幸福花园6栋1203室");
         assert_rejected("收件地点是 123 Main Street");
     }
 
@@ -1235,6 +1356,9 @@ mod tests {
         assert_allowed("用户偏好 password-free 登录体验");
         assert_allowed("用户用 compass: north 描述导航方向");
         assert_allowed("用户正在阅读 Main Street. 这本小说");
+        assert_allowed("我喜欢公路自行车，计划周末骑20公里");
+        assert_allowed("用户选择技术路线2");
+        assert_allowed("用户计划完成道路测试3轮");
     }
 
     #[test]

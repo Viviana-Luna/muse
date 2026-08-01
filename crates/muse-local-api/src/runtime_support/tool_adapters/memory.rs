@@ -37,6 +37,19 @@ pub(in crate::runtime_support) fn memory_tool_failure(code: MemoryErrorCode) -> 
     }
 }
 
+/// 在进入具体 Handler 前，把三个精确记忆工具名的失败收口到记忆领域协议。
+/// 相似前缀或其他工具继续使用运行时的通用失败结构。
+pub(in crate::runtime_support) fn memory_pre_handler_failure(
+    tool_name: &str,
+) -> Option<ToolResult> {
+    let code = match tool_name {
+        MEMORY_QUERY_TOOL_NAME => MemoryErrorCode::QueryRejected,
+        MEMORY_MUTATE_TOOL_NAME | MEMORY_DELETE_TOOL_NAME => MemoryErrorCode::InvalidRequest,
+        _ => return None,
+    };
+    Some(memory_tool_failure(code))
+}
+
 /// memory_delete 未取得专用真人确认时的唯一模型可见失败形态。
 pub(in crate::runtime_support) fn memory_delete_confirmation_required() -> ToolResult {
     memory_tool_failure(MemoryErrorCode::DeleteConfirmationRequired)
@@ -386,6 +399,24 @@ mod tests {
                 provider_event["structured"]["error_code"],
                 serde_json::json!(code)
             );
+        }
+    }
+
+    #[test]
+    fn pre_handler_failure_only_matches_exact_memory_tool_names() {
+        for (tool_name, code) in [
+            (MEMORY_QUERY_TOOL_NAME, MemoryErrorCode::QueryRejected),
+            (MEMORY_MUTATE_TOOL_NAME, MemoryErrorCode::InvalidRequest),
+            (MEMORY_DELETE_TOOL_NAME, MemoryErrorCode::InvalidRequest),
+        ] {
+            let result = memory_pre_handler_failure(tool_name).expect("精确记忆工具名必须命中");
+            assert_eq!(
+                result.structured,
+                Some(serde_json::json!({ "error_code": code }))
+            );
+        }
+        for tool_name in ["memory_query_extra", "Memory_query", "file_read"] {
+            assert!(memory_pre_handler_failure(tool_name).is_none());
         }
     }
 

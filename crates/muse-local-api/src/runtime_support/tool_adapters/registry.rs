@@ -34,7 +34,8 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         return Err(TURN_CANCELLED_MESSAGE.to_string());
     }
     if let Err(error) = snapshot.authorize_tool_call(&call.name, request_capability_epoch) {
-        let result = tool_failed(error, "stale_or_hidden_capability");
+        let result = memory_pre_handler_failure(&call.name)
+            .unwrap_or_else(|| tool_failed(error, "stale_or_hidden_capability"));
         emit_and_record_tool_call(
             state,
             tx,
@@ -48,11 +49,11 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         return emit_and_record_tool_result(state, tx, turn, &call, &result).await;
     }
     let Some(def) = snapshot.tool_definition(&call.name).cloned() else {
-        let result = ToolResult {
+        let result = memory_pre_handler_failure(&call.name).unwrap_or_else(|| ToolResult {
             status: ToolResultStatus::Failed,
             content: format!("工具 `{}` 不存在，无法执行。", call.name),
             structured: Some(serde_json::json!({ "reason": "not_found" })),
-        };
+        });
         emit_and_record_tool_call(
             state,
             tx,
@@ -68,7 +69,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         return Ok(recorded_result);
     };
     if !def.available {
-        let result = ToolResult {
+        let result = memory_pre_handler_failure(&call.name).unwrap_or_else(|| ToolResult {
             status: ToolResultStatus::Failed,
             content: format!(
                 "工具 `{}` 当前不可用：{}",
@@ -83,7 +84,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
                 "execution_owner": def.execution_owner,
                 "disabled_reason": def.disabled_reason,
             })),
-        };
+        });
         emit_and_record_tool_call(
             state,
             tx,
@@ -100,7 +101,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
     let active_preset =
         ToolPreset::from_protocol(&turn.tool_preset).unwrap_or(ToolPreset::FocusBuild);
     if !ToolRegistry::is_tool_definition_allowed_for_preset(&def, active_preset) {
-        let result = ToolResult {
+        let result = memory_pre_handler_failure(&call.name).unwrap_or_else(|| ToolResult {
             status: ToolResultStatus::Failed,
             content: format!(
                 "当前运行模式的工具预设 `{}` 未开放工具 `{}`。",
@@ -112,7 +113,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
                 "tool_preset": active_preset.as_str(),
                 "turn_tool_preset": turn.tool_preset,
             })),
-        };
+        });
         emit_and_record_tool_call(
             state,
             tx,

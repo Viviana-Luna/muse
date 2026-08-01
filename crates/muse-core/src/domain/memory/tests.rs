@@ -382,6 +382,16 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
     )
     .expect("安全的显式记忆请求与我的到用户的转换应可验证");
 
+    MemorySourceEligibility::verify_direct_user_message(
+        scope(),
+        "conversation-1",
+        "turn-1",
+        "call-yemen",
+        "我来自也门",
+        "用户来自也门",
+    )
+    .expect("国家名内部的‘也’不得被误判为混合从句");
+
     for ineligible in [
         "assistant 声称用户住在海边",
         "Tool 返回用户喜欢红茶",
@@ -418,6 +428,7 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
         ("我引用网页结论", "用户引用网页结论"),
         ("我喜欢红茶，但是网页称用户喜欢咖啡", "用户喜欢红茶"),
         ("我喜欢红茶，而且用户喜欢咖啡", "用户喜欢红茶"),
+        ("我喜欢红茶也喜欢咖啡", "用户喜欢红茶也喜欢咖啡"),
     ] {
         let error = MemorySourceEligibility::verify_direct_user_message(
             scope(),

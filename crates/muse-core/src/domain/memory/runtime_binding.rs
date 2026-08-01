@@ -238,8 +238,8 @@ fn is_explicit_memory_prefix_separator(character: char) -> bool {
 }
 
 /// 来源资格采用正向、可证明的语法，而不是枚举网页、文件、Tool 等外部来源名称。
-/// 只要句子包含从句边界、否定、转述、推理或并列信号，就无法证明候选是当前
-/// 用户的单一直接断言，因此一律 fail closed。
+/// 从句边界直接拒绝；无标点的混合从句只在连接词后确实出现新主语、谓词、否定
+/// 或转述起点时拒绝，避免把“也门”等普通词内部字符当成歧义信号。
 fn has_ambiguous_direct_user_syntax(value: &str) -> bool {
     const CLAUSE_OR_QUOTE_MARKERS: [char; 19] = [
         '，', ',', '、', '；', ';', '：', ':', '\n', '\r', '“', '”', '‘', '’', '「', '」', '『',
@@ -251,14 +251,66 @@ fn has_ambiguous_direct_user_syntax(value: &str) -> bool {
     {
         return true;
     }
-    const AMBIGUOUS_MARKERS: [&str; 30] = [
-        "不", "没", "未", "无", "并非", "不是", "否认", "另外", "还有", "并且", "而且", "以及",
-        "同时", "但是", "不过", "却", "也", "听说", "据说", "声称", "转述", "报道", "报告", "显示",
-        "推测", "推断", "猜测", "认为", "可能", "似乎",
+    contains_mixed_clause(value)
+}
+
+fn contains_mixed_clause(value: &str) -> bool {
+    const CONNECTORS: [&str; 12] = [
+        "另外", "还有", "并且", "而且", "以及", "同时", "但是", "不过", "却", "也", "但", "又",
     ];
-    AMBIGUOUS_MARKERS
-        .iter()
-        .any(|marker| value.contains(marker))
+    const CLAUSE_STARTERS: [&str; 37] = [
+        "我",
+        "我的",
+        "用户",
+        "他",
+        "她",
+        "它",
+        "他们",
+        "网页",
+        "文件",
+        "assistant",
+        "tool",
+        "mcp",
+        "system",
+        "reasoning",
+        "报告",
+        "不",
+        "没",
+        "未",
+        "无",
+        "并非",
+        "不是",
+        "否认",
+        "听说",
+        "据说",
+        "声称",
+        "转述",
+        "报道",
+        "显示",
+        "推测",
+        "推断",
+        "猜测",
+        "认为",
+        "可能",
+        "似乎",
+        "喜欢",
+        "偏好",
+        "计划",
+    ];
+    for connector in CONNECTORS {
+        let mut search_from = 0;
+        while let Some(relative) = value[search_from..].find(connector) {
+            let after = search_from + relative + connector.len();
+            if CLAUSE_STARTERS
+                .iter()
+                .any(|starter| value[after..].starts_with(starter))
+            {
+                return true;
+            }
+            search_from = after;
+        }
+    }
+    false
 }
 
 /// 裸 `我` 后只接受描述当前用户状态、偏好或意图的正向谓词。这里是正向
