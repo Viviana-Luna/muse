@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{require_non_empty, require_opaque_token, require_rfc3339};
 use super::ports::MemoryPersistencePermit;
+use super::tool_request::{validate_memory_change_reason, validate_memory_content};
 use super::{
     MemoryCategory, MemoryChangeType, MemoryEntry, MemoryEntryState, MemoryError, MemoryErrorCode,
     MemoryId, MemoryImportance, MemoryPersonaScope, MemoryRecord, MemoryRevision, MemoryRevisionId,
@@ -141,8 +142,8 @@ impl std::fmt::Debug for MemoryManagementContentParams {
 
 impl MemoryManagementContentParams {
     pub fn validate(&self) -> Result<(), MemoryError> {
-        require_non_empty(self.content())?;
-        require_non_empty(self.change_reason())?;
+        validate_memory_content(self.content())?;
+        validate_memory_change_reason(self.change_reason())?;
         if let Some(memory_id) = self.memory_id() {
             require_non_empty(&memory_id.0)?;
         }
@@ -265,6 +266,14 @@ impl MemoryManagementContentMutation {
         &self.params
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_params_for_repository_test(
+        &mut self,
+        params: MemoryManagementContentParams,
+    ) {
+        self.params = params;
+    }
+
     pub fn binding(&self) -> &MemoryManagementBinding {
         &self.binding
     }
@@ -297,6 +306,8 @@ impl MemoryManagementContentMutation {
         current: Option<&MemoryRecord>,
         sensitivity: &dyn MemorySensitivityPolicy,
     ) -> Result<super::MemoryMutationTransition, MemoryError> {
+        // Repository 最终门在散列、敏感评分和 SQL 之前重验有界字段。
+        self.params.validate()?;
         let request = self.sensitivity_request(MemorySafetyStage::RepositoryCommit);
         let permit = sensitivity
             .assess(request)

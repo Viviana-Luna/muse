@@ -455,7 +455,8 @@ pub trait MemoryDeletionAuthority: Send + Sync {
 /// 可替换的检索端口。
 ///
 /// 实现必须先硬过滤不相关候选，再按有效权重排序；游标必须绑定 Persona、
-/// 查询条件与快照，且不得返回 corrected、deleted 或跨 Persona 内容。
+/// 查询条件、排序版本与真实 Turn，且不得返回 corrected、deleted 或跨 Persona 内容。
+/// 同 Turn 同 cursor 重放必须幂等返回同一页；跨 Turn 使用必须稳定拒绝。
 pub trait MemoryRetriever: Send + Sync {
     fn retrieve(
         &self,

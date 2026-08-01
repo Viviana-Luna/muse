@@ -324,7 +324,16 @@ fn all_model_controlled_strings_are_validated_before_runtime_binding() {
         memory_id: None,
         include_history: false,
     };
-    assert!(MemoryRetrievalRequest::bind(invalid_query, scope()).is_err());
+    assert!(
+        MemoryRetrievalRequest::bind(
+            invalid_query,
+            scope(),
+            MemoryRetrievalTurn::from_runtime("turn-query", "nonce-query")
+                .expect("Turn 绑定应有效"),
+            MemoryRetrievalFilters::none(),
+        )
+        .is_err()
+    );
 
     let invalid_event_time = MemoryMutateParams::Create {
         category: MemoryCategory::UserFact,
@@ -1772,6 +1781,93 @@ fn stable_error_codes_are_unique_and_matchable() {
     assert_eq!(
         serde_json::to_string(&MemoryErrorCode::RevisionConflict).expect("错误码应可序列化"),
         "\"memory_revision_conflict\""
+    );
+}
+
+#[test]
+fn query_content_and_change_reason_limits_are_frozen_before_runtime_work() {
+    let query = MemoryQueryParams {
+        query: "查".repeat(MAX_MEMORY_QUERY_CHARS + 1),
+        limit: None,
+        cursor: None,
+        as_of: None,
+        memory_id: None,
+        include_history: false,
+    };
+    assert_eq!(
+        query.validate().expect_err("查询字符超限应拒绝").code(),
+        MemoryErrorCode::QueryRejected
+    );
+    let byte_heavy_query = MemoryQueryParams {
+        query: "😀".repeat(MAX_MEMORY_QUERY_BYTES / 4 + 1),
+        limit: None,
+        cursor: None,
+        as_of: None,
+        memory_id: None,
+        include_history: false,
+    };
+    assert_eq!(
+        byte_heavy_query
+            .validate()
+            .expect_err("查询字节超限应在 Unicode 过滤前拒绝")
+            .code(),
+        MemoryErrorCode::QueryRejected
+    );
+
+    let oversized_content = MemoryMutateParams::Create {
+        category: MemoryCategory::UserFact,
+        content: "内".repeat(MAX_MEMORY_CONTENT_CHARS + 1),
+        importance: MemoryImportance::Normal,
+        event_time: None,
+        change_reason: "测试原因".to_string(),
+    };
+    assert_eq!(
+        MemoryStagedMutation::stage(
+            oversized_content,
+            binding("operation-content-limit", TIME_1),
+            MemoryId("memory-content-limit".to_string()),
+            MemoryRevisionId("revision-content-limit".to_string()),
+            &AllowPolicy,
+        )
+        .expect_err("正文字符超限应在第一敏感门前拒绝")
+        .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+
+    let oversized_reason = MemoryManagementContentParams::Create {
+        category: MemoryCategory::UserFact,
+        content: "有效正文".to_string(),
+        importance: MemoryImportance::Normal,
+        event_time: None,
+        change_reason: "因".repeat(MAX_MEMORY_CHANGE_REASON_CHARS + 1),
+    };
+    assert_eq!(
+        MemoryManagementContentMutation::bind(
+            oversized_reason,
+            management_binding("management-reason-limit", TIME_1),
+            MemoryId("memory-reason-limit".to_string()),
+            MemoryRevisionId("revision-reason-limit".to_string()),
+            &AllowPolicy,
+        )
+        .expect_err("管理路径变化原因超限应拒绝")
+        .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+}
+
+#[test]
+fn retrieval_turn_binding_requires_nonempty_id_and_opaque_nonce() {
+    assert_eq!(
+        MemoryRetrievalTurn::from_runtime("", "nonce")
+            .expect_err("空 turn_id 应拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        MemoryRetrievalTurn::from_runtime("turn", "包含 空格")
+            .expect_err("不可验证 nonce 应拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
     );
 }
 

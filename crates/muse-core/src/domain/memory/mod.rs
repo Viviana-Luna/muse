@@ -28,13 +28,19 @@ pub use ports::{
 pub use runtime_binding::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryMutationTransition, MemoryPersonaScope,
-    MemoryRetrievalRequest, MemoryRuntimeBinding, MemorySourceEligibility, MemoryStagedMutation,
+    MemoryRetrievalFilters, MemoryRetrievalRequest, MemoryRetrievalTurn, MemoryRuntimeBinding,
+    MemorySourceEligibility, MemoryStagedMutation,
 };
 pub use tool_request::{
+    MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CHANGE_REASON_CHARS, MAX_MEMORY_CONTENT_BYTES,
+    MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES, MAX_MEMORY_QUERY_CHARS,
     MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
     MemoryBatchCommitReceipt, MemoryCursor, MemoryDeleteParams, MemoryDeleteReceipt,
     MemoryMutateParams, MemoryMutationReceipt, MemoryMutationReceiptState, MemoryQueryItem,
     MemoryQueryPageReceipt, MemoryQueryParams,
+};
+pub(crate) use tool_request::{
+    validate_memory_change_reason, validate_memory_content, validate_memory_query_text,
 };
 
 #[cfg(test)]

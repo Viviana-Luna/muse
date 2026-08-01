@@ -8,6 +8,16 @@ use super::{
     MemoryRevisionId,
 };
 
+/// 模型查询原文的硬上限；必须在 Unicode 规范化前检查。
+pub const MAX_MEMORY_QUERY_BYTES: usize = 384;
+pub const MAX_MEMORY_QUERY_CHARS: usize = 120;
+/// 单条原子记忆正文的硬上限；第一门与 Repository 门必须使用同一组数值。
+pub const MAX_MEMORY_CONTENT_BYTES: usize = 4 * 1024;
+pub const MAX_MEMORY_CONTENT_CHARS: usize = 1024;
+/// revision 变化原因的硬上限。
+pub const MAX_MEMORY_CHANGE_REASON_BYTES: usize = 1024;
+pub const MAX_MEMORY_CHANGE_REASON_CHARS: usize = 256;
+
 /// 记忆工具使用的稳定名称。
 pub const MEMORY_QUERY_TOOL_NAME: &str = "memory_query";
 pub const MEMORY_MUTATE_TOOL_NAME: &str = "memory_mutate";
@@ -74,7 +84,7 @@ pub struct MemoryQueryParams {
 
 impl MemoryQueryParams {
     pub fn validate(&self) -> Result<(), MemoryError> {
-        require_non_empty(&self.query)?;
+        validate_memory_query_text(&self.query)?;
         if self.limit == Some(0) {
             return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
         }
@@ -149,8 +159,8 @@ impl MemoryMutateParams {
     }
 
     pub fn validate(&self) -> Result<(), MemoryError> {
-        require_non_empty(self.content())?;
-        require_non_empty(self.change_reason())?;
+        validate_memory_content(self.content())?;
+        validate_memory_change_reason(self.change_reason())?;
         if let Some(memory_id) = self.memory_id() {
             require_non_empty(&memory_id.0)?;
         }
@@ -223,6 +233,45 @@ impl MemoryMutateParams {
             } => Some(expected_revision_id),
         }
     }
+}
+
+pub(crate) fn validate_memory_query_text(value: &str) -> Result<(), MemoryError> {
+    validate_bounded_text(
+        value,
+        MAX_MEMORY_QUERY_BYTES,
+        MAX_MEMORY_QUERY_CHARS,
+        MemoryErrorCode::QueryRejected,
+    )
+}
+
+pub(crate) fn validate_memory_content(value: &str) -> Result<(), MemoryError> {
+    validate_bounded_text(
+        value,
+        MAX_MEMORY_CONTENT_BYTES,
+        MAX_MEMORY_CONTENT_CHARS,
+        MemoryErrorCode::InvalidRequest,
+    )
+}
+
+pub(crate) fn validate_memory_change_reason(value: &str) -> Result<(), MemoryError> {
+    validate_bounded_text(
+        value,
+        MAX_MEMORY_CHANGE_REASON_BYTES,
+        MAX_MEMORY_CHANGE_REASON_CHARS,
+        MemoryErrorCode::InvalidRequest,
+    )
+}
+
+fn validate_bounded_text(
+    value: &str,
+    max_bytes: usize,
+    max_chars: usize,
+    error_code: MemoryErrorCode,
+) -> Result<(), MemoryError> {
+    if value.len() > max_bytes || value.chars().count() > max_chars {
+        return Err(MemoryError::new(error_code));
+    }
+    require_non_empty(value).map_err(|_| MemoryError::new(error_code))
 }
 
 /// 模型可传的 `memory_delete` 参数。

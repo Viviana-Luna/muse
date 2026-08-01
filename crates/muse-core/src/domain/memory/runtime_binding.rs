@@ -744,14 +744,104 @@ fn encode_hex(bytes: &[u8]) -> String {
 /// 已绑定 Persona scope 的查询请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRetrievalRequest {
-    pub params: MemoryQueryParams,
-    pub scope: MemoryPersonaScope,
+    params: MemoryQueryParams,
+    scope: MemoryPersonaScope,
+    turn: MemoryRetrievalTurn,
+    filters: MemoryRetrievalFilters,
 }
 
 impl MemoryRetrievalRequest {
-    pub fn bind(params: MemoryQueryParams, scope: MemoryPersonaScope) -> Result<Self, MemoryError> {
+    pub fn bind(
+        params: MemoryQueryParams,
+        scope: MemoryPersonaScope,
+        turn: MemoryRetrievalTurn,
+        filters: MemoryRetrievalFilters,
+    ) -> Result<Self, MemoryError> {
         params.validate()?;
-        Ok(Self { params, scope })
+        Ok(Self {
+            params,
+            scope,
+            turn,
+            filters,
+        })
+    }
+
+    pub fn params(&self) -> &MemoryQueryParams {
+        &self.params
+    }
+
+    pub fn scope(&self) -> &MemoryPersonaScope {
+        &self.scope
+    }
+
+    pub fn turn(&self) -> &MemoryRetrievalTurn {
+        &self.turn
+    }
+
+    pub fn filters(&self) -> &MemoryRetrievalFilters {
+        &self.filters
+    }
+}
+
+/// 由真实 Turn 生命周期创建的查询所有权；nonce 阻止相同 turn_id 被恢复重放。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRetrievalTurn {
+    turn_id: String,
+    turn_nonce: String,
+}
+
+impl MemoryRetrievalTurn {
+    pub fn from_runtime(
+        turn_id: impl Into<String>,
+        turn_nonce: impl Into<String>,
+    ) -> Result<Self, MemoryError> {
+        let turn_id = turn_id.into();
+        let turn_nonce = turn_nonce.into();
+        require_non_empty(&turn_id)?;
+        require_opaque_token(&turn_nonce)?;
+        Ok(Self {
+            turn_id,
+            turn_nonce,
+        })
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn turn_nonce(&self) -> &str {
+        &self.turn_nonce
+    }
+}
+
+/// Retriever 内部统一筛选条件；Tool 查询使用 `none`，管理 API 可绑定显式筛选。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryRetrievalFilters {
+    category: Option<super::MemoryCategory>,
+    importance: Option<super::MemoryImportance>,
+}
+
+impl MemoryRetrievalFilters {
+    pub const fn new(
+        category: Option<super::MemoryCategory>,
+        importance: Option<super::MemoryImportance>,
+    ) -> Self {
+        Self {
+            category,
+            importance,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self::new(None, None)
+    }
+
+    pub const fn category(&self) -> Option<super::MemoryCategory> {
+        self.category
+    }
+
+    pub const fn importance(&self) -> Option<super::MemoryImportance> {
+        self.importance
     }
 }
 
@@ -817,6 +907,11 @@ impl MemoryStagedMutation {
         &self.params
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_params_for_repository_test(&mut self, params: MemoryMutateParams) {
+        self.params = params;
+    }
+
     pub fn binding(&self) -> &MemoryRuntimeBinding {
         &self.binding
     }
@@ -858,6 +953,8 @@ impl MemoryStagedMutation {
         current: Option<&MemoryRecord>,
         sensitivity: &dyn MemorySensitivityPolicy,
     ) -> Result<MemoryMutationTransition, MemoryError> {
+        // Repository 最终门在散列、敏感评分和 SQL 之前重验有界字段。
+        self.params.validate()?;
         let request = self.sensitivity_request(MemorySafetyStage::RepositoryCommit);
         let permit = sensitivity
             .assess(request)

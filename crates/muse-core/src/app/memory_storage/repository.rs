@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use unicode_normalization::UnicodeNormalization;
 
 use super::authority::{
     AuthorityDeleteIntent, AuthorityDeletionEvent, SqliteMemoryDeletionAuthority,
@@ -27,6 +28,10 @@ use crate::domain::memory::{
     MemoryMutationTransition, MemoryPersonaScope, MemoryRecord, MemoryRepository, MemoryRevision,
     MemoryRevisionId, MemoryRevisionState, MemorySensitivityPolicy, MemorySourceEvidence,
     MemorySourceKind,
+};
+use crate::domain::memory::{
+    MAX_MEMORY_QUERY_CHARS, validate_memory_change_reason, validate_memory_content,
+    validate_memory_query_text,
 };
 
 /// 所有记忆写入、FTS 投影和幂等收据的唯一 SQLite 实现。
@@ -327,6 +332,9 @@ impl MemoryRepository for SqliteMemoryRepository {
         envelope: &MemoryCommitEnvelope,
         sensitivity: &dyn MemorySensitivityPolicy,
     ) -> Result<MemoryBatchCommitReceipt, MemoryError> {
+        for mutation in envelope.mutations() {
+            mutation.params().validate()?;
+        }
         let digest = envelope_digest(&self.authority, envelope)?;
         let authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
@@ -439,6 +447,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         mutation: &MemoryManagementContentMutation,
         sensitivity: &dyn MemorySensitivityPolicy,
     ) -> Result<MemoryMutationReceipt, MemoryError> {
+        mutation.params().validate()?;
         let scope = mutation.binding().scope();
         let digest = management_content_digest(&self.authority, mutation)?;
         let authority_guard = self.authority.begin_guard()?;
@@ -801,10 +810,14 @@ fn validate_authority_receipt(
     Ok(())
 }
 
-/// FTS 查询与投影使用同一个确定性规范化器：仅保留 Unicode 字母数字并转小写。
+/// FTS 查询与投影使用同一个确定性 NFKC 规范化器：兼容等价字符先折叠，
+/// 再仅保留 Unicode 字母数字并转小写。
 pub fn normalize_memory_fts_query(query: &str) -> Result<String, MemoryError> {
+    // 原始字节与字符上限必须在任何 Unicode 展开、复制或评分之前冻结。
+    validate_memory_query_text(query)?;
     let normalized = normalize_search_text(query);
-    if normalized.chars().count() < 3 {
+    let normalized_chars = normalized.chars().count();
+    if !(3..=MAX_MEMORY_QUERY_CHARS).contains(&normalized_chars) {
         return Err(MemoryError::new(MemoryErrorCode::QueryRejected));
     }
     Ok(normalized)
@@ -812,7 +825,7 @@ pub fn normalize_memory_fts_query(query: &str) -> Result<String, MemoryError> {
 
 pub(crate) fn normalize_search_text(value: &str) -> String {
     value
-        .chars()
+        .nfkc()
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
@@ -992,6 +1005,9 @@ fn apply_transition(
     scope: &MemoryPersonaScope,
     transition: &MemoryMutationTransition,
 ) -> Result<(), MemoryError> {
+    // 即使未来新增内部构造路径，Repository 门也必须先于派生键、FTS 与 SQL 拒绝超限正文。
+    validate_memory_content(&transition.new_revision.content)?;
+    validate_memory_change_reason(&transition.new_revision.change_reason)?;
     if transition.entry.persona_id != scope.persona_id()
         || transition.new_revision.memory_id != transition.entry.memory_id
     {

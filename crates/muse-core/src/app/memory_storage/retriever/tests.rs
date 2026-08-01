@@ -12,9 +12,11 @@ use chrono::Utc;
 
 use super::*;
 use crate::domain::memory::{
-    MemoryCommitEnvelope, MemoryEntry, MemoryEntryState, MemoryMutateParams, MemoryRepository,
-    MemoryRevisionState, MemoryRuntimeBinding, MemorySafetyAssessment, MemorySensitivityPolicy,
-    MemorySensitivityRequest, MemorySourceKind, MemoryStagedMutation,
+    ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
+    MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryEntry, MemoryEntryState,
+    MemoryMutateParams, MemoryRepository, MemoryRevisionState, MemoryRuntimeBinding,
+    MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceKind,
+    MemoryStagedMutation,
 };
 
 const T1: &str = "2026-07-30T01:00:00Z";
@@ -266,6 +268,28 @@ fn update_memory(
     );
 }
 
+fn delete_memory(repository: &SqliteMemoryRepository, scope: &MemoryPersonaScope, memory_id: &str) {
+    let confirmation = MemoryDeleteConfirmation::new(
+        unique("delete"),
+        T3,
+        MemoryDeleteConfirmationSource::PersonaManagement {
+            action_id: unique("delete-action"),
+        },
+    )
+    .expect("删除确认应有效");
+    let request = ConfirmedMemoryDeleteRequest::bind(
+        MemoryDeleteParams::Memory {
+            memory_id: MemoryId(memory_id.to_string()),
+        },
+        scope.clone(),
+        confirmation,
+    )
+    .expect("删除请求应有效");
+    repository
+        .delete_confirmed(&request, repository.deletion_authority())
+        .expect("删除应 durable 成功");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn request(
     scope: &MemoryPersonaScope,
@@ -276,6 +300,32 @@ fn request(
     memory_id: Option<&str>,
     include_history: bool,
 ) -> MemoryRetrievalRequest {
+    request_for_turn_and_filters(
+        scope,
+        query,
+        limit,
+        cursor,
+        as_of,
+        memory_id,
+        include_history,
+        &MemoryRetrievalTurn::from_runtime("turn-default", "nonce-default")
+            .expect("默认 Turn 绑定应有效"),
+        MemoryRetrievalFilters::none(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_for_turn_and_filters(
+    scope: &MemoryPersonaScope,
+    query: &str,
+    limit: Option<u32>,
+    cursor: Option<MemoryCursor>,
+    as_of: Option<&str>,
+    memory_id: Option<&str>,
+    include_history: bool,
+    turn: &MemoryRetrievalTurn,
+    filters: MemoryRetrievalFilters,
+) -> MemoryRetrievalRequest {
     let params = MemoryQueryParams {
         query: query.to_string(),
         limit,
@@ -284,7 +334,8 @@ fn request(
         memory_id: memory_id.map(|value| MemoryId(value.to_string())),
         include_history,
     };
-    MemoryRetrievalRequest::bind(params, scope.clone()).expect("检索请求应有效")
+    MemoryRetrievalRequest::bind(params, scope.clone(), turn.clone(), filters)
+        .expect("检索请求应有效")
 }
 
 fn retrieve_ids(
@@ -569,6 +620,24 @@ fn english_and_unicode_recall_baseline() {
         normalize_memory_fts_query("ÅNGSTRÖM").expect("Unicode 字母应保留并小写"),
         "ångström"
     );
+    assert_eq!(
+        normalize_memory_fts_query("Cafe\u{301}").expect("分解态应可规范化"),
+        normalize_memory_fts_query("CAFÉ").expect("组合态应可规范化"),
+        "NFKC 必须统一组合态与分解态"
+    );
+    assert_eq!(
+        normalize_memory_fts_query("ＲＵＳＴ１２３").expect("全角兼容字符应折叠"),
+        "rust123"
+    );
+    assert_eq!(
+        normalize_memory_fts_query("a\u{200d}bc").expect("ZWJ 应被安全过滤"),
+        "abc"
+    );
+    assert_ne!(
+        normalize_memory_fts_query("paypal").expect("拉丁样本应有效"),
+        normalize_memory_fts_query("раypal").expect("混合脚本样本应有效"),
+        "NFKC 不得擅自把跨脚本同形字符折叠为同一查询"
+    );
 }
 
 #[test]
@@ -593,17 +662,43 @@ fn short_or_symbol_only_query_rejected() {
         "abc"
     );
     // 超长查询同样拒绝，避免无底线的候选扫描。
-    let long_query = "早".repeat(MAX_QUERY_CHARS + 1);
+    let long_query = "早".repeat(crate::domain::memory::MAX_MEMORY_QUERY_CHARS + 1);
+    let params = MemoryQueryParams {
+        query: long_query,
+        limit: None,
+        cursor: None,
+        as_of: None,
+        memory_id: None,
+        include_history: false,
+    };
     assert_eq!(
-        error_code(retriever.retrieve(&request(
-            &scope,
-            &long_query,
-            None,
-            None,
-            None,
-            None,
-            false
-        ))),
+        MemoryRetrievalRequest::bind(
+            params,
+            scope.clone(),
+            MemoryRetrievalTurn::from_runtime("turn-long", "nonce-long").expect("Turn 应有效"),
+            MemoryRetrievalFilters::none(),
+        )
+        .expect_err("超长查询必须在 Retriever 前拒绝")
+        .code(),
+        MemoryErrorCode::QueryRejected
+    );
+    let params = MemoryQueryParams {
+        query: "😀".repeat(100),
+        limit: None,
+        cursor: None,
+        as_of: None,
+        memory_id: None,
+        include_history: false,
+    };
+    assert_eq!(
+        MemoryRetrievalRequest::bind(
+            params,
+            scope,
+            MemoryRetrievalTurn::from_runtime("turn-bytes", "nonce-bytes").expect("Turn 应有效"),
+            MemoryRetrievalFilters::none(),
+        )
+        .expect_err("字节超限必须在过滤 emoji 前拒绝")
+        .code(),
         MemoryErrorCode::QueryRejected
     );
 }
@@ -836,6 +931,286 @@ fn pagination_snapshot_survives_concurrent_updates() {
 }
 
 #[test]
+fn frozen_second_page_is_invalidated_after_correction() {
+    let directory = TestDirectory::new("paging-correct");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("纠正续页-persona");
+    seed_paging_corpus(&repository, &scope, "m-correct-page");
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+    let page1 = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            None,
+            None,
+            None,
+            false,
+        ))
+        .expect("第一页应成功");
+    let cursor = page1.next_cursor.expect("应有第二页");
+
+    update_memory(
+        &repository,
+        &scope,
+        "m-correct-page-04",
+        "r-m-correct-page-04",
+        "r-m-correct-page-04-fixed",
+        "用户早餐记录第四条原本错误，现已纠正",
+        true,
+        T2,
+    );
+
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor),
+            None,
+            None,
+            false,
+        ))),
+        MemoryErrorCode::CursorExpired,
+        "纠正后的旧 revision 不得从冻结续页回放"
+    );
+    assert!(retriever.lock_snapshots().expect("快照锁应可用").is_empty());
+}
+
+#[test]
+fn frozen_second_page_is_invalidated_after_durable_delete() {
+    let directory = TestDirectory::new("paging-delete");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("删除续页-persona");
+    seed_paging_corpus(&repository, &scope, "m-delete-page");
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+    let page1 = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            None,
+            None,
+            None,
+            false,
+        ))
+        .expect("第一页应成功");
+    let cursor = page1.next_cursor.expect("应有第二页");
+
+    delete_memory(&repository, &scope, "m-delete-page-04");
+
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor),
+            None,
+            None,
+            false,
+        ))),
+        MemoryErrorCode::CursorExpired,
+        "durable delete 后不得返回任何冻结正文"
+    );
+    assert!(retriever.lock_snapshots().expect("快照锁应可用").is_empty());
+}
+
+#[test]
+fn same_turn_cursor_replay_is_idempotent() {
+    let directory = TestDirectory::new("cursor-replay");
+    let repository = open_repository(&directory);
+    let scope = scope("重放-persona");
+    seed_paging_corpus(&repository, &scope, "m-replay");
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+    let first = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            None,
+            None,
+            None,
+            false,
+        ))
+        .expect("第一页应成功");
+    let cursor = first.next_cursor.expect("应有第二页");
+    let second = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor.clone()),
+            None,
+            None,
+            false,
+        ))
+        .expect("首次续页应成功");
+    let replay = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor),
+            None,
+            None,
+            false,
+        ))
+        .expect("同 Turn 同 cursor 重放应幂等成功");
+    assert_eq!(second, replay);
+    let final_cursor = second.next_cursor.clone().expect("第二页应有末页游标");
+    let final_page = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(final_cursor.clone()),
+            None,
+            None,
+            false,
+        ))
+        .expect("末页应成功");
+    let final_replay = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(final_cursor),
+            None,
+            None,
+            false,
+        ))
+        .expect("末页 cursor 重放也应幂等成功");
+    assert_eq!(final_page, final_replay);
+    assert!(!final_page.has_more);
+}
+
+#[test]
+fn cursor_is_bound_to_real_turn_and_expire_turn_is_scoped() {
+    let directory = TestDirectory::new("cursor-turn");
+    let repository = open_repository(&directory);
+    let scope = scope("同一-persona");
+    seed_paging_corpus(&repository, &scope, "m-turn");
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+    let turn_a = MemoryRetrievalTurn::from_runtime("turn-a", "nonce-a").expect("Turn A 应有效");
+    let turn_b = MemoryRetrievalTurn::from_runtime("turn-b", "nonce-b").expect("Turn B 应有效");
+
+    let first_a = retriever
+        .retrieve(&request_for_turn_and_filters(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            None,
+            None,
+            None,
+            false,
+            &turn_a,
+            MemoryRetrievalFilters::none(),
+        ))
+        .expect("Turn A 第一页应成功");
+    let cursor_a = first_a.next_cursor.expect("Turn A 应有游标");
+    assert_eq!(
+        error_code(retriever.retrieve(&request_for_turn_and_filters(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor_a.clone()),
+            None,
+            None,
+            false,
+            &turn_b,
+            MemoryRetrievalFilters::none(),
+        ))),
+        MemoryErrorCode::InvalidCursor,
+        "同 Persona 同查询也不得跨 Turn 续页"
+    );
+
+    assert_eq!(
+        retriever.expire_turn(&turn_a).expect("Turn A 失效应成功"),
+        1
+    );
+    assert_eq!(
+        error_code(retriever.retrieve(&request_for_turn_and_filters(
+            &scope,
+            "用户早餐记录",
+            Some(3),
+            Some(cursor_a),
+            None,
+            None,
+            false,
+            &turn_a,
+            MemoryRetrievalFilters::none(),
+        ))),
+        MemoryErrorCode::CursorExpired
+    );
+}
+
+#[test]
+fn cursor_binds_limit_category_importance_and_uses_opaque_handle() {
+    let directory = TestDirectory::new("cursor-complete-binding");
+    let repository = open_repository(&directory);
+    let scope = scope("完整绑定-persona");
+    seed_paging_corpus(&repository, &scope, "m-bind");
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+    let turn = MemoryRetrievalTurn::from_runtime("turn-bind", "nonce-bind").expect("Turn 应有效");
+    let initial_filters = MemoryRetrievalFilters::new(
+        Some(MemoryCategory::UserPreference),
+        Some(MemoryImportance::Normal),
+    );
+    let first = retriever
+        .retrieve(&request_for_turn_and_filters(
+            &scope,
+            "用户早餐记录",
+            Some(2),
+            None,
+            None,
+            None,
+            false,
+            &turn,
+            initial_filters,
+        ))
+        .expect("第一页应成功");
+    let cursor = first.next_cursor.expect("应有游标");
+    let parts: Vec<&str> = cursor.as_str().split('.').collect();
+    assert_eq!(parts.len(), 4, "客户端只看到版本、快照句柄、页句柄和 MAC");
+    assert_eq!(parts[1].len(), 16);
+    assert_eq!(parts[2].len(), 16);
+    assert_eq!(parts[3].len(), 64);
+
+    for (limit, filters) in [
+        (Some(3), initial_filters),
+        (
+            Some(2),
+            MemoryRetrievalFilters::new(
+                Some(MemoryCategory::UserFact),
+                Some(MemoryImportance::Normal),
+            ),
+        ),
+        (
+            Some(2),
+            MemoryRetrievalFilters::new(
+                Some(MemoryCategory::UserPreference),
+                Some(MemoryImportance::High),
+            ),
+        ),
+    ] {
+        assert_eq!(
+            error_code(retriever.retrieve(&request_for_turn_and_filters(
+                &scope,
+                "用户早餐记录",
+                limit,
+                Some(cursor.clone()),
+                None,
+                None,
+                false,
+                &turn,
+                filters,
+            ))),
+            MemoryErrorCode::InvalidCursor
+        );
+    }
+}
+
+#[test]
 fn cursor_tampered_rejected() {
     let directory = TestDirectory::new("tamper");
     let repository = open_repository(&directory);
@@ -872,16 +1247,21 @@ fn cursor_tampered_rejected() {
         MemoryErrorCode::InvalidCursor
     );
 
-    let mut position_parts: Vec<&str> = cursor.as_str().split('.').collect();
-    position_parts[2] = "4";
-    let position_tampered =
-        MemoryCursor::from_runtime(position_parts.join(".")).expect("位置篡改后仍符合 token 形态");
+    let mut handle_parts: Vec<String> = cursor.as_str().split('.').map(str::to_string).collect();
+    let replacement = if handle_parts[2].starts_with('a') {
+        "b"
+    } else {
+        "a"
+    };
+    handle_parts[2].replace_range(..1, replacement);
+    let handle_tampered =
+        MemoryCursor::from_runtime(handle_parts.join(".")).expect("页句柄篡改后仍符合 token 形态");
     assert_eq!(
         error_code(retriever.retrieve(&request(
             &scope,
             "用户早餐记录",
             Some(3),
-            Some(position_tampered),
+            Some(handle_tampered),
             None,
             None,
             false,
@@ -1204,6 +1584,117 @@ fn turn_boundary_expiration_does_not_affect_concurrent_turn() {
         ))
         .expect("Turn A 结束不得使并发 Turn B 过期");
     assert_eq!(continued_b.items.len(), 3);
+}
+
+#[test]
+fn as_of_relevance_uses_revision_body_from_that_instant() {
+    let directory = TestDirectory::new("as-of-relevance");
+    let repository = open_repository(&directory);
+    let scope = scope("时间点-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-location",
+        "r-location-beijing",
+        MemoryCategory::UserFact,
+        "用户计划搬到北京居住",
+        MemoryImportance::Normal,
+        T1,
+    );
+    update_memory(
+        &repository,
+        &scope,
+        "m-location",
+        "r-location-beijing",
+        "r-location-shanghai",
+        "用户已经搬到上海居住",
+        false,
+        T2,
+    );
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+
+    let beijing = retriever
+        .retrieve(&request(
+            &scope,
+            "搬到北京居住",
+            None,
+            None,
+            Some("2026-07-30T01:30:00Z"),
+            None,
+            false,
+        ))
+        .expect("北京时间点查询应成功");
+    assert_eq!(
+        beijing.items.len(),
+        1,
+        "不得因 current FTS 为上海而漏召回北京"
+    );
+    assert_eq!(beijing.items[0].revision_id.0, "r-location-beijing");
+    assert!(beijing.items[0].content.contains("北京"));
+
+    let shanghai = retriever
+        .retrieve(&request(
+            &scope,
+            "搬到上海居住",
+            None,
+            None,
+            Some("2026-07-30T01:30:00Z"),
+            None,
+            false,
+        ))
+        .expect("上海时间点查询应成功");
+    assert!(
+        shanghai.items.is_empty(),
+        "不得用 current 上海召回后替换为不相关的历史北京正文"
+    );
+}
+
+#[test]
+fn iterative_candidate_scan_reaches_hard_match_beyond_first_hundred() {
+    let directory = TestDirectory::new("candidate-pressure");
+    let repository = open_repository(&directory);
+    let scope = scope("候选压力-persona");
+    let mut mutations = Vec::new();
+    let turn_id = unique("turn-pressure");
+    for index in 0..120 {
+        mutations.push(stage_create(
+            &scope,
+            "conv-pressure",
+            &turn_id,
+            &unique("op-pressure"),
+            &format!("m-pressure-{index:03}"),
+            &format!("r-pressure-{index:03}"),
+            MemoryCategory::UserFact,
+            "abcxbcdxcde xdef xefg xfgh xghi",
+            MemoryImportance::Normal,
+            FRESH,
+        ));
+    }
+    mutations.push(stage_create(
+        &scope,
+        "conv-pressure",
+        &turn_id,
+        &unique("op-pressure-target"),
+        "z-pressure-target",
+        "z-pressure-target-revision",
+        MemoryCategory::UserFact,
+        "abcdefghi 是唯一连续命中的压力目标",
+        MemoryImportance::Normal,
+        FRESH,
+    ));
+    commit_batch(&repository, &scope, "conv-pressure", &turn_id, mutations);
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+    let page = retriever
+        .retrieve(&request(&scope, "abcdefghi", None, None, None, None, false))
+        .expect("压力查询应成功");
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.memory_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["z-pressure-target"],
+        "硬门候选位于首批 100 条之后也不得被永久截断"
+    );
 }
 
 #[test]
@@ -1541,15 +2032,15 @@ fn scoring_and_paging_primitives() {
     assert_eq!(ordered, vec!["m-d", "m-c", "m-a", "m-b"]);
 
     // 游标解析：合法形态往返成功，畸形一律 memory_cursor_invalid。
-    let legal = format!("mqc1.0123456789abcdef.3.1900000000.{}", "0".repeat(64));
+    let legal = format!("mqc1.0123456789abcdef.89abcdef01234567.{}", "0".repeat(64));
     let parsed = parse_cursor(&legal).expect("合法游标应解析成功");
     assert_eq!(parsed.snapshot_id, "0123456789abcdef");
-    assert_eq!(parsed.position, 3);
+    assert_eq!(parsed.cursor_handle, "89abcdef01234567");
     for malformed in [
         "",
         "mqc1",
-        "mqc1.xyz.3.1900000000.0000",
-        "v2.0123456789abcdef.3.1.0000",
+        "mqc1.xyz.89abcdef01234567.0000",
+        "v2.0123456789abcdef.89abcdef01234567.0000",
     ] {
         assert_eq!(
             parse_cursor(malformed).expect_err("畸形游标应拒绝").code(),
@@ -1569,7 +2060,7 @@ fn page_token_budget_is_hard_and_skips_oversized_item() {
         "m-budget-oversized",
         "r-budget-oversized",
         MemoryCategory::UserFact,
-        &"预算样本".repeat(300),
+        &"预算样本".repeat(200),
         MemoryImportance::High,
         FRESH,
     );
@@ -1594,6 +2085,143 @@ fn page_token_budget_is_hard_and_skips_oversized_item() {
         estimated_memory_query_page_tokens(&page).expect("页 Token 估算应成功")
             <= MEMORY_QUERY_PAGE_TOKEN_BUDGET
     );
+}
+
+#[test]
+fn snapshot_budgets_cover_global_persona_and_turn_counts_and_bytes() {
+    let directory = TestDirectory::new("snapshot-budget");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("快照预算-persona");
+    seed_paging_corpus(&repository, &scope, "m-snapshot-budget");
+    let no_bytes = SnapshotBudgetLimits {
+        global_count: MAX_FROZEN_SNAPSHOTS,
+        global_bytes: 1,
+        persona_count: MAX_PERSONA_FROZEN_SNAPSHOTS,
+        persona_bytes: MAX_PERSONA_FROZEN_SNAPSHOT_BYTES,
+        turn_count: MAX_TURN_FROZEN_SNAPSHOTS,
+        turn_bytes: MAX_TURN_FROZEN_SNAPSHOT_BYTES,
+    };
+    let rejecting = SqliteMemoryRetriever::with_snapshot_limits(Arc::clone(&repository), no_bytes);
+    assert_eq!(
+        error_code(rejecting.retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(2),
+            None,
+            None,
+            None,
+            false,
+        ))),
+        MemoryErrorCode::QueryBudgetExceeded
+    );
+    assert!(
+        rejecting.lock_snapshots().expect("快照锁应可用").is_empty(),
+        "预算拒绝不得遗留含正文快照"
+    );
+
+    let retriever = SqliteMemoryRetriever::new(repository);
+    let page = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐记录",
+            Some(2),
+            None,
+            None,
+            None,
+            false,
+        ))
+        .expect("基准快照应创建成功");
+    assert!(page.has_more);
+    let snapshots = retriever.lock_snapshots().expect("快照锁应可用");
+    let snapshot = snapshots.values().next().expect("应有一个快照");
+    let same_owner = snapshot.owner.clone();
+    let other_turn = SnapshotOwner {
+        persona_id: same_owner.persona_id.clone(),
+        turn: MemoryRetrievalTurn::from_runtime("turn-other", "nonce-other")
+            .expect("其他 Turn 应有效"),
+    };
+    let other_persona = SnapshotOwner {
+        persona_id: "其他-persona".to_string(),
+        turn: MemoryRetrievalTurn::from_runtime("turn-other-persona", "nonce-other-persona")
+            .expect("其他 Persona Turn 应有效"),
+    };
+    let generous = usize::MAX;
+    for (owner, limits) in [
+        (
+            &other_persona,
+            SnapshotBudgetLimits {
+                global_count: 1,
+                global_bytes: generous,
+                persona_count: generous,
+                persona_bytes: generous,
+                turn_count: generous,
+                turn_bytes: generous,
+            },
+        ),
+        (
+            &other_turn,
+            SnapshotBudgetLimits {
+                global_count: generous,
+                global_bytes: generous,
+                persona_count: 1,
+                persona_bytes: generous,
+                turn_count: generous,
+                turn_bytes: generous,
+            },
+        ),
+        (
+            &same_owner,
+            SnapshotBudgetLimits {
+                global_count: generous,
+                global_bytes: generous,
+                persona_count: generous,
+                persona_bytes: generous,
+                turn_count: 1,
+                turn_bytes: generous,
+            },
+        ),
+        (
+            &other_persona,
+            SnapshotBudgetLimits {
+                global_count: generous,
+                global_bytes: snapshot.byte_size,
+                persona_count: generous,
+                persona_bytes: generous,
+                turn_count: generous,
+                turn_bytes: generous,
+            },
+        ),
+        (
+            &other_turn,
+            SnapshotBudgetLimits {
+                global_count: generous,
+                global_bytes: generous,
+                persona_count: generous,
+                persona_bytes: snapshot.byte_size,
+                turn_count: generous,
+                turn_bytes: generous,
+            },
+        ),
+        (
+            &same_owner,
+            SnapshotBudgetLimits {
+                global_count: generous,
+                global_bytes: generous,
+                persona_count: generous,
+                persona_bytes: generous,
+                turn_count: generous,
+                turn_bytes: snapshot.byte_size,
+            },
+        ),
+    ] {
+        assert_eq!(
+            ensure_snapshot_budget(&snapshots, owner, 1, limits)
+                .expect_err("对应层级预算应拒绝")
+                .code(),
+            MemoryErrorCode::QueryBudgetExceeded
+        );
+    }
+    assert_eq!(snapshots.len(), 1, "预算探测不得改变既有快照");
 }
 
 #[test]
@@ -1723,11 +2351,19 @@ fn fixed_bilingual_corpus_evaluation() {
         memory_id: None,
         include_history: false,
     };
+    let evaluation_request = MemoryRetrievalRequest::bind(
+        params,
+        scope.clone(),
+        MemoryRetrievalTurn::from_runtime("turn-evaluation", "nonce-evaluation")
+            .expect("评估 Turn 应有效"),
+        MemoryRetrievalFilters::none(),
+    )
+    .expect("评估请求应有效");
     let evaluation_now = chrono::DateTime::parse_from_rfc3339(FRESH)
         .expect("固定评估时间应有效")
         .with_timezone(&Utc);
     let items = retriever
-        .build_frozen_items(&scope, &params, &normalized, evaluation_now)
+        .build_frozen_items(&evaluation_request, &normalized, evaluation_now)
         .expect("冻结构建应成功");
     assert_eq!(items.len(), 3);
     assert_eq!(items[0].memory_id.0, "m-eval-01");

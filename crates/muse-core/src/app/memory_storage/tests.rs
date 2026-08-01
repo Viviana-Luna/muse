@@ -1834,6 +1834,80 @@ fn 第一门与第二门拒绝正文不进入任何存储面或_debug() {
 }
 
 #[test]
+fn repository_最终门在散列与_sql_前拒绝超限写入() {
+    let root = TestDirectory::new("repository-field-limits");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let scope = scope("persona-field-limits");
+
+    let mut staged = staged_create(
+        &scope,
+        "limit-conversation",
+        "limit-turn",
+        "limit-operation",
+        "limit-memory",
+        "limit-revision",
+        "初始有效正文",
+    );
+    staged.replace_params_for_repository_test(MemoryMutateParams::Create {
+        category: MemoryCategory::UserFact,
+        content: "超".repeat(crate::domain::memory::MAX_MEMORY_CONTENT_CHARS + 1),
+        importance: MemoryImportance::Normal,
+        event_time: None,
+        change_reason: "测试 Repository 最终门".to_string(),
+    });
+    let oversized_envelope = envelope(
+        &scope,
+        "limit-batch",
+        "limit-conversation",
+        "limit-turn",
+        vec![staged],
+    );
+    assert_eq!(
+        repository
+            .apply_committed_batch(&oversized_envelope, &AllowPolicy)
+            .expect_err("Repository 必须重验超限正文")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+    assert!(
+        repository
+            .current(&scope, &MemoryId("limit-memory".to_string()))
+            .expect("拒绝后读取应成功")
+            .is_none()
+    );
+
+    let mut management = management_create(
+        &scope,
+        "limit-management-operation",
+        "limit-management-memory",
+        "limit-management-revision",
+        "管理初始有效正文",
+        &AllowPolicy,
+    )
+    .expect("管理第一门应允许基准参数");
+    management.replace_params_for_repository_test(MemoryManagementContentParams::Create {
+        category: MemoryCategory::UserFact,
+        content: "管理有效正文".to_string(),
+        importance: MemoryImportance::Normal,
+        event_time: None,
+        change_reason: "因".repeat(crate::domain::memory::MAX_MEMORY_CHANGE_REASON_CHARS + 1),
+    });
+    assert_eq!(
+        repository
+            .apply_management_content_mutation(&management, &AllowPolicy)
+            .expect_err("管理写入也必须在 Repository 重验变化原因")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+    assert!(
+        repository
+            .current(&scope, &MemoryId("limit-management-memory".to_string()))
+            .expect("管理拒绝后读取应成功")
+            .is_none()
+    );
+}
+
+#[test]
 fn management_content_双门幂等冲突与_corrected_隔离() {
     let root = TestDirectory::new("management-content");
     let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
