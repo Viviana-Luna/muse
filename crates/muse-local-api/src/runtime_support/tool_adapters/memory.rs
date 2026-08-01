@@ -25,23 +25,21 @@ pub(in crate::runtime_support) static MEMORY_DELETE_HANDLER: MemoryDeleteHandler
     MemoryDeleteHandler;
 
 fn memory_tool_failed(error: MemoryError) -> ToolResult {
-    tool_failed(error.to_string(), error.stable_code())
+    memory_tool_failure(error.code())
 }
 
-fn memory_tool_failed_code(code: MemoryErrorCode, message: impl Into<String>) -> ToolResult {
-    tool_failed(message, code.as_str())
+/// 记忆工具专用失败包装：模型、SSE 与 Session 消费端只依赖同一个稳定字段。
+pub(in crate::runtime_support) fn memory_tool_failure(code: MemoryErrorCode) -> ToolResult {
+    ToolResult {
+        status: ToolResultStatus::Failed,
+        content: MemoryError::new(code).to_string(),
+        structured: Some(serde_json::json!({ "error_code": code })),
+    }
 }
 
 /// memory_delete 未取得专用真人确认时的唯一模型可见失败形态。
-pub(in crate::runtime_support) fn memory_delete_confirmation_required(outcome: &str) -> ToolResult {
-    ToolResult {
-        status: ToolResultStatus::Failed,
-        content: "删除记忆需要专用用户确认，本次未删除任何内容。".to_string(),
-        structured: Some(serde_json::json!({
-            "reason": MemoryErrorCode::DeleteConfirmationRequired.as_str(),
-            "confirmation_outcome": outcome,
-        })),
-    }
+pub(in crate::runtime_support) fn memory_delete_confirmation_required() -> ToolResult {
+    memory_tool_failure(MemoryErrorCode::DeleteConfirmationRequired)
 }
 
 /// 从冻结 TurnContext 解析 persona scope；无活动角色时记忆工具一律拒绝。
@@ -50,12 +48,17 @@ fn memory_scope_for_turn(
     code: MemoryErrorCode,
 ) -> Result<MemoryPersonaScope, ToolResult> {
     let Some(persona_id) = turn.persona_id.as_deref() else {
-        return Err(memory_tool_failed_code(
-            code,
-            "当前对话没有活动角色，记忆工具不可用。",
-        ));
+        return Err(memory_tool_failure(code));
     };
     MemoryPersonaScope::new(persona_id).map_err(memory_tool_failed)
+}
+
+fn check_memory_permissions(turn: &TurnContext, call: &ToolCall) -> Result<(), ToolResult> {
+    if runtime_tool_allowed(turn, &call.name) {
+        Ok(())
+    } else {
+        Err(memory_tool_failure(MemoryErrorCode::InvalidRequest))
+    }
 }
 
 impl RuntimeToolHandler for MemoryQueryHandler {
@@ -64,14 +67,18 @@ impl RuntimeToolHandler for MemoryQueryHandler {
     }
 
     fn validate_input(&self, call: &ToolCall) -> Result<(), ToolResult> {
-        let params: MemoryQueryParams =
-            serde_json::from_value(call.arguments.clone()).map_err(|_| {
-                memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_query 参数不符合冻结 schema。",
-                )
-            })?;
+        let params: MemoryQueryParams = serde_json::from_value(call.arguments.clone())
+            .map_err(|_| memory_tool_failure(MemoryErrorCode::InvalidRequest))?;
         params.validate().map_err(memory_tool_failed)
+    }
+
+    fn check_permissions(
+        &self,
+        _state: &Arc<AppState>,
+        turn: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<(), ToolResult> {
+        check_memory_permissions(turn, call)
     }
 
     fn call<'a>(&'a self, invocation: RuntimeToolInvocation<'a>) -> RuntimeToolFuture<'a> {
@@ -85,17 +92,11 @@ impl RuntimeToolHandler for MemoryQueryHandler {
             } = invocation;
             let Some(services) = state.memory.as_ref() else {
                 // 未接线是稳定拒绝而不是内部错误，模型可据此放弃记忆路径继续回答。
-                return memory_tool_failed_code(
-                    MemoryErrorCode::QueryRejected,
-                    "记忆检索当前未接线，本次无法查询长期记忆。",
-                );
+                return memory_tool_failure(MemoryErrorCode::QueryRejected);
             };
             let Ok(params) = serde_json::from_value::<MemoryQueryParams>(call.arguments.clone())
             else {
-                return memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_query 参数不符合冻结 schema。",
-                );
+                return memory_tool_failure(MemoryErrorCode::InvalidRequest);
             };
             let scope = match memory_scope_for_turn(turn, MemoryErrorCode::QueryRejected) {
                 Ok(scope) => scope,
@@ -141,14 +142,18 @@ impl RuntimeToolHandler for MemoryMutateHandler {
     }
 
     fn validate_input(&self, call: &ToolCall) -> Result<(), ToolResult> {
-        let params: MemoryMutateParams =
-            serde_json::from_value(call.arguments.clone()).map_err(|_| {
-                memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_mutate 参数不符合冻结 schema。",
-                )
-            })?;
+        let params: MemoryMutateParams = serde_json::from_value(call.arguments.clone())
+            .map_err(|_| memory_tool_failure(MemoryErrorCode::InvalidRequest))?;
         params.validate().map_err(memory_tool_failed)
+    }
+
+    fn check_permissions(
+        &self,
+        _state: &Arc<AppState>,
+        turn: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<(), ToolResult> {
+        check_memory_permissions(turn, call)
     }
 
     fn is_read_only(&self, _call: &ToolCall) -> bool {
@@ -178,10 +183,7 @@ impl RuntimeToolHandler for MemoryMutateHandler {
             };
             let Ok(params) = serde_json::from_value::<MemoryMutateParams>(call.arguments.clone())
             else {
-                return memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_mutate 参数不符合冻结 schema。",
-                );
+                return memory_tool_failure(MemoryErrorCode::InvalidRequest);
             };
             // 来源资格由 Turn 开始时冻结的 API 用户输入签发，候选事实还必须能在
             // 当前最新用户消息的统一规范化正文中确定性验证；模型不能自报来源。
@@ -235,14 +237,18 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
     }
 
     fn validate_input(&self, call: &ToolCall) -> Result<(), ToolResult> {
-        let params: MemoryDeleteParams =
-            serde_json::from_value(call.arguments.clone()).map_err(|_| {
-                memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_delete 参数不符合冻结 schema。",
-                )
-            })?;
+        let params: MemoryDeleteParams = serde_json::from_value(call.arguments.clone())
+            .map_err(|_| memory_tool_failure(MemoryErrorCode::InvalidRequest))?;
         params.validate().map_err(memory_tool_failed)
+    }
+
+    fn check_permissions(
+        &self,
+        _state: &Arc<AppState>,
+        turn: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<(), ToolResult> {
+        check_memory_permissions(turn, call)
     }
 
     fn is_read_only(&self, _call: &ToolCall) -> bool {
@@ -272,7 +278,7 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
             let Some(approval_evidence) = approval_evidence
                 .filter(|evidence| approval_obtained && evidence.call_id == call.call_id)
             else {
-                return memory_delete_confirmation_required("missing_dedicated_confirmation");
+                return memory_delete_confirmation_required();
             };
             let Some(services) = state.memory.as_ref() else {
                 return memory_tool_failed(MemoryError::new(
@@ -281,10 +287,7 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
             };
             let Ok(params) = serde_json::from_value::<MemoryDeleteParams>(call.arguments.clone())
             else {
-                return memory_tool_failed_code(
-                    MemoryErrorCode::InvalidRequest,
-                    "memory_delete 参数不符合冻结 schema。",
-                );
+                return memory_tool_failure(MemoryErrorCode::InvalidRequest);
             };
             let scope = match memory_scope_for_turn(turn, MemoryErrorCode::PersonaScopeMismatch) {
                 Ok(scope) => scope,
@@ -332,24 +335,58 @@ mod tests {
 
     #[test]
     fn delete_without_dedicated_confirmation_uses_stable_failure() {
-        let result = memory_delete_confirmation_required("rejected");
+        let result = memory_delete_confirmation_required();
         assert_eq!(result.status, ToolResultStatus::Failed);
         assert_eq!(
-            result
-                .structured
-                .as_ref()
-                .and_then(|value| value.get("reason"))
-                .and_then(serde_json::Value::as_str),
-            Some(MemoryErrorCode::DeleteConfirmationRequired.as_str())
+            result.structured,
+            Some(serde_json::json!({
+                "error_code": MemoryErrorCode::DeleteConfirmationRequired,
+            }))
         );
-        assert_eq!(
-            result
-                .structured
-                .as_ref()
-                .and_then(|value| value.get("confirmation_outcome"))
-                .and_then(serde_json::Value::as_str),
-            Some("rejected")
-        );
+    }
+
+    #[test]
+    fn every_memory_failure_uses_the_session_consumer_contract() {
+        let codes = [
+            MemoryErrorCode::InvalidRequest,
+            MemoryErrorCode::InvalidStateTransition,
+            MemoryErrorCode::MemoryNotFound,
+            MemoryErrorCode::RevisionConflict,
+            MemoryErrorCode::PersonaScopeMismatch,
+            MemoryErrorCode::SourceIneligible,
+            MemoryErrorCode::SensitiveContentRejected,
+            MemoryErrorCode::SensitivityUnavailable,
+            MemoryErrorCode::InvalidCursor,
+            MemoryErrorCode::CursorExpired,
+            MemoryErrorCode::QueryRejected,
+            MemoryErrorCode::QueryBudgetExceeded,
+            MemoryErrorCode::DeleteConfirmationRequired,
+            MemoryErrorCode::DeletionAuthorityUnavailable,
+            MemoryErrorCode::DeletionIncomplete,
+            MemoryErrorCode::RepositoryUnavailable,
+        ];
+        for code in codes {
+            let result = memory_tool_failure(code);
+            assert_eq!(result.status, ToolResultStatus::Failed);
+            assert_eq!(result.content, MemoryError::new(code).to_string());
+            let structured = result.structured.expect("记忆失败必须提供稳定错误码");
+            assert_eq!(structured, serde_json::json!({ "error_code": code }));
+            assert_eq!(structured.as_object().map(serde_json::Map::len), Some(1));
+            assert!(structured.get("reason").is_none());
+
+            let provider_event = runtime_tool_result_event(
+                "call-memory-failure",
+                MEMORY_MUTATE_TOOL_NAME,
+                false,
+                &result.content,
+                Some(&structured),
+            );
+            assert_eq!(provider_event["structured"], structured);
+            assert_eq!(
+                provider_event["structured"]["error_code"],
+                serde_json::json!(code)
+            );
+        }
     }
 
     #[test]

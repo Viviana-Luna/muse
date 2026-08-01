@@ -13,7 +13,7 @@ use crate::domain::memory::{
 use unicode_normalization::UnicodeNormalization;
 
 /// 当前确定性规则集版本；规则变化必须同步升级，持久化 revision 凭它审计。
-pub const MEMORY_SENSITIVITY_POLICY_VERSION: &str = "deterministic-nfkc-v2";
+pub const MEMORY_SENSITIVITY_POLICY_VERSION: &str = "deterministic-nfkc-v3";
 
 /// 确定性敏感检测器；无状态，可跨线程共享。
 #[derive(Debug, Default, Clone, Copy)]
@@ -224,6 +224,7 @@ fn fold_common_homoglyph(character: char) -> char {
         'а' | 'α' => 'a',
         'в' | 'β' => 'b',
         'с' | 'ϲ' => 'c',
+        'ԁ' => 'd',
         'е' | 'ε' => 'e',
         'һ' | 'η' => 'h',
         'і' | 'ι' => 'i',
@@ -235,6 +236,7 @@ fn fold_common_homoglyph(character: char) -> char {
         'р' | 'ρ' => 'p',
         'ѕ' => 's',
         'т' | 'τ' => 't',
+        'ԝ' => 'w',
         'х' | 'χ' => 'x',
         'у' | 'υ' => 'y',
         _ => character,
@@ -261,7 +263,16 @@ fn collect_json_fields(
                         push_json_field(fields, key, value.to_string())?;
                     }
                     serde_json::Value::Null => push_json_field(fields, key, String::new())?,
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                    serde_json::Value::Object(values) => {
+                        if !values.is_empty() {
+                            push_json_field(fields, key, "nested".to_string())?;
+                        }
+                        collect_json_fields(value, fields, depth + 1)?;
+                    }
+                    serde_json::Value::Array(values) => {
+                        if !values.is_empty() {
+                            push_json_field(fields, key, "nested".to_string())?;
+                        }
                         collect_json_fields(value, fields, depth + 1)?;
                     }
                 }
@@ -306,10 +317,15 @@ fn sensitive_field_name(value: &str) -> bool {
         .chars()
         .filter(|character| character.is_alphanumeric())
         .collect::<String>();
-    const FIELD_NAMES: [&str; 42] = [
+    const FIELD_NAMES: [&str; 48] = [
+        "pwd",
+        "pass",
         "password",
         "passwd",
         "passcode",
+        "token",
+        "credential",
+        "secret",
         "apikey",
         "secretkey",
         "clientsecret",
@@ -335,6 +351,7 @@ fn sensitive_field_name(value: &str) -> bool {
         "homeaddress",
         "streetaddress",
         "preciseaddress",
+        "address",
         "密码",
         "口令",
         "密钥",
@@ -350,9 +367,7 @@ fn sensitive_field_name(value: &str) -> bool {
         "详细住址",
         "家庭住址",
     ];
-    FIELD_NAMES
-        .iter()
-        .any(|field| identifier == *field || identifier.ends_with(field))
+    FIELD_NAMES.iter().any(|field| identifier == *field)
 }
 
 fn has_field_value(value: &str) -> bool {
@@ -430,9 +445,14 @@ fn contains_hard_secret(text: &NormalizedSensitiveText) -> bool {
     {
         return true;
     }
-    const ASSIGNMENT_KEYS: [&str; 17] = [
+    const ASSIGNMENT_KEYS: [&str; 22] = [
+        "pwd",
+        "pass",
         "password",
         "passwd",
+        "token",
+        "credential",
+        "secret",
         "api_key",
         "apikey",
         "api-key",
@@ -449,12 +469,15 @@ fn contains_hard_secret(text: &NormalizedSensitiveText) -> bool {
         "otp",
         "pin",
     ];
-    if contains_assignment_pattern(canonical, &ASSIGNMENT_KEYS, &[":", "-"]) {
+    if contains_assignment_pattern(canonical, &ASSIGNMENT_KEYS, &[":"])
+        || contains_spaced_hyphen_assignment(canonical, &ASSIGNMENT_KEYS)
+    {
         return true;
     }
     const CJK_CREDENTIAL_KEYS: [&str; 7] =
         ["密码", "口令", "密钥", "凭据", "令牌", "验证码", "支付码"];
-    contains_assignment_pattern(canonical, &CJK_CREDENTIAL_KEYS, &[":", "-"])
+    contains_assignment_pattern(canonical, &CJK_CREDENTIAL_KEYS, &[":"])
+        || contains_spaced_hyphen_assignment(canonical, &CJK_CREDENTIAL_KEYS)
 }
 
 /// 身份证明：带校验位的中国大陆身份证号，或证件关键词伴随数字编号。
@@ -519,7 +542,10 @@ fn contains_precise_location(canonical: &str, compact: &str) -> bool {
     if keyword_followed_by_digit_run(compact, "门牌号", 1, 16) {
         return true;
     }
-    const LOCATION_KEYS: [&str; 11] = [
+    if contains_street_house_number(canonical, compact) {
+        return true;
+    }
+    const LOCATION_KEYS: [&str; 10] = [
         "详细住址",
         "家庭住址",
         "居住地址",
@@ -530,7 +556,6 @@ fn contains_precise_location(canonical: &str, compact: &str) -> bool {
         "定位到",
         "经纬度",
         "gps坐标",
-        "address",
     ];
     if LOCATION_KEYS
         .iter()
@@ -554,6 +579,9 @@ fn contains_precise_location(canonical: &str, compact: &str) -> bool {
 
 /// 私人联系方式：手机号、国际号码、邮箱地址，或联系方式关键词伴随号码。
 fn contains_private_contact(canonical: &str, compact: &str) -> bool {
+    if contains_phone_number(canonical) {
+        return true;
+    }
     for run in digit_runs(compact) {
         let digits = run.as_str();
         if run.len() == 11
@@ -562,14 +590,6 @@ fn contains_private_contact(canonical: &str, compact: &str) -> bool {
                 .chars()
                 .nth(1)
                 .is_some_and(|c| ('3'..='9').contains(&c))
-        {
-            return true;
-        }
-    }
-    for word in ascii_words(canonical) {
-        if let Some(rest) = word.strip_prefix('+')
-            && (8..=15).contains(&rest.len())
-            && rest.bytes().all(|byte| byte.is_ascii_digit())
         {
             return true;
         }
@@ -743,7 +763,12 @@ fn contains_assignment_pattern(text: &str, keys: &[&str], separators: &[&str]) -
     for key in keys {
         let mut search_from = 0;
         while let Some(relative) = text[search_from..].find(key) {
-            let after = search_from + relative + key.len();
+            let key_start = search_from + relative;
+            let after = key_start + key.len();
+            if !has_assignment_key_boundary(text, key, key_start) {
+                search_from = after;
+                continue;
+            }
             let tail = text[after..].trim_start_matches([' ', '\t', '"', '\'', '`']);
             let has_value = separators.iter().any(|separator| {
                 tail.strip_prefix(separator).is_some_and(|rest| {
@@ -760,6 +785,129 @@ fn contains_assignment_pattern(text: &str, keys: &[&str], separators: &[&str]) -
             }
             search_from = after;
         }
+    }
+    false
+}
+
+/// 连字符只有在键值之间至少一侧保留空白时才视作赋值符，避免把
+/// `password-free` 之类普通复合词误判为凭据。
+fn contains_spaced_hyphen_assignment(text: &str, keys: &[&str]) -> bool {
+    for key in keys {
+        let mut search_from = 0;
+        while let Some(relative) = text[search_from..].find(key) {
+            let key_start = search_from + relative;
+            let after = key_start + key.len();
+            if !has_assignment_key_boundary(text, key, key_start) {
+                search_from = after;
+                continue;
+            }
+            let tail = &text[after..];
+            let Some(hyphen_index) = tail.find('-') else {
+                search_from = after;
+                continue;
+            };
+            if !tail[..hyphen_index].chars().all(char::is_whitespace) {
+                search_from = after;
+                continue;
+            }
+            let value = &tail[hyphen_index + 1..];
+            let has_spacing =
+                hyphen_index > 0 || value.chars().next().is_some_and(char::is_whitespace);
+            if has_spacing
+                && value
+                    .trim_start()
+                    .chars()
+                    .take(8)
+                    .any(|ch| ch.is_alphanumeric() || matches!(ch, '!' | '@' | '#' | '$'))
+            {
+                return true;
+            }
+            search_from = after;
+        }
+    }
+    false
+}
+
+fn has_assignment_key_boundary(text: &str, key: &str, key_start: usize) -> bool {
+    !key.is_ascii()
+        || key_start == 0
+        || text[..key_start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric())
+}
+
+/// 识别中文道路/街道或英文 Street/Road 等标记附近的门牌数字。
+fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
+    const CJK_STREET_MARKERS: [&str; 7] = ["路", "街", "大道", "巷", "弄", "胡同", "公路"];
+    if CJK_STREET_MARKERS
+        .iter()
+        .any(|marker| keyword_followed_by_digit_run(compact, marker, 1, 16))
+    {
+        return true;
+    }
+
+    const ASCII_STREET_MARKERS: [&str; 6] =
+        ["street", "road", "avenue", "lane", "drive", "boulevard"];
+    let words = ascii_words(canonical);
+    for (index, word) in words.iter().enumerate() {
+        let marker = word.trim_matches(['.', '-']);
+        if !ASCII_STREET_MARKERS.contains(&marker) {
+            continue;
+        }
+        let start = index.saturating_sub(3);
+        let end = (index + 4).min(words.len());
+        if words[start..end].iter().any(|candidate| {
+            let candidate = candidate.trim_matches(['.', '-']);
+            !candidate.is_empty() && candidate.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 识别允许括号、空格和横线分隔的手机号；带 `+86` 时先压缩国家码。
+fn contains_phone_number(canonical: &str) -> bool {
+    let chars = canonical.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '+' && !chars[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let started_with_plus = chars[index] == '+';
+        let mut digits = String::new();
+        let mut cursor = index;
+        while cursor < chars.len() {
+            let character = chars[cursor];
+            if character.is_ascii_digit() {
+                digits.push(character);
+            } else if matches!(character, '+' | '-' | ' ' | '(' | ')') {
+                // 电话内部常见分隔符；字母和其他标点会结束候选。
+            } else {
+                break;
+            }
+            cursor += 1;
+        }
+        let local = if started_with_plus {
+            digits.strip_prefix("86").unwrap_or(&digits)
+        } else {
+            digits.as_str()
+        };
+        if local.len() == 11
+            && local.starts_with('1')
+            && local
+                .chars()
+                .nth(1)
+                .is_some_and(|character| ('3'..='9').contains(&character))
+        {
+            return true;
+        }
+        if started_with_plus && (8..=15).contains(&digits.len()) {
+            return true;
+        }
+        index = cursor.max(index + 1);
     }
     false
 }
@@ -1021,6 +1169,8 @@ mod tests {
         assert_rejected("我在 39.90420, 116.40740 附近等");
         assert_rejected("家庭住址：朝阳区幸福里小区 3 号楼 2 单元 501");
         assert_rejected("实时位置分享给你了，在北门");
+        assert_rejected("我家在幸福路 88 号");
+        assert_rejected("收件地点是 123 Main Street");
     }
 
     #[test]
@@ -1028,6 +1178,8 @@ mod tests {
         assert_rejected("我的手机号 13812345678 没变");
         assert_rejected("邮箱 some.one+test@example.com 用来收通知");
         assert_rejected("电话 +8613812345678 可以联系到我");
+        assert_rejected("电话 +86 (138) 1234-5678 可以联系到我");
+        assert_rejected("手机号 138 1234 5678 没变");
         assert_rejected("微信号 abc12345 加一下");
     }
 
@@ -1078,6 +1230,11 @@ mod tests {
         assert_allowed("用户今年 18 岁，刚参加完高考");
         // 关键词后没有实质尾文（纯提问）不命中住址规则。
         assert_allowed("用户随口问了句「什么是经纬度」");
+        // 安全工具名与带连字符的普通形容词不是地址或凭据赋值。
+        assert_allowed("用户正在学习 AddressSanitizer 的使用方法");
+        assert_allowed("用户偏好 password-free 登录体验");
+        assert_allowed("用户用 compass: north 描述导航方向");
+        assert_allowed("用户正在阅读 Main Street. 这本小说");
     }
 
     #[test]
@@ -1085,12 +1242,31 @@ mod tests {
         assert_rejected(
             "ｓｋ－ａｎｔ－ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ１２３４５６",
         );
-        assert_rejected("pаss\u{200b}ｗord：hunter2hunter2");
+        assert_rejected("pаss\u{200b}ｗorԁ：hunter2hunter2");
+        assert_rejected("pаssԝorԁ：hunter2hunter2");
         assert_rejected(r#"{"profile":{"p.a.s.s.w.o.r.d":"hunter2hunter2"}}"#);
         assert_rejected("p-а-s-s-w-o-r-d ⇒ hunter2hunter2");
         assert_rejected("password / hunter2hunter2");
         assert_rejected("id-card | masked-abc-123");
         assert_rejected(r#"{"outer":{"credential":{"access_token":"abcdef1234567890"}}}"#);
+        for key in [
+            "pwd",
+            "pass",
+            "passwd",
+            "password",
+            "token",
+            "access_token",
+            "refresh_token",
+            "credential",
+            "secret",
+            "api_key",
+        ] {
+            assert_rejected(&format!(
+                r#"{{"outer":{{"nested":{{"{key}":"probe-value-123"}}}}}}"#
+            ));
+        }
+        assert_rejected("pwd ⟹ probe-value-123");
+        assert_rejected("secret | probe-value-123");
     }
 
     #[test]

@@ -162,8 +162,8 @@ fn staged_create(
         conversation_id,
         turn_id,
         operation_id,
-        content,
-        content,
+        "请记住我喜欢这条测试记忆",
+        "用户喜欢这条测试记忆",
     )
     .expect("直接用户来源应可验证");
     let binding =
@@ -202,8 +202,8 @@ fn staged_change(
         conversation_id,
         turn_id,
         operation_id,
-        content,
-        content,
+        "请记住我喜欢更新测试记忆",
+        "用户喜欢更新测试记忆",
     )
     .expect("直接用户来源应可验证");
     let binding =
@@ -1768,8 +1768,8 @@ fn 第一门与第二门拒绝正文不进入任何存储面或_debug() {
         "sensitive-conversation-1",
         "sensitive-turn-1",
         "sensitive-operation-1",
-        first_sentinel,
-        first_sentinel,
+        "请记住我喜欢敏感测试记忆",
+        "用户喜欢敏感测试记忆",
     )
     .expect("直接用户来源应可验证");
     let first_binding =

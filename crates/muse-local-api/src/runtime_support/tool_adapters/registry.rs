@@ -265,7 +265,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         .map_err(|_| "工具审批等待被中断。".to_string())?;
         if !approved {
             let result = if call.name == MEMORY_DELETE_TOOL_NAME {
-                memory_delete_confirmation_required(&approval_reason)
+                memory_delete_confirmation_required()
             } else {
                 let content = match approval_reason.as_str() {
                     "timeout" => format!("工具 `{}` 等待审批超时，已取消执行。", call.name),

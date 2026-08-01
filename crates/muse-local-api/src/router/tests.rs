@@ -362,7 +362,7 @@ fn memory_lifecycle_request(client_request_id: &str) -> Request<Body> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             serde_json::json!({
-                "message": "用户喜欢夜间散步",
+                "message": "我喜欢夜间散步",
                 "conversation_id": "default",
                 "client_request_id": client_request_id
             })

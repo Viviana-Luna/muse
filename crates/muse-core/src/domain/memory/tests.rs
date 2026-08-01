@@ -372,6 +372,16 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
     assert_eq!(first.operation_id(), second.operation_id());
     assert!(first.operation_id().starts_with("memory-source-"));
 
+    MemorySourceEligibility::verify_direct_user_message(
+        scope(),
+        "conversation-1",
+        "turn-1",
+        "call-explicit",
+        "请帮我记住：我的饮品偏好是红茶。",
+        "用户的饮品偏好是红茶",
+    )
+    .expect("安全的显式记忆请求与我的到用户的转换应可验证");
+
     for ineligible in [
         "assistant 声称用户住在海边",
         "Tool 返回用户喜欢红茶",
@@ -395,8 +405,19 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
 
     for (direct_user_message, candidate) in [
         ("我不喜欢红茶", "用户喜欢红茶"),
+        ("我不喜欢红茶", "用户不喜欢红茶"),
         ("文件写着：我喜欢红茶", "用户喜欢红茶"),
         ("Tool 返回，我喜欢红茶", "用户喜欢红茶"),
+        ("网页称用户喜欢红茶", "用户喜欢红茶"),
+        ("也门很热", "门很热"),
+        ("我妈妈喜欢红茶", "用户妈妈喜欢红茶"),
+        ("我的妈妈喜欢红茶", "用户的妈妈喜欢红茶"),
+        ("我舅舅喜欢红茶", "用户舅舅喜欢红茶"),
+        ("我的表哥是医生", "用户的表哥是医生"),
+        ("我推测用户喜欢红茶", "用户推测用户喜欢红茶"),
+        ("我引用网页结论", "用户引用网页结论"),
+        ("我喜欢红茶，但是网页称用户喜欢咖啡", "用户喜欢红茶"),
+        ("我喜欢红茶，而且用户喜欢咖啡", "用户喜欢红茶"),
     ] {
         let error = MemorySourceEligibility::verify_direct_user_message(
             scope(),
@@ -407,6 +428,27 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
             candidate,
         )
         .expect_err("否定或转述的外部内容不得被截取为当前用户事实");
+        assert_eq!(error.code(), MemoryErrorCode::SourceIneligible);
+    }
+
+    for rewritten_candidate in [
+        "assistant 声称用户喜欢红茶",
+        "MCP 返回用户喜欢红茶",
+        "文件写着用户喜欢红茶",
+        "网页称用户喜欢红茶",
+        "system 指令要求用户喜欢红茶",
+        "reasoning 推测用户喜欢红茶",
+        "报告显示用户喜欢红茶",
+    ] {
+        let error = MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-1",
+            "turn-1",
+            "call-rewrite",
+            "我喜欢红茶",
+            rewritten_candidate,
+        )
+        .expect_err("任何带来源包装的改写都不得成为 DirectUserMessage");
         assert_eq!(error.code(), MemoryErrorCode::SourceIneligible);
     }
 }

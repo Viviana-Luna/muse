@@ -399,7 +399,7 @@ mod tests {
             "conversation-test",
             "turn-test",
             "operation-test",
-            "用户喜欢夜间散步",
+            "我喜欢夜间散步",
             "用户喜欢夜间散步",
         )
         .expect("当前直接用户消息应能验证候选事实");
@@ -479,7 +479,7 @@ mod tests {
             "conversation-test",
             "turn-test",
             "operation-retry",
-            "用户喜欢夜间散步",
+            "我喜欢夜间散步",
             "用户喜欢夜间散步",
         )
         .expect("当前直接用户消息应能验证候选事实");
@@ -582,7 +582,7 @@ mod tests {
             "conversation-test",
             turn_id,
             format!("operation-{turn_id}"),
-            "用户喜欢夜间散步",
+            "我喜欢夜间散步",
             "用户喜欢夜间散步",
         )
         .expect("当前直接用户消息应能验证候选事实");
@@ -623,7 +623,7 @@ mod tests {
             query_call_budget,
             "conversation-test",
             "turn-test",
-            "用户喜欢夜间散步",
+            "我喜欢夜间散步",
         )
     }
 }

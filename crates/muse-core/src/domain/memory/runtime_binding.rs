@@ -72,16 +72,11 @@ impl MemorySourceEligibility {
 
         let normalized_source = normalize_source_evidence_text(direct_user_message)?;
         let normalized_candidate = normalize_source_evidence_text(candidate_content)?;
-        let candidate_fact = canonical_direct_user_fact(&normalized_candidate);
-        let whole_source_fact = canonical_direct_user_fact(&normalized_source);
-        if candidate_fact.chars().count() < 2
-            || has_indirect_source_marker(&normalized_source)
-            || (whole_source_fact != candidate_fact
-                && !normalized_source
-                    .split(is_direct_user_clause_separator)
-                    .map(canonical_direct_user_fact)
-                    .any(|source_fact| source_fact == candidate_fact))
-        {
+        let source_fact = canonical_direct_user_fact(&normalized_source)
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::SourceIneligible))?;
+        let candidate_fact = canonical_memory_candidate(&normalized_candidate)
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::SourceIneligible))?;
+        if candidate_fact.chars().count() < 3 || source_fact != candidate_fact {
             return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
         }
 
@@ -197,73 +192,146 @@ fn normalize_source_evidence_text(value: &str) -> Result<String, MemoryError> {
     Ok(normalized)
 }
 
-fn strip_direct_user_subject(value: &str) -> &str {
-    const SUBJECTS: [&str; 5] = ["用户", "本人", "我自己", "我", "俺"];
-    SUBJECTS
+fn canonical_direct_user_fact(value: &str) -> Option<String> {
+    const COMMAND_PREFIXES: [&str; 5] = ["请帮我记住", "请你记住", "请记住", "帮我记住", "记住"];
+    let mut fact = value.trim_matches(is_direct_user_terminal_separator);
+    if let Some(stripped) = COMMAND_PREFIXES
         .iter()
-        .find_map(|subject| value.strip_prefix(subject))
-        .unwrap_or(value)
-}
-
-fn canonical_direct_user_fact(value: &str) -> &str {
-    const COMMAND_PREFIXES: [&str; 10] = [
-        "请帮我记住",
-        "请你记住",
-        "请记住",
-        "帮我记住",
-        "记住",
-        "另外",
-        "还有",
-        "并且",
-        "而且",
-        "也",
-    ];
-    let mut fact = value.trim_matches(is_direct_user_clause_separator);
-    loop {
-        let stripped = COMMAND_PREFIXES
-            .iter()
-            .find_map(|prefix| fact.strip_prefix(prefix))
-            .unwrap_or(fact);
-        let stripped = strip_direct_user_subject(stripped);
-        if stripped == fact {
-            break;
-        }
-        fact = stripped;
+        .find_map(|prefix| fact.strip_prefix(prefix))
+    {
+        fact = stripped.trim_start_matches(is_explicit_memory_prefix_separator);
     }
-    fact.trim_matches(is_direct_user_clause_separator)
+    if fact.is_empty() || has_ambiguous_direct_user_syntax(fact) {
+        return None;
+    }
+
+    let canonical = if let Some(rest) = fact.strip_prefix("我的") {
+        if !is_safe_direct_user_attribute(rest) {
+            return None;
+        }
+        format!("用户的{rest}")
+    } else if let Some(rest) = fact.strip_prefix('我') {
+        if !is_safe_direct_user_predicate(rest) {
+            return None;
+        }
+        format!("用户{rest}")
+    } else {
+        return None;
+    };
+    canonical_memory_candidate(&canonical)
 }
 
-fn is_direct_user_clause_separator(character: char) -> bool {
-    matches!(
-        character,
-        '。' | '，' | ',' | '、' | '；' | ';' | '！' | '!' | '？' | '?'
-    )
+fn canonical_memory_candidate(value: &str) -> Option<String> {
+    let fact = value.trim_matches(is_direct_user_terminal_separator);
+    if fact.is_empty() || has_ambiguous_direct_user_syntax(fact) {
+        return None;
+    }
+    Some(fact.to_string())
 }
 
-fn has_indirect_source_marker(value: &str) -> bool {
-    const MARKERS: [&str; 20] = [
-        "assistant说",
-        "assistant声称",
-        "tool说",
-        "tool返回",
-        "工具说",
-        "工具返回",
-        "工具结果",
-        "mcp说",
-        "mcp返回",
-        "mcp结果",
-        "网页说",
-        "网页写着",
-        "网页内容",
-        "文件说",
-        "文件写着",
-        "文件内容",
-        "资料写着",
-        "文档写着",
-        "system指令",
-        "reasoning推测",
+fn is_direct_user_terminal_separator(character: char) -> bool {
+    matches!(character, '。' | '！' | '!' | '？' | '?')
+}
+
+fn is_explicit_memory_prefix_separator(character: char) -> bool {
+    matches!(character, '：' | ':' | '，' | ',' | '。' | '、')
+}
+
+/// 来源资格采用正向、可证明的语法，而不是枚举网页、文件、Tool 等外部来源名称。
+/// 只要句子包含从句边界、否定、转述、推理或并列信号，就无法证明候选是当前
+/// 用户的单一直接断言，因此一律 fail closed。
+fn has_ambiguous_direct_user_syntax(value: &str) -> bool {
+    const CLAUSE_OR_QUOTE_MARKERS: [char; 19] = [
+        '，', ',', '、', '；', ';', '：', ':', '\n', '\r', '“', '”', '‘', '’', '「', '」', '『',
+        '』', '《', '》',
     ];
-    MARKERS.iter().any(|marker| value.contains(marker))
+    if value
+        .chars()
+        .any(|character| CLAUSE_OR_QUOTE_MARKERS.contains(&character))
+    {
+        return true;
+    }
+    const AMBIGUOUS_MARKERS: [&str; 30] = [
+        "不", "没", "未", "无", "并非", "不是", "否认", "另外", "还有", "并且", "而且", "以及",
+        "同时", "但是", "不过", "却", "也", "听说", "据说", "声称", "转述", "报道", "报告", "显示",
+        "推测", "推断", "猜测", "认为", "可能", "似乎",
+    ];
+    AMBIGUOUS_MARKERS
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+/// 裸 `我` 后只接受描述当前用户状态、偏好或意图的正向谓词。这里是正向
+/// 能力边界，不是外部来源黑名单；未被证明是第一人称谓词的名词和转述动词
+/// 都会自然落到拒绝分支。
+fn is_safe_direct_user_predicate(value: &str) -> bool {
+    const PREDICATES: [&str; 25] = [
+        "是",
+        "叫",
+        "喜欢",
+        "偏好",
+        "习惯",
+        "通常",
+        "常常",
+        "经常",
+        "希望",
+        "想要",
+        "需要",
+        "使用",
+        "选择",
+        "计划",
+        "打算",
+        "正在",
+        "会",
+        "能够",
+        "从事",
+        "工作",
+        "学习",
+        "关注",
+        "住在",
+        "来自",
+        "倾向于",
+    ];
+    PREDICATES
+        .iter()
+        .any(|predicate| value.starts_with(predicate) && value.len() > predicate.len())
+}
+
+/// `我的` 只接受明确属于当前用户的有限属性槽位，并要求使用系词提供值。
+/// 这避免把“我的亲属/同事……”之类第三方事实误当成用户自身事实。
+fn is_safe_direct_user_attribute(value: &str) -> bool {
+    const ATTRIBUTES: [&str; 23] = [
+        "名字",
+        "昵称",
+        "称呼",
+        "生日",
+        "纪念日",
+        "时区",
+        "职业",
+        "工作",
+        "目标",
+        "计划",
+        "需求",
+        "饮品偏好",
+        "食物偏好",
+        "颜色偏好",
+        "语言偏好",
+        "工具偏好",
+        "工作偏好",
+        "沟通偏好",
+        "代码风格",
+        "工作习惯",
+        "学习习惯",
+        "作息习惯",
+        "常用语言",
+    ];
+    ATTRIBUTES.iter().any(|attribute| {
+        value.strip_prefix(attribute).is_some_and(|rest| {
+            rest.strip_prefix('是')
+                .or_else(|| rest.strip_prefix('为'))
+                .is_some_and(|fact| !fact.is_empty())
+        })
+    })
 }
 
 fn is_ignored_format_character(character: char) -> bool {
@@ -285,6 +353,7 @@ fn fold_common_homoglyph(character: char) -> char {
         'а' | 'α' => 'a',
         'в' | 'β' => 'b',
         'с' | 'ϲ' => 'c',
+        'ԁ' => 'd',
         'е' | 'ε' => 'e',
         'һ' | 'η' => 'h',
         'і' | 'ι' => 'i',
@@ -296,6 +365,7 @@ fn fold_common_homoglyph(character: char) -> char {
         'р' | 'ρ' => 'p',
         'ѕ' => 's',
         'т' | 'τ' => 't',
+        'ԝ' => 'w',
         'х' | 'χ' => 'x',
         'у' | 'υ' => 'y',
         _ => character,

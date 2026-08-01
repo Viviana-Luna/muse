@@ -333,7 +333,7 @@ pub(crate) async fn handle_fetch_model_catalog(
     }))
 }
 
-async fn probe_provider_chat(
+pub(crate) async fn probe_provider_chat(
     api_base: &str,
     model: &str,
     api_key: &str,
@@ -666,7 +666,7 @@ async fn stored_api_key_for_provider(
     }
 }
 
-async fn fetch_provider_models(
+pub(crate) async fn fetch_provider_models(
     provider: &str,
     purpose: &str,
     api_base: &str,
