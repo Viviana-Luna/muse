@@ -3480,25 +3480,43 @@ async fn canonical_tool_events_survive_store_reopen_with_equivalent_provider_fra
 }
 
 async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholders() {
+    use axum::response::IntoResponse as _;
+
+    const MEMORY_ID: &str = "memory-1767225600000-1";
+    const REVISION_ID: &str = "memory-rev-1767225600000-2";
+    const MUTATION_REVISION_ID: &str = "memory-rev-1767225600000-3";
+    const DELETION_ID: &str = "memory-confirm-1767225600000-4";
+    const QUERY_SENTINEL: &str = "QUERY_SENTINEL_SECRET";
+    const CONTENT_SENTINEL: &str = "CONTENT_SENTINEL_SECRET";
+    const CHANGE_REASON_SENTINEL: &str = "CHANGE_REASON_SENTINEL_SECRET";
+    const SENSITIVE_INPUT_SENTINEL: &str = "SENSITIVE_INPUT_SENTINEL_SECRET";
+    const CURSOR_SENTINEL: &str = "CURSOR_SENTINEL_SECRET";
+    const MALICIOUS_ID_SENTINEL: &str = "MALICIOUS_ID_SENTINEL_SECRET";
+    const MALICIOUS_CODE_SENTINEL: &str = "MALICIOUS_CODE_SENTINEL_SECRET";
+    const MALICIOUS_ARGUMENT_KEY_SENTINEL: &str = "MALICIOUS_ARGUMENT_KEY_SENTINEL_SECRET";
+    const CALL_ID_SENTINEL: &str = "CALL_ID_SENTINEL_SECRET";
+
     let config_dir = unique_temp_dir("memory-session-redaction");
     let state = build_test_state(&config_dir);
     let turn = test_turn_context("turn-memory-redaction");
     let conversation_id = turn.conversation_id.clone();
     let turn_id = turn.turn_id.clone();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
 
-    // memory_query：query 原文、游标、排序分数与记忆正文都不得落盘。
-    let query_call = test_tool_call(
+    // memory_query：真实 SSE 与 Session 都不能暴露 query、游标、排序分数或正文。
+    let mut query_call = test_tool_call(
         "memory_query",
         serde_json::json!({
-            "query": "用户的早餐习惯是什么",
+            "query": QUERY_SENTINEL,
             "limit": 5,
-            "cursor": "opaque-cursor-token-001",
+            "cursor": CURSOR_SENTINEL,
             "include_history": false,
         }),
     );
+    query_call.call_id = format!("provider-call/{CALL_ID_SENTINEL}");
     super::emit_and_record_tool_call(
         &state,
-        None,
+        Some(&event_tx),
         &turn,
         &query_call,
         "low",
@@ -3508,42 +3526,102 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     .await
     .unwrap();
     let query_result = ToolResult::success(
-        "找到 1 条记忆：用户更喜欢在晚上吃第一顿饭",
+        format!("找到 1 条记忆：{CONTENT_SENTINEL}，排序分数 0.987654321"),
         Some(serde_json::json!({
             "items": [{
-                "memory_id": "mem-001",
-                "revision_id": "rev-001",
+                "memory_id": MEMORY_ID,
+                "revision_id": REVISION_ID,
                 "category": "user_preference",
-                "content": "用户更喜欢在晚上吃第一顿饭",
+                "content": CONTENT_SENTINEL,
                 "importance": "high",
-                "score": 0.87,
-                "change_reason": "用户在当前对话中更新了自己的用餐习惯"
+                "event_time": null,
+                "recorded_at": "2026-08-01T00:00:00Z",
+                "valid_from": "2026-08-01T00:00:00Z",
+                "valid_to": null,
+                "change_type": "create",
+                "change_reason": CHANGE_REASON_SENTINEL
             }],
             "has_more": true,
-            "next_cursor": "opaque-cursor-token-002"
+            "next_cursor": CURSOR_SENTINEL
         })),
     );
-    let returned =
-        super::emit_and_record_tool_result(&state, None, &turn, &query_call, &query_result)
-            .await
-            .unwrap();
+    let returned = super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &query_call,
+        &query_result,
+    )
+    .await
+    .unwrap();
     // 返回给工具循环的结果保持完整，供当前 Turn 私有工作副本继续推理。
     assert_eq!(returned.content, query_result.content);
 
+    // 畸形 ID 与任意参数键名都必须降级为无正文安全失败。
+    let mut invalid_query_call = test_tool_call(
+        "memory_query",
+        serde_json::json!({
+            "query": SENSITIVE_INPUT_SENTINEL,
+            (MALICIOUS_ARGUMENT_KEY_SENTINEL): SENSITIVE_INPUT_SENTINEL,
+        }),
+    );
+    invalid_query_call.call_id = "test-memory-query-invalid".to_string();
+    super::emit_and_record_tool_call(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &invalid_query_call,
+        "low",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let invalid_query_result = ToolResult::success(
+        SENSITIVE_INPUT_SENTINEL,
+        Some(serde_json::json!({
+            "items": [{
+                "memory_id": format!("{MEMORY_ID}/{MALICIOUS_ID_SENTINEL}"),
+                "revision_id": REVISION_ID,
+                "category": "user_fact",
+                "content": SENSITIVE_INPUT_SENTINEL,
+                "importance": "normal",
+                "event_time": null,
+                "recorded_at": "2026-08-01T00:00:00Z",
+                "valid_from": "2026-08-01T00:00:00Z",
+                "valid_to": null,
+                "change_type": "create",
+                "change_reason": SENSITIVE_INPUT_SENTINEL
+            }],
+            "has_more": false
+        })),
+    );
+    super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &invalid_query_call,
+        &invalid_query_result,
+    )
+    .await
+    .unwrap();
+
     // memory_mutate：整理后 content、change_reason 与敏感检测输入不得落盘。
-    let mutate_call = test_tool_call(
+    let mut mutate_call = test_tool_call(
         "memory_mutate",
         serde_json::json!({
             "operation": "create",
             "category": "user_preference",
-            "content": "用户更喜欢在晚上吃第一顿饭",
+            "content": CONTENT_SENTINEL,
             "importance": "high",
-            "change_reason": "用户在当前对话中更新了自己的用餐习惯"
+            "event_time": null,
+            "change_reason": CHANGE_REASON_SENTINEL
         }),
     );
+    mutate_call.call_id = "test-memory-mutate-valid".to_string();
     super::emit_and_record_tool_call(
         &state,
-        None,
+        Some(&event_tx),
         &turn,
         &mutate_call,
         "low",
@@ -3553,29 +3631,36 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     .await
     .unwrap();
     let mutate_result = ToolResult::success(
-        "已接受，等待本轮提交：用户更喜欢在晚上吃第一顿饭",
+        format!("已接受，等待本轮提交：{CONTENT_SENTINEL}"),
         Some(serde_json::json!({
             "operation": "create",
-            "memory_id": "mem-001",
-            "revision_id": "rev-002",
+            "memory_id": MEMORY_ID,
+            "revision_id": MUTATION_REVISION_ID,
             "state": "staged"
         })),
     );
-    super::emit_and_record_tool_result(&state, None, &turn, &mutate_call, &mutate_result)
-        .await
-        .unwrap();
+    super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &mutate_call,
+        &mutate_result,
+    )
+    .await
+    .unwrap();
 
     // memory_delete：只保留删除范围、不可逆结果与安全错误码。
-    let delete_call = test_tool_call(
+    let mut delete_call = test_tool_call(
         "memory_delete",
         serde_json::json!({
             "scope": "memory",
-            "memory_id": "mem-001"
+            "memory_id": MEMORY_ID
         }),
     );
+    delete_call.call_id = "test-memory-delete-valid".to_string();
     super::emit_and_record_tool_call(
         &state,
-        None,
+        Some(&event_tx),
         &turn,
         &delete_call,
         "high",
@@ -3585,16 +3670,65 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     .await
     .unwrap();
     let delete_result = ToolResult::success(
-        "已彻底删除：用户更喜欢在晚上吃第一顿饭",
+        format!("已彻底删除：{CONTENT_SENTINEL}"),
         Some(serde_json::json!({
-            "deletion_id": "del-001",
+            "deletion_id": DELETION_ID,
             "deleted_memory_count": 1,
-            "completed_at": "2026-07-30T08:00:00Z"
+            "completed_at": "2026-08-01T00:01:00Z"
         })),
     );
-    super::emit_and_record_tool_result(&state, None, &turn, &delete_call, &delete_result)
-        .await
-        .unwrap();
+    super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &delete_call,
+        &delete_result,
+    )
+    .await
+    .unwrap();
+
+    // 任意 memory_* 前缀、reason 与 message 都不能冒充稳定错误码。
+    let mut failed_call = test_tool_call(
+        "memory_mutate",
+        serde_json::json!({
+            "operation": "create",
+            "category": "user_fact",
+            "content": SENSITIVE_INPUT_SENTINEL,
+            "importance": "normal",
+            "event_time": null,
+            "change_reason": SENSITIVE_INPUT_SENTINEL
+        }),
+    );
+    failed_call.call_id = "test-memory-mutate-failed".to_string();
+    super::emit_and_record_tool_call(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &failed_call,
+        "low",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .unwrap();
+    let failed_result = ToolResult {
+        status: ToolResultStatus::from_success(false),
+        content: SENSITIVE_INPUT_SENTINEL.to_string(),
+        structured: Some(serde_json::json!({
+            "error_code": format!("memory_future_{MALICIOUS_CODE_SENTINEL}"),
+            "reason": "memory_sensitive_content_rejected",
+            "message": SENSITIVE_INPUT_SENTINEL,
+        })),
+    };
+    super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &failed_call,
+        &failed_result,
+    )
+    .await
+    .unwrap();
 
     // 非记忆工具对照：既有 canonical transcript 行为零回归。
     let command_call = test_tool_call(
@@ -3606,7 +3740,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     );
     super::emit_and_record_tool_call(
         &state,
-        None,
+        Some(&event_tx),
         &turn,
         &command_call,
         "medium",
@@ -3619,9 +3753,25 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
         "build completed",
         Some(serde_json::json!({ "stdout": "build completed", "status": 0 })),
     );
-    super::emit_and_record_tool_result(&state, None, &turn, &command_call, &command_result)
+    super::emit_and_record_tool_result(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &command_call,
+        &command_result,
+    )
+    .await
+    .unwrap();
+
+    // 真正消费 tx=Some 产生的 SSE 帧，不能只调用 payload helper 自证。
+    drop(event_tx);
+    let sse_response =
+        axum::response::sse::Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
+            .into_response();
+    let sse_bytes = axum::body::to_bytes(sse_response.into_body(), usize::MAX)
         .await
-        .unwrap();
+        .expect("应能接收完整 SSE 事件流");
+    let sse_text = String::from_utf8(sse_bytes.to_vec()).expect("SSE 应为 UTF-8");
 
     super::append_transcript_record(
         &state,
@@ -3635,7 +3785,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     .await
     .unwrap();
 
-    // generation 回读：从会话存储导出 Session JSONL 并做全文扫描。
+    // generation 回读：从会话存储导出 Session JSONL，并与真实 SSE 一起全文扫描。
     let store = state
         .runtime_service
         .session_store()
@@ -3647,26 +3797,46 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
         .unwrap();
     let transcript = super::session_events_as_jsonl(&events);
     for forbidden in [
-        "用户的早餐习惯",
-        "用户更喜欢在晚上吃第一顿饭",
-        "用户在当前对话中更新了自己的用餐习惯",
-        "opaque-cursor-token",
-        "0.87",
+        QUERY_SENTINEL,
+        CONTENT_SENTINEL,
+        CHANGE_REASON_SENTINEL,
+        SENSITIVE_INPUT_SENTINEL,
+        CURSOR_SENTINEL,
+        "0.987654321",
+        MALICIOUS_ID_SENTINEL,
+        MALICIOUS_CODE_SENTINEL,
+        MALICIOUS_ARGUMENT_KEY_SENTINEL,
+        CALL_ID_SENTINEL,
     ] {
         assert!(
             !transcript.contains(forbidden),
             "Session JSONL 不得包含 `{forbidden}`"
         );
+        assert!(!sse_text.contains(forbidden), "SSE 不得包含 `{forbidden}`");
     }
     // 去正文收据的白名单字段应保留。
-    assert!(transcript.contains("mem-001"));
-    assert!(transcript.contains("rev-001"));
-    assert!(transcript.contains("\"returned_count\":1"));
-    assert!(transcript.contains("\"state\":\"staged\""));
-    assert!(transcript.contains("\"deleted_memory_count\":1"));
+    for allowed in [
+        MEMORY_ID,
+        REVISION_ID,
+        MUTATION_REVISION_ID,
+        DELETION_ID,
+        "memory-call-",
+        "\"returned_count\":1",
+        "\"state\":\"staged\"",
+        "\"deleted_memory_count\":1",
+        "\"completed_at\":\"2026-08-01T00:01:00Z\"",
+    ] {
+        assert!(
+            transcript.contains(allowed),
+            "Session JSONL 应保留 `{allowed}`"
+        );
+        assert!(sse_text.contains(allowed), "SSE 应保留 `{allowed}`");
+    }
     // 非记忆工具的 canonical 内容与结果保持完整。
     assert!(transcript.contains("cargo test --workspace"));
     assert!(transcript.contains("build completed"));
+    assert!(sse_text.contains("cargo test --workspace"));
+    assert!(sse_text.contains("build completed"));
 
     // 恢复：配对合法、记忆 Tool 降级为协议合法占位、绝不重新执行。
     let (replayed, _) = super::replay_runtime_transcript_lines(
@@ -3694,10 +3864,14 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     }
     let replayed_text = serde_json::to_string(&replayed.messages).unwrap();
     for forbidden in [
-        "用户的早餐习惯",
-        "用户更喜欢在晚上吃第一顿饭",
-        "用户在当前对话中更新了自己的用餐习惯",
-        "opaque-cursor-token",
+        QUERY_SENTINEL,
+        CONTENT_SENTINEL,
+        CHANGE_REASON_SENTINEL,
+        SENSITIVE_INPUT_SENTINEL,
+        CURSOR_SENTINEL,
+        MALICIOUS_ID_SENTINEL,
+        MALICIOUS_CODE_SENTINEL,
+        CALL_ID_SENTINEL,
     ] {
         assert!(
             !replayed_text.contains(forbidden),
@@ -3780,13 +3954,49 @@ fn replay_compatibly_treats_legacy_argument_audit_as_unknown_arguments() {
 }
 
 fn memory_session_receipts_keep_only_whitelisted_fields() {
+    const MEMORY_ID: &str = "memory-1767225600000-11";
+    const REVISION_ID: &str = "memory-rev-1767225600000-12";
+    const EXPECTED_REVISION_ID: &str = "memory-rev-1767225600000-13";
+    const DELETION_ID: &str = "memory-confirm-1767225600000-14";
+    const SENTINEL: &str = "WHITELIST_SLOT_SENTINEL_SECRET";
+
+    fn valid_query_result() -> serde_json::Value {
+        serde_json::json!({
+            "items": [{
+                "memory_id": MEMORY_ID,
+                "revision_id": REVISION_ID,
+                "category": "user_preference",
+                "content": SENTINEL,
+                "importance": "high",
+                "event_time": null,
+                "recorded_at": "2026-08-01T00:00:00Z",
+                "valid_from": "2026-08-01T00:00:00Z",
+                "valid_to": null,
+                "change_type": "create",
+                "change_reason": SENTINEL
+            }],
+            "has_more": true,
+            "next_cursor": "WHITELIST_SLOT_SENTINEL_SECRET"
+        })
+    }
+
+    fn assert_safe_failure(receipt: &super::MemorySessionResultReceipt) {
+        assert!(!receipt.success);
+        assert_eq!(receipt.structured["state"], "error");
+        assert_eq!(
+            receipt.structured["error_code"],
+            "memory_repository_unavailable"
+        );
+        assert!(!format!("{}{}", receipt.content, receipt.structured).contains(SENTINEL));
+    }
+
     // memory_query 调用收据：游标续查形态，不落 query 原文与游标值。
     let receipt = super::memory_session_call_receipt(
         "memory_query",
         &serde_json::json!({
-            "query": "用户的早餐习惯",
+            "query": SENTINEL,
             "limit": 5,
-            "cursor": "opaque-cursor-token",
+            "cursor": SENTINEL,
             "include_history": true
         }),
     )
@@ -3799,29 +4009,30 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     // 按 ID 查询形态保留 memory_id。
     let receipt = super::memory_session_call_receipt(
         "memory_query",
-        &serde_json::json!({ "query": "按 ID", "memory_id": "mem-9" }),
+        &serde_json::json!({ "query": SENTINEL, "memory_id": MEMORY_ID }),
     )
     .unwrap();
     assert_eq!(receipt["query_kind"], "by_id");
-    assert_eq!(receipt["memory_id"], "mem-9");
+    assert_eq!(receipt["memory_id"], MEMORY_ID);
 
     // memory_mutate 调用收据：只保留 operation 与稳定标识。
     let receipt = super::memory_session_call_receipt(
         "memory_mutate",
         &serde_json::json!({
             "operation": "update",
-            "memory_id": "mem-1",
-            "expected_revision_id": "rev-1",
+            "memory_id": MEMORY_ID,
+            "expected_revision_id": EXPECTED_REVISION_ID,
             "category": "user_fact",
-            "content": "整理后的记忆正文",
+            "content": SENTINEL,
             "importance": "high",
-            "change_reason": "变化原因正文"
+            "event_time": null,
+            "change_reason": SENTINEL
         }),
     )
     .expect("memory_mutate 应生成调用收据");
     assert_eq!(receipt["operation"], "update");
-    assert_eq!(receipt["memory_id"], "mem-1");
-    assert_eq!(receipt["expected_revision_id"], "rev-1");
+    assert_eq!(receipt["memory_id"], MEMORY_ID);
+    assert_eq!(receipt["expected_revision_id"], EXPECTED_REVISION_ID);
     for dropped in ["content", "change_reason", "category", "importance"] {
         assert!(receipt.get(dropped).is_none(), "收据不得保留 {dropped}");
     }
@@ -3835,51 +4046,209 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     assert_eq!(receipt["scope"], "persona_all");
     assert!(receipt.get("memory_id").is_none());
 
-    // memory_query 结果收据：只保留数量、稳定 ID 与状态。
-    let query_result = ToolResult::success(
-        "查询完成",
-        Some(serde_json::json!({
-            "items": [{
-                "memory_id": "mem-1",
-                "revision_id": "rev-1",
-                "content": "记忆正文",
-                "score": 0.95,
-                "change_reason": "原因正文"
-            }],
-            "has_more": true,
-            "next_cursor": "opaque-cursor-token"
-        })),
-    );
+    // memory_query 成功结果必须先完整解析 F1 typed receipt，再输出固定白名单。
+    let query_result = ToolResult::success(SENTINEL, Some(valid_query_result()));
     let receipt = super::memory_session_result_receipt("memory_query", &query_result).unwrap();
+    assert!(receipt.success);
     assert_eq!(receipt.structured["returned_count"], 1);
-    assert_eq!(receipt.structured["memory_ids"][0], "mem-1");
-    assert_eq!(receipt.structured["revision_ids"][0], "rev-1");
+    assert_eq!(receipt.structured["memory_ids"][0], MEMORY_ID);
+    assert_eq!(receipt.structured["revision_ids"][0], REVISION_ID);
     assert_eq!(receipt.structured["has_more"], true);
     let receipt_text = format!("{}{}", receipt.content, receipt.structured);
-    for forbidden in ["记忆正文", "原因正文", "0.95", "opaque-cursor-token"] {
-        assert!(
-            !receipt_text.contains(forbidden),
-            "结果收据不得包含 `{forbidden}`"
-        );
+    assert!(!receipt_text.contains(SENTINEL));
+
+    // 每个来自 Tool 的字符串槽位都要经过枚举、时间或稳定 ID 格式校验。
+    let invalid_calls = [
+        (
+            "memory_query",
+            serde_json::json!({
+                "query": "安全查询",
+                "memory_id": format!("{MEMORY_ID}/{SENTINEL}")
+            }),
+        ),
+        (
+            "memory_mutate",
+            serde_json::json!({
+                "operation": SENTINEL,
+                "category": "user_fact",
+                "content": "安全正文",
+                "importance": "normal",
+                "event_time": null,
+                "change_reason": "安全原因"
+            }),
+        ),
+        (
+            "memory_mutate",
+            serde_json::json!({
+                "operation": "update",
+                "memory_id": format!("{MEMORY_ID}/{SENTINEL}"),
+                "expected_revision_id": EXPECTED_REVISION_ID,
+                "category": "user_fact",
+                "content": "安全正文",
+                "importance": "normal",
+                "event_time": null,
+                "change_reason": "安全原因"
+            }),
+        ),
+        (
+            "memory_mutate",
+            serde_json::json!({
+                "operation": "update",
+                "memory_id": MEMORY_ID,
+                "expected_revision_id": format!("{EXPECTED_REVISION_ID}/{SENTINEL}"),
+                "category": "user_fact",
+                "content": "安全正文",
+                "importance": "normal",
+                "event_time": null,
+                "change_reason": "安全原因"
+            }),
+        ),
+        (
+            "memory_mutate",
+            serde_json::json!({
+                "operation": "create",
+                "category": SENTINEL,
+                "content": "安全正文",
+                "importance": "normal",
+                "event_time": null,
+                "change_reason": "安全原因"
+            }),
+        ),
+        (
+            "memory_mutate",
+            serde_json::json!({
+                "operation": "create",
+                "category": "user_fact",
+                "content": "安全正文",
+                "importance": SENTINEL,
+                "event_time": null,
+                "change_reason": "安全原因"
+            }),
+        ),
+        ("memory_delete", serde_json::json!({ "scope": SENTINEL })),
+        (
+            "memory_delete",
+            serde_json::json!({
+                "scope": "memory",
+                "memory_id": format!("{MEMORY_ID}/{SENTINEL}")
+            }),
+        ),
+    ];
+    for (tool_name, arguments) in invalid_calls {
+        let receipt = super::memory_session_call_receipt(tool_name, &arguments)
+            .expect("记忆调用即使畸形也应生成安全收据");
+        assert_eq!(receipt["error_code"], "memory_invalid_request");
+        assert!(!receipt.to_string().contains(SENTINEL));
     }
+
+    for pointer in [
+        "/items/0/memory_id",
+        "/items/0/revision_id",
+        "/items/0/category",
+        "/items/0/importance",
+        "/items/0/event_time",
+        "/items/0/recorded_at",
+        "/items/0/valid_from",
+        "/items/0/valid_to",
+        "/items/0/change_type",
+    ] {
+        let mut structured = valid_query_result();
+        *structured.pointer_mut(pointer).expect("测试字段应存在") =
+            serde_json::Value::String(SENTINEL.to_string());
+        let result = ToolResult::success(SENTINEL, Some(structured));
+        let receipt =
+            super::memory_session_result_receipt("memory_query", &result).expect("应生成收据");
+        assert_safe_failure(&receipt);
+    }
+
+    let valid_mutation = serde_json::json!({
+        "operation": "create",
+        "memory_id": MEMORY_ID,
+        "revision_id": REVISION_ID,
+        "state": "staged"
+    });
+    for field in ["operation", "memory_id", "revision_id", "state"] {
+        let mut structured = valid_mutation.clone();
+        structured[field] = serde_json::Value::String(if field == "memory_id" {
+            format!("{MEMORY_ID}/{SENTINEL}")
+        } else if field == "revision_id" {
+            format!("{REVISION_ID}/{SENTINEL}")
+        } else {
+            SENTINEL.to_string()
+        });
+        let result = ToolResult::success(SENTINEL, Some(structured));
+        let receipt =
+            super::memory_session_result_receipt("memory_mutate", &result).expect("应生成收据");
+        assert_safe_failure(&receipt);
+    }
+
+    let valid_delete = serde_json::json!({
+        "deletion_id": DELETION_ID,
+        "deleted_memory_count": 1,
+        "completed_at": "2026-08-01T00:01:00Z"
+    });
+    for field in ["deletion_id", "completed_at"] {
+        let mut structured = valid_delete.clone();
+        structured[field] = serde_json::Value::String(if field == "deletion_id" {
+            format!("{DELETION_ID}/{SENTINEL}")
+        } else {
+            SENTINEL.to_string()
+        });
+        let result = ToolResult::success(SENTINEL, Some(structured));
+        let receipt =
+            super::memory_session_result_receipt("memory_delete", &result).expect("应生成收据");
+        assert_safe_failure(&receipt);
+    }
+
+    let delete_result = ToolResult::success("安全删除", Some(valid_delete));
+    let receipt = super::memory_session_result_receipt("memory_delete", &delete_result).unwrap();
+    assert!(receipt.success);
+    assert_eq!(receipt.structured["deletion_id"], DELETION_ID);
+    assert_eq!(receipt.structured["completed_at"], "2026-08-01T00:01:00Z");
 
     // 失败结果：只保留稳定安全错误码，错误正文中的敏感检测输入不落盘。
     let failed = ToolResult {
         status: ToolResultStatus::from_success(false),
-        content: "敏感检测拒绝：用户身份证号 110101199001011234".to_string(),
+        content: SENTINEL.to_string(),
         structured: Some(serde_json::json!({
             "error_code": "memory_sensitive_content_rejected",
-            "detail": "用户身份证号 110101199001011234"
+            "detail": SENTINEL
         })),
     };
     let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
+    assert!(!receipt.success);
     assert_eq!(receipt.structured["state"], "error");
     assert_eq!(
         receipt.structured["error_code"],
         "memory_sensitive_content_rejected"
     );
     let receipt_text = format!("{}{}", receipt.content, receipt.structured);
-    assert!(!receipt_text.contains("110101199001011234"));
+    assert!(!receipt_text.contains(SENTINEL));
+
+    for code_field in ["error_code", "code"] {
+        let failed = ToolResult {
+            status: ToolResultStatus::from_success(false),
+            content: SENTINEL.to_string(),
+            structured: Some(serde_json::json!({
+                (code_field): format!("memory_future_{SENTINEL}"),
+                "reason": "memory_sensitive_content_rejected",
+                "message": SENTINEL,
+            })),
+        };
+        let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
+        assert!(receipt.structured.get("error_code").is_none());
+        assert!(!format!("{}{}", receipt.content, receipt.structured).contains(SENTINEL));
+    }
+    let reason_only = ToolResult {
+        status: ToolResultStatus::from_success(false),
+        content: SENTINEL.to_string(),
+        structured: Some(serde_json::json!({
+            "reason": "memory_sensitive_content_rejected",
+            "message": SENTINEL,
+        })),
+    };
+    let receipt = super::memory_session_result_receipt("memory_delete", &reason_only).unwrap();
+    assert!(receipt.structured.get("error_code").is_none());
 
     // 非记忆工具不进入记忆去正文路径。
     assert!(super::memory_session_call_receipt("command_run", &serde_json::json!({})).is_none());
