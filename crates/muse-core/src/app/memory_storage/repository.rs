@@ -1,5 +1,7 @@
 //! Persona 长期记忆的 SQLite Repository。
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -37,14 +39,18 @@ pub const MAX_REVISION_HISTORY_PAGE_SIZE: usize = 64;
 const REVISION_HISTORY_STORAGE_BATCH_SIZE: usize = MAX_REVISION_HISTORY_PAGE_SIZE;
 const MAX_REVISION_HISTORY_PAGE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_ACTIVE_MEMORY_COUNT_ROWS: usize = 512;
-const MAX_ACTIVE_MEMORY_COUNT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_REVISION_METADATA_FIELD_BYTES: usize = 1024;
+const MAX_MEMORY_READ_SCAN_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_REVISION_METADATA_FIELD_BYTES: usize = 1024;
+const MEMORY_ENTRY_TEXT_FIELD_COUNT: usize = 8;
+const MAX_MEMORY_ENTRY_ROW_BYTES: usize =
+    MAX_REVISION_METADATA_FIELD_BYTES * MEMORY_ENTRY_TEXT_FIELD_COUNT;
 const MAX_REVISION_SOURCE_FIELD_BYTES: usize = 256;
 const MAX_REVISION_SOURCE_BYTES: usize = MAX_REVISION_SOURCE_FIELD_BYTES * 5;
 const MAX_REVISION_ROW_BYTES: usize = MAX_MEMORY_CONTENT_BYTES
     + MAX_MEMORY_CHANGE_REASON_BYTES
     + MAX_REVISION_SOURCE_BYTES
     + MAX_REVISION_METADATA_FIELD_BYTES * 10;
+const MAX_MEMORY_RECORD_BYTES: usize = MAX_MEMORY_ENTRY_ROW_BYTES + MAX_REVISION_ROW_BYTES;
 const REVISION_SQLITE_PROGRESS_INTERVAL_OPS: i32 = 1_000;
 const MAX_REVISION_SQLITE_PROGRESS_CALLBACKS: usize = 20_000;
 const RFC3339_MICROS_SQL_FUNCTION: &str = "muse_rfc3339_micros";
@@ -52,6 +58,28 @@ use crate::domain::memory::{
     MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_CHARS,
     validate_memory_change_reason, validate_memory_content, validate_memory_query_text,
 };
+
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_REVISION_MATERIALIZATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn install_revision_materialization_test_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_REVISION_MATERIALIZATION_HOOK.with(|slot| {
+        let previous = slot.replace(Some(Box::new(hook)));
+        assert!(previous.is_none(), "同一测试线程不得叠加 revision 物化钩子");
+    });
+}
+
+#[cfg(test)]
+fn run_revision_materialization_test_hook() {
+    let hook = BEFORE_REVISION_MATERIALIZATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// 管理审计读取的一页 revision；`next_cursor` 是稳定 revision_id keyset。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +90,11 @@ pub struct MemoryRevisionHistoryPage {
 
 pub(crate) struct BoundedMemoryRecord {
     pub record: MemoryRecord,
+    pub materialized_bytes: usize,
+}
+
+pub(crate) struct BoundedMemoryEntry {
+    pub entry: MemoryEntry,
     pub materialized_bytes: usize,
 }
 
@@ -132,51 +165,86 @@ impl SqliteMemoryRepository {
         let normalized = normalize_memory_fts_query(query)?;
         let authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(repository_unavailable)?;
-        let mut statement = transaction
-            .prepare(
-                "SELECT projection.memory_id
-                 FROM memory_fts
-                 JOIN memory_search_projection AS projection
-                   ON projection.row_id = memory_fts.rowid
-                  AND projection.persona_id = ?2
-                 WHERE memory_fts MATCH ?1
-                   AND memory_fts.persona_id = ?2
-                 ORDER BY bm25(memory_fts), projection.memory_id
-                 LIMIT ?3",
-            )
-            .map_err(repository_unavailable)?;
-        let memory_ids = statement
-            .query_map(
-                params![normalized, scope.persona_id(), limit as i64],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(repository_unavailable)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(repository_unavailable)?;
-        drop(statement);
+        let exhausted = install_revision_progress_handler(&connection);
+        let result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(repository_unavailable)?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT CASE
+                                WHEN typeof(projection.memory_id) = 'text'
+                                 AND length(CAST(projection.memory_id AS BLOB)) <= ?4
+                                THEN projection.memory_id
+                            END,
+                            length(CAST(projection.memory_id AS BLOB))
+                     FROM memory_fts
+                     JOIN memory_search_projection AS projection
+                       ON projection.row_id = memory_fts.rowid
+                      AND projection.persona_id = ?2
+                     WHERE memory_fts MATCH ?1
+                       AND memory_fts.persona_id = ?2
+                     ORDER BY bm25(memory_fts), projection.memory_id
+                     LIMIT ?3",
+                )
+                .map_err(repository_unavailable)?;
+            let raw_memory_ids = statement
+                .query_map(
+                    params![
+                        normalized,
+                        scope.persona_id(),
+                        limit as i64,
+                        MAX_REVISION_METADATA_FIELD_BYTES as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
+                )
+                .map_err(repository_unavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(repository_unavailable)?;
+            drop(statement);
 
-        let mut records = Vec::with_capacity(memory_ids.len());
-        for memory_id in memory_ids {
-            let Some(record) = load_current(
-                &transaction,
-                scope,
-                &MemoryId(memory_id),
-                MAX_REVISION_ROW_BYTES,
-            )?
-            .map(|bounded| bounded.record) else {
-                continue;
-            };
-            if record_is_blocked(&authority_guard, &self.authority, scope, &record)? {
-                continue;
+            let mut records = Vec::with_capacity(raw_memory_ids.len());
+            let mut materialized_bytes = 0_usize;
+            for (memory_id, memory_id_bytes) in raw_memory_ids {
+                let memory_id_bytes = bounded_revision_length(
+                    required_revision_length(memory_id_bytes)?,
+                    MAX_REVISION_METADATA_FIELD_BYTES,
+                )?;
+                materialized_bytes = materialized_bytes
+                    .checked_add(memory_id_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                let memory_id = memory_id
+                    .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+                let remaining_bytes = MAX_MEMORY_READ_SCAN_BYTES
+                    .checked_sub(materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                let Some(bounded) =
+                    load_current(&transaction, scope, &MemoryId(memory_id), remaining_bytes)?
+                else {
+                    continue;
+                };
+                materialized_bytes = materialized_bytes
+                    .checked_add(bounded.materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                if record_is_blocked(&authority_guard, &self.authority, scope, &bounded.record)? {
+                    continue;
+                }
+                records.push(bounded.record);
             }
-            records.push(record);
+            transaction.commit().map_err(repository_unavailable)?;
+            authority_guard.finish()?;
+            Ok(records)
+        })();
+        if exhausted.load(Ordering::Relaxed) {
+            Err(query_budget_exceeded())
+        } else {
+            result
         }
-        transaction.commit().map_err(repository_unavailable)?;
-        authority_guard.finish()?;
-        Ok(records)
     }
 
     /// 管理审计专用的有界 revision 页（含 corrected），仅供管理 API。
@@ -317,13 +385,16 @@ impl SqliteMemoryRepository {
             let mut count = 0_u64;
             let mut materialized_bytes = 0_usize;
             for (memory_id, memory_id_bytes) in memory_ids {
-                bounded_revision_length(
+                let memory_id_bytes = bounded_revision_length(
                     required_revision_length(memory_id_bytes)?,
                     MAX_REVISION_METADATA_FIELD_BYTES,
                 )?;
+                materialized_bytes = materialized_bytes
+                    .checked_add(memory_id_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
                 let memory_id = memory_id
                     .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
-                let remaining_bytes = MAX_ACTIVE_MEMORY_COUNT_BYTES
+                let remaining_bytes = MAX_MEMORY_READ_SCAN_BYTES
                     .checked_sub(materialized_bytes)
                     .ok_or_else(query_budget_exceeded)?;
                 let bounded =
@@ -366,8 +437,9 @@ impl SqliteMemoryRepository {
         connection: &Connection,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
-    ) -> Result<Option<MemoryEntry>, MemoryError> {
-        load_active_entry(connection, scope, memory_id)
+        max_materialized_bytes: usize,
+    ) -> Result<Option<BoundedMemoryEntry>, MemoryError> {
+        load_active_entry(connection, scope, memory_id, max_materialized_bytes)
     }
 
     /// 按 as_of 时点在 SQL 层最多选出两条可读 revision；两条同时有效说明
@@ -569,7 +641,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(repository_unavailable)?;
-        let record = load_current(&transaction, scope, memory_id, MAX_REVISION_ROW_BYTES)?
+        let record = load_current(&transaction, scope, memory_id, MAX_MEMORY_RECORD_BYTES)?
             .map(|bounded| bounded.record);
         let result = match record {
             Some(record)
@@ -627,7 +699,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                         &transaction,
                         envelope.scope(),
                         mutation.assigned_memory_id(),
-                        MAX_REVISION_ROW_BYTES,
+                        MAX_MEMORY_RECORD_BYTES,
                     )?
                     .map(|bounded| bounded.record),
                 );
@@ -732,7 +804,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             &transaction,
             scope,
             mutation.assigned_memory_id(),
-            MAX_REVISION_ROW_BYTES,
+            MAX_MEMORY_RECORD_BYTES,
         )?
         .map(|bounded| bounded.record);
         let transition = mutation.transition(current.as_ref(), sensitivity)?;
@@ -785,7 +857,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             &transaction,
             scope,
             adjustment.memory_id(),
-            MAX_REVISION_ROW_BYTES,
+            MAX_MEMORY_RECORD_BYTES,
         )?
         .map(|bounded| bounded.record)
         .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
@@ -1221,6 +1293,120 @@ fn revision_snapshot_from_raw(
     })
 }
 
+struct RawMemoryEntry {
+    persona_id: Option<String>,
+    persona_id_bytes: Option<i64>,
+    memory_id: Option<String>,
+    memory_id_bytes: Option<i64>,
+    category: Option<String>,
+    category_bytes: Option<i64>,
+    current_revision_id: Option<String>,
+    current_revision_id_bytes: Option<i64>,
+    importance: Option<String>,
+    importance_bytes: Option<i64>,
+    freshness_at: Option<String>,
+    freshness_at_bytes: Option<i64>,
+    created_at: Option<String>,
+    created_at_bytes: Option<i64>,
+    state: Option<String>,
+    state_bytes: Option<i64>,
+}
+
+fn raw_memory_entry_from_row(row: &Row<'_>) -> rusqlite::Result<RawMemoryEntry> {
+    Ok(RawMemoryEntry {
+        persona_id: row.get(0)?,
+        persona_id_bytes: row.get(1)?,
+        memory_id: row.get(2)?,
+        memory_id_bytes: row.get(3)?,
+        category: row.get(4)?,
+        category_bytes: row.get(5)?,
+        current_revision_id: row.get(6)?,
+        current_revision_id_bytes: row.get(7)?,
+        importance: row.get(8)?,
+        importance_bytes: row.get(9)?,
+        freshness_at: row.get(10)?,
+        freshness_at_bytes: row.get(11)?,
+        created_at: row.get(12)?,
+        created_at_bytes: row.get(13)?,
+        state: row.get(14)?,
+        state_bytes: row.get(15)?,
+    })
+}
+
+impl RawMemoryEntry {
+    fn into_bounded_entry(
+        self,
+        scope: &MemoryPersonaScope,
+        requested_memory_id: &MemoryId,
+        maximum_bytes: usize,
+    ) -> Result<BoundedMemoryEntry, MemoryError> {
+        let lengths = [
+            self.persona_id_bytes,
+            self.memory_id_bytes,
+            self.category_bytes,
+            self.current_revision_id_bytes,
+            self.importance_bytes,
+            self.freshness_at_bytes,
+            self.created_at_bytes,
+            self.state_bytes,
+        ];
+        let mut materialized_bytes = 0_usize;
+        for length in lengths {
+            materialized_bytes = materialized_bytes
+                .checked_add(bounded_revision_length(
+                    required_revision_length(length)?,
+                    MAX_REVISION_METADATA_FIELD_BYTES,
+                )?)
+                .ok_or_else(query_budget_exceeded)?;
+        }
+        bounded_revision_length(materialized_bytes, MAX_MEMORY_ENTRY_ROW_BYTES)?;
+        if materialized_bytes > maximum_bytes {
+            return Err(query_budget_exceeded());
+        }
+
+        let persona_id = self
+            .persona_id
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let memory_id = self
+            .memory_id
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        if persona_id != scope.persona_id() || memory_id != requested_memory_id.0 {
+            return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+        }
+        let category = self
+            .category
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let current_revision_id = self
+            .current_revision_id
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let importance = self
+            .importance
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let freshness_at = self
+            .freshness_at
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let created_at = self
+            .created_at
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        let state = self
+            .state
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        Ok(BoundedMemoryEntry {
+            entry: MemoryEntry {
+                memory_id: MemoryId(memory_id),
+                persona_id,
+                category: parse_category(&category)?,
+                current_revision_id: MemoryRevisionId(current_revision_id),
+                importance: parse_importance(&importance)?,
+                freshness_at,
+                created_at,
+                state: parse_entry_state(&state)?,
+            },
+            materialized_bytes,
+        })
+    }
+}
+
 struct RawRevisionLengths {
     row_id: i64,
     revision_id_value: Option<String>,
@@ -1503,6 +1689,8 @@ fn load_revision_snapshot_by_identity(
     metadata: &RawRevisionLengths,
 ) -> Result<RevisionSnapshotRow, MemoryError> {
     let revision_id = metadata.revision_id()?;
+    #[cfg(test)]
+    run_revision_materialization_test_hook();
     let raw = connection
         .query_row(
             "SELECT revision.persona_id, revision.memory_id, revision.revision_id,
@@ -1569,18 +1757,22 @@ fn load_current(
     memory_id: &MemoryId,
     max_materialized_bytes: usize,
 ) -> Result<Option<BoundedMemoryRecord>, MemoryError> {
-    let Some(entry) = load_active_entry(connection, scope, memory_id)? else {
+    let Some(bounded_entry) =
+        load_active_entry(connection, scope, memory_id, max_materialized_bytes)?
+    else {
         return Ok(None);
     };
+    let remaining_bytes = max_materialized_bytes
+        .checked_sub(bounded_entry.materialized_bytes)
+        .ok_or_else(query_budget_exceeded)?;
+    let entry = bounded_entry.entry;
     let Some(metadata) =
         revision_lengths_by_id(connection, scope, memory_id, &entry.current_revision_id)?
     else {
         return Ok(None);
     };
-    let materialized_bytes = authorize_revision_materialization(
-        std::slice::from_ref(&metadata),
-        max_materialized_bytes,
-    )?;
+    let materialized_bytes =
+        authorize_revision_materialization(std::slice::from_ref(&metadata), remaining_bytes)?;
     let snapshot = load_revision_snapshot_by_identity(connection, scope, memory_id, &metadata)?;
     if snapshot.revision.state != MemoryRevisionState::Current
         || snapshot.revision.valid_to.is_some()
@@ -1597,7 +1789,10 @@ fn load_current(
             entry,
             current_revision: snapshot.revision,
         },
-        materialized_bytes,
+        materialized_bytes: bounded_entry
+            .materialized_bytes
+            .checked_add(materialized_bytes)
+            .ok_or_else(query_budget_exceeded)?,
     }))
 }
 
@@ -1605,42 +1800,73 @@ fn load_active_entry(
     connection: &Connection,
     scope: &MemoryPersonaScope,
     memory_id: &MemoryId,
-) -> Result<Option<MemoryEntry>, MemoryError> {
+    max_materialized_bytes: usize,
+) -> Result<Option<BoundedMemoryEntry>, MemoryError> {
     let row = connection
         .query_row(
-            "SELECT category, current_revision_id, importance, freshness_at,
-                    created_at, state
+            "SELECT CASE
+                        WHEN typeof(persona_id) = 'text'
+                         AND length(CAST(persona_id AS BLOB)) <= ?3
+                        THEN persona_id
+                    END,
+                    length(CAST(persona_id AS BLOB)),
+                    CASE
+                        WHEN typeof(memory_id) = 'text'
+                         AND length(CAST(memory_id AS BLOB)) <= ?3
+                        THEN memory_id
+                    END,
+                    length(CAST(memory_id AS BLOB)),
+                    CASE
+                        WHEN typeof(category) = 'text'
+                         AND length(CAST(category AS BLOB)) <= ?3
+                        THEN category
+                    END,
+                    length(CAST(category AS BLOB)),
+                    CASE
+                        WHEN typeof(current_revision_id) = 'text'
+                         AND length(CAST(current_revision_id AS BLOB)) <= ?3
+                        THEN current_revision_id
+                    END,
+                    length(CAST(current_revision_id AS BLOB)),
+                    CASE
+                        WHEN typeof(importance) = 'text'
+                         AND length(CAST(importance AS BLOB)) <= ?3
+                        THEN importance
+                    END,
+                    length(CAST(importance AS BLOB)),
+                    CASE
+                        WHEN typeof(freshness_at) = 'text'
+                         AND length(CAST(freshness_at AS BLOB)) <= ?3
+                        THEN freshness_at
+                    END,
+                    length(CAST(freshness_at AS BLOB)),
+                    CASE
+                        WHEN typeof(created_at) = 'text'
+                         AND length(CAST(created_at AS BLOB)) <= ?3
+                        THEN created_at
+                    END,
+                    length(CAST(created_at AS BLOB)),
+                    CASE
+                        WHEN typeof(state) = 'text'
+                         AND length(CAST(state AS BLOB)) <= ?3
+                        THEN state
+                    END,
+                    length(CAST(state AS BLOB))
              FROM memory_entry
              WHERE persona_id = ?1
                AND memory_id = ?2
                AND state = 'active'",
-            params![scope.persona_id(), memory_id.0],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
+            params![
+                scope.persona_id(),
+                memory_id.0,
+                MAX_REVISION_METADATA_FIELD_BYTES as i64
+            ],
+            raw_memory_entry_from_row,
         )
         .optional()
         .map_err(repository_unavailable)?;
-    let Some((category, revision_id, importance, freshness_at, created_at, state)) = row else {
-        return Ok(None);
-    };
-    Ok(Some(MemoryEntry {
-        memory_id: memory_id.clone(),
-        persona_id: scope.persona_id().to_string(),
-        category: parse_category(&category)?,
-        current_revision_id: MemoryRevisionId(revision_id),
-        importance: parse_importance(&importance)?,
-        freshness_at,
-        created_at,
-        state: parse_entry_state(&state)?,
-    }))
+    row.map(|row| row.into_bounded_entry(scope, memory_id, max_materialized_bytes))
+        .transpose()
 }
 
 fn parse_revision_source(

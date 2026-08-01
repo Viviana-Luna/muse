@@ -13,7 +13,10 @@ use rusqlite::{TransactionBehavior, params};
 
 use super::*;
 use crate::app::memory_storage::MAX_REVISION_HISTORY_PAGE_SIZE;
-use crate::app::memory_storage::repository::MAX_ACTIVE_MEMORY_COUNT_ROWS;
+use crate::app::memory_storage::repository::{
+    MAX_ACTIVE_MEMORY_COUNT_ROWS, MAX_REVISION_METADATA_FIELD_BYTES,
+    install_revision_materialization_test_hook,
+};
 use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryEntry, MemoryEntryState,
@@ -423,6 +426,134 @@ fn retrieve_ids(
 
 fn error_code(result: Result<MemoryQueryPageReceipt, MemoryError>) -> MemoryErrorCode {
     result.expect_err("应返回稳定错误").code()
+}
+
+fn replace_entry_text_metadata(
+    repository: &SqliteMemoryRepository,
+    scope: &MemoryPersonaScope,
+    memory_id: &str,
+    column: &str,
+    value: &str,
+) {
+    let sql = match column {
+        "category" => {
+            "UPDATE memory_entry SET category = ?1 WHERE persona_id = ?2 AND memory_id = ?3"
+        }
+        "current_revision_id" => {
+            "UPDATE memory_entry SET current_revision_id = ?1 WHERE persona_id = ?2 AND memory_id = ?3"
+        }
+        "freshness_at" => {
+            "UPDATE memory_entry SET freshness_at = ?1 WHERE persona_id = ?2 AND memory_id = ?3"
+        }
+        "created_at" => {
+            "UPDATE memory_entry SET created_at = ?1 WHERE persona_id = ?2 AND memory_id = ?3"
+        }
+        _ => panic!("测试只允许替换已冻结的 memory_entry TEXT 字段"),
+    };
+    let connection = repository.open_connection().expect("应打开旁路连接");
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("旁路攻击应关闭外键约束");
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .expect("旁路攻击应关闭 CHECK 约束");
+    assert_eq!(
+        connection
+            .execute(sql, params![value, scope.persona_id(), memory_id])
+            .expect("应替换 memory_entry 元数据"),
+        1
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_revision_row_in_wal(
+    repository: &SqliteMemoryRepository,
+    original_persona_id: &str,
+    original_memory_id: &str,
+    original_revision_id: &str,
+    replacement_persona_id: &str,
+    replacement_memory_id: &str,
+    replacement_revision_id: &str,
+    replacement_content: rusqlite::types::Value,
+) {
+    let mut connection = repository.open_connection().expect("应打开 WAL 攻击连接");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("应读取真实 SQLite journal_mode");
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("替换攻击应关闭旁路连接外键");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("WAL 旁路写事务应在读快照期间启动");
+    let row_id: i64 = transaction
+        .query_row(
+            "SELECT row_id
+             FROM memory_revision
+             WHERE persona_id = ?1 AND memory_id = ?2 AND revision_id = ?3",
+            params![
+                original_persona_id,
+                original_memory_id,
+                original_revision_id
+            ],
+            |row| row.get(0),
+        )
+        .expect("应定位待复用的 revision row_id");
+    transaction
+        .execute(
+            "DELETE FROM memory_revision_source
+             WHERE persona_id = ?1 AND memory_id = ?2 AND revision_id = ?3",
+            params![
+                original_persona_id,
+                original_memory_id,
+                original_revision_id
+            ],
+        )
+        .expect("应删除旧 revision source");
+    assert_eq!(
+        transaction
+            .execute(
+                "DELETE FROM memory_revision WHERE row_id = ?1",
+                params![row_id],
+            )
+            .expect("应删除旧 revision"),
+        1
+    );
+    transaction
+        .execute(
+            "INSERT INTO memory_revision(
+                row_id, persona_id, memory_id, revision_id, content, derivation_key,
+                event_time, recorded_at, valid_from, valid_to, change_type,
+                change_reason, safety_policy_version, state, category, importance
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, NULL, 'create',
+                      'WAL 替换攻击', '测试策略-v1', 'current', 'user_fact', 'normal')",
+            params![
+                row_id,
+                replacement_persona_id,
+                replacement_memory_id,
+                replacement_revision_id,
+                replacement_content,
+                vec![7_u8; 32],
+                T1,
+            ],
+        )
+        .expect("应以相同 row_id 插入替换 revision");
+    transaction
+        .execute(
+            "INSERT INTO memory_revision_source(
+                persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                conversation_id, turn_id, action_id, authorized_at
+             ) VALUES(?1, ?2, ?3, 0, 'user_confirmation',
+                      'wal-replacement-conversation', 'wal-replacement-turn', NULL, NULL)",
+            params![
+                replacement_persona_id,
+                replacement_memory_id,
+                replacement_revision_id
+            ],
+        )
+        .expect("应插入替换 revision source");
+    transaction.commit().expect("WAL 替换攻击应提交");
 }
 
 /// 固定中文语料：覆盖中文、混合语言、标点、emoji、同音干扰、散乱凑字与无关干扰项。
@@ -2702,6 +2833,374 @@ fn active_memory_count_rejects_over_limit_before_materializing_revisions() {
         .active_memory_count(&scope)
         .expect_err("超量计数不得扫描并物化全部 revision");
     assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+}
+
+#[test]
+fn public_read_paths_reject_oversized_memory_entry_metadata_before_materialization() {
+    enum PublicReadPath {
+        Current,
+        Search,
+        AsOf,
+        History,
+    }
+
+    let cases = [
+        (PublicReadPath::Current, "current_revision_id"),
+        (PublicReadPath::Search, "freshness_at"),
+        (PublicReadPath::AsOf, "created_at"),
+        (PublicReadPath::History, "category"),
+    ];
+    for (path, column) in cases {
+        let directory = TestDirectory::new("entry-metadata-single-field-limit");
+        let repository = Arc::new(open_repository(&directory));
+        let scope = scope("entry-metadata-persona");
+        create_memory(
+            &repository,
+            &scope,
+            "m-entry-metadata",
+            "r-entry-metadata",
+            MemoryCategory::UserFact,
+            "用户早餐习惯必须在公开读取路径保持有界",
+            MemoryImportance::Normal,
+            T1,
+        );
+        replace_entry_text_metadata(
+            &repository,
+            &scope,
+            "m-entry-metadata",
+            column,
+            &"x".repeat(MAX_REVISION_METADATA_FIELD_BYTES + 1),
+        );
+
+        let code = match path {
+            PublicReadPath::Current => repository
+                .current(&scope, &MemoryId("m-entry-metadata".to_string()))
+                .expect_err("current 必须在物化超长条目元数据前拒绝")
+                .code(),
+            PublicReadPath::Search => {
+                let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+                error_code(retriever.retrieve(&request(
+                    &scope,
+                    "用户早餐",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )))
+            }
+            PublicReadPath::AsOf => {
+                let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+                error_code(retriever.retrieve(&request(
+                    &scope,
+                    "用户早餐",
+                    None,
+                    None,
+                    Some(T1),
+                    Some("m-entry-metadata"),
+                    false,
+                )))
+            }
+            PublicReadPath::History => {
+                let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+                error_code(retriever.retrieve(&request(
+                    &scope,
+                    "用户早餐",
+                    None,
+                    None,
+                    None,
+                    Some("m-entry-metadata"),
+                    true,
+                )))
+            }
+        };
+        assert_eq!(
+            code,
+            MemoryErrorCode::QueryBudgetExceeded,
+            "{column} 的超长旁路值必须稳定 fail closed"
+        );
+    }
+}
+
+#[test]
+fn active_memory_count_rejects_cumulative_memory_entry_metadata_over_two_mib() {
+    let directory = TestDirectory::new("active-count-entry-metadata-bytes");
+    let repository = open_repository(&directory);
+    let persona_id = "p".repeat(MAX_REVISION_METADATA_FIELD_BYTES);
+    let scope = scope(&persona_id);
+    let mut connection = repository.open_connection().expect("应打开计数夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启累计元数据夹具事务");
+    let oversized_but_individually_bounded_time = "2".repeat(MAX_REVISION_METADATA_FIELD_BYTES);
+    for index in 0..MAX_ACTIVE_MEMORY_COUNT_ROWS {
+        let memory_id = format!("m-entry-budget-{index:04}");
+        let revision_id = format!(
+            "r{index:04}{}",
+            "x".repeat(MAX_REVISION_METADATA_FIELD_BYTES - 5)
+        );
+        transaction
+            .execute(
+                "INSERT INTO memory_entry(
+                    persona_id, memory_id, category, current_revision_id,
+                    importance, freshness_at, created_at, state
+                 ) VALUES(?1, ?2, 'user_fact', ?3, 'normal', ?4, ?4, 'active')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    oversized_but_individually_bounded_time
+                ],
+            )
+            .expect("应插入单字段仍在硬界内的 memory entry");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, NULL, 'create',
+                          '累计元数据预算夹具', '测试策略-v1', 'current',
+                          'user_fact', 'normal')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    format!("第 {index} 条累计元数据预算正文"),
+                    vec![(index % 251) as u8; 32],
+                    T1,
+                ],
+            )
+            .expect("应插入累计元数据 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'user_confirmation',
+                          'entry-budget-conversation', ?4, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    format!("entry-budget-turn-{index:04}"),
+                ],
+            )
+            .expect("应插入累计元数据 revision source");
+    }
+    transaction.commit().expect("累计元数据夹具应原子提交");
+    drop(connection);
+
+    let error = repository
+        .active_memory_count(&scope)
+        .expect_err("512 行内累计条目元数据超过 2 MiB 必须拒绝");
+    assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+}
+
+#[test]
+fn public_current_keeps_wal_snapshot_when_row_id_is_reused_across_personas() {
+    let directory = TestDirectory::new("wal-current-persona-replacement");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("wal-current-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-wal-current",
+        "r-wal-current",
+        MemoryCategory::UserFact,
+        "用户早餐偏好原始事实",
+        MemoryImportance::Normal,
+        T1,
+    );
+    let writer_repository = Arc::clone(&repository);
+    install_revision_materialization_test_hook(move || {
+        replace_revision_row_in_wal(
+            &writer_repository,
+            "wal-current-persona",
+            "m-wal-current",
+            "r-wal-current",
+            "wal-attacker-persona",
+            "m-wal-current",
+            "r-wal-current",
+            rusqlite::types::Value::Text("跨 Persona 替换正文不得混入".to_string()),
+        );
+    });
+
+    let record = repository
+        .current(&scope, &MemoryId("m-wal-current".to_string()))
+        .expect("current 公开路径应完成稳定读快照")
+        .expect("旧快照中的原始记录应存在");
+    assert_eq!(record.current_revision.content, "用户早餐偏好原始事实");
+    assert!(
+        repository
+            .current(&scope, &MemoryId("m-wal-current".to_string()))
+            .expect("替换后的新 current 快照应 fail closed")
+            .is_none(),
+        "跨 Persona 复用 row_id 后不得返回替换 revision"
+    );
+}
+
+#[test]
+fn public_search_keeps_wal_snapshot_when_row_id_is_reused_across_memories() {
+    let directory = TestDirectory::new("wal-search-memory-replacement");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("wal-search-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-wal-search",
+        "r-wal-search",
+        MemoryCategory::UserPreference,
+        "用户早餐偏好原始事实",
+        MemoryImportance::Normal,
+        T1,
+    );
+    let writer_repository = Arc::clone(&repository);
+    install_revision_materialization_test_hook(move || {
+        replace_revision_row_in_wal(
+            &writer_repository,
+            "wal-search-persona",
+            "m-wal-search",
+            "r-wal-search",
+            "wal-search-persona",
+            "m-wal-attacker",
+            "r-wal-search",
+            rusqlite::types::Value::Text("跨 Memory 替换正文不得混入".to_string()),
+        );
+    });
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+
+    let page = retriever
+        .retrieve(&request(&scope, "用户早餐", None, None, None, None, false))
+        .expect("search 公开路径应完成稳定读快照");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content, "用户早餐偏好原始事实");
+    let after = retriever
+        .retrieve(&request(&scope, "用户早餐", None, None, None, None, false))
+        .expect("替换后的新 search 快照应 fail closed");
+    assert!(
+        after.items.is_empty(),
+        "跨 Memory revision 不得进入搜索结果"
+    );
+}
+
+#[test]
+fn public_history_keeps_wal_snapshot_when_row_id_is_reused_across_revisions() {
+    let directory = TestDirectory::new("wal-history-revision-replacement");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("wal-history-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-wal-history",
+        "r-wal-history",
+        MemoryCategory::UserFact,
+        "用户早餐历史原始事实",
+        MemoryImportance::Normal,
+        T1,
+    );
+    let writer_repository = Arc::clone(&repository);
+    install_revision_materialization_test_hook(move || {
+        replace_revision_row_in_wal(
+            &writer_repository,
+            "wal-history-persona",
+            "m-wal-history",
+            "r-wal-history",
+            "wal-history-persona",
+            "m-wal-history",
+            "r-wal-attacker",
+            rusqlite::types::Value::Text("跨 Revision 替换正文不得混入".to_string()),
+        );
+    });
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+
+    let page = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐",
+            None,
+            None,
+            None,
+            Some("m-wal-history"),
+            true,
+        ))
+        .expect("history 公开路径应完成稳定读快照");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content, "用户早餐历史原始事实");
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "用户早餐",
+            None,
+            None,
+            None,
+            Some("m-wal-history"),
+            true,
+        ))),
+        MemoryErrorCode::MemoryNotFound,
+        "entry 当前指针与 revision 身份断裂后历史读取必须 fail closed"
+    );
+}
+
+#[test]
+fn public_as_of_keeps_wal_snapshot_and_rejects_same_identity_oversized_replacement() {
+    let directory = TestDirectory::new("wal-as-of-same-identity-replacement");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("wal-as-of-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-wal-as-of",
+        "r-wal-as-of",
+        MemoryCategory::UserFact,
+        "用户早餐时点原始事实",
+        MemoryImportance::Normal,
+        T1,
+    );
+    let writer_repository = Arc::clone(&repository);
+    install_revision_materialization_test_hook(move || {
+        replace_revision_row_in_wal(
+            &writer_repository,
+            "wal-as-of-persona",
+            "m-wal-as-of",
+            "r-wal-as-of",
+            "wal-as-of-persona",
+            "m-wal-as-of",
+            "r-wal-as-of",
+            rusqlite::types::Value::Blob(vec![
+                0_u8;
+                crate::domain::memory::MAX_MEMORY_CONTENT_BYTES + 1
+            ]),
+        );
+    });
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+
+    let page = retriever
+        .retrieve(&request(
+            &scope,
+            "用户早餐",
+            None,
+            None,
+            Some(T1),
+            Some("m-wal-as-of"),
+            false,
+        ))
+        .expect("as_of 公开路径应完成稳定读快照");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content, "用户早餐时点原始事实");
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "用户早餐",
+            None,
+            None,
+            Some(T1),
+            Some("m-wal-as-of"),
+            false,
+        ))),
+        MemoryErrorCode::QueryBudgetExceeded,
+        "同 revision 身份替换后的超长正文必须在新快照物化前拒绝"
+    );
 }
 
 #[test]

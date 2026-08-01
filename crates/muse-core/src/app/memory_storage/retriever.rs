@@ -18,8 +18,8 @@ use rusqlite::{TransactionBehavior, params};
 
 use super::authority::{CanonicalAuthorityGuard, SqliteMemoryDeletionAuthority};
 use super::repository::{
-    SqliteMemoryRepository, canonicalize_derivation_content, normalize_memory_fts_query,
-    normalize_search_text, rfc3339_micros,
+    MAX_REVISION_METADATA_FIELD_BYTES, SqliteMemoryRepository, canonicalize_derivation_content,
+    normalize_memory_fts_query, normalize_search_text, rfc3339_micros,
 };
 use crate::domain::memory::{
     MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_CHARS, MemoryCategory, MemoryChangeType,
@@ -76,7 +76,13 @@ const CURSOR_HANDLE_DOMAIN: &[u8] = b"muse-memory-query-page-handle/v1";
 const RETRIEVAL_SORT_VERSION: &[u8] = b"effective-weight-v1";
 const CURSOR_PREFIX: &str = "mqc1";
 
-const FTS_CANDIDATE_SQL: &str = "SELECT projection.memory_id, bm25(memory_fts)
+const FTS_CANDIDATE_SQL: &str = "SELECT CASE
+            WHEN typeof(projection.memory_id) = 'text'
+             AND length(CAST(projection.memory_id AS BLOB)) <= ?5
+            THEN projection.memory_id
+        END,
+        length(CAST(projection.memory_id AS BLOB)),
+        bm25(memory_fts)
      FROM memory_fts
      JOIN memory_search_projection AS projection
        ON projection.row_id = memory_fts.rowid
@@ -97,7 +103,12 @@ const FTS_CANDIDATE_SQL: &str = "SELECT projection.memory_id, bm25(memory_fts)
               projection.memory_id
      LIMIT ?3 OFFSET ?4";
 
-const AS_OF_CANDIDATE_SQL: &str = "SELECT memory_id
+const AS_OF_CANDIDATE_SQL: &str = "SELECT CASE
+            WHEN typeof(memory_id) = 'text'
+             AND length(CAST(memory_id AS BLOB)) <= ?4
+            THEN memory_id
+        END,
+        length(CAST(memory_id AS BLOB))
      FROM memory_entry
      WHERE persona_id = ?1 AND state = 'active'
      ORDER BY memory_id
@@ -465,9 +476,16 @@ impl SqliteMemoryRetriever {
                         normalized,
                         scope.persona_id(),
                         batch_size.saturating_add(1) as i64,
-                        scanned as i64
+                        scanned as i64,
+                        MAX_REVISION_METADATA_FIELD_BYTES as i64
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, f64>(2)?,
+                        ))
+                    },
                 )
                 .map_err(repository_unavailable)?
                 .collect::<Result<Vec<_>, _>>()
@@ -478,8 +496,13 @@ impl SqliteMemoryRetriever {
             if has_more && scanned.saturating_add(fetched) >= MAX_CANDIDATES_SCANNED {
                 return Err(query_budget_exceeded());
             }
-            for (memory_id, bm25) in candidates {
-                let memory_id = MemoryId(memory_id);
+            for (memory_id, memory_id_bytes, bm25) in candidates {
+                let memory_id = bounded_candidate_memory_id(
+                    memory_id,
+                    memory_id_bytes,
+                    budget.remaining_revision_bytes(),
+                )?;
+                budget.consume_materialized_metadata(memory_id.0.len())?;
                 let Some(bounded) = self.repository.load_current_on(
                     transaction,
                     scope,
@@ -565,9 +588,15 @@ impl SqliteMemoryRetriever {
                     params![
                         scope.persona_id(),
                         batch_size.saturating_add(1) as i64,
-                        scanned as i64
+                        scanned as i64,
+                        MAX_REVISION_METADATA_FIELD_BYTES as i64
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
                 )
                 .map_err(repository_unavailable)?
                 .collect::<Result<Vec<_>, _>>()
@@ -578,26 +607,44 @@ impl SqliteMemoryRetriever {
             if has_more && scanned.saturating_add(fetched) >= MAX_CANDIDATES_SCANNED {
                 return Err(query_budget_exceeded());
             }
-            for memory_id in memory_ids {
-                let memory_id = MemoryId(memory_id);
-                let Some(entry) =
-                    self.repository
-                        .load_active_entry_on(transaction, scope, &memory_id)?
-                else {
-                    continue;
-                };
-                let Some(snapshot) = self.repository.revision_at_on(
+            for (memory_id, memory_id_bytes) in memory_ids {
+                let memory_id = bounded_candidate_memory_id(
+                    memory_id,
+                    memory_id_bytes,
+                    budget.remaining_revision_bytes(),
+                )?;
+                budget.consume_materialized_metadata(memory_id.0.len())?;
+                let Some(bounded_entry) = self.repository.load_active_entry_on(
                     transaction,
                     scope,
                     &memory_id,
-                    at_micros,
                     budget.remaining_revision_bytes(),
                 )?
                 else {
                     continue;
                 };
-                budget.consume_materialized_revisions(1, snapshot.materialized_bytes)?;
-                let historical_entry = historical_entry(&entry, &snapshot);
+                let remaining_bytes = budget
+                    .remaining_revision_bytes()
+                    .checked_sub(bounded_entry.materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                let Some(snapshot) = self.repository.revision_at_on(
+                    transaction,
+                    scope,
+                    &memory_id,
+                    at_micros,
+                    remaining_bytes,
+                )?
+                else {
+                    continue;
+                };
+                budget.consume_materialized_revisions(
+                    1,
+                    bounded_entry
+                        .materialized_bytes
+                        .checked_add(snapshot.materialized_bytes)
+                        .ok_or_else(query_budget_exceeded)?,
+                )?;
+                let historical_entry = historical_entry(&bounded_entry.entry, &snapshot);
                 if !entry_matches_filters(&historical_entry, filters) {
                     continue;
                 }
@@ -657,25 +704,40 @@ impl SqliteMemoryRetriever {
     ) -> Result<Vec<FrozenItem>, MemoryError> {
         budget.authorize_revision_batch(1)?;
         if let Some(value) = as_of {
-            let entry = self
+            let bounded_entry = self
                 .repository
-                .load_active_entry_on(transaction, scope, memory_id)?
+                .load_active_entry_on(
+                    transaction,
+                    scope,
+                    memory_id,
+                    budget.remaining_revision_bytes(),
+                )?
                 .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
+            let remaining_bytes = budget
+                .remaining_revision_bytes()
+                .checked_sub(bounded_entry.materialized_bytes)
+                .ok_or_else(query_budget_exceeded)?;
             let at = rfc3339_micros(value)?;
             let Some(snapshot) = self.repository.revision_at_on(
                 transaction,
                 scope,
                 memory_id,
                 at,
-                budget.remaining_revision_bytes(),
+                remaining_bytes,
             )?
             else {
                 // 该时刻不存在模型可读 revision（例如正处于 corrected 区间）时
                 // 返回空页，而不是把不可读内容暴露给模型。
                 return Ok(Vec::new());
             };
-            budget.consume_materialized_revisions(1, snapshot.materialized_bytes)?;
-            let historical_entry = historical_entry(&entry, &snapshot);
+            budget.consume_materialized_revisions(
+                1,
+                bounded_entry
+                    .materialized_bytes
+                    .checked_add(snapshot.materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?,
+            )?;
+            let historical_entry = historical_entry(&bounded_entry.entry, &snapshot);
             if !entry_matches_filters(&historical_entry, filters) {
                 return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
             }
@@ -748,10 +810,18 @@ impl SqliteMemoryRetriever {
         filters: &MemoryRetrievalFilters,
         budget: &mut RetrievalResourceBudget,
     ) -> Result<Vec<FrozenItem>, MemoryError> {
-        let entry = self
+        budget.authorize_revision_batch(1)?;
+        let bounded_current = self
             .repository
-            .load_active_entry_on(transaction, scope, memory_id)?
+            .load_current_on(
+                transaction,
+                scope,
+                memory_id,
+                budget.remaining_revision_bytes(),
+            )?
             .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
+        budget.consume_materialized_revisions(1, bounded_current.materialized_bytes)?;
+        let entry = bounded_current.record.entry;
         if !entry_matches_filters(&entry, filters) {
             return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
         }
@@ -1224,6 +1294,18 @@ impl RetrievalResourceBudget {
         Ok(())
     }
 
+    fn consume_materialized_metadata(&mut self, bytes: usize) -> Result<(), MemoryError> {
+        let next_bytes = self
+            .revision_bytes
+            .checked_add(bytes)
+            .ok_or_else(query_budget_exceeded)?;
+        if next_bytes > MAX_REVISION_BYTES_SCANNED {
+            return Err(query_budget_exceeded());
+        }
+        self.revision_bytes = next_bytes;
+        Ok(())
+    }
+
     fn consume_relevance(
         &mut self,
         query_chars: usize,
@@ -1337,6 +1419,24 @@ fn entry_matches_filters(
         && filters
             .importance()
             .is_none_or(|importance| entry.importance == importance)
+}
+
+fn bounded_candidate_memory_id(
+    value: Option<String>,
+    byte_length: Option<i64>,
+    maximum_bytes: usize,
+) -> Result<MemoryId, MemoryError> {
+    let byte_length = byte_length
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+    if byte_length > MAX_REVISION_METADATA_FIELD_BYTES || byte_length > maximum_bytes {
+        return Err(query_budget_exceeded());
+    }
+    let value = value.ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+    if value.len() != byte_length {
+        return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+    }
+    Ok(MemoryId(value))
 }
 
 fn validate_revision_fields(revision: &MemoryRevision) -> Result<(), MemoryError> {
