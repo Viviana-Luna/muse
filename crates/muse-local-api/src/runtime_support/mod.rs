@@ -42,6 +42,7 @@ use crate::state::{
 use events::{RuntimeEventEmitter, RuntimeSseSender, RuntimeTurnOutcome, runtime_event_payload};
 use muse_core::domain::conversation::{Conversation, Message, Role};
 use muse_core::domain::mcp;
+use muse_core::domain::memory::{MEMORY_DELETE_TOOL_NAME, MemoryDeleteParams, MemoryErrorCode};
 use muse_core::domain::persona::Persona;
 use muse_core::domain::persona::character::card::PersonaCard;
 use muse_core::domain::persona::character::store::{PersonaStore, PersonaStoreError};
@@ -790,6 +791,12 @@ impl ConversationRuntime {
             turn_id,
             runtime_lease,
         } = prepared;
+        let memory_turn = MemoryTurnState::new(
+            self.state
+                .memory
+                .as_ref()
+                .map_or(0, |services| services.query_call_budget.get()),
+        );
         let (cancel_token, _active_turn_guard) =
             register_active_turn(&self.state, &turn_id, runtime_lease)?;
         let _client_disconnect_guard =
@@ -1276,6 +1283,7 @@ impl ConversationRuntime {
                                     turn: &turn_context,
                                     cancel_token: &cancel_token,
                                     conversation: &working_conversation,
+                                    memory_turn: &memory_turn,
                                 },
                                 tool_call.clone(),
                             ))
@@ -1393,9 +1401,12 @@ impl ConversationRuntime {
                                 &emitter,
                                 &turn_context,
                                 switched_conversation,
-                                "角色切换已完成，本轮状态已经提交。",
-                                "角色已切换，本轮已结束。",
+                                CommittedTurnPresentation {
+                                    summary: "角色切换已完成，本轮状态已经提交。",
+                                    status_message: "角色已切换，本轮已结束。",
+                                },
                                 None,
+                                &memory_turn,
                             )
                             .await
                             {
@@ -1426,6 +1437,15 @@ impl ConversationRuntime {
 
                         if tool_call.name == "session_compact" && result.is_success() {
                             apply_session_compaction_result(&mut working_conversation, &result);
+                        }
+                        if tool_call.name == MEMORY_DELETE_TOOL_NAME
+                            && result.is_success()
+                            && let Ok(params) = serde_json::from_value::<MemoryDeleteParams>(
+                                tool_call.arguments.clone(),
+                            )
+                        {
+                            memory_turn
+                                .redact_deleted_query_results(&mut working_conversation, &params);
                         }
                         working_conversation.add_tool_result_with_status(
                             tool_call.call_id.clone(),
@@ -1497,9 +1517,12 @@ impl ConversationRuntime {
                     &emitter,
                     &turn_context,
                     working_conversation.clone(),
-                    "模型回复与工具结果已经提交。",
-                    "回复已完成。",
+                    CommittedTurnPresentation {
+                        summary: "模型回复与工具结果已经提交。",
+                        status_message: "回复已完成。",
+                    },
                     final_emotion_candidate,
+                    &memory_turn,
                 )
                 .await
                 {
@@ -1669,18 +1692,24 @@ async fn emit_committed_memory_publish_failure(emitter: &RuntimeEventEmitter, me
     let _ = emitter.emit(RuntimeEvent::Done).await;
 }
 
+struct CommittedTurnPresentation<'a> {
+    summary: &'a str,
+    status_message: &'a str,
+}
+
 async fn publish_committed_turn(
     state: &Arc<AppState>,
     emitter: &RuntimeEventEmitter,
     turn: &TurnContext,
     conversation: Conversation,
-    summary: &str,
-    status_message: &str,
+    presentation: CommittedTurnPresentation<'_>,
     emotion_candidate: Option<PersonaEmotionEffect>,
+    memory_turn: &MemoryTurnState,
 ) -> Result<(), PublishCommittedTurnError> {
-    let committed = append_turn_committed(state, turn, summary, emotion_candidate)
+    let committed = append_turn_committed(state, turn, presentation.summary, emotion_candidate)
         .await
         .map_err(PublishCommittedTurnError::CommitPersistence)?;
+    apply_committed_memory_mutations(state, emitter, turn, memory_turn, &committed.time).await;
     state
         .runtime_service
         .session_repository()
@@ -1696,13 +1725,89 @@ async fn publish_committed_turn(
     let _ = emitter
         .emit(RuntimeEvent::Status {
             phase: "completed".to_string(),
-            message: status_message.to_string(),
+            message: presentation.status_message.to_string(),
             detail: None,
             state: "completed".to_string(),
         })
         .await;
     let _ = emitter.emit(RuntimeEvent::Done).await;
     Ok(())
+}
+
+/// `turn_committed` 之后原子应用本 Turn 的全部记忆暂存。
+///
+/// 失败只影响记忆：聊天已可靠提交，继续发布会话并发送无正文稳定失败事件。
+async fn apply_committed_memory_mutations(
+    state: &Arc<AppState>,
+    emitter: &RuntimeEventEmitter,
+    turn: &TurnContext,
+    memory_turn: &MemoryTurnState,
+    committed_at: &str,
+) {
+    let envelope = match memory_turn.take_committed_envelope(
+        turn.persona_id.as_deref(),
+        &turn.conversation_id,
+        &turn.turn_id,
+        committed_at,
+    ) {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => return,
+        Err(error) => {
+            emit_memory_commit_result(emitter, Err(error.code())).await;
+            return;
+        }
+    };
+    let Some(services) = state.memory.as_ref() else {
+        emit_memory_commit_result(emitter, Err(MemoryErrorCode::RepositoryUnavailable)).await;
+        return;
+    };
+    let repository = Arc::clone(&services.repository);
+    let sensitivity = Arc::clone(&services.sensitivity);
+    let result = tokio::task::spawn_blocking(move || {
+        apply_memory_commit_envelope(repository, sensitivity, envelope)
+    })
+    .await
+    .map_err(|_| MemoryErrorCode::RepositoryUnavailable)
+    .and_then(|result| result);
+    emit_memory_commit_result(emitter, result).await;
+}
+
+fn apply_memory_commit_envelope(
+    repository: Arc<dyn muse_core::domain::memory::MemoryRepository>,
+    sensitivity: Arc<dyn muse_core::domain::memory::MemorySensitivityPolicy>,
+    envelope: muse_core::domain::memory::MemoryCommitEnvelope,
+) -> Result<usize, MemoryErrorCode> {
+    repository
+        .apply_committed_batch(&envelope, sensitivity.as_ref())
+        .map(|receipt| receipt.mutations.len())
+        .map_err(|error| error.code())
+}
+
+async fn emit_memory_commit_result(
+    emitter: &RuntimeEventEmitter,
+    result: Result<usize, MemoryErrorCode>,
+) {
+    if let Err(code) = result {
+        tracing::warn!(code = code.as_str(), "Turn 已提交，但记忆批次持久化失败");
+    }
+    let _ = emitter.emit(memory_commit_result_event(result)).await;
+}
+
+fn memory_commit_result_event(result: Result<usize, MemoryErrorCode>) -> RuntimeEvent {
+    match result {
+        Ok(count) => RuntimeEvent::Status {
+            phase: "memory_commit_completed".to_string(),
+            message: "本次记忆已保存。".to_string(),
+            detail: Some(format!("已提交 {count} 项记忆变更。")),
+            state: "completed".to_string(),
+        },
+        Err(code) => RuntimeEvent::Status {
+            phase: "memory_commit_failed".to_string(),
+            message: "本次记忆未保存。".to_string(),
+            detail: Some(code.as_str().to_string()),
+            state: "error".to_string(),
+        },
+    }
 }
 
 async fn append_turn_committed(
@@ -1924,6 +2029,8 @@ mod streaming;
 pub(crate) use streaming::*;
 mod persona_sessions;
 pub(crate) use persona_sessions::*;
+mod memory_turn;
+pub(crate) use memory_turn::*;
 mod tool_adapters;
 use tool_adapters::*;
 

@@ -26,5 +26,7 @@ mod mcp_adapter;
 pub(in crate::runtime_support) use mcp_adapter::*;
 mod session;
 pub(in crate::runtime_support) use session::*;
+mod memory;
+pub(in crate::runtime_support) use memory::*;
 mod persona_context;
 pub(in crate::runtime_support) use persona_context::*;

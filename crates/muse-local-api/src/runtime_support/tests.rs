@@ -546,6 +546,7 @@ fn build_test_state(config_dir: &Path) -> Arc<AppState> {
         mutating_tool_gate: tokio::sync::Mutex::new(()),
         chat_request_ids: tokio::sync::Mutex::new(crate::state::ChatRequestRegistry::in_memory()),
         emotion_tx: tokio::sync::broadcast::channel(1).0,
+        memory: None,
     })
 }
 
@@ -5199,6 +5200,7 @@ fn resolves_visual_pack_for_persona() {
         mutating_tool_gate: tokio::sync::Mutex::new(()),
         chat_request_ids: tokio::sync::Mutex::new(crate::state::ChatRequestRegistry::in_memory()),
         emotion_tx: tokio::sync::broadcast::channel(1).0,
+        memory: None,
     };
 
     let visual_packs = state.visual_packs.blocking_lock();

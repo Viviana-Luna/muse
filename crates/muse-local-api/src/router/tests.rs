@@ -218,6 +218,7 @@ fn build_test_state_with_persona(
         mutating_tool_gate: Mutex::new(()),
         chat_request_ids: Mutex::new(crate::state::ChatRequestRegistry::in_memory()),
         emotion_tx: broadcast::channel(1).0,
+        memory: None,
     })
 }
 

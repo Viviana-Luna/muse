@@ -2,6 +2,9 @@
 
 pub mod builtin;
 
+use crate::domain::memory::{
+    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
+};
 use crate::domain::persona::{ToolPolicy, ToolPolicyMode};
 use crate::domain::runtime::ToolPreset;
 use crate::domain::turn::TurnContext;
@@ -584,6 +587,11 @@ fn is_tool_definition_allowed(policy: Option<&ToolPolicy>, name: &str) -> bool {
         // 默认工作态继承完整通用工具池。写入、命令和外部副作用仍由风险审批、
         // 沙箱与工作区边界约束；角色显式禁用或白名单继续作为更窄的安全上限。
         None | Some(ToolPolicyMode::Inherit) => true,
+        // intrinsic 记忆工具是 Persona 对话的本地连续性能力，不属于通用工具池；
+        // 通用 allow list 不能意外把它们过滤掉。该豁免只覆盖 F1 冻结的三个固定
+        // 工具名，且只豁免可见性过滤：Turn 预算、敏感门禁、来源资格与
+        // memory_delete 专用确认仍在运行时强制，严禁扩展到其他工具。
+        Some(ToolPolicyMode::AllowList) if is_intrinsic_memory_tool(name) => true,
         Some(ToolPolicyMode::Disabled) => false,
         Some(ToolPolicyMode::AllowList) => policy
             .map(|value| value.allowed_tools.iter().any(|item| item == name))
@@ -591,8 +599,26 @@ fn is_tool_definition_allowed(policy: Option<&ToolPolicy>, name: &str) -> bool {
     }
 }
 
+/// 判断工具名是否属于 intrinsic 记忆工具分类。
+///
+/// 该分类只覆盖 `memory_query`、`memory_mutate`、`memory_delete` 三个固定内置
+/// 工具名；它不是通用绕过通道，任何其他工具（文件、命令、联网、MCP）都不得
+/// 通过它跳过 Persona 策略、运行模式预设或审批。
+pub fn is_intrinsic_memory_tool(name: &str) -> bool {
+    matches!(
+        name,
+        MEMORY_QUERY_TOOL_NAME | MEMORY_MUTATE_TOOL_NAME | MEMORY_DELETE_TOOL_NAME
+    )
+}
+
 // 判断工具是否属于当前运行模式预设。
 fn is_tool_allowed_for_preset(definition: &ToolDef, preset: ToolPreset) -> bool {
+    // intrinsic 记忆工具默认对正常对话可见；历史 daily 与计划态等运行模式
+    // 预设只收窄通用工具池，不能意外隐藏这三个固定工具。该豁免同样只覆盖
+    // 可见性，不改变预算、敏感门禁与专用确认等执行期约束。
+    if is_intrinsic_memory_tool(&definition.name) {
+        return true;
+    }
     match preset {
         ToolPreset::Daily => is_daily_tool(&definition.name),
         ToolPreset::FocusPlan => {
@@ -800,10 +826,13 @@ fn tool_call_id(value: &serde_json::Value) -> String {
 mod tests {
     use super::builtin;
     use super::{ToolExecutionOwner, ToolRegistry, ToolRisk};
+    use crate::domain::memory::{
+        MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
+    };
     use crate::domain::persona::{ToolPolicy, ToolPolicyMode};
     use crate::domain::runtime::ToolPreset;
 
-    // 验证 allow-list 策略只暴露白名单工具。
+    // 验证 allow-list 策略只暴露白名单工具，intrinsic 记忆工具按契约豁免但不可波及其他工具。
     #[test]
     fn filters_tools_for_allow_list_policy() {
         let mut registry = ToolRegistry::new();
@@ -814,8 +843,38 @@ mod tests {
         };
 
         let defs = registry.list_definitions_for_policy(Some(&policy));
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name, "voice_current");
+        let names = defs.iter().map(|definition| definition.name.as_str());
+        let names = names.collect::<Vec<_>>();
+        assert_eq!(names.len(), 4);
+        assert!(names.contains(&"voice_current"));
+        assert!(names.contains(&MEMORY_QUERY_TOOL_NAME));
+        assert!(names.contains(&MEMORY_MUTATE_TOOL_NAME));
+        assert!(names.contains(&MEMORY_DELETE_TOOL_NAME));
+    }
+
+    #[test]
+    fn memory_tool_definitions_keep_frozen_risk_and_scope_contract() {
+        let mut registry = ToolRegistry::new();
+        builtin::register_all(&mut registry);
+
+        let query = registry
+            .tool_def(MEMORY_QUERY_TOOL_NAME)
+            .expect("memory_query 应注册");
+        assert_eq!(query.risk, ToolRisk::ReadOnly);
+        assert!(!query.requires_approval);
+        assert!(query.parameters["properties"].get("persona_id").is_none());
+
+        let mutate = registry
+            .tool_def(MEMORY_MUTATE_TOOL_NAME)
+            .expect("memory_mutate 应注册");
+        assert_eq!(mutate.risk, ToolRisk::ReadOnly);
+        assert!(!mutate.requires_approval);
+
+        let delete = registry
+            .tool_def(MEMORY_DELETE_TOOL_NAME)
+            .expect("memory_delete 应注册");
+        assert_eq!(delete.risk, ToolRisk::ExternalSideEffect);
+        assert!(delete.requires_approval);
     }
 
     // 新 Turn 只看见 canonical 工具，旧别名仍保留在注册表供历史 dispatch 兼容。

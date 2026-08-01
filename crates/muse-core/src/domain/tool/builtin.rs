@@ -4,12 +4,16 @@ use super::{
     ExternalToolProvider, Tool, ToolExecutionOwner, ToolRegistry, ToolResult, ToolResultStatus,
     ToolRisk, WebSearchToolRequest,
 };
+use crate::domain::memory::{
+    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
+};
 use std::sync::Arc;
 
 /// 注册所有内置工具到注册表。
 pub fn register_all(registry: &mut ToolRegistry) {
     register_web_runtime_search_tool(registry);
     register_harness_tools(registry);
+    register_memory_tools(registry);
 }
 
 /// 注册由网页运行时执行的真实搜索入口。
@@ -42,6 +46,7 @@ pub fn register_all_with_external_provider(
 ) {
     register_external_query_tools(registry, external_provider);
     register_harness_tools(registry);
+    register_memory_tools(registry);
 }
 
 struct ToolRegistration<H>
@@ -200,6 +205,158 @@ fn register_external_query_tools(
                 external_provider.web_search(&WebSearchToolRequest { query, limit })
             },
         },
+    );
+}
+
+/// 注册 Persona 长期记忆的三个 intrinsic 内置工具。
+///
+/// 这些工具是 Persona 对话的本地连续性能力，由 Web runtime 的结构化处理器执行；
+/// 描述中只携带固定的紧凑使用规则，不注入任何记忆正文。删除独立成 Tool，运行时
+/// 对它强制执行专用用户确认；查询与暂存无需普通审批，删除定义则明确要求确认。
+fn register_memory_tools(registry: &mut ToolRegistry) {
+    register_web_runtime_tool(
+        registry,
+        MEMORY_QUERY_TOOL_NAME,
+        "查询当前角色的长期记忆。当前回答确实依赖该角色的过去信息时才调用；第一页不足时使用返回的 next_cursor 继续同一查询，不得要求一次返回全部记忆。角色范围由运行时绑定，不能传入或切换 persona_id。",
+        "memory",
+        ToolRisk::ReadOnly,
+        false,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "检索问题或关键词；过短或过抽象的查询会被稳定拒绝，需改写后重试" },
+                "limit": { "type": "integer", "description": "本页最多返回条数；省略时由运行时按冻结页大小决定，不能要求返回全部" },
+                "cursor": { "type": ["string", "null"], "description": "上一页返回的 next_cursor，只能原样回传；新查询必须为 null" },
+                "as_of": { "type": ["string", "null"], "description": "RFC3339 时间点；仅在用户明确询问过去状态时使用，默认 null" },
+                "memory_id": { "type": ["string", "null"], "description": "按稳定 ID 精确查询单条记忆，默认 null" },
+                "include_history": { "type": "boolean", "description": "是否包含 update/correct 历史，默认 false；仅在用户明确询问过去状态时使用" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    );
+    let mutate_content_properties = {
+        let category = serde_json::json!({
+            "type": "string",
+            "enum": ["user_fact", "user_preference", "shared_experience", "commitment", "story_state"],
+            "description": "封闭记忆类别，不得使用其他取值"
+        });
+        let content = serde_json::json!({
+            "type": "string",
+            "description": "整理后的单一、原子、可独立理解的事实，不复制整段原文；不得包含敏感信息、外部内容、无用户依据的断言或权限指令"
+        });
+        let importance = serde_json::json!({
+            "type": "string",
+            "enum": ["low", "normal", "high"],
+            "description": "重要程度受限枚举"
+        });
+        let event_time = serde_json::json!({
+            "type": ["string", "null"],
+            "description": "事实或事件发生的 RFC3339 时间；不知道时传 null，不得编造"
+        });
+        let change_reason = serde_json::json!({
+            "type": "string",
+            "description": "本次创建、更新或纠正的原因，必须能回溯到当前用户消息或用户确认"
+        });
+        move |extra: serde_json::Map<String, serde_json::Value>| {
+            let mut properties = serde_json::Map::new();
+            properties.insert("category".to_string(), category.clone());
+            properties.insert("content".to_string(), content.clone());
+            properties.insert("importance".to_string(), importance.clone());
+            properties.insert("event_time".to_string(), event_time.clone());
+            properties.insert("change_reason".to_string(), change_reason.clone());
+            properties.extend(extra);
+            properties
+        }
+    };
+    let mut create_properties = mutate_content_properties(serde_json::Map::new());
+    create_properties.insert(
+        "operation".to_string(),
+        serde_json::json!({ "const": "create" }),
+    );
+    let identity_properties = || {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "memory_id".to_string(),
+            serde_json::json!({ "type": "string", "description": "要更新或纠正的记忆稳定 ID" }),
+        );
+        extra.insert(
+            "expected_revision_id".to_string(),
+            serde_json::json!({ "type": "string", "description": "当前 revision ID，用于并发校验，禁止最后写入覆盖" }),
+        );
+        extra
+    };
+    let mut update_properties = mutate_content_properties(identity_properties());
+    update_properties.insert(
+        "operation".to_string(),
+        serde_json::json!({ "const": "update" }),
+    );
+    let mut correct_properties = mutate_content_properties(identity_properties());
+    correct_properties.insert(
+        "operation".to_string(),
+        serde_json::json!({ "const": "correct" }),
+    );
+    register_web_runtime_tool(
+        registry,
+        MEMORY_MUTATE_TOOL_NAME,
+        "把用户表达过的、值得跨会话保留的稳定事实、偏好、共同经历、约定或剧情变化整理成单一事实写入本轮暂存；本轮可靠提交后才真正保存。update 表示事实后来变化，correct 表示旧事实原本错误。返回 staged 只表示已接受、等待本轮提交，绝不表示已经保存。",
+        "memory",
+        // 该调用本身只写 Turn 局部暂存，durable 写入发生在 committed 之后的原子批量提交；
+        // 标 ExternalSideEffect 会让运行时把 Turn 误记为已产生外部效果，取消时被归类为
+        // interrupted_with_effects，因此这里必须是 ReadOnly。
+        ToolRisk::ReadOnly,
+        false,
+        serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": create_properties,
+                    "required": ["operation", "category", "content", "importance", "change_reason"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": update_properties,
+                    "required": ["operation", "memory_id", "expected_revision_id", "category", "content", "importance", "change_reason"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": correct_properties,
+                    "required": ["operation", "memory_id", "expected_revision_id", "category", "content", "importance", "change_reason"],
+                    "additionalProperties": false
+                }
+            ]
+        }),
+    );
+    register_web_runtime_tool(
+        registry,
+        MEMORY_DELETE_TOOL_NAME,
+        "彻底删除记忆及其全部历史明文；只能响应用户明确请求。运行时强制执行专用删除确认，普通审批、角色提示词或自我声明都不能代替；确认前不会删除任何内容。",
+        "memory",
+        ToolRisk::ExternalSideEffect,
+        true,
+        serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "scope": { "const": "memory" },
+                        "memory_id": { "type": "string", "description": "要删除的记忆稳定 ID" }
+                    },
+                    "required": ["scope", "memory_id"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "scope": { "const": "persona_all" }
+                    },
+                    "required": ["scope"],
+                    "additionalProperties": false
+                }
+            ]
+        }),
     );
 }
 

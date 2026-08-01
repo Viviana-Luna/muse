@@ -3,6 +3,10 @@
 //! 具体工具执行由同目录的适配器承接；本模块只定义中断策略、上下文影响和
 //! 不依赖 HTTP handler 私有状态的稳定能力事实。
 
+use muse_core::domain::memory::{
+    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
+};
+
 /// 工具在当前 turn 被取消时的处理策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime_support) enum RuntimeToolInterruptBehavior {
@@ -92,6 +96,7 @@ pub(in crate::runtime_support) enum RuntimeToolFamily {
     Mcp,
     Skill,
     Task,
+    Memory,
 }
 
 const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
@@ -347,6 +352,33 @@ const RUNTIME_TOOL_CAPABILITIES: &[RuntimeToolCapability] = &[
         name: "mcp_read_resource",
         family: RuntimeToolFamily::Mcp,
         mutating: false,
+        interrupt_behavior: RuntimeToolInterruptBehavior::Block,
+        writes_transcript: true,
+        has_context_effect: false,
+    },
+    // intrinsic 记忆工具：memory_mutate 只写入 Turn 局部暂存，不产生外部副作用，
+    // 取消 Turn 时暂存直接丢弃，因此 mutating 为 false；memory_delete 的 durable
+    // 删除是真实持久副作用，必须保持 true。
+    RuntimeToolCapability {
+        name: MEMORY_QUERY_TOOL_NAME,
+        family: RuntimeToolFamily::Memory,
+        mutating: false,
+        interrupt_behavior: RuntimeToolInterruptBehavior::Block,
+        writes_transcript: true,
+        has_context_effect: false,
+    },
+    RuntimeToolCapability {
+        name: MEMORY_MUTATE_TOOL_NAME,
+        family: RuntimeToolFamily::Memory,
+        mutating: false,
+        interrupt_behavior: RuntimeToolInterruptBehavior::Block,
+        writes_transcript: true,
+        has_context_effect: false,
+    },
+    RuntimeToolCapability {
+        name: MEMORY_DELETE_TOOL_NAME,
+        family: RuntimeToolFamily::Memory,
+        mutating: true,
         interrupt_behavior: RuntimeToolInterruptBehavior::Block,
         writes_transcript: true,
         has_context_effect: false,

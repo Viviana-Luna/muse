@@ -1,6 +1,7 @@
 //! 运行时工具注册、权限边界与分派实现。
 
 use super::*;
+use muse_core::domain::memory::MEMORY_DELETE_TOOL_NAME;
 
 pub(in crate::runtime_support) struct RuntimeToolExecutionContext<'a> {
     pub(in crate::runtime_support) snapshot: &'a TurnSnapshot,
@@ -11,6 +12,7 @@ pub(in crate::runtime_support) struct RuntimeToolExecutionContext<'a> {
     pub(in crate::runtime_support) turn: &'a TurnContext,
     pub(in crate::runtime_support) cancel_token: &'a RuntimeTurnCancel,
     pub(in crate::runtime_support) conversation: &'a Conversation,
+    pub(in crate::runtime_support) memory_turn: &'a MemoryTurnState,
 }
 pub(in crate::runtime_support) async fn execute_runtime_tool(
     state: &Arc<AppState>,
@@ -26,6 +28,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         turn,
         cancel_token,
         conversation,
+        memory_turn,
     } = context;
     if cancel_token.is_cancelled() {
         return Err(TURN_CANCELLED_MESSAGE.to_string());
@@ -188,12 +191,15 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
     let requires_workspace_boundary_approval = runtime_handler
         .map(|handler| handler.requires_workspace_boundary_approval(&execution_boundary, &call))
         .unwrap_or(false);
-    let requires_approval = should_require_tool_approval(
-        &execution_boundary,
-        &call,
-        def.risk.as_str(),
-        def.requires_approval,
-    ) || requires_workspace_boundary_approval;
+    // memory_delete 的专用用户确认不能被全局 Never 或 AUTO 审查策略绕过。
+    let requires_approval = call.name == MEMORY_DELETE_TOOL_NAME
+        || should_require_tool_approval(
+            &execution_boundary,
+            &call,
+            def.risk.as_str(),
+            def.requires_approval,
+        )
+        || requires_workspace_boundary_approval;
     let execution_policy = RuntimeToolExecutionPolicy::from_handler(
         runtime_handler,
         &call,
@@ -228,10 +234,16 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         if requires_workspace_boundary_approval {
             summary.push_str("\n目标路径不在当前允许工作区内；允许后仅本次工具调用可访问该路径。");
         }
-        let approvals_reviewer = if mcp::is_external_mcp_tool_name(&call.name) {
-            ApprovalsReviewer::User
+        let approvals_reviewer =
+            if call.name == MEMORY_DELETE_TOOL_NAME || mcp::is_external_mcp_tool_name(&call.name) {
+                ApprovalsReviewer::User
+            } else {
+                execution_boundary.approvals_reviewer
+            };
+        let approval_risk = if call.name == MEMORY_DELETE_TOOL_NAME {
+            MEMORY_DELETE_TOOL_NAME
         } else {
-            execution_boundary.approvals_reviewer
+            def.risk.as_str()
         };
         let (approved, approval_reason) = wait_for_tool_approval(
             state,
@@ -239,7 +251,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
                 tx,
                 turn,
                 call: &call,
-                risk: def.risk.as_str(),
+                risk: approval_risk,
                 summary,
                 cancel_token,
                 provider,
@@ -251,20 +263,24 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         .await
         .map_err(|_| "工具审批等待被中断。".to_string())?;
         if !approved {
-            let content = match approval_reason.as_str() {
-                "timeout" => format!("工具 `{}` 等待审批超时，已取消执行。", call.name),
-                "client_disconnected" => {
-                    format!("工具 `{}` 因前端连接断开，已取消执行。", call.name)
+            let result = if call.name == MEMORY_DELETE_TOOL_NAME {
+                memory_delete_confirmation_required(&approval_reason)
+            } else {
+                let content = match approval_reason.as_str() {
+                    "timeout" => format!("工具 `{}` 等待审批超时，已取消执行。", call.name),
+                    "client_disconnected" => {
+                        format!("工具 `{}` 因前端连接断开，已取消执行。", call.name)
+                    }
+                    reason if reason.contains("取消") => {
+                        format!("工具 `{}` 已由用户取消，未执行。", call.name)
+                    }
+                    _ => format!("用户拒绝执行工具 `{}`。", call.name),
+                };
+                ToolResult {
+                    status: ToolResultStatus::Failed,
+                    content,
+                    structured: Some(serde_json::json!({ "reason": approval_reason })),
                 }
-                reason if reason.contains("取消") => {
-                    format!("工具 `{}` 已由用户取消，未执行。", call.name)
-                }
-                _ => format!("用户拒绝执行工具 `{}`。", call.name),
-            };
-            let result = ToolResult {
-                status: ToolResultStatus::Failed,
-                content,
-                structured: Some(serde_json::json!({ "reason": approval_reason })),
             };
             let recorded_result =
                 emit_and_record_tool_result(state, tx, turn, &call, &result).await?;
@@ -294,6 +310,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
             turn,
             cancel_token,
             conversation,
+            memory_turn,
             &call,
             &def,
             execution_policy,
@@ -311,6 +328,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
             turn,
             cancel_token,
             conversation,
+            memory_turn,
             &call,
             &def,
             execution_policy,
@@ -362,6 +380,7 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool_with_latest_policy
     turn: &TurnContext,
     cancel_token: &RuntimeTurnCancel,
     conversation: &Conversation,
+    memory_turn: &MemoryTurnState,
     call: &ToolCall,
     definition: &ToolDef,
     execution_policy: RuntimeToolExecutionPolicy,
@@ -404,6 +423,8 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool_with_latest_policy
             turn,
             cancel_token,
             conversation,
+            memory_turn,
+            approval_obtained,
             allow_approved_external_path,
         },
         call,
@@ -523,6 +544,8 @@ pub(in crate::runtime_support) struct RuntimeToolInvocation<'a> {
     pub(in crate::runtime_support) call: &'a ToolCall,
     pub(in crate::runtime_support) cancel_token: &'a RuntimeTurnCancel,
     pub(in crate::runtime_support) conversation: &'a Conversation,
+    pub(in crate::runtime_support) memory_turn: &'a MemoryTurnState,
+    pub(in crate::runtime_support) approval_obtained: bool,
     pub(in crate::runtime_support) allow_approved_external_path: bool,
 }
 
@@ -1909,6 +1932,9 @@ pub(in crate::runtime_support) static RUNTIME_TOOL_HANDLERS: &[&dyn RuntimeToolH
     &MCP_LIST_RESOURCES_HANDLER,
     &MCP_LIST_RESOURCE_TEMPLATES_HANDLER,
     &MCP_READ_RESOURCE_HANDLER,
+    &MEMORY_QUERY_HANDLER,
+    &MEMORY_MUTATE_HANDLER,
+    &MEMORY_DELETE_HANDLER,
 ];
 
 pub(in crate::runtime_support) fn runtime_tool_handler(
@@ -1929,6 +1955,8 @@ pub(in crate::runtime_support) struct RuntimeToolDispatchContext<'a> {
     turn: &'a TurnContext,
     cancel_token: &'a RuntimeTurnCancel,
     conversation: &'a Conversation,
+    memory_turn: &'a MemoryTurnState,
+    approval_obtained: bool,
     allow_approved_external_path: bool,
 }
 
@@ -1945,6 +1973,8 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool(
         turn,
         cancel_token,
         conversation,
+        memory_turn,
+        approval_obtained,
         allow_approved_external_path,
     } = context;
     if let Some(handler) = runtime_tool_handler(&call.name) {
@@ -1958,6 +1988,8 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool(
             call,
             cancel_token,
             conversation,
+            memory_turn,
+            approval_obtained,
             allow_approved_external_path,
         });
         tokio::pin!(handler_call);

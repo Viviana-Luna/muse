@@ -5,6 +5,9 @@ use muse_core::app::secret::PlatformSecretStore;
 use muse_core::config::Config;
 use muse_core::domain::conversation::Conversation;
 use muse_core::domain::mcp::migration::migrate_mcp_profiles;
+use muse_core::domain::memory::{
+    MemoryDeletionAuthority, MemoryRepository, MemoryRetriever, MemorySensitivityPolicy,
+};
 use muse_core::domain::persona::Persona;
 use muse_core::domain::persona::character::store::{PersonaStore, PersonaStoreError};
 use muse_core::domain::persona::visual::store::VisualPackStore;
@@ -20,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,6 +387,19 @@ pub struct AppState {
     pub chat_request_ids: Mutex<ChatRequestRegistry>,
     /// 用于情绪广播的 WebSocket 频道。
     pub emotion_tx: broadcast::Sender<String>,
+    /// 记忆运行时服务；真实 Retriever/Repository/策略实例由协调者集成分支注入，默认 None 表示未接线。
+    pub memory: Option<MemoryRuntimeServices>,
+}
+
+/// 记忆运行时服务集合，按端口持有真实实现；字段只读，共享指针克隆廉价。
+#[derive(Clone)]
+pub struct MemoryRuntimeServices {
+    pub retriever: Arc<dyn MemoryRetriever>,
+    pub repository: Arc<dyn MemoryRepository>,
+    pub sensitivity: Arc<dyn MemorySensitivityPolicy>,
+    pub deletion_authority: Arc<dyn MemoryDeletionAuthority>,
+    /// 单 Turn 最多允许的记忆查询调用数；具体值由检索切片评估后在集成层冻结。
+    pub query_call_budget: NonZeroU32,
 }
 
 #[derive(serde::Deserialize)]
@@ -623,6 +640,8 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
         mutating_tool_gate: Mutex::new(()),
         chat_request_ids: Mutex::new(ChatRequestRegistry::load_from_dir(Config::config_dir())?),
         emotion_tx,
+        // 默认未接线；真实记忆服务由协调者集成分支在 AppState 构建阶段注入。
+        memory: None,
     }))
 }
 
