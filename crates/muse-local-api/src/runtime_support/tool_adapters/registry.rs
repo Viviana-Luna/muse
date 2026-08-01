@@ -224,15 +224,21 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
     let mut approval_evidence = None;
     let mut allow_approved_external_path = false;
     if requires_approval {
-        let mut summary = runtime_handler
-            .map(|handler| handler.approval_summary(&call))
-            .unwrap_or_else(|| {
-                if mcp::is_external_mcp_tool_name(&call.name) {
-                    format!("调用外部 MCP 工具：{}", call.name)
-                } else {
-                    format!("执行工具：{}", call.name)
-                }
-            });
+        let memory_call_receipt = memory_session_call_receipt(&call.name, &call.arguments);
+        let mut summary = memory_call_receipt.as_ref().map_or_else(
+            || {
+                runtime_handler
+                    .map(|handler| handler.approval_summary(&call))
+                    .unwrap_or_else(|| {
+                        if mcp::is_external_mcp_tool_name(&call.name) {
+                            format!("调用外部 MCP 工具：{}", call.name)
+                        } else {
+                            format!("执行工具：{}", call.name)
+                        }
+                    })
+            },
+            |receipt| receipt.approval_summary().to_string(),
+        );
         if requires_workspace_boundary_approval {
             summary.push_str("\n目标路径不在当前允许工作区内；允许后仅本次工具调用可访问该路径。");
         }
@@ -496,6 +502,11 @@ pub(in crate::runtime_support) async fn persist_external_effect_boundary_before_
                 | ToolRisk::ExternalSideEffect
         )
     {
+        let canonical_call_id = if is_memory_session_redacted_tool(&call.name) {
+            memory_session_call_id(&call.call_id)
+        } else {
+            call.call_id.clone()
+        };
         // 真实 dispatch 可能在返回 Failed 前已经部分改变外部状态。必需事件
         // 只记录调用身份和风险，不持久化参数或正文；写成功后才能越过边界。
         durable_effect_boundary_before_dispatch(
@@ -506,7 +517,7 @@ pub(in crate::runtime_support) async fn persist_external_effect_boundary_before_
                     serde_json::json!({
                         "conversation_id": turn.conversation_id,
                         "turn_id": turn.turn_id,
-                        "call_id": call.call_id,
+                        "call_id": canonical_call_id,
                         "tool": call.name,
                         "risk": definition.risk.as_str(),
                     }),

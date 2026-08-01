@@ -18,7 +18,8 @@ use muse_core::domain::persona::visual::VisualPack;
 use muse_core::domain::persona::visual::store::VisualPackStore;
 use muse_core::domain::persona::{Persona, RoleplayStyle, ToolPolicy};
 use muse_core::domain::tool::{
-    ToolCall, ToolCallSource, ToolDef, ToolRegistry, ToolResult, ToolResultStatus, builtin,
+    Tool, ToolCall, ToolCallSource, ToolDef, ToolExecutionOwner, ToolRegistry, ToolResult,
+    ToolResultStatus, ToolRisk, builtin,
 };
 use muse_core::domain::turn::TurnContext;
 use muse_core::model::catalog::ModelCatalogModelDraft;
@@ -27,7 +28,7 @@ use muse_core::model::provider::{ChatModelProvider, ChatModelResult, ChatStreamR
 use muse_runtime::interactions::{PendingApproval, PendingUserQuestion};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt as _;
 
 struct PendingHandshakeProvider {
@@ -3486,6 +3487,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     const REVISION_ID: &str = "memory-rev-1767225600000-2";
     const MUTATION_REVISION_ID: &str = "memory-rev-1767225600000-3";
     const DELETION_ID: &str = "memory-confirm-1767225600000-4";
+    const DELETE_MEMORY_ID: &str = "memory-1767225600000-987654321";
     const QUERY_SENTINEL: &str = "QUERY_SENTINEL_SECRET";
     const CONTENT_SENTINEL: &str = "CONTENT_SENTINEL_SECRET";
     const CHANGE_REASON_SENTINEL: &str = "CHANGE_REASON_SENTINEL_SECRET";
@@ -3654,7 +3656,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
         "memory_delete",
         serde_json::json!({
             "scope": "memory",
-            "memory_id": MEMORY_ID
+            "memory_id": DELETE_MEMORY_ID
         }),
     );
     delete_call.call_id = "test-memory-delete-valid".to_string();
@@ -3807,6 +3809,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
         MALICIOUS_CODE_SENTINEL,
         MALICIOUS_ARGUMENT_KEY_SENTINEL,
         CALL_ID_SENTINEL,
+        DELETE_MEMORY_ID,
     ] {
         assert!(
             !transcript.contains(forbidden),
@@ -3872,6 +3875,7 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
         MALICIOUS_ID_SENTINEL,
         MALICIOUS_CODE_SENTINEL,
         CALL_ID_SENTINEL,
+        DELETE_MEMORY_ID,
     ] {
         assert!(
             !replayed_text.contains(forbidden),
@@ -3882,6 +3886,314 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
     // 非记忆工具恢复后内容保持完整。
     assert!(replayed_text.contains("cargo test --workspace"));
     assert!(replayed_text.contains("build completed"));
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+async fn memory_delete_registry_approval_chain_is_canonical_and_replay_only() {
+    use axum::response::IntoResponse as _;
+
+    const PROVIDER_CALL_ID_SENTINEL: &str = "provider-call/{CALL_ID_SENTINEL_SECRET}/memory_delete";
+    const MEMORY_ID_SENTINEL: &str = "memory-1767225600000-998877665544332211";
+    const MANUAL_SUMMARY_SENTINEL: &str = "MANUAL_SUMMARY_SENTINEL_SECRET";
+    const RESULT_CONTENT_SENTINEL: &str = "RESULT_CONTENT_SENTINEL_SECRET";
+    const DELETION_ID: &str = "approval-1767225600000-778899";
+
+    let config_dir = unique_temp_dir("memory-delete-registry-approval");
+    let dispatch_count = Arc::new(AtomicUsize::new(0));
+    let handler_dispatch_count = Arc::clone(&dispatch_count);
+    let mut state = build_test_state(&config_dir);
+    Arc::get_mut(&mut state)
+        .expect("测试状态尚未共享")
+        .tools
+        .register(Tool {
+            name: "memory_delete".to_string(),
+            description: "测试真实 registry 的记忆删除确认链".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+            }),
+            category: "memory".to_string(),
+            risk: ToolRisk::ExternalSideEffect,
+            requires_approval: true,
+            expose_to_model: true,
+            execution_owner: ToolExecutionOwner::Core,
+            available: true,
+            disabled_reason: None,
+            handler: Arc::new(move |_arguments| {
+                handler_dispatch_count.fetch_add(1, Ordering::SeqCst);
+                ToolResult::success(
+                    RESULT_CONTENT_SENTINEL,
+                    Some(serde_json::json!({
+                        "deletion_id": DELETION_ID,
+                        "deleted_memory_count": 1,
+                        "completed_at": "2026-08-01T00:02:00Z",
+                    })),
+                )
+            }),
+        });
+
+    let roots = vec![
+        std::env::current_dir()
+            .expect("应能读取测试工作区")
+            .canonicalize()
+            .expect("应能解析测试工作区"),
+    ];
+    let execution_policy = muse_runtime::FrozenExecutionPolicy::from_preset(
+        muse_runtime::ApprovalModePreset::Manual,
+        roots,
+        91,
+    );
+    state
+        .runtime_service
+        .set_execution_policy(execution_policy.clone())
+        .expect("应能冻结手动审批策略");
+
+    let definitions = state.tools.list_definitions();
+    let mut turn = test_turn_context("turn-memory-delete-registry");
+    turn.tool_definitions = definitions.clone();
+    let conversation_id = turn.conversation_id.clone();
+    let turn_id = turn.turn_id.clone();
+    let snapshot = muse_runtime::TurnSnapshot::new(turn.clone(), definitions)
+        .with_execution_policy(execution_policy);
+    let frozen_mcp_catalog = muse_core::domain::mcp::McpToolCatalog::empty_for_config_path(
+        config_dir.join("mcp").join("servers.json"),
+    );
+    let provider: Arc<dyn ChatModelProvider> = Arc::new(PendingHandshakeProvider {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    let conversation = Conversation::new("测试系统提示".to_string(), 10);
+    let runtime_lease = state
+        .runtime_service
+        .begin_turn(&turn_id, &conversation_id)
+        .expect("应能开始 registry 测试 Turn");
+    runtime_lease
+        .mark_running()
+        .expect("registry 测试 Turn 应进入运行态");
+    let (cancel_token, active_guard) = super::register_active_turn(&state, &turn_id, runtime_lease)
+        .expect("应能注册 registry 测试 Turn");
+    let call = ToolCall {
+        call_id: PROVIDER_CALL_ID_SENTINEL.to_string(),
+        name: "memory_delete".to_string(),
+        arguments: serde_json::json!({
+            "scope": "memory",
+            "memory_id": MEMORY_ID_SENTINEL,
+        }),
+        source: ToolCallSource::Native,
+    };
+    let canonical_call_id = super::memory_session_call_id(PROVIDER_CALL_ID_SENTINEL);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+
+    let execute_state = Arc::clone(&state);
+    let execute_tx = event_tx.clone();
+    let execute_task = tokio::spawn(async move {
+        super::execute_runtime_tool(
+            &execute_state,
+            Some(&execute_tx),
+            super::RuntimeToolExecutionContext {
+                snapshot: &snapshot,
+                frozen_mcp_catalog: &frozen_mcp_catalog,
+                provider: &provider,
+                request_capability_epoch: snapshot.capability_epoch(),
+                turn: &turn,
+                cancel_token: &cancel_token,
+                conversation: &conversation,
+            },
+            call,
+        )
+        .await
+    });
+
+    let approval_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let store = state
+                .runtime_service
+                .session_store()
+                .await
+                .expect("应能打开 Session Store");
+            let events = store
+                .events_for_conversation(&conversation_id)
+                .await
+                .expect("应能读取审批前事件");
+            if let Some(approval_id) = events.iter().find_map(|event| {
+                (event.kind == "approval_pending")
+                    .then(|| {
+                        event
+                            .payload
+                            .get("approval_id")
+                            .and_then(|value| value.as_str())
+                    })
+                    .flatten()
+                    .map(ToString::to_string)
+            }) {
+                break approval_id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("真实 registry 应进入 memory_delete 专用确认等待");
+
+    super::resolve_runtime_approval_command(
+        Arc::clone(&state),
+        turn_id.clone(),
+        approval_id.clone(),
+        true,
+        Some(MANUAL_SUMMARY_SENTINEL.to_string()),
+    )
+    .await
+    .expect("应能批准 memory_delete 专用确认");
+    let result = execute_task
+        .await
+        .expect("registry 执行任务不应 panic")
+        .expect("registry 执行链应完成");
+    assert!(result.is_success());
+    assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+    drop(active_guard);
+    drop(event_tx);
+
+    // 必须消费 tx=Some 产生的真实 SSE body，不能只检查 payload helper。
+    let sse_response =
+        axum::response::sse::Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
+            .into_response();
+    let sse_bytes = axum::body::to_bytes(sse_response.into_body(), usize::MAX)
+        .await
+        .expect("应能消费 registry 审批 SSE body");
+    let sse_text = String::from_utf8(sse_bytes.to_vec()).expect("SSE 应为 UTF-8");
+
+    super::append_transcript_record(
+        &state,
+        "turn_committed",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "outcome": "committed",
+        }),
+    )
+    .await
+    .expect("应能提交 registry 测试 Turn");
+    let store = state
+        .runtime_service
+        .session_store()
+        .await
+        .expect("应能重开 Session Store");
+    let events = store
+        .events_for_conversation(&conversation_id)
+        .await
+        .expect("应能回读 Session 事件");
+    let transcript = super::session_events_as_jsonl(&events);
+
+    for forbidden in [
+        PROVIDER_CALL_ID_SENTINEL,
+        "CALL_ID_SENTINEL_SECRET",
+        MEMORY_ID_SENTINEL,
+        MANUAL_SUMMARY_SENTINEL,
+        RESULT_CONTENT_SENTINEL,
+    ] {
+        assert!(!sse_text.contains(forbidden), "SSE 不得包含 `{forbidden}`");
+        assert!(
+            !transcript.contains(forbidden),
+            "Session JSONL 不得包含 `{forbidden}`"
+        );
+    }
+    assert!(sse_text.contains(&canonical_call_id));
+    assert!(transcript.contains(&canonical_call_id));
+
+    let event_of_kind = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event.kind == kind)
+            .unwrap_or_else(|| panic!("Session 应包含 {kind}"))
+    };
+    for kind in [
+        "tool_call",
+        "approval_pending",
+        "approval_resolved",
+        "turn_effect_started",
+        "tool_result",
+    ] {
+        assert_eq!(
+            event_of_kind(kind).payload["call_id"],
+            canonical_call_id,
+            "{kind} 必须与 canonical call_id 配对"
+        );
+    }
+    assert_eq!(
+        event_of_kind("approval_pending").payload["approval_id"],
+        approval_id
+    );
+    assert_eq!(
+        event_of_kind("approval_resolved").payload["approval_id"],
+        approval_id
+    );
+    for kind in ["tool_call", "approval_pending", "approval_resolved"] {
+        let arguments = &event_of_kind(kind).payload["canonical_arguments"];
+        assert_eq!(arguments["memory_receipt"], "memory_delete");
+        assert_eq!(arguments["scope"], "memory");
+        assert!(arguments.get("memory_id").is_none());
+    }
+
+    let sse_events = sse_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .collect::<Vec<_>>();
+    for event_type in [
+        "tool_call",
+        "approval_pending",
+        "approval_resolved",
+        "tool_result",
+    ] {
+        let event = sse_events
+            .iter()
+            .find(|event| event["type"] == event_type)
+            .unwrap_or_else(|| panic!("SSE 应包含 {event_type}"));
+        assert_eq!(event["call_id"], canonical_call_id);
+        if matches!(
+            event_type,
+            "tool_call" | "approval_pending" | "approval_resolved"
+        ) {
+            assert_eq!(event["arguments"]["memory_receipt"], "memory_delete");
+            assert!(event["arguments"].get("memory_id").is_none());
+        }
+    }
+
+    // Session 恢复只建立协议合法占位，不能再次触发 registry dispatch。
+    let dispatches_before_replay = dispatch_count.load(Ordering::SeqCst);
+    let (replayed, _) = super::replay_runtime_transcript_lines(
+        "测试系统提示".to_string(),
+        20,
+        &transcript,
+        &conversation_id,
+        None,
+    );
+    assert!(replayed.validate_tool_protocol().is_ok());
+    assert_eq!(
+        dispatch_count.load(Ordering::SeqCst),
+        dispatches_before_replay
+    );
+    assert_eq!(
+        replayed
+            .messages
+            .iter()
+            .filter(|message| message.tool_name.as_deref() == Some("memory_delete"))
+            .count(),
+        2,
+        "恢复后应保留一组 memory_delete call/result 配对"
+    );
+    let replayed_text = serde_json::to_string(&replayed.messages).unwrap();
+    for forbidden in [
+        PROVIDER_CALL_ID_SENTINEL,
+        MEMORY_ID_SENTINEL,
+        MANUAL_SUMMARY_SENTINEL,
+        RESULT_CONTENT_SENTINEL,
+    ] {
+        assert!(
+            !replayed_text.contains(forbidden),
+            "恢复上下文不得包含 `{forbidden}`"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(config_dir);
 }
@@ -4000,7 +4312,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
             "include_history": true
         }),
     )
-    .expect("memory_query 应生成调用收据");
+    .expect("memory_query 应生成调用收据")
+    .to_json();
     assert_eq!(receipt["query_kind"], "cursor_continue");
     assert_eq!(receipt["include_history"], true);
     assert!(receipt.get("query").is_none());
@@ -4011,7 +4324,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
         "memory_query",
         &serde_json::json!({ "query": SENTINEL, "memory_id": MEMORY_ID }),
     )
-    .unwrap();
+    .unwrap()
+    .to_json();
     assert_eq!(receipt["query_kind"], "by_id");
     assert_eq!(receipt["memory_id"], MEMORY_ID);
 
@@ -4029,7 +4343,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
             "change_reason": SENTINEL
         }),
     )
-    .expect("memory_mutate 应生成调用收据");
+    .expect("memory_mutate 应生成调用收据")
+    .to_json();
     assert_eq!(receipt["operation"], "update");
     assert_eq!(receipt["memory_id"], MEMORY_ID);
     assert_eq!(receipt["expected_revision_id"], EXPECTED_REVISION_ID);
@@ -4037,13 +4352,14 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
         assert!(receipt.get(dropped).is_none(), "收据不得保留 {dropped}");
     }
 
-    // memory_delete 调用收据：只保留删除范围与目标标识。
+    // memory_delete 调用收据：只保留删除范围，目标 ID 也不得进入审批或 Session。
     let receipt = super::memory_session_call_receipt(
         "memory_delete",
-        &serde_json::json!({ "scope": "persona_all" }),
+        &serde_json::json!({ "scope": "memory", "memory_id": MEMORY_ID }),
     )
-    .expect("memory_delete 应生成调用收据");
-    assert_eq!(receipt["scope"], "persona_all");
+    .expect("memory_delete 应生成调用收据")
+    .to_json();
+    assert_eq!(receipt["scope"], "memory");
     assert!(receipt.get("memory_id").is_none());
 
     // memory_query 成功结果必须先完整解析 F1 typed receipt，再输出固定白名单。
@@ -4136,7 +4452,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     ];
     for (tool_name, arguments) in invalid_calls {
         let receipt = super::memory_session_call_receipt(tool_name, &arguments)
-            .expect("记忆调用即使畸形也应生成安全收据");
+            .expect("记忆调用即使畸形也应生成安全收据")
+            .to_json();
         assert_eq!(receipt["error_code"], "memory_invalid_request");
         assert!(!receipt.to_string().contains(SENTINEL));
     }
@@ -4239,6 +4556,18 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
         assert!(receipt.structured.get("error_code").is_none());
         assert!(!format!("{}{}", receipt.content, receipt.structured).contains(SENTINEL));
     }
+    let ambiguous_code = ToolResult {
+        status: ToolResultStatus::Failed,
+        content: SENTINEL.to_string(),
+        structured: Some(serde_json::json!({
+            "error_code": "memory_sensitive_content_rejected",
+            "code": "memory_repository_unavailable",
+        })),
+    };
+    let receipt = super::memory_session_result_receipt("memory_mutate", &ambiguous_code).unwrap();
+    assert!(receipt.structured.get("error_code").is_none());
+    assert_eq!(receipt.content, "记忆工具调用失败。");
+
     let reason_only = ToolResult {
         status: ToolResultStatus::from_success(false),
         content: SENTINEL.to_string(),
@@ -4250,12 +4579,63 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     let receipt = super::memory_session_result_receipt("memory_delete", &reason_only).unwrap();
     assert!(receipt.structured.get("error_code").is_none());
 
+    // structured 缺失或不是对象时，即使 content 伪装成合法成功收据或稳定
+    // error_code JSON，也不得恢复 content 回退解析。
+    for structured in [None, Some(serde_json::json!("scalar-structured"))] {
+        let content_receipt = valid_query_result().to_string();
+        let success = ToolResult {
+            status: ToolResultStatus::Success,
+            content: content_receipt,
+            structured: structured.clone(),
+        };
+        let receipt = super::memory_session_result_receipt("memory_query", &success).unwrap();
+        assert_safe_failure(&receipt);
+
+        let failed = ToolResult {
+            status: ToolResultStatus::Failed,
+            content: serde_json::json!({
+                "error_code": "memory_sensitive_content_rejected"
+            })
+            .to_string(),
+            structured,
+        };
+        let receipt = super::memory_session_result_receipt("memory_delete", &failed).unwrap();
+        assert!(!receipt.success);
+        assert!(receipt.structured.get("error_code").is_none());
+        assert_eq!(receipt.content, "记忆工具调用失败。");
+    }
+
     // 非记忆工具不进入记忆去正文路径。
     assert!(super::memory_session_call_receipt("command_run", &serde_json::json!({})).is_none());
     assert!(super::memory_session_result_receipt("command_run", &query_result).is_none());
 }
 
 fn memory_session_replay_skips_uncommitted_turns_and_degrades_receipts() {
+    const RECOVERY_SENTINEL: &str = "恢复路径不得接受的原始-memory-id";
+    let mut malformed_conversation = Conversation::new("系统提示".to_string(), 20);
+    let restored = super::replay_runtime_transcript_record(
+        &mut malformed_conversation,
+        "tool_call",
+        &serde_json::json!({
+            "conversation_id": "session-mem-malformed",
+            "turn_id": "turn-mem-malformed",
+            "call_id": "provider-call-id-malformed",
+            "tool": "memory_delete",
+            "canonical_arguments": {
+                "memory_receipt": "memory_delete",
+                "scope": "memory",
+                "memory_id": RECOVERY_SENTINEL
+            }
+        }),
+    );
+    assert!(!restored);
+    assert_eq!(malformed_conversation.messages.len(), 1);
+    assert!(
+        !serde_json::to_string(&malformed_conversation.messages)
+            .unwrap()
+            .contains(RECOVERY_SENTINEL)
+    );
+
     let content = [
         serde_json::json!({
             "schema_version": muse_runtime::session::SESSION_EVENT_SCHEMA_VERSION,
@@ -7260,6 +7640,17 @@ async fn aggregated_async_test_cases() {
         {
             failures
                 .push("memory_tool_events_are_redacted_before_session_and_replay_as_placeholders");
+        }
+    }
+    {
+        if std::panic::AssertUnwindSafe(
+            memory_delete_registry_approval_chain_is_canonical_and_replay_only(),
+        )
+        .catch_unwind()
+        .await
+        .is_err()
+        {
+            failures.push("memory_delete_registry_approval_chain_is_canonical_and_replay_only");
         }
     }
     #[cfg(feature = "live-tests")]

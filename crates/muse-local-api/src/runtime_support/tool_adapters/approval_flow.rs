@@ -43,6 +43,24 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
     let Some(tx) = tx else {
         return Ok((false, "no_event_channel".to_string(), None));
     };
+    let memory_call_receipt = memory_session_call_receipt(&call.name, &call.arguments);
+    let memory_call_receipt_json = memory_call_receipt
+        .as_ref()
+        .map(MemorySessionCallReceipt::to_json);
+    let approval_call_id = memory_call_receipt.as_ref().map_or_else(
+        || call.call_id.clone(),
+        |_| memory_session_call_id(&call.call_id),
+    );
+    let summary = memory_call_receipt
+        .as_ref()
+        .map_or(summary, |receipt| receipt.approval_summary().to_string());
+    // intrinsic 记忆 Tool 不进入自动审查器；memory_delete 的专用用户确认
+    // 不能由模型审查结果替代，其他记忆工具若未来要求审批也按同一安全上限处理。
+    let approvals_reviewer = if memory_call_receipt.is_some() {
+        ApprovalsReviewer::User
+    } else {
+        approvals_reviewer
+    };
     let approval_id = next_runtime_id("approval");
     state
         .runtime_service
@@ -58,7 +76,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
                 "conversation_id": turn.conversation_id,
                 "turn_id": turn.turn_id,
                 "approval_id": approval_id,
-                "call_id": call.call_id,
+                "call_id": approval_call_id,
                 "tool": call.name,
                 "risk": risk,
                 "policy_revision": policy_revision,
@@ -90,7 +108,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
                 "conversation_id": turn.conversation_id,
                 "turn_id": turn.turn_id,
                 "approval_id": approval_id,
-                "call_id": call.call_id,
+                "call_id": approval_call_id,
                 "tool": call.name,
                 "allowed": outcome.allowed(),
                 "risk_level": outcome.risk_level(),
@@ -172,7 +190,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
                     "conversation_id": turn.conversation_id,
                     "turn_id": turn.turn_id,
                     "approval_id": approval_id,
-                    "call_id": call.call_id,
+                    "call_id": approval_call_id,
                     "tool": call.name,
                     "approved": true,
                     "reviewer": "auto_review",
@@ -183,7 +201,14 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
             .map_err(|_| ())?;
             emit_json_event(
                 tx,
-                runtime_approval_resolved_event(&approval_id, true, Some("auto_review_allowed")),
+                canonical_approval_resolved_event(
+                    &approval_id,
+                    call,
+                    &approval_call_id,
+                    memory_call_receipt_json.as_ref(),
+                    true,
+                    "auto_review_allowed",
+                ),
             )
             .await?;
             let evidence = approval_evidence(&approval_id, &call.call_id);
@@ -225,29 +250,29 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
         .await
         .map_err(|_| ())?;
     let _pending_guard = PendingInteractionGuard::approval(state, &turn.turn_id, &approval_id);
-    append_transcript_record(
-        state,
-        "approval_pending",
+    let approval_pending_payload = with_memory_approval_receipt(
         serde_json::json!({
             "conversation_id": turn.conversation_id,
             "turn_id": turn.turn_id,
             "approval_id": approval_id,
-            "call_id": call.call_id,
+            "call_id": approval_call_id,
             "tool": call.name,
             "risk": risk,
             "reviewer": if approvals_reviewer == ApprovalsReviewer::AutoReview { "auto_review_fallback" } else { "user" },
             "audit_note": "工具审批请求已登记；命令、查询、参数和说明未写入审计事件。",
         }),
-    )
-    .await
-    .map_err(|err| {
-        tracing::error!(target: "muse::transcript", error = %err, "持久化审批请求失败");
-    })?;
+        memory_call_receipt_json.as_ref(),
+    );
+    append_transcript_record(state, "approval_pending", approval_pending_payload)
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "muse::transcript", error = %err, "持久化审批请求失败");
+        })?;
     emit_json_event(
         tx,
         runtime_approval_pending_event(
             &approval_id,
-            &call.call_id,
+            &approval_call_id,
             &call.name,
             risk,
             if approvals_reviewer == ApprovalsReviewer::AutoReview {
@@ -256,7 +281,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
                 "这个工具需要你的确认后才能继续。"
             },
             Some(&manual_summary),
-            &call.arguments,
+            memory_call_receipt_json.as_ref().unwrap_or(&call.arguments),
         ),
     )
     .await?;
@@ -293,27 +318,34 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
             .runtime_service
             .transition_active(&turn.turn_id, RuntimePhase::Running);
     }
-    append_transcript_record(
-        state,
-        "approval_resolved",
+    let approval_resolved_payload = with_memory_approval_receipt(
         serde_json::json!({
             "conversation_id": turn.conversation_id,
             "turn_id": turn.turn_id,
             "approval_id": approval_id,
-            "call_id": call.call_id,
+            "call_id": approval_call_id,
             "tool": call.name,
             "approved": approved,
             "audit_note": "工具审批结果已登记；用户说明未写入审计事件。",
         }),
-    )
-    .await
-    .map_err(|err| {
-        tracing::error!(target: "muse::transcript", error = %err, "持久化审批结果失败");
-    })?;
+        memory_call_receipt_json.as_ref(),
+    );
+    append_transcript_record(state, "approval_resolved", approval_resolved_payload)
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "muse::transcript", error = %err, "持久化审批结果失败");
+        })?;
     if !tx.is_closed() {
         let _ = emit_json_event(
             tx,
-            runtime_approval_resolved_event(&approval_id, approved, Some(&reason)),
+            canonical_approval_resolved_event(
+                &approval_id,
+                call,
+                &approval_call_id,
+                memory_call_receipt_json.as_ref(),
+                approved,
+                &reason,
+            ),
         )
         .await;
     }
@@ -330,4 +362,47 @@ fn approval_evidence(approval_id: &str, call_id: &str) -> ToolApprovalEvidence {
         approved_at: approved_at.to_rfc3339(),
         expires_at: expires_at.to_rfc3339(),
     }
+}
+
+fn with_memory_approval_receipt(
+    mut payload: serde_json::Value,
+    receipt: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    if let (Some(object), Some(receipt)) = (payload.as_object_mut(), receipt) {
+        object.insert("canonical_arguments".to_string(), receipt.clone());
+    }
+    payload
+}
+
+fn canonical_approval_resolved_event(
+    approval_id: &str,
+    call: &ToolCall,
+    canonical_call_id: &str,
+    memory_receipt: Option<&serde_json::Value>,
+    approved: bool,
+    reason: &str,
+) -> serde_json::Value {
+    let Some(memory_receipt) = memory_receipt else {
+        return runtime_approval_resolved_event(approval_id, approved, Some(reason));
+    };
+    let reason = match reason {
+        "timeout" => "timeout",
+        "turn_cancelled" => "turn_cancelled",
+        "client_disconnected" => "client_disconnected",
+        "approval_channel_dropped" => "approval_channel_dropped",
+        "auto_review_allowed" => "auto_review_allowed",
+        _ if approved => "approved",
+        _ => "rejected",
+    };
+    serde_json::json!({
+        "type": "approval_resolved",
+        "phase": "approval_resolved",
+        "approval_id": approval_id,
+        "call_id": canonical_call_id,
+        "name": call.name,
+        "approved": approved,
+        "reason": reason,
+        "arguments": memory_receipt,
+        "state": "completed",
+    })
 }

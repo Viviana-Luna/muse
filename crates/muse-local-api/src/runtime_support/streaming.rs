@@ -1004,11 +1004,22 @@ pub(super) fn replay_runtime_transcript_record(
             true
         }
         "tool_call" => {
-            let Some(call_id) = transcript_payload_string(payload, "call_id") else {
+            let Some(raw_call_id) = transcript_payload_string(payload, "call_id") else {
                 return false;
             };
             let Some(tool_name) = transcript_payload_string(payload, "tool") else {
                 return false;
+            };
+            let call_id = if is_memory_session_redacted_tool(&tool_name) {
+                let Some(canonical_arguments) = payload.get("canonical_arguments") else {
+                    return false;
+                };
+                if MemorySessionCallReceipt::from_json(&tool_name, canonical_arguments).is_none() {
+                    return false;
+                }
+                canonical_memory_session_call_id(&raw_call_id)
+            } else {
+                raw_call_id
             };
             let arguments = replay_tool_arguments(payload);
             conv.add_assistant_tool_call_with_reasoning(
@@ -1020,11 +1031,16 @@ pub(super) fn replay_runtime_transcript_record(
             true
         }
         "tool_result" => {
-            let Some(call_id) = transcript_payload_string(payload, "call_id") else {
+            let Some(raw_call_id) = transcript_payload_string(payload, "call_id") else {
                 return false;
             };
             let Some(tool_name) = transcript_payload_string(payload, "tool") else {
                 return false;
+            };
+            let call_id = if is_memory_session_redacted_tool(&tool_name) {
+                canonical_memory_session_call_id(&raw_call_id)
+            } else {
+                raw_call_id
             };
             let canonical_result = payload.get("canonical_result").unwrap_or(payload);
             let success = canonical_result
@@ -2721,12 +2737,27 @@ fn is_valid_memory_revision_id(value: &str) -> bool {
 
 fn is_valid_memory_deletion_id(value: &str) -> bool {
     is_runtime_memory_identifier(value, "memory-confirm")
+        || is_runtime_memory_identifier(value, "approval")
 }
 
 /// Provider 生成的原始 call_id 也是自由字符串。记忆事件只保留稳定摘要，以便
 /// SSE 与 Session 恢复继续配对，同时避免把正文伪装成调用标识持久化。
-fn memory_session_call_id(call_id: &str) -> String {
+pub(super) fn memory_session_call_id(call_id: &str) -> String {
     format!("memory-call-{:x}", Sha256::digest(call_id.as_bytes()))
+}
+
+fn canonical_memory_session_call_id(call_id: &str) -> String {
+    let is_canonical = call_id.strip_prefix("memory-call-").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    });
+    if is_canonical {
+        call_id.to_string()
+    } else {
+        memory_session_call_id(call_id)
+    }
 }
 
 fn memory_change_type_name(change_type: MemoryChangeType) -> &'static str {
@@ -2737,11 +2768,213 @@ fn memory_change_type_name(change_type: MemoryChangeType) -> &'static str {
     }
 }
 
-fn memory_session_invalid_call_receipt(tool_name: &'static str) -> serde_json::Value {
-    serde_json::json!({
-        "memory_receipt": tool_name,
-        "error_code": MemoryErrorCode::InvalidRequest.as_str(),
-    })
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MemorySessionQueryKind {
+    Search,
+    ById,
+    CursorContinue,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MemorySessionDeleteScope {
+    Memory,
+    PersonaAll,
+}
+
+/// 记忆 Tool 在 SSE、审批和 Session 中共享的强类型调用收据。
+///
+/// 删除收据有意只保存范围，不保存目标 memory_id；其余标识只有通过运行时
+/// 严格格式校验后才允许进入收据。自由正文与不透明游标没有对应字段，因此
+/// 无法被后续调用方误写回事件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "memory_receipt")]
+pub(super) enum MemorySessionCallReceipt {
+    #[serde(rename = "memory_query")]
+    Query {
+        query_kind: MemorySessionQueryKind,
+        include_history: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_id: Option<String>,
+    },
+    #[serde(rename = "memory_mutate")]
+    Mutate {
+        operation: MemoryChangeType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_revision_id: Option<String>,
+    },
+    #[serde(rename = "memory_delete")]
+    Delete { scope: MemorySessionDeleteScope },
+    #[serde(rename = "memory_query")]
+    InvalidQuery { error_code: MemoryErrorCode },
+    #[serde(rename = "memory_mutate")]
+    InvalidMutate { error_code: MemoryErrorCode },
+    #[serde(rename = "memory_delete")]
+    InvalidDelete { error_code: MemoryErrorCode },
+}
+
+impl MemorySessionCallReceipt {
+    pub(super) fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            let tool_name = match self {
+                Self::Query { .. } | Self::InvalidQuery { .. } => MEMORY_QUERY_TOOL_NAME,
+                Self::Mutate { .. } | Self::InvalidMutate { .. } => MEMORY_MUTATE_TOOL_NAME,
+                Self::Delete { .. } | Self::InvalidDelete { .. } => MEMORY_DELETE_TOOL_NAME,
+            };
+            serde_json::json!({
+                "memory_receipt": tool_name,
+                "error_code": MemoryErrorCode::InvalidRequest.as_str(),
+            })
+        })
+    }
+
+    /// 审批说明只由收据枚举决定，绝不拼接 provider 参数或 memory_id。
+    pub(super) const fn approval_summary(&self) -> &'static str {
+        match self {
+            Self::Query { .. } => "确认查询当前 Persona 的长期记忆。",
+            Self::Mutate { .. } => "确认暂存当前 Persona 的长期记忆变更。",
+            Self::Delete {
+                scope: MemorySessionDeleteScope::Memory,
+            } => "确认彻底删除当前 Persona 的一条长期记忆。",
+            Self::Delete {
+                scope: MemorySessionDeleteScope::PersonaAll,
+            } => "确认彻底清空当前 Persona 的全部长期记忆。",
+            Self::InvalidQuery { .. } | Self::InvalidMutate { .. } | Self::InvalidDelete { .. } => {
+                "确认处理不符合协议的记忆工具调用。"
+            }
+        }
+    }
+
+    fn from_json(tool_name: &str, value: &serde_json::Value) -> Option<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct QueryReceipt {
+            memory_receipt: String,
+            query_kind: MemorySessionQueryKind,
+            include_history: bool,
+            #[serde(default)]
+            memory_id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MutateReceipt {
+            memory_receipt: String,
+            operation: MemoryChangeType,
+            #[serde(default)]
+            memory_id: Option<String>,
+            #[serde(default)]
+            expected_revision_id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DeleteReceipt {
+            memory_receipt: String,
+            scope: MemorySessionDeleteScope,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct InvalidReceipt {
+            memory_receipt: String,
+            error_code: MemoryErrorCode,
+        }
+
+        if value.get("error_code").is_some() {
+            let receipt = serde_json::from_value::<InvalidReceipt>(value.clone()).ok()?;
+            if receipt.memory_receipt != tool_name
+                || receipt.error_code != MemoryErrorCode::InvalidRequest
+            {
+                return None;
+            }
+            return match tool_name {
+                MEMORY_QUERY_TOOL_NAME => Some(Self::InvalidQuery {
+                    error_code: receipt.error_code,
+                }),
+                MEMORY_MUTATE_TOOL_NAME => Some(Self::InvalidMutate {
+                    error_code: receipt.error_code,
+                }),
+                MEMORY_DELETE_TOOL_NAME => Some(Self::InvalidDelete {
+                    error_code: receipt.error_code,
+                }),
+                _ => None,
+            };
+        }
+
+        match tool_name {
+            MEMORY_QUERY_TOOL_NAME => {
+                let receipt = serde_json::from_value::<QueryReceipt>(value.clone()).ok()?;
+                if receipt.memory_receipt != tool_name
+                    || receipt
+                        .memory_id
+                        .as_deref()
+                        .is_some_and(|memory_id| !is_valid_memory_id(memory_id))
+                {
+                    return None;
+                }
+                Some(Self::Query {
+                    query_kind: receipt.query_kind,
+                    include_history: receipt.include_history,
+                    memory_id: receipt.memory_id,
+                })
+            }
+            MEMORY_MUTATE_TOOL_NAME => {
+                let receipt = serde_json::from_value::<MutateReceipt>(value.clone()).ok()?;
+                let identifiers_match_operation = match receipt.operation {
+                    MemoryChangeType::Create => {
+                        receipt.memory_id.is_none() && receipt.expected_revision_id.is_none()
+                    }
+                    MemoryChangeType::Update | MemoryChangeType::Correct => {
+                        receipt.memory_id.is_some() && receipt.expected_revision_id.is_some()
+                    }
+                };
+                if receipt.memory_receipt != tool_name
+                    || !identifiers_match_operation
+                    || receipt
+                        .memory_id
+                        .as_deref()
+                        .is_some_and(|memory_id| !is_valid_memory_id(memory_id))
+                    || receipt
+                        .expected_revision_id
+                        .as_deref()
+                        .is_some_and(|revision_id| !is_valid_memory_revision_id(revision_id))
+                {
+                    return None;
+                }
+                Some(Self::Mutate {
+                    operation: receipt.operation,
+                    memory_id: receipt.memory_id,
+                    expected_revision_id: receipt.expected_revision_id,
+                })
+            }
+            MEMORY_DELETE_TOOL_NAME => {
+                let receipt = serde_json::from_value::<DeleteReceipt>(value.clone()).ok()?;
+                (receipt.memory_receipt == tool_name).then_some(Self::Delete {
+                    scope: receipt.scope,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn memory_session_invalid_call_receipt(tool_name: &'static str) -> MemorySessionCallReceipt {
+    match tool_name {
+        MEMORY_QUERY_TOOL_NAME => MemorySessionCallReceipt::InvalidQuery {
+            error_code: MemoryErrorCode::InvalidRequest,
+        },
+        MEMORY_MUTATE_TOOL_NAME => MemorySessionCallReceipt::InvalidMutate {
+            error_code: MemoryErrorCode::InvalidRequest,
+        },
+        MEMORY_DELETE_TOOL_NAME => MemorySessionCallReceipt::InvalidDelete {
+            error_code: MemoryErrorCode::InvalidRequest,
+        },
+        _ => unreachable!("只为三个 intrinsic 记忆 Tool 生成失败收据"),
+    }
 }
 
 /// 记忆 Tool 调用的 canonical 去正文收据。
@@ -2751,7 +2984,7 @@ fn memory_session_invalid_call_receipt(tool_name: &'static str) -> serde_json::V
 pub(super) fn memory_session_call_receipt(
     tool_name: &str,
     arguments: &serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> Option<MemorySessionCallReceipt> {
     match tool_name {
         MEMORY_QUERY_TOOL_NAME => {
             let Ok(params) = serde_json::from_value::<MemoryQueryParams>(arguments.clone()) else {
@@ -2768,21 +3001,17 @@ pub(super) fn memory_session_call_receipt(
             // 查询类型只描述调用形态，便于审计区分新查询、按 ID 查询和游标续查；
             // 游标值属于不透明定位符，按契约不落盘。
             let query_kind = if params.cursor.is_some() {
-                "cursor_continue"
+                MemorySessionQueryKind::CursorContinue
             } else if params.memory_id.is_some() {
-                "by_id"
+                MemorySessionQueryKind::ById
             } else {
-                "search"
+                MemorySessionQueryKind::Search
             };
-            let mut receipt = serde_json::json!({
-                "memory_receipt": MEMORY_QUERY_TOOL_NAME,
-                "query_kind": query_kind,
-                "include_history": params.include_history,
-            });
-            if let Some(memory_id) = params.memory_id {
-                receipt["memory_id"] = serde_json::Value::String(memory_id.0);
-            }
-            Some(receipt)
+            Some(MemorySessionCallReceipt::Query {
+                query_kind,
+                include_history: params.include_history,
+                memory_id: params.memory_id.map(|memory_id| memory_id.0),
+            })
         }
         MEMORY_MUTATE_TOOL_NAME => {
             let Ok(params) = serde_json::from_value::<MemoryMutateParams>(arguments.clone()) else {
@@ -2798,17 +3027,13 @@ pub(super) fn memory_session_call_receipt(
             {
                 return Some(memory_session_invalid_call_receipt(MEMORY_MUTATE_TOOL_NAME));
             }
-            let mut receipt = serde_json::json!({
-                "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
-                "operation": memory_change_type_name(params.operation()),
-            });
-            if let Some(memory_id) = params.memory_id() {
-                receipt["memory_id"] = serde_json::Value::String(memory_id.0.clone());
-            }
-            if let Some(revision_id) = params.expected_revision_id() {
-                receipt["expected_revision_id"] = serde_json::Value::String(revision_id.0.clone());
-            }
-            Some(receipt)
+            Some(MemorySessionCallReceipt::Mutate {
+                operation: params.operation(),
+                memory_id: params.memory_id().map(|memory_id| memory_id.0.clone()),
+                expected_revision_id: params
+                    .expected_revision_id()
+                    .map(|revision_id| revision_id.0.clone()),
+            })
         }
         MEMORY_DELETE_TOOL_NAME => {
             let Ok(params) = serde_json::from_value::<MemoryDeleteParams>(arguments.clone()) else {
@@ -2819,16 +3044,13 @@ pub(super) fn memory_session_call_receipt(
             }
             match params {
                 MemoryDeleteParams::Memory { memory_id } if is_valid_memory_id(&memory_id.0) => {
-                    Some(serde_json::json!({
-                        "memory_receipt": MEMORY_DELETE_TOOL_NAME,
-                        "scope": "memory",
-                        "memory_id": memory_id.0,
-                    }))
+                    Some(MemorySessionCallReceipt::Delete {
+                        scope: MemorySessionDeleteScope::Memory,
+                    })
                 }
-                MemoryDeleteParams::PersonaAll => Some(serde_json::json!({
-                    "memory_receipt": MEMORY_DELETE_TOOL_NAME,
-                    "scope": "persona_all",
-                })),
+                MemoryDeleteParams::PersonaAll => Some(MemorySessionCallReceipt::Delete {
+                    scope: MemorySessionDeleteScope::PersonaAll,
+                }),
                 MemoryDeleteParams::Memory { .. } => {
                     Some(memory_session_invalid_call_receipt(MEMORY_DELETE_TOOL_NAME))
                 }
@@ -2846,17 +3068,14 @@ pub(super) struct MemorySessionResultReceipt {
     pub(super) structured: serde_json::Value,
 }
 
-/// 提取可能的结构化收据来源：优先 structured；Tool adapter 也可能把收据
-/// 序列化为文本正文，此时把 content 按 JSON 对象解析。
-fn memory_session_result_source(result: &ToolResult) -> Option<serde_json::Value> {
-    if let Some(structured) = &result.structured
-        && structured.is_object()
-    {
-        return Some(structured.clone());
-    }
-    serde_json::from_str::<serde_json::Value>(&result.content)
-        .ok()
-        .filter(|value| value.is_object())
+/// 记忆结果只信任 ToolResult.structured 对象；content 永远只是模型正文，
+/// 即使看起来像合法 JSON 收据也不能回退解析。
+fn memory_session_structured_result(result: &ToolResult) -> Option<serde_json::Value> {
+    result
+        .structured
+        .as_ref()
+        .filter(|structured| structured.is_object())
+        .cloned()
 }
 
 fn memory_session_failure_receipt(
@@ -2882,13 +3101,15 @@ fn memory_session_failure_receipt(
 }
 
 fn memory_error_code_from_source(source: Option<&serde_json::Value>) -> Option<MemoryErrorCode> {
-    let source = source?;
-    ["error_code", "code"].into_iter().find_map(|key| {
-        source
-            .get(key)
-            .cloned()
-            .and_then(|value| serde_json::from_value::<MemoryErrorCode>(value).ok())
-    })
+    let source = source?.as_object()?;
+    let mut candidates = ["error_code", "code"]
+        .into_iter()
+        .filter_map(|key| source.get(key));
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    serde_json::from_value::<MemoryErrorCode>(candidate.clone()).ok()
 }
 
 fn validate_memory_query_page_receipt(receipt: &MemoryQueryPageReceipt) -> bool {
@@ -2918,7 +3139,7 @@ pub(super) fn memory_session_result_receipt(
     if !is_memory_session_redacted_tool(tool_name) {
         return None;
     }
-    let source = memory_session_result_source(result);
+    let source = memory_session_structured_result(result);
     if !result.is_success() {
         // 失败只保留稳定安全错误码；错误正文可能携带敏感检测输入，不落盘。
         let error_code = memory_error_code_from_source(source.as_ref());
@@ -3227,7 +3448,12 @@ pub(super) async fn emit_and_record_tool_call(
         .find(|entry| entry.name == call.name);
     // 记忆 Tool 必须先完成专用去正文转换，再进入任何前端事件或 Session 记录。
     let memory_call_receipt = memory_session_call_receipt(&call.name, &call.arguments);
-    let emitted_arguments = memory_call_receipt.as_ref().unwrap_or(&call.arguments);
+    let memory_call_receipt_value = memory_call_receipt
+        .as_ref()
+        .map(MemorySessionCallReceipt::to_json);
+    let emitted_arguments = memory_call_receipt_value
+        .as_ref()
+        .unwrap_or(&call.arguments);
     let canonical_call_id = if is_memory_tool {
         memory_session_call_id(&call.call_id)
     } else {
@@ -3271,7 +3497,7 @@ pub(super) async fn emit_and_record_tool_call(
             "concurrency_safe": policy.concurrency_safe,
             "interrupt_behavior": policy.interrupt_behavior.as_str(),
             "safety_notes": safety_notes,
-            "canonical_arguments": memory_call_receipt
+            "canonical_arguments": memory_call_receipt_value
                 .clone()
                 .unwrap_or_else(|| canonical_session_tool_arguments(&call.arguments)),
             "argument_audit": if is_memory_tool {
