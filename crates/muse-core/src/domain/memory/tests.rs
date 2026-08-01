@@ -1080,6 +1080,104 @@ fn memory_source_eligibility_public_api_covers_required_and_reviewer_grammar() {
 }
 
 #[test]
+fn memory_source_eligibility_reuses_positive_actions_for_connector_clauses() {
+    let assert_eligibility = |source: &str, expected_allowed: bool| {
+        let candidate = format!(
+            "用户{}",
+            source
+                .strip_prefix('我')
+                .expect("来源语料应使用第一人称主语")
+        );
+        let actual_allowed = MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-positive-grammar",
+            "turn-positive-grammar",
+            "call-positive-grammar",
+            source,
+            &candidate,
+        )
+        .is_ok();
+        assert_eq!(
+            actual_allowed, expected_allowed,
+            "来源资格应由共享正向动作与从句结构决定：{source}"
+        );
+    };
+
+    for source in [
+        "我喜欢茶也买书",
+        "我喜欢茶但买书",
+        "我喜欢茶并买书",
+        "我希望写信并寄出",
+        "我计划阅读书又寄信",
+        "我习惯记笔记但发帖",
+        "我喜欢猫但发帖",
+        "我喜欢琴又寄信",
+        "我喜欢书并下单",
+        "我喜欢画却分享",
+        "我喜欢歌也上传",
+        "我喜欢棋但部署",
+        "我喜欢茶并购买",
+        "我喜欢花又直播",
+        "我喜欢祖母养花",
+        "我喜欢老板工作",
+        "我喜欢医生工作",
+        "我喜欢男友做饭",
+        "我喜欢伴侣散步",
+        "我喜欢网友回复帖子",
+        "我喜欢祖母看报",
+        "我喜欢老板开会",
+        "我喜欢医生看诊",
+        "我喜欢男友发帖",
+        "我喜欢伴侣寄信",
+        "我喜欢网友直播",
+    ] {
+        assert_eligibility(source, false);
+    }
+
+    for source in [
+        "我偏好持续并发编程",
+        "我喜欢二十世纪同时代音乐",
+        "我喜欢桑巴也门咖啡",
+        "我喜欢维也纳咖啡",
+        "我偏好业务合并请求",
+        "我喜欢因为爱情这首歌",
+        "我在北京所以然教育公司工作",
+        "我偏好多线程并发模型",
+        "我喜欢现代同时代艺术",
+        "我喜欢桑巴也门风味",
+        "我喜欢巴黎但是乐队",
+        "我喜欢电影因为爱情",
+        "我偏好古典和声理论",
+        "我喜欢软件合并请求",
+        "我喜欢北京所以然课程",
+        "我喜欢祖母绿",
+        "我喜欢阿姨奶茶",
+        "我喜欢妈妈的拿手菜",
+        "我喜欢哥哥的工作风格",
+        "我计划购买咖啡",
+        "我计划部署系统",
+        "我习惯发布文章",
+        "我希望上传文件",
+        "我计划订购书籍",
+        "我计划寄出包裹",
+        "我习惯寄信",
+        "我计划买书",
+        "我习惯发帖",
+        "我希望泄露秘密",
+        "我习惯推荐书籍",
+        "我计划决定路线",
+        "我计划下单",
+        "我习惯分享",
+        "我习惯直播",
+        "我习惯看报",
+        "我习惯开会",
+        "我习惯看诊",
+    ] {
+        assert_eligibility(source, true);
+    }
+}
+
+#[test]
 fn safety_request_covers_event_time_and_runtime_source() {
     let staged = staged(
         create_params(),

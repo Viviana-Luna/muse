@@ -317,7 +317,7 @@ fn validate_direct_user_complement(value: &str, kind: DirectUserComplementKind) 
 }
 
 fn validate_direct_user_nominal(value: &str) -> Option<()> {
-    if starts_direct_user_negation(value) || contains_direct_user_predicate(value) {
+    if starts_direct_user_negation(value) || has_direct_user_clause_predicate(value) {
         return None;
     }
     Some(())
@@ -329,7 +329,7 @@ fn validate_direct_user_preference(value: &str) -> Option<()> {
     }
     if starts_direct_user_negation(value)
         || has_structured_clause_connector(value)
-        || contains_non_nominalized_clause_predicate(value)
+        || has_direct_user_clause_predicate(value)
     {
         return None;
     }
@@ -367,7 +367,7 @@ fn validate_direct_user_action_object(value: &str) -> bool {
     !starts_direct_user_negation(value)
         && !starts_structured_external_source(value)
         && !has_structured_clause_connector(value)
-        && !contains_non_nominalized_clause_predicate(value)
+        && !has_direct_user_clause_predicate(value)
 }
 
 fn direct_user_action_predicates() -> &'static [(&'static str, DirectUserActionTail)] {
@@ -375,6 +375,23 @@ fn direct_user_action_predicates() -> &'static [(&'static str, DirectUserActionT
 
     &[
         ("回答保持", Required),
+        ("购买", Required),
+        ("订购", Required),
+        ("部署", Required),
+        ("发布", Required),
+        ("上传", Required),
+        ("寄出", Optional),
+        ("寄信", Optional),
+        ("发帖", Optional),
+        ("泄露", Required),
+        ("推荐", Required),
+        ("决定", Required),
+        ("下单", Optional),
+        ("分享", Optional),
+        ("直播", Optional),
+        ("看报", Optional),
+        ("开会", Optional),
+        ("看诊", Optional),
         ("整理", Required),
         ("收藏", Required),
         ("联系", Required),
@@ -398,6 +415,7 @@ fn direct_user_action_predicates() -> &'static [(&'static str, DirectUserActionT
         ("喝", Required),
         ("吃", Required),
         ("写", Required),
+        ("买", Required),
         ("做", Required),
         ("去", Required),
         ("骑", Required),
@@ -475,7 +493,7 @@ fn has_structured_clause_connector(value: &str) -> bool {
             let after = connector_start + connector.len();
             let prefix = &value[..connector_start];
             let suffix = &value[after..];
-            if is_structural_connector_occurrence(connector, prefix, suffix) {
+            if is_structural_connector_occurrence(prefix, suffix) {
                 return true;
             }
             search_from = after;
@@ -484,31 +502,13 @@ fn has_structured_clause_connector(value: &str) -> bool {
     false
 }
 
-fn is_structural_connector_occurrence(connector: &str, prefix: &str, suffix: &str) -> bool {
+fn is_structural_connector_occurrence(prefix: &str, suffix: &str) -> bool {
     if prefix.is_empty() || suffix.is_empty() {
         return false;
     }
-    if starts_direct_user_clause(suffix) {
-        return true;
-    }
-
-    match connector {
-        // 转折、因果或时序词只有位于已形成的成分之后，且后半段具备最小从句
-        // 长度时才算连接位置；词首及“合并请求”这类词内片段仍按名词处理。
-        "并且" | "而且" | "同时" | "但是" | "不过" | "因为" | "所以" | "由于" | "因此" | "否则"
-        | "然后" | "接着" | "另外" | "还有" => true,
-        "并" | "又" | "但" | "却" | "也" => {
-            looks_like_unmarked_clause_after_connector(prefix, suffix)
-        }
-        // “和、与、或、以及”可以连接同一名词短语，只有后半段满足正向从句骨架
-        // 时才拒绝；普通并列名词本身仍是一项偏好对象。
-        "和" | "与" | "或" | "以及" => false,
-        _ => false,
-    }
-}
-
-fn looks_like_unmarked_clause_after_connector(prefix: &str, suffix: &str) -> bool {
-    prefix.chars().count() >= 2 && suffix.chars().count() >= 3
+    // 连接词只有在后半段复用同一套正向从句语法成功时才具备结构意义；
+    // 词内片段和专名不因字符长度或连接词本身被推断为第二事实。
+    starts_direct_user_clause(suffix)
 }
 
 fn starts_direct_user_clause(value: &str) -> bool {
@@ -516,7 +516,7 @@ fn starts_direct_user_clause(value: &str) -> bool {
         || starts_direct_user_negation(value)
         || starts_structured_external_source(value)
         || starts_positive_action_predicate(value)
-        || contains_non_nominalized_clause_predicate(value)
+        || has_embedded_subject_predicate_clause(value)
 }
 
 fn starts_positive_action_predicate(value: &str) -> bool {
@@ -572,11 +572,10 @@ fn starts_structured_external_source(value: &str) -> bool {
     false
 }
 
-fn contains_direct_user_predicate(value: &str) -> bool {
-    value.char_indices().any(|(index, _)| {
-        let tail = &value[index..];
-        starts_direct_user_outer_predicate(tail) || starts_positive_action_predicate(tail)
-    })
+fn has_direct_user_clause_predicate(value: &str) -> bool {
+    starts_direct_user_outer_predicate(value)
+        || starts_positive_action_predicate(value)
+        || has_embedded_subject_predicate_clause(value)
 }
 
 fn direct_user_outer_predicates() -> &'static [&'static str] {
@@ -609,23 +608,12 @@ fn starts_direct_user_outer_predicate(value: &str) -> bool {
         .any(|predicate| value.starts_with(predicate))
 }
 
-fn contains_non_nominalized_clause_predicate(value: &str) -> bool {
-    value.char_indices().any(|(index, _)| {
+fn has_embedded_subject_predicate_clause(value: &str) -> bool {
+    value.char_indices().skip(1).any(|(index, _)| {
         let tail = &value[index..];
-        let predicate = direct_user_outer_predicates()
-            .iter()
-            .copied()
-            .find(|predicate| tail.starts_with(predicate))
-            .or_else(|| {
-                direct_user_action_predicates()
-                    .iter()
-                    .map(|(predicate, _)| *predicate)
-                    .find(|predicate| tail.starts_with(predicate))
-            });
-        predicate.is_some_and(|predicate| {
-            let prefix = &value[..index];
-            !(prefix.ends_with('的') && matches!(predicate, "回答" | "回复" | "工作" | "学习"))
-        })
+        let subject = &value[..index];
+        !subject.ends_with('的')
+            && (starts_direct_user_outer_predicate(tail) || starts_positive_action_predicate(tail))
     })
 }
 
