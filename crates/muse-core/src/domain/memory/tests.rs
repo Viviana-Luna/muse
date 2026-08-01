@@ -1178,6 +1178,242 @@ fn memory_source_eligibility_reuses_positive_actions_for_connector_clauses() {
 }
 
 #[test]
+fn memory_source_eligibility_public_api_distinguishes_third_party_clauses_from_compound_nouns() {
+    struct SourceCase {
+        source: &'static str,
+        expected_allowed: bool,
+    }
+
+    // 这里必须走公开来源资格 API，避免私有语法 helper 的测试绕过实际安全边界。
+    let cases = [
+        SourceCase {
+            source: "我喜欢软件部署平台",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好内容发布系统",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢文件上传组件",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好商品购买流程",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢直播平台",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢代码部署规范",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好版本发布策略",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢图片上传模块",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好订单购买系统",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢内容分享平台",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好会议直播服务",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢文档阅读器",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好语言学习工具",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢祖母养花",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢老板部署系统",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢医生发布文章",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢男友上传文件",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢网友直播",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢妈妈的拿手菜",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢哥哥的工作风格",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢祖母绿",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢阿姨奶茶",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢爷爷学习书法",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢姐姐购买咖啡",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢朋友发布动态",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢同事上传文档",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢老师直播课程",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢护士阅读文章",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢客户部署系统",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢伴侣分享照片",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢网友看报",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢经理开会",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢表哥写代码",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我喜欢阿姨买菜",
+            expected_allowed: false,
+        },
+        SourceCase {
+            source: "我偏好新建发布策略",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢文件上传时间",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好商品购买路径",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢视频直播质量",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好服务部署环境",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢文章发布平台",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好界面上传体验",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢方案购买成本",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好仓库部署拓扑",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢稿件发布渠道",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好图像上传队列",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢图书订购页面",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好包裹寄出提醒",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢社交发帖权限",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我偏好海外直播节点",
+            expected_allowed: true,
+        },
+        SourceCase {
+            source: "我喜欢晨间散步路线",
+            expected_allowed: true,
+        },
+    ];
+    assert_eq!(cases.len(), 50, "终审来源语料必须固定为 50 条");
+
+    for (index, case) in cases.iter().enumerate() {
+        let candidate = format!(
+            "用户{}",
+            case.source
+                .strip_prefix('我')
+                .expect("来源语料应使用第一人称主语")
+        );
+        let actual_allowed = MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-third-party-grammar",
+            "turn-third-party-grammar",
+            format!("call-third-party-grammar-{index}"),
+            case.source,
+            &candidate,
+        )
+        .is_ok();
+        assert_eq!(
+            actual_allowed, case.expected_allowed,
+            "来源资格不符合第三方主体与复合名词语法：{}",
+            case.source
+        );
+    }
+}
+
+#[test]
 fn safety_request_covers_event_time_and_runtime_source() {
     let staged = staged(
         create_params(),

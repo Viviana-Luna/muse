@@ -512,11 +512,15 @@ fn is_structural_connector_occurrence(prefix: &str, suffix: &str) -> bool {
 }
 
 fn starts_direct_user_clause(value: &str) -> bool {
-    starts_direct_user_outer_predicate(value)
+    starts_shared_clause_predicate(value)
         || starts_direct_user_negation(value)
         || starts_structured_external_source(value)
-        || starts_positive_action_predicate(value)
         || has_embedded_subject_predicate_clause(value)
+}
+
+/// 第二从句与第三方从句只复用已经声明的用户谓词，不按任意词内片段推断动作。
+fn starts_shared_clause_predicate(value: &str) -> bool {
+    starts_direct_user_outer_predicate(value) || starts_positive_action_predicate(value)
 }
 
 fn starts_positive_action_predicate(value: &str) -> bool {
@@ -573,9 +577,7 @@ fn starts_structured_external_source(value: &str) -> bool {
 }
 
 fn has_direct_user_clause_predicate(value: &str) -> bool {
-    starts_direct_user_outer_predicate(value)
-        || starts_positive_action_predicate(value)
-        || has_embedded_subject_predicate_clause(value)
+    starts_shared_clause_predicate(value) || has_embedded_subject_predicate_clause(value)
 }
 
 fn direct_user_outer_predicates() -> &'static [&'static str] {
@@ -609,12 +611,40 @@ fn starts_direct_user_outer_predicate(value: &str) -> bool {
 }
 
 fn has_embedded_subject_predicate_clause(value: &str) -> bool {
-    value.char_indices().skip(1).any(|(index, _)| {
-        let tail = &value[index..];
-        let subject = &value[..index];
-        !subject.ends_with('的')
-            && (starts_direct_user_outer_predicate(tail) || starts_positive_action_predicate(tail))
-    })
+    third_party_subject_categories()
+        .iter()
+        .flat_map(|category| category.iter())
+        .filter_map(|subject| value.strip_prefix(subject))
+        .any(starts_shared_clause_predicate)
+}
+
+/// 第三方主体必须位于补语起始处，且只接受集中列出的可解释语法类别。
+/// 所有格（如“妈妈的”）不会匹配共享谓词，因此仍按单一名词补语处理。
+fn third_party_subject_categories() -> &'static [&'static [&'static str]] {
+    const KINSHIP_TERMS: &[&str] = &[
+        "爸爸", "妈妈", "爷爷", "奶奶", "祖父", "祖母", "外公", "外婆", "哥哥", "姐姐", "弟弟",
+        "妹妹", "表哥", "表姐", "堂哥", "堂姐", "舅舅", "舅妈", "叔叔", "阿姨", "姑姑", "姨妈",
+        "伯父", "伯母",
+    ];
+    const SOCIAL_ROLES: &[&str] = &[
+        "男友", "女友", "伴侣", "朋友", "同事", "网友", "室友", "老板", "上司", "经理", "客户",
+        "用户", "对方",
+    ];
+    const PROFESSIONAL_ROLES: &[&str] = &[
+        "医生",
+        "老师",
+        "护士",
+        "律师",
+        "工程师",
+        "设计师",
+        "程序员",
+        "教练",
+        "司机",
+        "店员",
+    ];
+    const PRONOUNS: &[&str] = &["他们", "她们", "他", "她", "别人", "某人"];
+
+    &[KINSHIP_TERMS, SOCIAL_ROLES, PROFESSIONAL_ROLES, PRONOUNS]
 }
 
 /// `我的` 只接受与偏好、习惯、计划、学习、工作、时区或昵称直接相关的有限
