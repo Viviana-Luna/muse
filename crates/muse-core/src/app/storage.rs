@@ -13,7 +13,7 @@ const RUNTIME_DATABASE_FILE: &str = "muse.sqlite";
 const LEGACY_RUNTIME_DATABASE_FILE: &str = "agent-vp.sqlite";
 const RUNTIME_DATABASE_DIR: &str = "runtime";
 const RUNTIME_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 8;
+const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 9;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 统一运行时数据库初始化、连接或迁移错误。
@@ -434,6 +434,26 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
             END;
         "#,
     },
+    RuntimeMigration {
+        version: 9,
+        name: "memory_revision_attribute_snapshots",
+        // category 与 importance 属于 revision 当时的检索语义。旧 v8 库无法从
+        // current entry 反推出历史值，因此升级前只接受空 revision 表；有数据时
+        // 由迁移前置检查 fail closed，禁止伪造历史快照。
+        sql: r#"
+            ALTER TABLE memory_revision
+                ADD COLUMN category TEXT NOT NULL CHECK (
+                    category IN (
+                        'user_fact', 'user_preference', 'shared_experience',
+                        'commitment', 'story_state'
+                    )
+                );
+            ALTER TABLE memory_revision
+                ADD COLUMN importance TEXT NOT NULL CHECK (
+                    importance IN ('low', 'normal', 'high')
+                );
+        "#,
+    },
 ];
 
 /// 打开指定数据目录的统一运行时库，并完成连接配置与显式 migration。
@@ -561,6 +581,17 @@ fn run_runtime_migrations(
             }
             transaction.commit()?;
             continue;
+        }
+        if migration.version == 9 {
+            let revision_count: i64 =
+                transaction
+                    .query_row("SELECT COUNT(*) FROM memory_revision", [], |row| row.get(0))?;
+            if revision_count != 0 {
+                return Err(RuntimeStorageError::Integrity(
+                    "旧版记忆 revision 缺少 category/importance 历史快照，已拒绝自动升级"
+                        .to_string(),
+                ));
+            }
         }
         transaction.execute_batch(migration.sql)?;
         if migration.version == 8 {
@@ -1092,7 +1123,7 @@ mod tests {
             .expect("应记录最新 migration");
         assert_eq!(
             migration,
-            (8, "persona_long_term_memory_storage".to_string())
+            (9, "memory_revision_attribute_snapshots".to_string())
         );
         let tables: i64 = connection
             .query_row(
@@ -1131,7 +1162,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",
@@ -1217,7 +1248,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取最新 migration");
-        assert_eq!(latest, 8);
+        assert_eq!(latest, 9);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }

@@ -6,7 +6,10 @@ mod repository;
 mod retriever;
 
 pub use authority::SqliteMemoryDeletionAuthority;
-pub use repository::{SqliteMemoryRepository, normalize_memory_fts_query};
+pub use repository::{
+    MAX_REVISION_HISTORY_PAGE_SIZE, MemoryRevisionHistoryPage, SqliteMemoryRepository,
+    normalize_memory_fts_query,
+};
 pub use retriever::{
     DEFAULT_MEMORY_QUERY_PAGE_SIZE, MAX_MEMORY_QUERY_PAGE_SIZE, MEMORY_QUERY_PAGE_TOKEN_BUDGET,
     MEMORY_QUERY_TURN_MAX_CALLS, MEMORY_QUERY_TURN_TOKEN_BUDGET, MemoryQueryBudget,

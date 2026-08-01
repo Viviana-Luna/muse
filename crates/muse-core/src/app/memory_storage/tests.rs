@@ -439,7 +439,7 @@ fn downgrade_runtime_to_v7(root: &Path) {
              DROP TABLE IF EXISTS memory_revision;
              DROP TABLE IF EXISTS memory_entry;
              DROP TABLE IF EXISTS memory_authority_anchor;
-             DELETE FROM schema_migrations WHERE version = 8;
+             DELETE FROM schema_migrations WHERE version IN (8, 9);
              COMMIT;
              PRAGMA foreign_keys = ON;",
         )
@@ -452,11 +452,26 @@ fn downgrade_runtime_to_v7(root: &Path) {
     assert_eq!(checkpoint.0, 0, "v7 runtime checkpoint 不得 busy");
 }
 
+fn downgrade_runtime_to_v8_without_attribute_snapshots(root: &Path) {
+    let connection = Connection::open(root.join("runtime/muse.sqlite")).expect("应打开 runtime 库");
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN IMMEDIATE;
+             ALTER TABLE memory_revision DROP COLUMN importance;
+             ALTER TABLE memory_revision DROP COLUMN category;
+             DELETE FROM schema_migrations WHERE version = 9;
+             COMMIT;
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("应还原缺少 revision 属性快照的 v8 结构");
+}
+
 fn seed_completed_deletion(
     root: &Path,
     label: &str,
 ) -> (crate::domain::memory::MemoryPersonaScope, MemoryId) {
-    let repository = SqliteMemoryRepository::open(root).expect("应初始化 v8 Repository");
+    let repository = SqliteMemoryRepository::open(root).expect("应初始化记忆 Repository");
     let scope = scope(&format!("persona-v7-{label}"));
     let memory_id = MemoryId(format!("memory-v7-{label}"));
     commit_create(
@@ -647,7 +662,8 @@ fn assert_storage_does_not_contain(root: &Path, backup: &Path, sentinel: &str) {
 #[test]
 fn migration_八覆盖空库_v7升级与完整性约束() {
     let empty = TestDirectory::new("migration-empty");
-    let (database_path, connection) = open_runtime_database(empty.path()).expect("空库应迁移到 v8");
+    let (database_path, connection) =
+        open_runtime_database(empty.path()).expect("空库应迁移到最新版本");
     let latest: (i64, String) = connection
         .query_row(
             "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
@@ -655,7 +671,10 @@ fn migration_八覆盖空库_v7升级与完整性约束() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("应读取 migration");
-    assert_eq!(latest, (8, "persona_long_term_memory_storage".to_string()));
+    assert_eq!(
+        latest,
+        (9, "memory_revision_attribute_snapshots".to_string())
+    );
     for table in [
         "memory_authority_anchor",
         "memory_entry",
@@ -717,7 +736,7 @@ fn migration_八覆盖空库_v7升级与完整性约束() {
             row.get(0)
         })
         .expect("应读取升级版本");
-    assert_eq!(latest, 8);
+    assert_eq!(latest, 9);
     let verifier_lengths: (i64, i64) = Connection::open(
         upgraded
             .path()
@@ -732,6 +751,50 @@ fn migration_八覆盖空库_v7升级与完整性约束() {
     )
     .expect("应读取 key verifier 与 ledger commitment");
     assert_eq!(verifier_lengths, (32, 32));
+}
+
+#[test]
+fn migration_九只升级空_revision库并对旧历史_fail_closed() {
+    let empty = TestDirectory::new("migration-v9-empty");
+    drop(open_runtime_database(empty.path()).expect("应先建立最新空库"));
+    downgrade_runtime_to_v8_without_attribute_snapshots(empty.path());
+    let (_, connection) =
+        open_runtime_database(empty.path()).expect("空 revision 的 v8 库应可证明升级");
+    let columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(memory_revision)")
+        .expect("应准备 revision 列检查")
+        .query_map([], |row| row.get(1))
+        .expect("应查询 revision 列")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("应收集 revision 列");
+    assert!(columns.iter().any(|column| column == "category"));
+    assert!(columns.iter().any(|column| column == "importance"));
+    drop(connection);
+
+    let populated = TestDirectory::new("migration-v9-populated");
+    let repository = SqliteMemoryRepository::open(populated.path()).expect("应建立最新记忆库");
+    let scope = scope("migration-v9-persona");
+    commit_create(
+        &repository,
+        &scope,
+        "migration-v9-batch",
+        "migration-v9-conversation",
+        "migration-v9-turn",
+        "migration-v9-operation",
+        "migration-v9-memory",
+        "migration-v9-revision",
+        "旧库历史属性无法可靠反推",
+    );
+    drop(repository);
+    downgrade_runtime_to_v8_without_attribute_snapshots(populated.path());
+    let error =
+        open_runtime_database(populated.path()).expect_err("有历史的 v8 库必须 fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("缺少 category/importance 历史快照"),
+        "应明确拒绝伪造历史属性快照：{error}"
+    );
 }
 
 #[test]

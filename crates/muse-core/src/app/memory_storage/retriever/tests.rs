@@ -12,6 +12,7 @@ use chrono::Utc;
 use rusqlite::{TransactionBehavior, params};
 
 use super::*;
+use crate::app::memory_storage::MAX_REVISION_HISTORY_PAGE_SIZE;
 use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryEntry, MemoryEntryState,
@@ -133,6 +134,37 @@ fn stage_change(
     correct: bool,
     time: &str,
 ) -> MemoryStagedMutation {
+    stage_change_with_attributes(
+        scope,
+        conversation_id,
+        turn_id,
+        operation_id,
+        memory_id,
+        expected_revision_id,
+        revision_id,
+        content,
+        MemoryCategory::UserPreference,
+        MemoryImportance::Normal,
+        correct,
+        time,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_change_with_attributes(
+    scope: &MemoryPersonaScope,
+    conversation_id: &str,
+    turn_id: &str,
+    operation_id: &str,
+    memory_id: &str,
+    expected_revision_id: &str,
+    revision_id: &str,
+    content: &str,
+    category: MemoryCategory,
+    importance: MemoryImportance,
+    correct: bool,
+    time: &str,
+) -> MemoryStagedMutation {
     let binding = MemoryRuntimeBinding::new(
         scope.clone(),
         conversation_id,
@@ -147,9 +179,9 @@ fn stage_change(
     let common = (
         MemoryId(memory_id.to_string()),
         MemoryRevisionId(expected_revision_id.to_string()),
-        MemoryCategory::UserPreference,
+        category,
         content.to_string(),
-        MemoryImportance::Normal,
+        importance,
         None,
         "测试变更".to_string(),
     );
@@ -264,6 +296,41 @@ fn update_memory(
             revision_id,
             content,
             correct,
+            time,
+        )],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_memory_with_attributes(
+    repository: &SqliteMemoryRepository,
+    scope: &MemoryPersonaScope,
+    memory_id: &str,
+    expected_revision_id: &str,
+    revision_id: &str,
+    content: &str,
+    category: MemoryCategory,
+    importance: MemoryImportance,
+    time: &str,
+) {
+    let turn_id = unique("turn");
+    commit_batch(
+        repository,
+        scope,
+        "conv",
+        &turn_id,
+        vec![stage_change_with_attributes(
+            scope,
+            "conv",
+            &turn_id,
+            &unique("op"),
+            memory_id,
+            expected_revision_id,
+            revision_id,
+            content,
+            category,
+            importance,
+            false,
             time,
         )],
     );
@@ -1736,6 +1803,141 @@ fn future_updates_do_not_reorder_the_same_as_of_query() {
 }
 
 #[test]
+fn future_category_and_importance_updates_do_not_change_as_of_filters_order_or_pages() {
+    let directory = TestDirectory::new("as-of-versioned-attributes");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("历史属性-persona");
+    let seeds = [
+        (
+            "m-as-of-attr-high",
+            "r-as-of-attr-high",
+            "历史属性锚点：高权重旧事实",
+            MemoryImportance::High,
+            T1,
+        ),
+        (
+            "m-as-of-attr-normal",
+            "r-as-of-attr-normal",
+            "历史属性锚点：普通权重旧事实",
+            MemoryImportance::Normal,
+            T2,
+        ),
+        (
+            "m-as-of-attr-low",
+            "r-as-of-attr-low",
+            "历史属性锚点：低权重旧事实",
+            MemoryImportance::Low,
+            T3,
+        ),
+    ];
+    for (memory_id, revision_id, content, importance, time) in seeds {
+        create_memory(
+            &repository,
+            &scope,
+            memory_id,
+            revision_id,
+            MemoryCategory::UserFact,
+            content,
+            importance,
+            time,
+        );
+    }
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+    let turn = MemoryRetrievalTurn::from_runtime("turn-as-of-attributes", "nonce-as-of-attributes")
+        .expect("Turn 绑定应有效");
+    let filters = MemoryRetrievalFilters::new(Some(MemoryCategory::UserFact), None);
+    let first_request = || {
+        request_for_turn_and_filters(
+            &scope,
+            "历史属性锚点",
+            Some(2),
+            None,
+            Some("2026-07-30T04:00:00Z"),
+            None,
+            false,
+            &turn,
+            filters,
+        )
+    };
+    let collect_two_pages = |first: MemoryQueryPageReceipt| {
+        let cursor = first.next_cursor.clone().expect("三条结果应产生第二页");
+        let second = retriever
+            .retrieve(&request_for_turn_and_filters(
+                &scope,
+                "历史属性锚点",
+                Some(2),
+                Some(cursor),
+                Some("2026-07-30T04:00:00Z"),
+                None,
+                false,
+                &turn,
+                filters,
+            ))
+            .expect("历史属性第二页应成功");
+        first
+            .items
+            .into_iter()
+            .chain(second.items)
+            .map(|item| {
+                (
+                    item.memory_id.0,
+                    item.revision_id.0,
+                    item.category,
+                    item.importance,
+                    item.content,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let before = collect_two_pages(
+        retriever
+            .retrieve(&first_request())
+            .expect("未来 update 前的历史属性查询应成功"),
+    );
+    assert_eq!(
+        before
+            .iter()
+            .map(|item| item.3)
+            .collect::<Vec<MemoryImportance>>(),
+        vec![
+            MemoryImportance::High,
+            MemoryImportance::Normal,
+            MemoryImportance::Low,
+        ]
+    );
+
+    for (index, (memory_id, revision_id, _, _, _)) in seeds.into_iter().enumerate() {
+        let future_importance = match index {
+            0 => MemoryImportance::Low,
+            1 => MemoryImportance::High,
+            _ => MemoryImportance::Normal,
+        };
+        update_memory_with_attributes(
+            &repository,
+            &scope,
+            memory_id,
+            revision_id,
+            &format!("{revision_id}-future"),
+            &format!("历史属性锚点：未来第 {index} 次改写"),
+            MemoryCategory::StoryState,
+            future_importance,
+            "2026-07-31T01:00:00Z",
+        );
+    }
+
+    let after = collect_two_pages(
+        retriever
+            .retrieve(&first_request())
+            .expect("未来 update 后的历史属性查询应成功"),
+    );
+    assert_eq!(
+        after, before,
+        "同一 as_of 的筛选、权重排序、游标页内容必须只由历史 revision 快照决定"
+    );
+}
+
+#[test]
 fn iterative_candidate_scan_reaches_hard_match_beyond_first_hundred() {
     let directory = TestDirectory::new("candidate-pressure");
     let repository = open_repository(&directory);
@@ -2031,9 +2233,10 @@ fn large_single_memory_history_is_bounded_but_as_of_selects_one_revision() {
                 "INSERT INTO memory_revision(
                     persona_id, memory_id, revision_id, content, derivation_key,
                     event_time, recorded_at, valid_from, valid_to, change_type,
-                    change_reason, safety_policy_version, state
+                    change_reason, safety_policy_version, state, category, importance
                  ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?7, 'correct',
-                          '压力夹具纠正', '测试策略-v1', 'corrected')",
+                          '压力夹具纠正', '测试策略-v1', 'corrected',
+                          'user_fact', 'normal')",
                 params![
                     scope.persona_id(),
                     "m-large-history",
@@ -2093,6 +2296,74 @@ fn large_single_memory_history_is_bounded_but_as_of_selects_one_revision() {
         .expect("as_of 应在 SQL 层只选中一条可读 revision");
     assert_eq!(at_time.items.len(), 1);
     assert_eq!(at_time.items[0].revision_id.0, "r-large-history-current");
+}
+
+#[test]
+fn bypassed_oversized_revision_is_rejected_before_body_materialization() {
+    let directory = TestDirectory::new("oversized-revision-preflight");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("超限正文-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-oversized",
+        "r-oversized-current",
+        MemoryCategory::UserFact,
+        "当前正文保持可读",
+        MemoryImportance::Normal,
+        T1,
+    );
+
+    let connection = repository.open_connection().expect("应打开旁路夹具连接");
+    connection
+        .execute(
+            "INSERT INTO memory_revision(
+                persona_id, memory_id, revision_id, content, derivation_key,
+                event_time, recorded_at, valid_from, valid_to, change_type,
+                change_reason, safety_policy_version, state, category, importance
+             ) VALUES(?1, ?2, 'zz-oversized-bypass', ?3, ?4, NULL, ?5, ?5, ?6,
+                      'correct', '旁路损坏', '测试策略-v1', 'corrected',
+                      'user_fact', 'normal')",
+            params![
+                scope.persona_id(),
+                "m-oversized",
+                vec![0_u8; crate::domain::memory::MAX_MEMORY_CONTENT_BYTES + 1],
+                vec![7_u8; 32],
+                T1,
+                T2,
+            ],
+        )
+        .expect("应直接旁路插入超大 BLOB revision");
+    connection
+        .execute(
+            "INSERT INTO memory_revision_source(
+                persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                conversation_id, turn_id, action_id, authorized_at
+             ) VALUES(?1, ?2, 'zz-oversized-bypass', 0, 'user_confirmation',
+                      'conv-oversized', 'turn-oversized', NULL, NULL)",
+            params![scope.persona_id(), "m-oversized"],
+        )
+        .expect("应插入旁路 revision source");
+    drop(connection);
+
+    let retriever = SqliteMemoryRetriever::new(repository);
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "当前正文",
+            None,
+            None,
+            None,
+            Some("m-oversized"),
+            true,
+        ))),
+        MemoryErrorCode::QueryBudgetExceeded,
+        "长度预检必须在 row.get::<String> 触碰损坏 BLOB 前稳定拒绝"
+    );
+    assert!(
+        retriever.lock_snapshots().expect("快照锁应可用").is_empty(),
+        "正文预检失败不得落下部分冻结快照"
+    );
 }
 
 #[test]
@@ -2156,34 +2427,146 @@ fn revision_history_includes_corrected_for_management() {
         T3,
     );
 
-    // 管理审计读取含 corrected，按 valid_from 升序。
+    // 管理审计读取含 corrected，并按 revision_id 倒序提供稳定 keyset 页。
     let history = repository
-        .revision_history(&persona_scope, &MemoryId("m-correct-01".to_string()))
+        .revision_history(
+            &persona_scope,
+            &MemoryId("m-correct-01".to_string()),
+            None,
+            MAX_REVISION_HISTORY_PAGE_SIZE,
+        )
         .expect("管理历史应可读");
-    assert_eq!(history.len(), 3);
-    assert_eq!(history[0].revision_id.0, "r-correct-01");
-    assert_eq!(history[0].state, MemoryRevisionState::Superseded);
-    assert_eq!(history[1].revision_id.0, "r-correct-02");
-    assert_eq!(history[1].state, MemoryRevisionState::Corrected);
-    assert_eq!(history[2].revision_id.0, "r-correct-03");
-    assert_eq!(history[2].state, MemoryRevisionState::Current);
+    assert_eq!(history.revisions.len(), 3);
+    assert!(history.next_cursor.is_none());
+    assert_eq!(history.revisions[0].revision_id.0, "r-correct-03");
+    assert_eq!(history.revisions[0].state, MemoryRevisionState::Current);
+    assert_eq!(history.revisions[1].revision_id.0, "r-correct-02");
+    assert_eq!(history.revisions[1].state, MemoryRevisionState::Corrected);
+    assert_eq!(history.revisions[2].revision_id.0, "r-correct-01");
+    assert_eq!(history.revisions[2].state, MemoryRevisionState::Superseded);
 
     // 跨 Persona 与未知记忆都按不存在处理。
     let other = scope("其他-persona");
     assert_eq!(
         repository
-            .revision_history(&other, &MemoryId("m-correct-01".to_string()))
+            .revision_history(
+                &other,
+                &MemoryId("m-correct-01".to_string()),
+                None,
+                MAX_REVISION_HISTORY_PAGE_SIZE,
+            )
             .expect_err("跨 Persona 应拒绝")
             .code(),
         MemoryErrorCode::MemoryNotFound
     );
     assert_eq!(
         repository
-            .revision_history(&persona_scope, &MemoryId("m-unknown".to_string()))
+            .revision_history(
+                &persona_scope,
+                &MemoryId("m-unknown".to_string()),
+                None,
+                MAX_REVISION_HISTORY_PAGE_SIZE,
+            )
             .expect_err("未知记忆应拒绝")
             .code(),
         MemoryErrorCode::MemoryNotFound
     );
+}
+
+#[test]
+fn management_revision_history_returns_one_bounded_keyset_page() {
+    let directory = TestDirectory::new("management-history-page");
+    let repository = open_repository(&directory);
+    let scope = scope("管理历史分页-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-management-page",
+        "r-management-page-9999",
+        MemoryCategory::UserFact,
+        "管理历史当前正文",
+        MemoryImportance::Normal,
+        T1,
+    );
+
+    let mut connection = repository.open_connection().expect("应打开分页夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启分页夹具事务");
+    for index in 0..130 {
+        let revision_id = format!("r-management-page-{index:04}");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?7, 'correct',
+                          '管理分页夹具', '测试策略-v1', 'corrected',
+                          'user_fact', 'normal')",
+                params![
+                    scope.persona_id(),
+                    "m-management-page",
+                    revision_id,
+                    format!("管理历史第 {index} 条正文"),
+                    vec![(index % 251) as u8; 32],
+                    T1,
+                    T2,
+                ],
+            )
+            .expect("应插入分页 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'user_confirmation',
+                          'conv-management-page', ?4, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    "m-management-page",
+                    revision_id,
+                    format!("turn-management-page-{index:04}"),
+                ],
+            )
+            .expect("应插入分页 revision source");
+    }
+    transaction.commit().expect("分页夹具应原子提交");
+    drop(connection);
+
+    let memory_id = MemoryId("m-management-page".to_string());
+    let first = repository
+        .revision_history(&scope, &memory_id, None, MAX_REVISION_HISTORY_PAGE_SIZE)
+        .expect("第一页应有界返回");
+    assert_eq!(first.revisions.len(), MAX_REVISION_HISTORY_PAGE_SIZE);
+    assert!(first.next_cursor.is_some(), "大量历史必须返回 keyset 游标");
+
+    let mut all_ids = first
+        .revisions
+        .iter()
+        .map(|revision| revision.revision_id.0.clone())
+        .collect::<Vec<_>>();
+    let mut cursor = first.next_cursor;
+    while let Some(after) = cursor {
+        let page = repository
+            .revision_history(
+                &scope,
+                &memory_id,
+                Some(&after),
+                MAX_REVISION_HISTORY_PAGE_SIZE,
+            )
+            .expect("keyset 续页应成功");
+        all_ids.extend(
+            page.revisions
+                .iter()
+                .map(|revision| revision.revision_id.0.clone()),
+        );
+        cursor = page.next_cursor;
+    }
+    let unique_ids = all_ids.iter().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(all_ids.len(), 131);
+    assert_eq!(unique_ids.len(), 131, "keyset 续页不得重复或遗漏 revision");
+    assert!(all_ids.windows(2).all(|pair| pair[0] > pair[1]));
 }
 
 #[test]

@@ -100,13 +100,7 @@ const FTS_CANDIDATE_SQL: &str = "SELECT projection.memory_id, bm25(memory_fts)
 const AS_OF_CANDIDATE_SQL: &str = "SELECT memory_id
      FROM memory_entry
      WHERE persona_id = ?1 AND state = 'active'
-     ORDER BY CASE importance
-                WHEN 'high' THEN 0
-                WHEN 'normal' THEN 1
-                ELSE 2
-              END,
-              freshness_at DESC,
-              memory_id
+     ORDER BY memory_id
      LIMIT ?2 OFFSET ?3";
 
 /// SQLite FTS 版记忆检索器；真实实例由协调者在集成时注入运行时。
@@ -486,14 +480,18 @@ impl SqliteMemoryRetriever {
             }
             for (memory_id, bm25) in candidates {
                 let memory_id = MemoryId(memory_id);
-                let Some(record) =
-                    self.repository
-                        .load_current_on(transaction, scope, &memory_id)?
+                let Some(bounded) = self.repository.load_current_on(
+                    transaction,
+                    scope,
+                    &memory_id,
+                    budget.remaining_revision_bytes(),
+                )?
                 else {
                     continue;
                 };
+                budget.consume_materialized_revisions(1, bounded.materialized_bytes)?;
+                let record = bounded.record;
                 validate_revision_fields(&record.current_revision)?;
-                budget.consume_revision(&record.current_revision)?;
                 if !record_matches_filters(&record, filters)
                     || candidate_blocked(
                         authority_guard,
@@ -588,17 +586,23 @@ impl SqliteMemoryRetriever {
                 else {
                     continue;
                 };
-                if !entry_matches_filters(&entry, filters) {
-                    continue;
-                }
-                let Some(revision) =
-                    self.repository
-                        .revision_at_on(transaction, scope, &memory_id, at_micros)?
+                let Some(snapshot) = self.repository.revision_at_on(
+                    transaction,
+                    scope,
+                    &memory_id,
+                    at_micros,
+                    budget.remaining_revision_bytes(),
+                )?
                 else {
                     continue;
                 };
+                budget.consume_materialized_revisions(1, snapshot.materialized_bytes)?;
+                let historical_entry = historical_entry(&entry, &snapshot);
+                if !entry_matches_filters(&historical_entry, filters) {
+                    continue;
+                }
+                let revision = snapshot.revision;
                 validate_revision_fields(&revision)?;
-                budget.consume_revision(&revision)?;
                 if candidate_blocked(
                     authority_guard,
                     authority,
@@ -618,10 +622,10 @@ impl SqliteMemoryRetriever {
                 // 历史查询的 freshness 只能来自该 revision 的可靠记录时间；current
                 // entry 的未来 update 时间不得改写既往时点排序。
                 let freshness_micros = rfc3339_micros(&revision.recorded_at)?;
-                let effective_weight = importance_weight(entry.importance)
+                let effective_weight = importance_weight(historical_entry.importance)
                     * freshness_decay(at_micros - freshness_micros);
                 items.push(FrozenItem::new(
-                    &entry,
+                    &historical_entry,
                     revision,
                     effective_weight,
                     -relevance_ratio,
@@ -657,20 +661,26 @@ impl SqliteMemoryRetriever {
                 .repository
                 .load_active_entry_on(transaction, scope, memory_id)?
                 .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
-            if !entry_matches_filters(&entry, filters) {
-                return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
-            }
             let at = rfc3339_micros(value)?;
-            let Some(revision) =
-                self.repository
-                    .revision_at_on(transaction, scope, memory_id, at)?
+            let Some(snapshot) = self.repository.revision_at_on(
+                transaction,
+                scope,
+                memory_id,
+                at,
+                budget.remaining_revision_bytes(),
+            )?
             else {
                 // 该时刻不存在模型可读 revision（例如正处于 corrected 区间）时
                 // 返回空页，而不是把不可读内容暴露给模型。
                 return Ok(Vec::new());
             };
+            budget.consume_materialized_revisions(1, snapshot.materialized_bytes)?;
+            let historical_entry = historical_entry(&entry, &snapshot);
+            if !entry_matches_filters(&historical_entry, filters) {
+                return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
+            }
+            let revision = snapshot.revision;
             validate_revision_fields(&revision)?;
-            budget.consume_revision(&revision)?;
             if candidate_blocked(
                 authority_guard,
                 authority,
@@ -682,7 +692,7 @@ impl SqliteMemoryRetriever {
             }
             let freshness_micros = rfc3339_micros(&revision.recorded_at)?;
             return Ok(vec![FrozenItem::new(
-                &entry,
+                &historical_entry,
                 revision,
                 0.0,
                 0.0,
@@ -690,16 +700,22 @@ impl SqliteMemoryRetriever {
             )?]);
         }
 
-        let record = self
+        let bounded = self
             .repository
-            .load_current_on(transaction, scope, memory_id)?
+            .load_current_on(
+                transaction,
+                scope,
+                memory_id,
+                budget.remaining_revision_bytes(),
+            )?
             .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
+        budget.consume_materialized_revisions(1, bounded.materialized_bytes)?;
+        let record = bounded.record;
         if !record_matches_filters(&record, filters) {
             return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
         }
         let revision = record.current_revision.clone();
         validate_revision_fields(&revision)?;
-        budget.consume_revision(&revision)?;
         if candidate_blocked(
             authority_guard,
             authority,
@@ -740,7 +756,7 @@ impl SqliteMemoryRetriever {
             return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
         }
         let mut items = Vec::new();
-        let mut after: Option<MemoryRevision> = None;
+        let mut after: Option<MemoryRevisionId> = None;
         loop {
             let remaining = budget.remaining_revision_rows();
             if remaining == 0 {
@@ -764,15 +780,19 @@ impl SqliteMemoryRetriever {
                 memory_id,
                 after.as_ref(),
                 batch_size,
+                budget.remaining_revision_bytes(),
             )?;
-            let fetched = page.len();
+            let fetched = page.revisions.len();
             if fetched == 0 {
                 break;
             }
-            after = page.last().cloned();
-            for revision in page {
+            after = page
+                .revisions
+                .last()
+                .map(|revision| revision.revision_id.clone());
+            budget.consume_materialized_revisions(fetched, page.materialized_bytes)?;
+            for revision in page.revisions {
                 validate_revision_fields(&revision)?;
-                budget.consume_revision(&revision)?;
                 if !revision.state.is_model_readable()
                     || candidate_blocked(
                         authority_guard,
@@ -1150,8 +1170,8 @@ impl SnapshotBudgetLimits {
     }
 }
 
-/// 单次新查询的资源预算；SQL 页读取前先校验最大行数，读取后再按真实
-/// revision 序列化字节与 LCS 字符比较量扣减。
+/// 单次新查询的资源预算；SQL 正文物化前先校验最大行数与真实存储字节，
+/// 物化后只扣减已经预检授权的字节与 LCS 字符比较量。
 #[derive(Debug, Clone, Copy, Default)]
 struct RetrievalResourceBudget {
     revision_rows: usize,
@@ -1172,6 +1192,10 @@ impl RetrievalResourceBudget {
         MAX_REVISIONS_SCANNED.saturating_sub(self.revision_rows)
     }
 
+    fn remaining_revision_bytes(&self) -> usize {
+        MAX_REVISION_BYTES_SCANNED.saturating_sub(self.revision_bytes)
+    }
+
     fn authorize_revision_batch(&self, max_rows: usize) -> Result<(), MemoryError> {
         if max_rows == 0 || self.revision_rows.saturating_add(max_rows) > MAX_REVISIONS_SCANNED {
             return Err(query_budget_exceeded());
@@ -1179,13 +1203,14 @@ impl RetrievalResourceBudget {
         Ok(())
     }
 
-    fn consume_revision(&mut self, revision: &MemoryRevision) -> Result<(), MemoryError> {
-        let bytes = serde_json::to_vec(revision)
-            .map_err(repository_unavailable)?
-            .len();
+    fn consume_materialized_revisions(
+        &mut self,
+        rows: usize,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
         let next_rows = self
             .revision_rows
-            .checked_add(1)
+            .checked_add(rows)
             .ok_or_else(query_budget_exceeded)?;
         let next_bytes = self
             .revision_bytes
@@ -1284,6 +1309,22 @@ fn record_matches_filters(
     filters: &MemoryRetrievalFilters,
 ) -> bool {
     entry_matches_filters(&record.entry, filters)
+}
+
+fn historical_entry(
+    current_entry: &crate::domain::memory::MemoryEntry,
+    snapshot: &super::repository::BoundedRevisionSnapshot,
+) -> crate::domain::memory::MemoryEntry {
+    crate::domain::memory::MemoryEntry {
+        memory_id: current_entry.memory_id.clone(),
+        persona_id: current_entry.persona_id.clone(),
+        category: snapshot.category,
+        current_revision_id: snapshot.revision.revision_id.clone(),
+        importance: snapshot.importance,
+        freshness_at: snapshot.revision.recorded_at.clone(),
+        created_at: current_entry.created_at.clone(),
+        state: current_entry.state,
+    }
 }
 
 fn entry_matches_filters(

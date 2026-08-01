@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::Utc;
 use rusqlite::{
@@ -32,12 +33,47 @@ use crate::domain::memory::{
     MemorySourceKind,
 };
 
-const REVISION_HISTORY_STORAGE_BATCH_SIZE: usize = 64;
+pub const MAX_REVISION_HISTORY_PAGE_SIZE: usize = 64;
+const REVISION_HISTORY_STORAGE_BATCH_SIZE: usize = MAX_REVISION_HISTORY_PAGE_SIZE;
+const MAX_REVISION_HISTORY_PAGE_BYTES: usize = 256 * 1024;
+const MAX_REVISION_METADATA_FIELD_BYTES: usize = 1024;
+const MAX_REVISION_SOURCE_FIELD_BYTES: usize = 256;
+const MAX_REVISION_SOURCE_BYTES: usize = MAX_REVISION_SOURCE_FIELD_BYTES * 5;
+const MAX_REVISION_ROW_BYTES: usize = MAX_MEMORY_CONTENT_BYTES
+    + MAX_MEMORY_CHANGE_REASON_BYTES
+    + MAX_REVISION_SOURCE_BYTES
+    + MAX_REVISION_METADATA_FIELD_BYTES * 10;
+const REVISION_SQLITE_PROGRESS_INTERVAL_OPS: i32 = 1_000;
+const MAX_REVISION_SQLITE_PROGRESS_CALLBACKS: usize = 20_000;
 const RFC3339_MICROS_SQL_FUNCTION: &str = "muse_rfc3339_micros";
 use crate::domain::memory::{
-    MAX_MEMORY_QUERY_CHARS, validate_memory_change_reason, validate_memory_content,
-    validate_memory_query_text,
+    MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_CHARS,
+    validate_memory_change_reason, validate_memory_content, validate_memory_query_text,
 };
+
+/// 管理审计读取的一页 revision；`next_cursor` 是稳定 revision_id keyset。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRevisionHistoryPage {
+    pub revisions: Vec<MemoryRevision>,
+    pub next_cursor: Option<MemoryRevisionId>,
+}
+
+pub(crate) struct BoundedMemoryRecord {
+    pub record: MemoryRecord,
+    pub materialized_bytes: usize,
+}
+
+pub(crate) struct BoundedRevisionSnapshot {
+    pub revision: MemoryRevision,
+    pub category: MemoryCategory,
+    pub importance: MemoryImportance,
+    pub materialized_bytes: usize,
+}
+
+pub(crate) struct BoundedRevisionPage {
+    pub revisions: Vec<MemoryRevision>,
+    pub materialized_bytes: usize,
+}
 
 /// 所有记忆写入、FTS 投影和幂等收据的唯一 SQLite 实现。
 pub struct SqliteMemoryRepository {
@@ -119,7 +155,13 @@ impl SqliteMemoryRepository {
 
         let mut records = Vec::with_capacity(memory_ids.len());
         for memory_id in memory_ids {
-            let Some(record) = load_current(&connection, scope, &MemoryId(memory_id))? else {
+            let Some(record) = load_current(
+                &connection,
+                scope,
+                &MemoryId(memory_id),
+                MAX_REVISION_ROW_BYTES,
+            )?
+            .map(|bounded| bounded.record) else {
                 continue;
             };
             if record_is_blocked(&authority_guard, &self.authority, scope, &record)? {
@@ -131,41 +173,76 @@ impl SqliteMemoryRepository {
         Ok(records)
     }
 
-    /// 管理审计专用的完整 revision 链只读读取（含 corrected），仅供管理 API。
+    /// 管理审计专用的有界 revision 页（含 corrected），仅供管理 API。
     ///
-    /// 模型读取面不得使用本方法；被删除权威阻断的 revision 与空历史一样按
-    /// 不存在处理，与 `current` 的读取口径保持一致。
+    /// 模型读取面不得使用本方法。每次调用最多返回一个硬上限页，游标使用
+    /// revision_id keyset；正文先在 SQLite 内完成长度预检，任一字段、单行或
+    /// 本页累计超限都整页拒绝，不返回部分结果。
     pub fn revision_history(
         &self,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
-    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        after: Option<&MemoryRevisionId>,
+        limit: usize,
+    ) -> Result<MemoryRevisionHistoryPage, MemoryError> {
+        if limit == 0 || limit > MAX_REVISION_HISTORY_PAGE_SIZE {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
         let authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(repository_unavailable)?;
-        let revisions = self.revision_history_on(&transaction, scope, memory_id)?;
-        if revisions.is_empty() {
-            return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
-        }
-        let mut readable = Vec::with_capacity(revisions.len());
-        for revision in revisions {
-            let check = read_deletion_check(&self.authority, scope, memory_id, &revision.content)?;
-            if matches!(
-                authority_guard.check(&check)?,
-                MemoryDeletionDecision::Blocked { .. }
-            ) {
-                continue;
+        let exhausted = install_revision_progress_handler(&connection);
+        let result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(repository_unavailable)?;
+            let page = self.revision_history_page_on(
+                &transaction,
+                scope,
+                memory_id,
+                after,
+                limit,
+                MAX_REVISION_HISTORY_PAGE_BYTES,
+            )?;
+            if page.revisions.is_empty() && after.is_none() {
+                return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
             }
-            readable.push(revision);
+            let raw_cursor = page
+                .revisions
+                .last()
+                .map(|revision| revision.revision_id.clone());
+            let has_more = match raw_cursor.as_ref() {
+                Some(cursor) => {
+                    self.revision_history_has_more_on(&transaction, scope, memory_id, cursor)?
+                }
+                None => false,
+            };
+            let mut readable = Vec::with_capacity(page.revisions.len());
+            for revision in page.revisions {
+                let check =
+                    read_deletion_check(&self.authority, scope, memory_id, &revision.content)?;
+                if matches!(
+                    authority_guard.check(&check)?,
+                    MemoryDeletionDecision::Blocked { .. }
+                ) {
+                    continue;
+                }
+                readable.push(revision);
+            }
+            if readable.is_empty() && after.is_none() {
+                return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
+            }
+            transaction.commit().map_err(repository_unavailable)?;
+            authority_guard.finish()?;
+            Ok(MemoryRevisionHistoryPage {
+                revisions: readable,
+                next_cursor: if has_more { raw_cursor } else { None },
+            })
+        })();
+        if exhausted.load(Ordering::Relaxed) {
+            Err(query_budget_exceeded())
+        } else {
+            result
         }
-        if readable.is_empty() {
-            return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
-        }
-        transaction.commit().map_err(repository_unavailable)?;
-        authority_guard.finish()?;
-        Ok(readable)
     }
 
     /// 返回指定 Persona 当前仍可读取的有效记忆数量，供删除影响预览使用。
@@ -197,8 +274,14 @@ impl SqliteMemoryRepository {
 
         let mut count = 0_u64;
         for memory_id in memory_ids {
-            let record = load_current(&transaction, scope, &MemoryId(memory_id))?
-                .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+            let record = load_current(
+                &transaction,
+                scope,
+                &MemoryId(memory_id),
+                MAX_REVISION_ROW_BYTES,
+            )?
+            .map(|bounded| bounded.record)
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
             if !record_is_blocked(&authority_guard, &self.authority, scope, &record)? {
                 count = count
                     .checked_add(1)
@@ -216,8 +299,9 @@ impl SqliteMemoryRepository {
         connection: &Connection,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
-    ) -> Result<Option<MemoryRecord>, MemoryError> {
-        load_current(connection, scope, memory_id)
+        max_materialized_bytes: usize,
+    ) -> Result<Option<BoundedMemoryRecord>, MemoryError> {
+        load_current(connection, scope, memory_id, max_materialized_bytes)
     }
 
     /// as_of 候选只读取稳定条目元数据，避免先把 current revision 正文载入内存。
@@ -227,89 +311,7 @@ impl SqliteMemoryRepository {
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
     ) -> Result<Option<MemoryEntry>, MemoryError> {
-        let row = connection
-            .query_row(
-                "SELECT category, current_revision_id, importance, freshness_at,
-                        created_at, state
-                 FROM memory_entry
-                 WHERE persona_id = ?1
-                   AND memory_id = ?2
-                   AND state = 'active'",
-                params![scope.persona_id(), memory_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(repository_unavailable)?;
-        let Some((category, revision_id, importance, freshness_at, created_at, state)) = row else {
-            return Ok(None);
-        };
-        Ok(Some(MemoryEntry {
-            memory_id: memory_id.clone(),
-            persona_id: scope.persona_id().to_string(),
-            category: parse_category(&category)?,
-            current_revision_id: MemoryRevisionId(revision_id),
-            importance: parse_importance(&importance)?,
-            freshness_at,
-            created_at,
-            state: parse_entry_state(&state)?,
-        }))
-    }
-
-    /// 在调用方持有的读快照连接上加载完整 revision 链（含 corrected），
-    /// 按 valid_from、recorded_at、revision_id 升序保证确定顺序。
-    ///
-    /// 管理审计端口沿用完整返回契约，但底层按固定 keyset 页读取并在同一 SQL
-    /// 联结 source，避免一次无界 `collect` 和逐 revision 的 source N+1。
-    pub(crate) fn revision_history_on(
-        &self,
-        connection: &Connection,
-        scope: &MemoryPersonaScope,
-        memory_id: &MemoryId,
-    ) -> Result<Vec<MemoryRevision>, MemoryError> {
-        let mut revisions = Vec::new();
-        let mut after: Option<MemoryRevision> = None;
-        loop {
-            let mut page = self.revision_history_page_on(
-                connection,
-                scope,
-                memory_id,
-                after.as_ref(),
-                REVISION_HISTORY_STORAGE_BATCH_SIZE,
-            )?;
-            let fetched = page.len();
-            if fetched == 0 {
-                break;
-            }
-            after = page.last().cloned();
-            revisions.append(&mut page);
-            if fetched < REVISION_HISTORY_STORAGE_BATCH_SIZE {
-                break;
-            }
-        }
-        let mut keyed = Vec::with_capacity(revisions.len());
-        for revision in revisions {
-            keyed.push((
-                rfc3339_micros(&revision.valid_from)?,
-                rfc3339_micros(&revision.recorded_at)?,
-                revision,
-            ));
-        }
-        keyed.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.revision_id.0.cmp(&right.2.revision_id.0))
-        });
-        Ok(keyed.into_iter().map(|(_, _, revision)| revision).collect())
+        load_active_entry(connection, scope, memory_id)
     }
 
     /// 按 as_of 时点在 SQL 层最多选出两条可读 revision；两条同时有效说明
@@ -320,15 +322,28 @@ impl SqliteMemoryRepository {
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
         at_micros: i64,
-    ) -> Result<Option<MemoryRevision>, MemoryError> {
+        max_materialized_bytes: usize,
+    ) -> Result<Option<BoundedRevisionSnapshot>, MemoryError> {
         let mut statement = connection
             .prepare(
-                "SELECT revision.revision_id, revision.content, revision.event_time,
-                        revision.recorded_at, revision.valid_from, revision.valid_to,
-                        revision.change_type, revision.change_reason,
-                        revision.safety_policy_version, revision.state,
-                        source.source_kind, source.conversation_id, source.turn_id,
-                        source.action_id, source.authorized_at
+                "SELECT revision.row_id,
+                        length(CAST(revision.revision_id AS BLOB)),
+                        length(CAST(revision.content AS BLOB)),
+                        length(CAST(revision.event_time AS BLOB)),
+                        length(CAST(revision.recorded_at AS BLOB)),
+                        length(CAST(revision.valid_from AS BLOB)),
+                        length(CAST(revision.valid_to AS BLOB)),
+                        length(CAST(revision.change_type AS BLOB)),
+                        length(CAST(revision.change_reason AS BLOB)),
+                        length(CAST(revision.safety_policy_version AS BLOB)),
+                        length(CAST(revision.state AS BLOB)),
+                        length(CAST(revision.category AS BLOB)),
+                        length(CAST(revision.importance AS BLOB)),
+                        length(CAST(source.source_kind AS BLOB)),
+                        length(CAST(source.conversation_id AS BLOB)),
+                        length(CAST(source.turn_id AS BLOB)),
+                        length(CAST(source.action_id AS BLOB)),
+                        length(CAST(source.authorized_at AS BLOB))
                  FROM memory_revision AS revision
                  LEFT JOIN memory_revision_source AS source
                    ON source.persona_id = revision.persona_id
@@ -352,23 +367,32 @@ impl SqliteMemoryRepository {
         let raw = statement
             .query_map(
                 params![scope.persona_id(), memory_id.0, at_micros],
-                raw_revision_from_row,
+                raw_revision_lengths_from_row,
             )
             .map_err(repository_unavailable)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(repository_unavailable)?;
-        let revisions = raw
+        let materialized_bytes = authorize_revision_materialization(&raw, max_materialized_bytes)?;
+        let mut revisions = raw
             .into_iter()
-            .map(|row| revision_from_raw(memory_id, row))
+            .map(|row| load_revision_snapshot_by_row_id(connection, memory_id, row.row_id))
             .collect::<Result<Vec<_>, _>>()?;
-        match revisions.as_slice() {
-            [] => Ok(None),
-            [revision] => Ok(Some(revision.clone())),
+        match revisions.len() {
+            0 => Ok(None),
+            1 => {
+                let snapshot = revisions.remove(0);
+                Ok(Some(BoundedRevisionSnapshot {
+                    revision: snapshot.revision,
+                    category: snapshot.category,
+                    importance: snapshot.importance,
+                    materialized_bytes,
+                }))
+            }
             _ => Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable)),
         }
     }
 
-    /// 续页失效检查只按稳定 revision_id 精确取一条，并在同一 SQL 读取 source。
+    /// 续页失效检查只按稳定 revision_id 精确取一条，并先完成正文长度预检。
     pub(crate) fn revision_by_id_on(
         &self,
         connection: &Connection,
@@ -376,92 +400,45 @@ impl SqliteMemoryRepository {
         memory_id: &MemoryId,
         revision_id: &MemoryRevisionId,
     ) -> Result<Option<MemoryRevision>, MemoryError> {
-        let raw = connection
-            .query_row(
-                "SELECT revision.revision_id, revision.content, revision.event_time,
-                        revision.recorded_at, revision.valid_from, revision.valid_to,
-                        revision.change_type, revision.change_reason,
-                        revision.safety_policy_version, revision.state,
-                        source.source_kind, source.conversation_id, source.turn_id,
-                        source.action_id, source.authorized_at
-                 FROM memory_revision AS revision
-                 LEFT JOIN memory_revision_source AS source
-                   ON source.persona_id = revision.persona_id
-                  AND source.memory_id = revision.memory_id
-                  AND source.revision_id = revision.revision_id
-                  AND source.source_ordinal = 0
-                 WHERE revision.persona_id = ?1
-                   AND revision.memory_id = ?2
-                   AND revision.revision_id = ?3
-                 LIMIT 1",
-                params![scope.persona_id(), memory_id.0, revision_id.0],
-                raw_revision_from_row,
-            )
-            .optional()
-            .map_err(repository_unavailable)?;
-        raw.map(|row| revision_from_raw(memory_id, row)).transpose()
+        let metadata = revision_lengths_by_id(connection, scope, memory_id, revision_id)?;
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        authorize_revision_materialization(
+            std::slice::from_ref(&metadata),
+            MAX_REVISION_ROW_BYTES,
+        )?;
+        let snapshot = load_revision_snapshot_by_row_id(connection, memory_id, metadata.row_id)?;
+        Ok(Some(snapshot.revision))
     }
 
-    /// 模型历史读取使用的固定大小 keyset 页；内部按唯一 revision_id 遍历，
-    /// 调用方物化到预算内后再按解析时间形成产品顺序。
+    /// 模型历史读取使用的固定大小 keyset 页；先在 SQLite 内仅读取长度元数据，
+    /// 整页通过字段、单行与累计预算后才逐行物化正文。
     pub(crate) fn revision_history_page_on(
         &self,
         connection: &Connection,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
-        after: Option<&MemoryRevision>,
+        after: Option<&MemoryRevisionId>,
         limit: usize,
-    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        max_materialized_bytes: usize,
+    ) -> Result<BoundedRevisionPage, MemoryError> {
         if limit == 0 || limit > REVISION_HISTORY_STORAGE_BATCH_SIZE {
             return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
         }
         let (sql, cursor) = match after {
-            Some(revision) => (
-                "SELECT revision.revision_id, revision.content, revision.event_time,
-                        revision.recorded_at, revision.valid_from, revision.valid_to,
-                        revision.change_type, revision.change_reason,
-                        revision.safety_policy_version, revision.state,
-                        source.source_kind, source.conversation_id, source.turn_id,
-                        source.action_id, source.authorized_at
-                 FROM memory_revision AS revision
-                 LEFT JOIN memory_revision_source AS source
-                   ON source.persona_id = revision.persona_id
-                  AND source.memory_id = revision.memory_id
-                  AND source.revision_id = revision.revision_id
-                  AND source.source_ordinal = 0
-                 WHERE revision.persona_id = ?1
-                   AND revision.memory_id = ?2
-                   AND revision.revision_id < ?3
-                 ORDER BY revision.revision_id DESC
-                 LIMIT ?4",
-                Some(revision.revision_id.0.as_str()),
+            Some(revision_id) => (
+                revision_history_lengths_sql(true),
+                Some(revision_id.0.as_str()),
             ),
-            None => (
-                "SELECT revision.revision_id, revision.content, revision.event_time,
-                        revision.recorded_at, revision.valid_from, revision.valid_to,
-                        revision.change_type, revision.change_reason,
-                        revision.safety_policy_version, revision.state,
-                        source.source_kind, source.conversation_id, source.turn_id,
-                        source.action_id, source.authorized_at
-                 FROM memory_revision AS revision
-                 LEFT JOIN memory_revision_source AS source
-                   ON source.persona_id = revision.persona_id
-                  AND source.memory_id = revision.memory_id
-                  AND source.revision_id = revision.revision_id
-                  AND source.source_ordinal = 0
-                 WHERE revision.persona_id = ?1
-                   AND revision.memory_id = ?2
-                 ORDER BY revision.revision_id DESC
-                 LIMIT ?3",
-                None,
-            ),
+            None => (revision_history_lengths_sql(false), None),
         };
         let mut statement = connection.prepare(sql).map_err(repository_unavailable)?;
         let raw = match cursor {
             Some(revision_id) => statement
                 .query_map(
                     params![scope.persona_id(), memory_id.0, revision_id, limit as i64],
-                    raw_revision_from_row,
+                    raw_revision_lengths_from_row,
                 )
                 .map_err(repository_unavailable)?
                 .collect::<Result<Vec<_>, _>>()
@@ -469,15 +446,24 @@ impl SqliteMemoryRepository {
             None => statement
                 .query_map(
                     params![scope.persona_id(), memory_id.0, limit as i64],
-                    raw_revision_from_row,
+                    raw_revision_lengths_from_row,
                 )
                 .map_err(repository_unavailable)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(repository_unavailable)?,
         };
-        raw.into_iter()
-            .map(|row| revision_from_raw(memory_id, row))
-            .collect()
+        let materialized_bytes = authorize_revision_materialization(&raw, max_materialized_bytes)?;
+        let revisions = raw
+            .into_iter()
+            .map(|row| {
+                load_revision_snapshot_by_row_id(connection, memory_id, row.row_id)
+                    .map(|snapshot| snapshot.revision)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BoundedRevisionPage {
+            revisions,
+            materialized_bytes,
+        })
     }
 
     pub(crate) fn revision_history_has_more_on(
@@ -485,7 +471,7 @@ impl SqliteMemoryRepository {
         connection: &Connection,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
-        after: &MemoryRevision,
+        after: &MemoryRevisionId,
     ) -> Result<bool, MemoryError> {
         connection
             .query_row(
@@ -497,7 +483,7 @@ impl SqliteMemoryRepository {
                       AND revision.revision_id < ?3
                     LIMIT 1
                  )",
-                params![scope.persona_id(), memory_id.0, after.revision_id.0],
+                params![scope.persona_id(), memory_id.0, after.0],
                 |row| row.get(0),
             )
             .map_err(repository_unavailable)
@@ -519,7 +505,8 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> Result<Option<MemoryRecord>, MemoryError> {
         let authority_guard = self.authority.begin_guard()?;
         let connection = self.open_connection()?;
-        let record = load_current(&connection, scope, memory_id)?;
+        let record = load_current(&connection, scope, memory_id, MAX_REVISION_ROW_BYTES)?
+            .map(|bounded| bounded.record);
         let result = match record {
             Some(record)
                 if record_is_blocked(&authority_guard, &self.authority, scope, &record)? =>
@@ -575,7 +562,9 @@ impl MemoryRepository for SqliteMemoryRepository {
                         &transaction,
                         envelope.scope(),
                         mutation.assigned_memory_id(),
-                    )?,
+                        MAX_REVISION_ROW_BYTES,
+                    )?
+                    .map(|bounded| bounded.record),
                 );
             }
             let current = current_by_memory
@@ -674,7 +663,13 @@ impl MemoryRepository for SqliteMemoryRepository {
             mutation.binding().source(),
         )?;
         require_deletion_allowed(authority_guard.check(&check)?)?;
-        let current = load_current(&transaction, scope, mutation.assigned_memory_id())?;
+        let current = load_current(
+            &transaction,
+            scope,
+            mutation.assigned_memory_id(),
+            MAX_REVISION_ROW_BYTES,
+        )?
+        .map(|bounded| bounded.record);
         let transition = mutation.transition(current.as_ref(), sensitivity)?;
         apply_transition(&transaction, &self.authority, scope, &transition)?;
         let durable_at = Utc::now().to_rfc3339();
@@ -721,8 +716,14 @@ impl MemoryRepository for SqliteMemoryRepository {
             authority_guard.finish()?;
             return Ok(receipt);
         }
-        let current = load_current(&transaction, scope, adjustment.memory_id())?
-            .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
+        let current = load_current(
+            &transaction,
+            scope,
+            adjustment.memory_id(),
+            MAX_REVISION_ROW_BYTES,
+        )?
+        .map(|bounded| bounded.record)
+        .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
         if record_is_blocked(&authority_guard, &self.authority, scope, &current)? {
             return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
         }
@@ -1059,6 +1060,8 @@ struct RawRevisionRow {
     change_reason: String,
     safety_policy_version: String,
     state: String,
+    category: String,
+    importance: String,
     source_kind: Option<String>,
     conversation_id: Option<String>,
     turn_id: Option<String>,
@@ -1078,18 +1081,26 @@ fn raw_revision_from_row(row: &Row<'_>) -> rusqlite::Result<RawRevisionRow> {
         change_reason: row.get(7)?,
         safety_policy_version: row.get(8)?,
         state: row.get(9)?,
-        source_kind: row.get(10)?,
-        conversation_id: row.get(11)?,
-        turn_id: row.get(12)?,
-        action_id: row.get(13)?,
-        authorized_at: row.get(14)?,
+        category: row.get(10)?,
+        importance: row.get(11)?,
+        source_kind: row.get(12)?,
+        conversation_id: row.get(13)?,
+        turn_id: row.get(14)?,
+        action_id: row.get(15)?,
+        authorized_at: row.get(16)?,
     })
 }
 
-fn revision_from_raw(
+struct RevisionSnapshotRow {
+    revision: MemoryRevision,
+    category: MemoryCategory,
+    importance: MemoryImportance,
+}
+
+fn revision_snapshot_from_raw(
     memory_id: &MemoryId,
     row: RawRevisionRow,
-) -> Result<MemoryRevision, MemoryError> {
+) -> Result<RevisionSnapshotRow, MemoryError> {
     let source = parse_revision_source(
         row.source_kind,
         row.conversation_id,
@@ -1097,20 +1108,302 @@ fn revision_from_raw(
         row.action_id,
         row.authorized_at,
     )?;
-    Ok(MemoryRevision {
-        revision_id: MemoryRevisionId(row.revision_id),
-        memory_id: memory_id.clone(),
-        content: row.content,
-        event_time: row.event_time,
-        recorded_at: row.recorded_at,
-        valid_from: row.valid_from,
-        valid_to: row.valid_to,
-        change_type: parse_change_type(&row.change_type)?,
-        change_reason: row.change_reason,
-        source,
-        safety_policy_version: row.safety_policy_version,
-        state: parse_revision_state(&row.state)?,
+    let category = parse_category(&row.category)?;
+    let importance = parse_importance(&row.importance)?;
+    Ok(RevisionSnapshotRow {
+        revision: MemoryRevision {
+            revision_id: MemoryRevisionId(row.revision_id),
+            memory_id: memory_id.clone(),
+            content: row.content,
+            event_time: row.event_time,
+            recorded_at: row.recorded_at,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+            change_type: parse_change_type(&row.change_type)?,
+            change_reason: row.change_reason,
+            source,
+            safety_policy_version: row.safety_policy_version,
+            state: parse_revision_state(&row.state)?,
+        },
+        category,
+        importance,
     })
+}
+
+struct RawRevisionLengths {
+    row_id: i64,
+    revision_id: Option<i64>,
+    content: Option<i64>,
+    event_time: Option<i64>,
+    recorded_at: Option<i64>,
+    valid_from: Option<i64>,
+    valid_to: Option<i64>,
+    change_type: Option<i64>,
+    change_reason: Option<i64>,
+    safety_policy_version: Option<i64>,
+    state: Option<i64>,
+    category: Option<i64>,
+    importance: Option<i64>,
+    source_kind: Option<i64>,
+    conversation_id: Option<i64>,
+    turn_id: Option<i64>,
+    action_id: Option<i64>,
+    authorized_at: Option<i64>,
+}
+
+fn raw_revision_lengths_from_row(row: &Row<'_>) -> rusqlite::Result<RawRevisionLengths> {
+    Ok(RawRevisionLengths {
+        row_id: row.get(0)?,
+        revision_id: row.get(1)?,
+        content: row.get(2)?,
+        event_time: row.get(3)?,
+        recorded_at: row.get(4)?,
+        valid_from: row.get(5)?,
+        valid_to: row.get(6)?,
+        change_type: row.get(7)?,
+        change_reason: row.get(8)?,
+        safety_policy_version: row.get(9)?,
+        state: row.get(10)?,
+        category: row.get(11)?,
+        importance: row.get(12)?,
+        source_kind: row.get(13)?,
+        conversation_id: row.get(14)?,
+        turn_id: row.get(15)?,
+        action_id: row.get(16)?,
+        authorized_at: row.get(17)?,
+    })
+}
+
+fn required_revision_length(value: Option<i64>) -> Result<usize, MemoryError> {
+    let value = value.ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+    usize::try_from(value).map_err(|_| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
+}
+
+fn optional_revision_length(value: Option<i64>) -> Result<usize, MemoryError> {
+    value.map_or(Ok(0), |value| {
+        usize::try_from(value).map_err(|_| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
+    })
+}
+
+fn bounded_revision_length(value: usize, maximum: usize) -> Result<usize, MemoryError> {
+    if value > maximum {
+        Err(query_budget_exceeded())
+    } else {
+        Ok(value)
+    }
+}
+
+impl RawRevisionLengths {
+    fn materialized_bytes(&self) -> Result<usize, MemoryError> {
+        let metadata = [
+            required_revision_length(self.revision_id)?,
+            optional_revision_length(self.event_time)?,
+            required_revision_length(self.recorded_at)?,
+            required_revision_length(self.valid_from)?,
+            optional_revision_length(self.valid_to)?,
+            required_revision_length(self.change_type)?,
+            required_revision_length(self.safety_policy_version)?,
+            required_revision_length(self.state)?,
+            required_revision_length(self.category)?,
+            required_revision_length(self.importance)?,
+        ];
+        let mut total = 0_usize;
+        for length in metadata {
+            total = total
+                .checked_add(bounded_revision_length(
+                    length,
+                    MAX_REVISION_METADATA_FIELD_BYTES,
+                )?)
+                .ok_or_else(query_budget_exceeded)?;
+        }
+        let content = bounded_revision_length(
+            required_revision_length(self.content)?,
+            MAX_MEMORY_CONTENT_BYTES,
+        )?;
+        let change_reason = bounded_revision_length(
+            required_revision_length(self.change_reason)?,
+            MAX_MEMORY_CHANGE_REASON_BYTES,
+        )?;
+        total = total
+            .checked_add(content)
+            .and_then(|total| total.checked_add(change_reason))
+            .ok_or_else(query_budget_exceeded)?;
+
+        let source_lengths = [
+            required_revision_length(self.source_kind)?,
+            optional_revision_length(self.conversation_id)?,
+            optional_revision_length(self.turn_id)?,
+            optional_revision_length(self.action_id)?,
+            optional_revision_length(self.authorized_at)?,
+        ];
+        let mut source_total = 0_usize;
+        for length in source_lengths {
+            source_total = source_total
+                .checked_add(bounded_revision_length(
+                    length,
+                    MAX_REVISION_SOURCE_FIELD_BYTES,
+                )?)
+                .ok_or_else(query_budget_exceeded)?;
+        }
+        bounded_revision_length(source_total, MAX_REVISION_SOURCE_BYTES)?;
+        total = total
+            .checked_add(source_total)
+            .ok_or_else(query_budget_exceeded)?;
+        bounded_revision_length(total, MAX_REVISION_ROW_BYTES)
+    }
+}
+
+fn authorize_revision_materialization(
+    rows: &[RawRevisionLengths],
+    maximum_bytes: usize,
+) -> Result<usize, MemoryError> {
+    let mut total = 0_usize;
+    for row in rows {
+        total = total
+            .checked_add(row.materialized_bytes()?)
+            .ok_or_else(query_budget_exceeded)?;
+        if total > maximum_bytes {
+            return Err(query_budget_exceeded());
+        }
+    }
+    Ok(total)
+}
+
+fn revision_history_lengths_sql(has_cursor: bool) -> &'static str {
+    if has_cursor {
+        "SELECT revision.row_id,
+                length(CAST(revision.revision_id AS BLOB)),
+                length(CAST(revision.content AS BLOB)),
+                length(CAST(revision.event_time AS BLOB)),
+                length(CAST(revision.recorded_at AS BLOB)),
+                length(CAST(revision.valid_from AS BLOB)),
+                length(CAST(revision.valid_to AS BLOB)),
+                length(CAST(revision.change_type AS BLOB)),
+                length(CAST(revision.change_reason AS BLOB)),
+                length(CAST(revision.safety_policy_version AS BLOB)),
+                length(CAST(revision.state AS BLOB)),
+                length(CAST(revision.category AS BLOB)),
+                length(CAST(revision.importance AS BLOB)),
+                length(CAST(source.source_kind AS BLOB)),
+                length(CAST(source.conversation_id AS BLOB)),
+                length(CAST(source.turn_id AS BLOB)),
+                length(CAST(source.action_id AS BLOB)),
+                length(CAST(source.authorized_at AS BLOB))
+         FROM memory_revision AS revision
+         LEFT JOIN memory_revision_source AS source
+           ON source.persona_id = revision.persona_id
+          AND source.memory_id = revision.memory_id
+          AND source.revision_id = revision.revision_id
+          AND source.source_ordinal = 0
+         WHERE revision.persona_id = ?1
+           AND revision.memory_id = ?2
+           AND revision.revision_id < ?3
+         ORDER BY revision.revision_id DESC
+         LIMIT ?4"
+    } else {
+        "SELECT revision.row_id,
+                length(CAST(revision.revision_id AS BLOB)),
+                length(CAST(revision.content AS BLOB)),
+                length(CAST(revision.event_time AS BLOB)),
+                length(CAST(revision.recorded_at AS BLOB)),
+                length(CAST(revision.valid_from AS BLOB)),
+                length(CAST(revision.valid_to AS BLOB)),
+                length(CAST(revision.change_type AS BLOB)),
+                length(CAST(revision.change_reason AS BLOB)),
+                length(CAST(revision.safety_policy_version AS BLOB)),
+                length(CAST(revision.state AS BLOB)),
+                length(CAST(revision.category AS BLOB)),
+                length(CAST(revision.importance AS BLOB)),
+                length(CAST(source.source_kind AS BLOB)),
+                length(CAST(source.conversation_id AS BLOB)),
+                length(CAST(source.turn_id AS BLOB)),
+                length(CAST(source.action_id AS BLOB)),
+                length(CAST(source.authorized_at AS BLOB))
+         FROM memory_revision AS revision
+         LEFT JOIN memory_revision_source AS source
+           ON source.persona_id = revision.persona_id
+          AND source.memory_id = revision.memory_id
+          AND source.revision_id = revision.revision_id
+          AND source.source_ordinal = 0
+         WHERE revision.persona_id = ?1
+           AND revision.memory_id = ?2
+         ORDER BY revision.revision_id DESC
+         LIMIT ?3"
+    }
+}
+
+fn revision_lengths_by_id(
+    connection: &Connection,
+    scope: &MemoryPersonaScope,
+    memory_id: &MemoryId,
+    revision_id: &MemoryRevisionId,
+) -> Result<Option<RawRevisionLengths>, MemoryError> {
+    connection
+        .query_row(
+            "SELECT revision.row_id,
+                    length(CAST(revision.revision_id AS BLOB)),
+                    length(CAST(revision.content AS BLOB)),
+                    length(CAST(revision.event_time AS BLOB)),
+                    length(CAST(revision.recorded_at AS BLOB)),
+                    length(CAST(revision.valid_from AS BLOB)),
+                    length(CAST(revision.valid_to AS BLOB)),
+                    length(CAST(revision.change_type AS BLOB)),
+                    length(CAST(revision.change_reason AS BLOB)),
+                    length(CAST(revision.safety_policy_version AS BLOB)),
+                    length(CAST(revision.state AS BLOB)),
+                    length(CAST(revision.category AS BLOB)),
+                    length(CAST(revision.importance AS BLOB)),
+                    length(CAST(source.source_kind AS BLOB)),
+                    length(CAST(source.conversation_id AS BLOB)),
+                    length(CAST(source.turn_id AS BLOB)),
+                    length(CAST(source.action_id AS BLOB)),
+                    length(CAST(source.authorized_at AS BLOB))
+             FROM memory_revision AS revision
+             LEFT JOIN memory_revision_source AS source
+               ON source.persona_id = revision.persona_id
+              AND source.memory_id = revision.memory_id
+              AND source.revision_id = revision.revision_id
+              AND source.source_ordinal = 0
+             WHERE revision.persona_id = ?1
+               AND revision.memory_id = ?2
+               AND revision.revision_id = ?3
+             LIMIT 1",
+            params![scope.persona_id(), memory_id.0, revision_id.0],
+            raw_revision_lengths_from_row,
+        )
+        .optional()
+        .map_err(repository_unavailable)
+}
+
+fn load_revision_snapshot_by_row_id(
+    connection: &Connection,
+    memory_id: &MemoryId,
+    row_id: i64,
+) -> Result<RevisionSnapshotRow, MemoryError> {
+    let raw = connection
+        .query_row(
+            "SELECT revision.revision_id, revision.content, revision.event_time,
+                    revision.recorded_at, revision.valid_from, revision.valid_to,
+                    revision.change_type, revision.change_reason,
+                    revision.safety_policy_version, revision.state,
+                    revision.category, revision.importance,
+                    source.source_kind, source.conversation_id, source.turn_id,
+                    source.action_id, source.authorized_at
+             FROM memory_revision AS revision
+             LEFT JOIN memory_revision_source AS source
+               ON source.persona_id = revision.persona_id
+              AND source.memory_id = revision.memory_id
+              AND source.revision_id = revision.revision_id
+              AND source.source_ordinal = 0
+             WHERE revision.row_id = ?1
+             LIMIT 1",
+            [row_id],
+            raw_revision_from_row,
+        )
+        .optional()
+        .map_err(repository_unavailable)?
+        .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+    revision_snapshot_from_raw(memory_id, raw)
 }
 
 fn configure_memory_connection(connection: &Connection) -> Result<(), MemoryError> {
@@ -1142,25 +1435,53 @@ fn load_current(
     connection: &Connection,
     scope: &MemoryPersonaScope,
     memory_id: &MemoryId,
-) -> Result<Option<MemoryRecord>, MemoryError> {
+    max_materialized_bytes: usize,
+) -> Result<Option<BoundedMemoryRecord>, MemoryError> {
+    let Some(entry) = load_active_entry(connection, scope, memory_id)? else {
+        return Ok(None);
+    };
+    let Some(metadata) =
+        revision_lengths_by_id(connection, scope, memory_id, &entry.current_revision_id)?
+    else {
+        return Ok(None);
+    };
+    let materialized_bytes = authorize_revision_materialization(
+        std::slice::from_ref(&metadata),
+        max_materialized_bytes,
+    )?;
+    let snapshot = load_revision_snapshot_by_row_id(connection, memory_id, metadata.row_id)?;
+    if snapshot.revision.state != MemoryRevisionState::Current
+        || snapshot.revision.valid_to.is_some()
+    {
+        return Ok(None);
+    }
+    if snapshot.revision.revision_id != entry.current_revision_id
+        || snapshot.category != entry.category
+    {
+        return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+    }
+    Ok(Some(BoundedMemoryRecord {
+        record: MemoryRecord {
+            entry,
+            current_revision: snapshot.revision,
+        },
+        materialized_bytes,
+    }))
+}
+
+fn load_active_entry(
+    connection: &Connection,
+    scope: &MemoryPersonaScope,
+    memory_id: &MemoryId,
+) -> Result<Option<MemoryEntry>, MemoryError> {
     let row = connection
         .query_row(
-            "SELECT
-                entry.category, entry.current_revision_id, entry.importance,
-                entry.freshness_at, entry.created_at, entry.state,
-                revision.content, revision.event_time, revision.recorded_at,
-                revision.valid_from, revision.valid_to, revision.change_type,
-                revision.change_reason, revision.safety_policy_version, revision.state
-             FROM memory_entry AS entry
-             JOIN memory_revision AS revision
-               ON revision.persona_id = entry.persona_id
-              AND revision.memory_id = entry.memory_id
-              AND revision.revision_id = entry.current_revision_id
-             WHERE entry.persona_id = ?1
-               AND entry.memory_id = ?2
-               AND entry.state = 'active'
-               AND revision.state = 'current'
-               AND revision.valid_to IS NULL",
+            "SELECT category, current_revision_id, importance, freshness_at,
+                    created_at, state
+             FROM memory_entry
+             WHERE persona_id = ?1
+               AND memory_id = ?2
+               AND state = 'active'",
             params![scope.persona_id(), memory_id.0],
             |row| {
                 Ok((
@@ -1170,101 +1491,24 @@ fn load_current(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
                 ))
             },
         )
         .optional()
         .map_err(repository_unavailable)?;
-    let Some((
-        category,
-        current_revision_id,
-        importance,
-        freshness_at,
-        created_at,
-        entry_state,
-        content,
-        event_time,
-        recorded_at,
-        valid_from,
-        valid_to,
-        change_type,
-        change_reason,
-        safety_policy_version,
-        revision_state,
-    )) = row
-    else {
+    let Some((category, revision_id, importance, freshness_at, created_at, state)) = row else {
         return Ok(None);
     };
-    let source = load_revision_source(
-        connection,
-        scope,
-        memory_id,
-        &MemoryRevisionId(current_revision_id.clone()),
-    )?;
-    Ok(Some(MemoryRecord {
-        entry: MemoryEntry {
-            memory_id: memory_id.clone(),
-            persona_id: scope.persona_id().to_string(),
-            category: parse_category(&category)?,
-            current_revision_id: MemoryRevisionId(current_revision_id.clone()),
-            importance: parse_importance(&importance)?,
-            freshness_at,
-            created_at,
-            state: parse_entry_state(&entry_state)?,
-        },
-        current_revision: MemoryRevision {
-            revision_id: MemoryRevisionId(current_revision_id),
-            memory_id: memory_id.clone(),
-            content,
-            event_time,
-            recorded_at,
-            valid_from,
-            valid_to,
-            change_type: parse_change_type(&change_type)?,
-            change_reason,
-            source,
-            safety_policy_version,
-            state: parse_revision_state(&revision_state)?,
-        },
+    Ok(Some(MemoryEntry {
+        memory_id: memory_id.clone(),
+        persona_id: scope.persona_id().to_string(),
+        category: parse_category(&category)?,
+        current_revision_id: MemoryRevisionId(revision_id),
+        importance: parse_importance(&importance)?,
+        freshness_at,
+        created_at,
+        state: parse_entry_state(&state)?,
     }))
-}
-
-fn load_revision_source(
-    connection: &Connection,
-    scope: &MemoryPersonaScope,
-    memory_id: &MemoryId,
-    revision_id: &MemoryRevisionId,
-) -> Result<MemorySourceEvidence, MemoryError> {
-    let source = connection
-        .query_row(
-            "SELECT source_kind, conversation_id, turn_id, action_id, authorized_at
-             FROM memory_revision_source
-             WHERE persona_id = ?1
-               AND memory_id = ?2
-               AND revision_id = ?3
-               AND source_ordinal = 0",
-            params![scope.persona_id(), memory_id.0, revision_id.0],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            },
-        )
-        .map_err(repository_unavailable)?;
-    parse_revision_source(Some(source.0), source.1, source.2, source.3, source.4)
 }
 
 fn parse_revision_source(
@@ -1350,7 +1594,14 @@ fn apply_transition(
             .map_err(repository_unavailable)?;
     }
 
-    let row_id = insert_revision(connection, authority, scope, &transition.new_revision)?;
+    let row_id = insert_revision(
+        connection,
+        authority,
+        scope,
+        &transition.new_revision,
+        transition.entry.category,
+        transition.entry.importance,
+    )?;
     if let Some(previous) = &transition.previous_revision {
         let updated = connection
             .execute(
@@ -1387,6 +1638,8 @@ fn insert_revision(
     authority: &SqliteMemoryDeletionAuthority,
     scope: &MemoryPersonaScope,
     revision: &MemoryRevision,
+    category: MemoryCategory,
+    importance: MemoryImportance,
 ) -> Result<i64, MemoryError> {
     let canonical = canonicalize_derivation_content(&revision.content);
     let derivation_key = authority.derivation_key(scope.persona_id(), &canonical);
@@ -1395,9 +1648,10 @@ fn insert_revision(
             "INSERT INTO memory_revision(
                 persona_id, memory_id, revision_id, content, derivation_key,
                 event_time, recorded_at, valid_from, valid_to, change_type,
-                change_reason, safety_policy_version, state
+                change_reason, safety_policy_version, state, category, importance
              ) VALUES(
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15
              )",
             params![
                 scope.persona_id(),
@@ -1412,7 +1666,9 @@ fn insert_revision(
                 change_type_to_str(revision.change_type),
                 revision.change_reason,
                 revision.safety_policy_version,
-                revision_state_to_str(revision.state)
+                revision_state_to_str(revision.state),
+                category_to_str(category),
+                importance_to_str(importance)
             ],
         )
         .map_err(repository_unavailable)?;
@@ -2030,6 +2286,29 @@ fn parse_source_kind(value: &str) -> Result<MemorySourceKind, MemoryError> {
 
 fn repository_unavailable<T>(_error: T) -> MemoryError {
     MemoryError::new(MemoryErrorCode::RepositoryUnavailable)
+}
+
+fn query_budget_exceeded() -> MemoryError {
+    MemoryError::new(MemoryErrorCode::QueryBudgetExceeded)
+}
+
+fn install_revision_progress_handler(connection: &Connection) -> Arc<AtomicBool> {
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let exhausted = Arc::new(AtomicBool::new(false));
+    let callback_count = Arc::clone(&callbacks);
+    let callback_exhausted = Arc::clone(&exhausted);
+    connection.progress_handler(
+        REVISION_SQLITE_PROGRESS_INTERVAL_OPS,
+        Some(move || {
+            let should_interrupt = callback_count.fetch_add(1, Ordering::Relaxed) + 1
+                > MAX_REVISION_SQLITE_PROGRESS_CALLBACKS;
+            if should_interrupt {
+                callback_exhausted.store(true, Ordering::Relaxed);
+            }
+            should_interrupt
+        }),
+    );
+    exhausted
 }
 
 /// 存储侧时间解析失败一律视为数据损坏，不向调用方暴露解析细节。
