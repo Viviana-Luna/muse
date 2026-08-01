@@ -609,6 +609,19 @@ fn assert_exact_memory_failure(result: &ToolResult, expected_code: MemoryErrorCo
     assert_eq!(structured.as_object().map(serde_json::Map::len), Some(1));
 }
 
+fn assert_generic_failure(result: &ToolResult, expected_reason: &str) {
+    assert_eq!(result.status, ToolResultStatus::Failed);
+    let structured = result
+        .structured
+        .as_ref()
+        .expect("通用 pre-handler 失败必须包含原因");
+    assert_eq!(
+        structured.get("reason").and_then(serde_json::Value::as_str),
+        Some(expected_reason)
+    );
+    assert!(structured.get("error_code").is_none());
+}
+
 #[tokio::test]
 async fn execute_runtime_tool_pre_handler_memory_failures_keep_exact_contract() {
     let config_dir = unique_temp_dir("memory-pre-handler-contract");
@@ -713,14 +726,61 @@ async fn execute_runtime_tool_pre_handler_memory_failures_keep_exact_contract() 
             "file_read",
         )
         .await;
-    assert_eq!(
-        generic
-            .structured
-            .as_ref()
-            .and_then(|structured| structured.get("reason"))
-            .and_then(serde_json::Value::as_str),
-        Some("stale_or_hidden_capability")
-    );
+    assert_generic_failure(&generic, "stale_or_hidden_capability");
+
+    let near_name_snapshot = muse_runtime::TurnSnapshot::new(turn.clone(), Vec::new());
+    for (index, tool_name) in [
+        "memory_query_extra",
+        "Memory_query",
+        "memory_mutate_extra",
+        "memory_delete_extra",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = harness
+            .execute(
+                &near_name_snapshot,
+                near_name_snapshot.capability_epoch(),
+                &format!("call-near-memory-{index}"),
+                tool_name,
+            )
+            .await;
+        assert_generic_failure(&result, "stale_or_hidden_capability");
+    }
+
+    let mut daily_turn = turn.clone();
+    daily_turn.runtime_mode = "daily".to_string();
+    daily_turn.focus_phase = "idle".to_string();
+    daily_turn.tool_preset = "daily".to_string();
+    let daily_harness = PreHandlerToolHarness {
+        state: &state,
+        turn: &daily_turn,
+        provider: &provider,
+        frozen_mcp_catalog: &frozen_mcp_catalog,
+        cancel_token: &cancel_token,
+        conversation: &conversation,
+        memory_turn: &memory_turn,
+    };
+    let mut near_memory_definition = definition(MEMORY_QUERY_TOOL_NAME);
+    near_memory_definition.name = "memory_query_extra".to_string();
+    for (index, tool_definition) in [definition("file_read"), near_memory_definition]
+        .into_iter()
+        .enumerate()
+    {
+        let tool_name = tool_definition.name.clone();
+        let preset_snapshot =
+            muse_runtime::TurnSnapshot::new(daily_turn.clone(), vec![tool_definition]);
+        let result = daily_harness
+            .execute(
+                &preset_snapshot,
+                preset_snapshot.capability_epoch(),
+                &format!("call-preset-denied-{index}"),
+                &tool_name,
+            )
+            .await;
+        assert_generic_failure(&result, "preset_denied");
+    }
 
     let _ = std::fs::remove_dir_all(config_dir);
 }

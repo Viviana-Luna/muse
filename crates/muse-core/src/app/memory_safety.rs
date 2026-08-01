@@ -820,11 +820,11 @@ fn has_assignment_key_boundary(text: &str, key: &str, key_start: usize) -> bool 
             .is_none_or(|character| !character.is_ascii_alphanumeric())
 }
 
-/// 识别结构化中文门牌地址，或英文 Street/Road 等标记附近的门牌数字。
+/// 识别结构化中文门牌地址，或英文 Street/Road 等词法结构中的连续门牌数字。
 ///
-/// 中文规则只接受“道路/住宅标记紧邻编号与门牌单位”，或“至少两级位置链之后
-/// 出现编号与门牌单位”。数字必须与 `号`、`号楼`、`栋`、`幢`、`单元`、`室`
-/// 直接组成结构，不能在道路词之后开一个任意字符窗口寻找数字。
+/// 中文规则只接受“地址语境或道路/住宅标记 + 可选门牌前缀 + 编号 + 门牌单位”。
+/// 地址标记必须紧邻门牌结构；不能在道路词之后开任意字符窗口寻找数字，也不能
+/// 用地区后缀计数配合任意数词推断地址。
 fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
     if contains_structured_cjk_address(compact) {
         return true;
@@ -838,12 +838,16 @@ fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
         if !ASCII_STREET_MARKERS.contains(&marker) {
             continue;
         }
-        let start = index.saturating_sub(3);
-        let end = (index + 4).min(words.len());
-        if words[start..end].iter().any(|candidate| {
-            let candidate = candidate.trim_matches(['.', '-']);
-            !candidate.is_empty() && candidate.bytes().all(|byte| byte.is_ascii_digit())
-        }) {
+        let follows_street = words
+            .get(index + 1)
+            .is_some_and(|candidate| is_ascii_house_number(candidate.trim_matches(['.', '-'])));
+        let precedes_named_street = index >= 2
+            && is_ascii_house_number(words[index - 2].trim_matches(['.', '-']))
+            && words[index - 1]
+                .trim_matches(['.', '-'])
+                .bytes()
+                .any(|byte| byte.is_ascii_alphabetic());
+        if follows_street || precedes_named_street {
             return true;
         }
     }
@@ -851,7 +855,7 @@ fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
 }
 
 fn contains_structured_cjk_address(text: &str) -> bool {
-    const ADDRESS_MARKERS: [&str; 20] = [
+    const ADDRESS_MARKERS: [&str; 23] = [
         "住宅小区",
         "商业大厦",
         "工业园区",
@@ -868,6 +872,9 @@ fn contains_structured_cjk_address(text: &str) -> bool {
         "公寓",
         "园区",
         "里弄",
+        "村",
+        "镇",
+        "乡",
         "路",
         "街",
         "巷",
@@ -881,15 +888,22 @@ fn contains_structured_cjk_address(text: &str) -> bool {
             .last()
             .map(|(index, character)| number_start + index + character.len_utf8())
             .unwrap_or(number_start);
-        if number_end == number_start || !starts_with_cjk_house_unit(&text[number_end..]) {
+        let Some(unit) = cjk_house_unit(&text[number_end..]) else {
+            continue;
+        };
+
+        let suffix = &text[number_end + unit.len()..];
+        if unit == "号" && starts_with_non_address_numbering_tail(suffix) {
             continue;
         }
 
-        let prefix = &text[..number_start];
-        if ADDRESS_MARKERS
-            .iter()
-            .any(|marker| prefix.ends_with(marker))
-            || contains_cjk_location_chain(prefix)
+        let prefix = text[..number_start].trim_end_matches(is_cjk_house_designator);
+        let has_immediate_address_marker = ADDRESS_MARKERS.iter().any(|marker| {
+            prefix.ends_with(marker) && !has_non_address_marker_suffix(prefix, marker)
+        });
+        if has_immediate_address_marker
+            || ends_with_prior_house_unit(prefix)
+            || has_structured_address_context(prefix)
         {
             return true;
         }
@@ -944,17 +958,97 @@ fn is_cjk_address_number(character: char) -> bool {
         )
 }
 
-fn starts_with_cjk_house_unit(value: &str) -> bool {
+fn cjk_house_unit(value: &str) -> Option<&'static str> {
     const HOUSE_UNITS: [&str; 6] = ["号楼", "单元", "号", "栋", "幢", "室"];
-    HOUSE_UNITS.iter().any(|unit| value.starts_with(unit))
+    HOUSE_UNITS
+        .iter()
+        .copied()
+        .find(|unit| value.starts_with(unit))
 }
 
-fn contains_cjk_location_chain(prefix: &str) -> bool {
-    const LOCATION_COMPONENTS: [&str; 12] = [
+fn is_cjk_house_designator(character: char) -> bool {
+    matches!(
+        character,
+        '甲' | '乙' | '丙' | '丁' | '戊' | '己' | '庚' | '辛' | '壬' | '癸' | '之'
+    )
+}
+
+fn starts_with_non_address_numbering_tail(value: &str) -> bool {
+    const NON_ADDRESS_TAILS: [&str; 8] = [
+        "方案", "思路", "路线", "选项", "版本", "策略", "步骤", "议案",
+    ];
+    NON_ADDRESS_TAILS.iter().any(|tail| value.starts_with(tail))
+}
+
+fn is_ascii_house_number(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_alphabetic())
+}
+
+fn has_non_address_marker_suffix(prefix: &str, marker: &str) -> bool {
+    const NON_ADDRESS_WORDS: [&str; 9] = [
+        "思路", "出路", "回路", "电路", "线路", "铁路", "套路", "道路", "公路",
+    ];
+    marker == "路" && NON_ADDRESS_WORDS.iter().any(|word| prefix.ends_with(word))
+}
+
+fn has_structured_address_context(prefix: &str) -> bool {
+    const ADDRESS_CONTEXTS: [&str; 11] = [
+        "居住地址",
+        "家庭住址",
+        "详细住址",
+        "收货地址",
+        "收件地址",
+        "居住在",
+        "居住于",
+        "我住在",
+        "家住",
+        "家在",
+        "现居",
+    ];
+    ADDRESS_CONTEXTS.iter().any(|context| {
+        prefix.rfind(context).is_some_and(|index| {
+            let address_stem = &prefix[index + context.len()..];
+            address_stem.is_empty()
+                || ends_with_address_component(address_stem)
+                || ends_with_prior_house_unit(address_stem)
+        })
+    })
+}
+
+fn ends_with_prior_house_unit(value: &str) -> bool {
+    ["号楼", "栋", "幢", "单元"]
+        .iter()
+        .any(|unit| value.ends_with(unit))
+}
+
+fn ends_with_address_component(value: &str) -> bool {
+    const COMPONENTS: [&str; 32] = [
+        "特别行政区",
         "自治区",
         "自治州",
-        "特别行政区",
+        "住宅小区",
+        "商业大厦",
+        "工业园区",
+        "科技园区",
         "街道",
+        "大道",
+        "胡同",
+        "公路",
+        "小区",
+        "社区",
+        "花园",
+        "家园",
+        "大厦",
+        "公寓",
+        "园区",
+        "里弄",
         "省",
         "市",
         "区",
@@ -963,25 +1057,15 @@ fn contains_cjk_location_chain(prefix: &str) -> bool {
         "镇",
         "乡",
         "村",
+        "路",
+        "街",
+        "巷",
+        "弄",
+        "院",
     ];
-    let mut components = 0_usize;
-    let mut cursor = 0_usize;
-    while cursor < prefix.len() {
-        let tail = &prefix[cursor..];
-        if let Some(component) = LOCATION_COMPONENTS
-            .iter()
-            .find(|component| tail.starts_with(**component))
-        {
-            components += 1;
-            if components >= 2 {
-                return true;
-            }
-            cursor += component.len();
-        } else {
-            cursor += tail.chars().next().map(char::len_utf8).unwrap_or(1);
-        }
-    }
-    false
+    COMPONENTS
+        .iter()
+        .any(|component| value.ends_with(component))
 }
 
 /// 识别允许括号、空格和横线分隔的手机号；带 `+86` 时先压缩国家码。
@@ -1287,10 +1371,18 @@ mod tests {
         assert_rejected("家庭住址：朝阳区幸福里小区 3 号楼 2 单元 501");
         assert_rejected("实时位置分享给你了，在北门");
         assert_rejected("我家在幸福路 88 号");
+        assert_rejected("幸福路88号");
+        assert_rejected("小区3号楼");
+        for designator in ["甲", "乙", "丙", "丁", "之"] {
+            assert_rejected(&format!("我住在幸福路{designator}88号"));
+        }
         assert_rejected("我住在北京市朝阳区幸福小区3号楼");
         assert_rejected("我住在北京市朝阳区幸福小区三号楼二单元五〇一室");
         assert_rejected("我住在幸福路八十八号");
         assert_rejected("我住在幸福花园6栋1203室");
+        assert_rejected("幸福小区6幢");
+        assert_rejected("幸福小区2单元");
+        assert_rejected("幸福小区五〇一室");
         assert_rejected("收件地点是 123 Main Street");
     }
 
@@ -1357,6 +1449,10 @@ mod tests {
         assert_allowed("用户用 compass: north 描述导航方向");
         assert_allowed("用户正在阅读 Main Street. 这本小说");
         assert_allowed("我喜欢公路自行车，计划周末骑20公里");
+        assert_allowed("用户采用思路3号方案");
+        assert_allowed("用户采用思路3号楼方案");
+        assert_allowed("用户在北京市朝阳区统一室内设计公司工作");
+        assert_allowed("公路自行车20公里");
         assert_allowed("用户选择技术路线2");
         assert_allowed("用户计划完成道路测试3轮");
     }

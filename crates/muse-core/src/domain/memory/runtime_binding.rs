@@ -201,7 +201,7 @@ fn canonical_direct_user_fact(value: &str) -> Option<String> {
     {
         fact = stripped.trim_start_matches(is_explicit_memory_prefix_separator);
     }
-    if fact.is_empty() || has_ambiguous_direct_user_syntax(fact) {
+    if fact.is_empty() || has_direct_user_clause_boundary(fact) {
         return None;
     }
 
@@ -211,9 +211,7 @@ fn canonical_direct_user_fact(value: &str) -> Option<String> {
         }
         format!("用户的{rest}")
     } else if let Some(rest) = fact.strip_prefix('我') {
-        if !is_safe_direct_user_predicate(rest) {
-            return None;
-        }
+        validate_simple_direct_user_predicate(rest)?;
         format!("用户{rest}")
     } else {
         return None;
@@ -223,7 +221,7 @@ fn canonical_direct_user_fact(value: &str) -> Option<String> {
 
 fn canonical_memory_candidate(value: &str) -> Option<String> {
     let fact = value.trim_matches(is_direct_user_terminal_separator);
-    if fact.is_empty() || has_ambiguous_direct_user_syntax(fact) {
+    if fact.is_empty() || has_direct_user_clause_boundary(fact) {
         return None;
     }
     Some(fact.to_string())
@@ -237,74 +235,137 @@ fn is_explicit_memory_prefix_separator(character: char) -> bool {
     matches!(character, '：' | ':' | '，' | ',' | '。' | '、')
 }
 
-/// 来源资格采用正向、可证明的语法，而不是枚举网页、文件、Tool 等外部来源名称。
-/// 从句边界直接拒绝；无标点的混合从句只在连接词后确实出现新主语、谓词、否定
-/// 或转述起点时拒绝，避免把“也门”等普通词内部字符当成歧义信号。
-fn has_ambiguous_direct_user_syntax(value: &str) -> bool {
+fn has_direct_user_clause_boundary(value: &str) -> bool {
     const CLAUSE_OR_QUOTE_MARKERS: [char; 19] = [
         '，', ',', '、', '；', ';', '：', ':', '\n', '\r', '“', '”', '‘', '’', '「', '」', '『',
         '』', '《', '》',
     ];
-    if value
+    value
         .chars()
         .any(|character| CLAUSE_OR_QUOTE_MARKERS.contains(&character))
+}
+
+#[derive(Clone, Copy)]
+enum DirectUserComplementKind {
+    Nominal,
+    Preference,
+    Habit,
+    Intent,
+}
+
+/// 只接受一个主谓骨架；谓词和补语形态均由正向语法声明。
+fn validate_simple_direct_user_predicate(value: &str) -> Option<()> {
+    if let Some(location) = value
+        .strip_prefix('在')
+        .and_then(|rest| rest.strip_suffix("工作"))
+    {
+        return validate_direct_user_complement(location, DirectUserComplementKind::Nominal);
+    }
+    if let Some(occupation) = value.strip_prefix("从事") {
+        let occupation = occupation.strip_suffix("工作").unwrap_or(occupation);
+        return validate_direct_user_complement(occupation, DirectUserComplementKind::Nominal);
+    }
+    for prefix in ["时区是", "时区为", "昵称是", "昵称为", "昵称叫", "叫"] {
+        if let Some(fact) = value.strip_prefix(prefix) {
+            return validate_direct_user_complement(fact, DirectUserComplementKind::Nominal);
+        }
+    }
+
+    const PREDICATES: [(&str, DirectUserComplementKind); 10] = [
+        ("正在学习", DirectUserComplementKind::Nominal),
+        ("正在工作", DirectUserComplementKind::Nominal),
+        ("喜欢", DirectUserComplementKind::Preference),
+        ("偏好", DirectUserComplementKind::Preference),
+        ("习惯", DirectUserComplementKind::Habit),
+        ("希望", DirectUserComplementKind::Intent),
+        ("计划", DirectUserComplementKind::Intent),
+        ("学习", DirectUserComplementKind::Nominal),
+        ("工作", DirectUserComplementKind::Nominal),
+        ("来自", DirectUserComplementKind::Nominal),
+    ];
+    PREDICATES.iter().find_map(|(predicate, kind)| {
+        value
+            .strip_prefix(predicate)
+            .and_then(|complement| validate_direct_user_complement(complement, *kind))
+    })
+}
+
+fn validate_direct_user_complement(value: &str, kind: DirectUserComplementKind) -> Option<()> {
+    if value.is_empty()
+        || has_direct_user_clause_boundary(value)
+        || has_structured_clause_connector(value)
+        || has_structured_negation(value)
+        || has_structured_external_source(value)
+        || has_third_party_subject(value)
+    {
+        return None;
+    }
+
+    let predicate_spans = embedded_predicate_spans(value);
+    let permits_single_action =
+        |span: &(usize, usize)| span.0 == 0 || has_direct_user_action_modifier(&value[..span.0]);
+    match kind {
+        DirectUserComplementKind::Nominal if predicate_spans.is_empty() => Some(()),
+        DirectUserComplementKind::Preference | DirectUserComplementKind::Habit
+            if predicate_spans.is_empty()
+                || (predicate_spans.len() == 1 && permits_single_action(&predicate_spans[0])) =>
+        {
+            Some(())
+        }
+        DirectUserComplementKind::Intent
+            if predicate_spans.is_empty()
+                || (predicate_spans.len() == 1 && permits_single_action(&predicate_spans[0])) =>
+        {
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn has_direct_user_action_modifier(value: &str) -> bool {
+    const MODIFIERS: [&str; 20] = [
+        "在",
+        "每天",
+        "每周",
+        "每月",
+        "每年",
+        "早上",
+        "上午",
+        "中午",
+        "下午",
+        "晚上",
+        "夜里",
+        "夜间",
+        "周末",
+        "工作日",
+        "今天",
+        "明天",
+        "后天",
+        "今晚",
+        "明年",
+        "下周",
+    ];
+    MODIFIERS.iter().any(|modifier| value.starts_with(modifier))
+}
+
+fn has_structured_clause_connector(value: &str) -> bool {
+    const MULTI_CHARACTER_CONNECTORS: [&str; 15] = [
+        "另外", "还有", "并且", "而且", "以及", "同时", "但是", "不过", "因为", "所以", "由于",
+        "因此", "否则", "然后", "接着",
+    ];
+    if MULTI_CHARACTER_CONNECTORS
+        .iter()
+        .any(|connector| value.contains(connector))
     {
         return true;
     }
-    contains_mixed_clause(value)
-}
 
-fn contains_mixed_clause(value: &str) -> bool {
-    const CONNECTORS: [&str; 12] = [
-        "另外", "还有", "并且", "而且", "以及", "同时", "但是", "不过", "却", "也", "但", "又",
-    ];
-    const CLAUSE_STARTERS: [&str; 37] = [
-        "我",
-        "我的",
-        "用户",
-        "他",
-        "她",
-        "它",
-        "他们",
-        "网页",
-        "文件",
-        "assistant",
-        "tool",
-        "mcp",
-        "system",
-        "reasoning",
-        "报告",
-        "不",
-        "没",
-        "未",
-        "无",
-        "并非",
-        "不是",
-        "否认",
-        "听说",
-        "据说",
-        "声称",
-        "转述",
-        "报道",
-        "显示",
-        "推测",
-        "推断",
-        "猜测",
-        "认为",
-        "可能",
-        "似乎",
-        "喜欢",
-        "偏好",
-        "计划",
-    ];
-    for connector in CONNECTORS {
+    const SINGLE_CHARACTER_CONNECTORS: [&str; 4] = ["也", "又", "但", "却"];
+    for connector in SINGLE_CHARACTER_CONNECTORS {
         let mut search_from = 0;
         while let Some(relative) = value[search_from..].find(connector) {
             let after = search_from + relative + connector.len();
-            if CLAUSE_STARTERS
-                .iter()
-                .any(|starter| value[after..].starts_with(starter))
-            {
+            if starts_direct_user_clause(&value[after..]) {
                 return true;
             }
             search_from = after;
@@ -313,57 +374,216 @@ fn contains_mixed_clause(value: &str) -> bool {
     false
 }
 
-/// 裸 `我` 后只接受描述当前用户状态、偏好或意图的正向谓词。这里是正向
-/// 能力边界，不是外部来源黑名单；未被证明是第一人称谓词的名词和转述动词
-/// 都会自然落到拒绝分支。
-fn is_safe_direct_user_predicate(value: &str) -> bool {
-    const PREDICATES: [&str; 25] = [
-        "是",
-        "叫",
+fn starts_direct_user_clause(value: &str) -> bool {
+    const CLAUSE_STARTERS: [&str; 36] = [
+        "我",
+        "用户",
+        "他",
+        "她",
+        "它",
+        "他们",
+        "妈妈",
+        "爸爸",
+        "朋友",
+        "同事",
+        "网页",
+        "文件",
+        "assistant",
+        "tool",
+        "mcp",
+        "system",
+        "reasoning",
+        "从",
+        "据",
+        "根据",
+        "不",
+        "没",
+        "未",
+        "无",
         "喜欢",
         "偏好",
         "习惯",
-        "通常",
-        "常常",
-        "经常",
         "希望",
+        "使用",
+        "计划",
+        "学习",
+        "工作",
+        "喝",
+        "知道",
+        "得知",
+        "认为",
+    ];
+    CLAUSE_STARTERS
+        .iter()
+        .any(|starter| value.starts_with(starter))
+}
+
+fn has_structured_negation(value: &str) -> bool {
+    const NEGATED_PREDICATES: [&str; 30] = [
+        "不喝",
+        "不吃",
+        "不用",
+        "不去",
+        "不做",
+        "不爱",
+        "不喜欢",
+        "不偏好",
+        "不习惯",
+        "不希望",
+        "不计划",
+        "不学习",
+        "不工作",
+        "不使用",
+        "不需要",
+        "不想",
+        "不会",
+        "不能",
+        "不是",
+        "没有",
+        "没喝",
+        "没吃",
+        "没做",
+        "没用",
+        "未使用",
+        "未完成",
+        "未学习",
+        "未工作",
+        "无需",
+        "无意",
+    ];
+    const NEGATION_PHRASES: [&str; 8] = [
+        "从不", "并非", "未曾", "尚未", "不要", "不再", "没再", "否认",
+    ];
+    NEGATED_PREDICATES
+        .iter()
+        .chain(NEGATION_PHRASES.iter())
+        .any(|negation| value.contains(negation))
+}
+
+fn has_structured_external_source(value: &str) -> bool {
+    const SOURCES: [&str; 7] = [
+        "网页",
+        "文件",
+        "assistant",
+        "tool",
+        "mcp",
+        "system",
+        "reasoning",
+    ];
+    const SOURCE_PREFIXES: [&str; 6] = ["从", "据", "根据", "读取", "查看", "参考"];
+    const REPORTING_PREDICATES: [&str; 11] = [
+        "称", "说", "写着", "显示", "返回", "报告", "推测", "得知", "指出", "要求", "推荐",
+    ];
+    const RELAY_MARKERS: [&str; 13] = [
+        "知道", "得知", "听说", "据说", "声称", "转述", "报道", "推测", "推断", "猜测", "认为",
+        "引用", "获悉",
+    ];
+    if RELAY_MARKERS.iter().any(|marker| value.contains(marker)) {
+        return true;
+    }
+    for source in SOURCES {
+        let mut search_from = 0;
+        while let Some(relative) = value[search_from..].find(source) {
+            let source_start = search_from + relative;
+            let source_end = source_start + source.len();
+            let prefix = &value[..source_start];
+            let suffix = &value[source_end..];
+            if SOURCE_PREFIXES
+                .iter()
+                .any(|marker| prefix.ends_with(marker))
+                || REPORTING_PREDICATES
+                    .iter()
+                    .any(|predicate| suffix.starts_with(predicate))
+            {
+                return true;
+            }
+            search_from = source_end;
+        }
+    }
+    false
+}
+
+fn has_third_party_subject(value: &str) -> bool {
+    const SUBJECTS: [&str; 22] = [
+        "妈妈", "爸爸", "父亲", "母亲", "家人", "朋友", "同事", "同学", "领导", "丈夫", "妻子",
+        "孩子", "儿子", "女儿", "邻居", "室友", "用户", "他", "她", "他们", "她们", "它们",
+    ];
+    for subject in SUBJECTS {
+        let mut search_from = 0;
+        while let Some(relative) = value[search_from..].find(subject) {
+            let after = search_from + relative + subject.len();
+            let suffix = &value[after..];
+            if !suffix.is_empty() && !suffix.starts_with('的') {
+                return true;
+            }
+            search_from = after;
+        }
+    }
+    false
+}
+
+fn embedded_predicate_spans(value: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0_usize;
+    while cursor < value.len() {
+        let tail = &value[cursor..];
+        if let Some(predicate) = embedded_predicates()
+            .iter()
+            .find(|predicate| tail.starts_with(**predicate))
+        {
+            spans.push((cursor, cursor + predicate.len()));
+            cursor += predicate.len();
+        } else {
+            cursor += tail.chars().next().map(char::len_utf8).unwrap_or(1);
+        }
+    }
+    spans
+}
+
+fn embedded_predicates() -> &'static [&'static str] {
+    &[
+        "倾向于",
+        "喜欢",
+        "偏好",
+        "习惯",
+        "希望",
+        "计划",
+        "打算",
         "想要",
         "需要",
         "使用",
         "选择",
-        "计划",
-        "打算",
-        "正在",
-        "会",
-        "能够",
         "从事",
         "工作",
         "学习",
         "关注",
         "住在",
         "来自",
-        "倾向于",
-    ];
-    PREDICATES
-        .iter()
-        .any(|predicate| value.starts_with(predicate) && value.len() > predicate.len())
+        "散步",
+        "知道",
+        "得知",
+        "认为",
+        "推测",
+        "声称",
+        "显示",
+        "返回",
+        "写着",
+        "喝",
+        "吃",
+        "做",
+        "是",
+        "有",
+    ]
 }
 
-/// `我的` 只接受明确属于当前用户的有限属性槽位，并要求使用系词提供值。
-/// 这避免把“我的亲属/同事……”之类第三方事实误当成用户自身事实。
+/// `我的` 只接受与偏好、习惯、计划、学习、工作、时区或昵称直接相关的有限
+/// 属性槽位，并要求使用系词提供一个值。
 fn is_safe_direct_user_attribute(value: &str) -> bool {
-    const ATTRIBUTES: [&str; 23] = [
-        "名字",
+    const ATTRIBUTES: [&str; 16] = [
         "昵称",
-        "称呼",
-        "生日",
-        "纪念日",
         "时区",
-        "职业",
         "工作",
-        "目标",
         "计划",
-        "需求",
         "饮品偏好",
         "食物偏好",
         "颜色偏好",
@@ -381,7 +601,18 @@ fn is_safe_direct_user_attribute(value: &str) -> bool {
         value.strip_prefix(attribute).is_some_and(|rest| {
             rest.strip_prefix('是')
                 .or_else(|| rest.strip_prefix('为'))
-                .is_some_and(|fact| !fact.is_empty())
+                .is_some_and(|fact| {
+                    let kind = if attribute.ends_with("偏好") {
+                        DirectUserComplementKind::Preference
+                    } else if attribute.ends_with("习惯") {
+                        DirectUserComplementKind::Habit
+                    } else if *attribute == "计划" {
+                        DirectUserComplementKind::Intent
+                    } else {
+                        DirectUserComplementKind::Nominal
+                    };
+                    validate_direct_user_complement(fact, kind).is_some()
+                })
         })
     })
 }

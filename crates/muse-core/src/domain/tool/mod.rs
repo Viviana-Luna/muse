@@ -932,6 +932,45 @@ mod tests {
         assert!(!names.contains(&"mcp_list_resources"));
     }
 
+    #[test]
+    fn exact_memory_intrinsics_are_allowed_by_every_tool_preset() {
+        let mut registry = ToolRegistry::new();
+        builtin::register_all(&mut registry);
+
+        for preset in [
+            ToolPreset::Daily,
+            ToolPreset::FocusPlan,
+            ToolPreset::FocusBuild,
+        ] {
+            for name in [
+                MEMORY_QUERY_TOOL_NAME,
+                MEMORY_MUTATE_TOOL_NAME,
+                MEMORY_DELETE_TOOL_NAME,
+            ] {
+                let definition = registry
+                    .tool_def(name)
+                    .unwrap_or_else(|| panic!("内建目录应包含 {name}"));
+                assert!(
+                    ToolRegistry::is_tool_definition_allowed_for_preset(&definition, preset),
+                    "精确 intrinsic {name} 不得被 {preset:?} 预设过滤"
+                );
+            }
+        }
+
+        let mut near_match = registry
+            .tool_def(MEMORY_QUERY_TOOL_NAME)
+            .expect("memory_query 应注册");
+        near_match.name = "memory_query_extra".to_string();
+        assert!(!ToolRegistry::is_tool_definition_allowed_for_preset(
+            &near_match,
+            ToolPreset::Daily,
+        ));
+        assert!(!ToolRegistry::is_tool_definition_allowed_for_preset(
+            &near_match,
+            ToolPreset::FocusPlan,
+        ));
+    }
+
     // 验证专注计划预设只开放读查问和计划相关工具，不允许写文件或执行命令。
     #[test]
     fn focus_plan_preset_hides_mutating_tools() {

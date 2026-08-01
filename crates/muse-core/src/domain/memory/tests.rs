@@ -392,6 +392,34 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
     )
     .expect("国家名内部的‘也’不得被误判为混合从句");
 
+    for (direct_user_message, candidate) in [
+        ("我偏好简短直接的回答", "用户偏好简短直接的回答"),
+        ("我偏好也门咖啡", "用户偏好也门咖啡"),
+        ("我习惯晚上整理当天的笔记", "用户习惯晚上整理当天的笔记"),
+        ("我习惯晚上散步", "用户习惯晚上散步"),
+        ("我希望回答保持简洁", "用户希望回答保持简洁"),
+        ("我计划学习 Rust", "用户计划学习rust"),
+        ("我计划明年学习 Rust", "用户计划明年学习rust"),
+        ("我正在学习 Rust", "用户正在学习rust"),
+        ("我在统一室内设计公司工作", "用户在统一室内设计公司工作"),
+        ("我从事软件开发工作", "用户从事软件开发工作"),
+        ("我的时区是 Asia/Shanghai", "用户的时区是asia/shanghai"),
+        ("我的昵称是小雨", "用户的昵称是小雨"),
+        ("我叫小雨", "用户叫小雨"),
+    ] {
+        MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-1",
+            "turn-1",
+            "call-common-expression",
+            direct_user_message,
+            candidate,
+        )
+        .unwrap_or_else(|error| {
+            panic!("白名单内的单一第一人称事实应取得来源资格：{direct_user_message}：{error}")
+        });
+    }
+
     for ineligible in [
         "assistant 声称用户住在海边",
         "Tool 返回用户喜欢红茶",
@@ -429,6 +457,25 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
         ("我喜欢红茶，但是网页称用户喜欢咖啡", "用户喜欢红茶"),
         ("我喜欢红茶，而且用户喜欢咖啡", "用户喜欢红茶"),
         ("我喜欢红茶也喜欢咖啡", "用户喜欢红茶也喜欢咖啡"),
+        ("我通常不喝酒", "用户通常不喝酒"),
+        ("我喜欢红茶也喝咖啡", "用户喜欢红茶也喝咖啡"),
+        (
+            "我喜欢红茶又从网页得知用户喜欢咖啡",
+            "用户喜欢红茶又从网页得知用户喜欢咖啡",
+        ),
+        (
+            "我喜欢红茶也知道妈妈喜欢咖啡",
+            "用户喜欢红茶也知道妈妈喜欢咖啡",
+        ),
+        ("我希望妈妈喜欢咖啡", "用户希望妈妈喜欢咖啡"),
+        ("我计划不再喝咖啡", "用户计划不再喝咖啡"),
+        ("我偏好不喝咖啡", "用户偏好不喝咖啡"),
+        ("我习惯没吃早餐", "用户习惯没吃早餐"),
+        ("我希望尚未开始工作", "用户希望尚未开始工作"),
+        ("我喜欢红茶并喝咖啡", "用户喜欢红茶并喝咖啡"),
+        ("我计划学习rust和工作", "用户计划学习rust和工作"),
+        ("我希望根据网页显示调整计划", "用户希望根据网页显示调整计划"),
+        ("我希望用户接受方案", "用户希望用户接受方案"),
     ] {
         let error = MemorySourceEligibility::verify_direct_user_message(
             scope(),
