@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::Utc;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::authority::{AuthorityAnchor, open_authority_for_anchor};
 use super::repository::normalize_search_text;
@@ -60,6 +60,14 @@ const MEMORY_FTS_SCHEMA: &str = r#"
     END;
 "#;
 
+const MEMORY_SEARCH_NORMALIZATION_VERSION: i64 = 2;
+const MEMORY_SEARCH_PROJECTION_META_SCHEMA: &str = r#"
+    CREATE TABLE IF NOT EXISTS memory_search_projection_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        normalization_version INTEGER NOT NULL CHECK (normalization_version > 0)
+    );
+"#;
+
 /// 每次开放 runtime 库前重放独立权威，旧备份不能越过该边界复活正文。
 pub(crate) fn reconcile_runtime_memory(
     connection: &mut Connection,
@@ -77,7 +85,8 @@ pub(crate) fn reconcile_runtime_memory(
     let events = guard
         .pending_events(anchor.last_applied_revision)
         .map_err(recovery_storage_error)?;
-    if events.is_empty() {
+    let projection_outdated = search_projection_requires_rebuild(connection)?;
+    if events.is_empty() && !projection_outdated {
         guard.finish().map_err(recovery_storage_error)?;
         return Ok(());
     }
@@ -88,7 +97,11 @@ pub(crate) fn reconcile_runtime_memory(
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(RuntimeStorageError::Sqlite)?;
-    let max_revision = guard.max_revision().map_err(recovery_storage_error)?;
+    let max_revision = if events.is_empty() {
+        anchor.last_applied_revision
+    } else {
+        guard.max_revision().map_err(recovery_storage_error)?
+    };
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(RuntimeStorageError::Sqlite)?;
@@ -98,25 +111,34 @@ pub(crate) fn reconcile_runtime_memory(
         delete_memory_ids(&transaction, &event.persona_id, &memory_ids)
             .map_err(recovery_storage_error)?;
     }
+    // 删除重放与规范化版本升级共用同一原子投影重建；即使没有待恢复删除，
+    // 旧 NFKC 前投影也必须在开放读取前完成升级。
     rebuild_search_projection(&transaction).map_err(recovery_storage_error)?;
-    let updated = transaction
-        .execute(
-            "UPDATE memory_authority_anchor
-             SET last_applied_revision = ?1
-             WHERE singleton = 1
-               AND authority_id = ?2
-               AND initialized_at = ?3
-               AND last_applied_revision <= ?1",
-            params![max_revision, anchor.authority_id, anchor.initialized_at],
-        )
-        .map_err(RuntimeStorageError::Sqlite)?;
-    if updated != 1 {
-        return Err(RuntimeStorageError::Integrity(
-            "记忆删除权威 anchor 在恢复期间发生冲突".to_string(),
-        ));
+    if !events.is_empty() {
+        let updated = transaction
+            .execute(
+                "UPDATE memory_authority_anchor
+                 SET last_applied_revision = ?1
+                 WHERE singleton = 1
+                   AND authority_id = ?2
+                   AND initialized_at = ?3
+                   AND last_applied_revision <= ?1",
+                params![max_revision, anchor.authority_id, anchor.initialized_at],
+            )
+            .map_err(RuntimeStorageError::Sqlite)?;
+        if updated != 1 {
+            return Err(RuntimeStorageError::Integrity(
+                "记忆删除权威 anchor 在恢复期间发生冲突".to_string(),
+            ));
+        }
     }
     transaction.commit().map_err(RuntimeStorageError::Sqlite)?;
     checkpoint_runtime_memory(connection).map_err(recovery_storage_error)?;
+    // FULL 只覆盖恢复事务与随后的 durable checkpoint；正式连接仍回到统一的
+    // NORMAL 运行参数，避免一次投影升级永久改变调用方连接语义。
+    connection
+        .pragma_update(None, "synchronous", "NORMAL")
+        .map_err(RuntimeStorageError::Sqlite)?;
 
     let completed_at = Utc::now().to_rfc3339();
     for event in &events {
@@ -130,8 +152,49 @@ pub(crate) fn reconcile_runtime_memory(
             .mark_cleanup_completed(&event.persona_id, &event.deletion_id, count, &completed_at)
             .map_err(recovery_storage_error)?;
     }
-    guard.finish_durable().map_err(recovery_storage_error)?;
+    if events.is_empty() {
+        guard.finish().map_err(recovery_storage_error)?;
+    } else {
+        guard.finish_durable().map_err(recovery_storage_error)?;
+    }
     Ok(())
+}
+
+fn search_projection_requires_rebuild(
+    connection: &Connection,
+) -> Result<bool, RuntimeStorageError> {
+    let metadata_exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'memory_search_projection_meta'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(RuntimeStorageError::Sqlite)?;
+    if !metadata_exists {
+        return Ok(true);
+    }
+    let version = connection
+        .query_row(
+            "SELECT normalization_version
+             FROM memory_search_projection_meta
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(RuntimeStorageError::Sqlite)?;
+    match version {
+        Some(version) if version == MEMORY_SEARCH_NORMALIZATION_VERSION => Ok(false),
+        Some(version) if version > MEMORY_SEARCH_NORMALIZATION_VERSION => {
+            Err(RuntimeStorageError::Integrity(format!(
+                "记忆检索投影规范化版本 {version} 高于当前支持的 {MEMORY_SEARCH_NORMALIZATION_VERSION}"
+            )))
+        }
+        _ => Ok(true),
+    }
 }
 
 pub(crate) fn load_anchor(connection: &Connection) -> Result<AuthorityAnchor, MemoryError> {
@@ -440,6 +503,17 @@ pub(crate) fn rebuild_search_projection(connection: &Connection) -> Result<(), M
         .map_err(repository_unavailable)?;
     connection
         .execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')", [])
+        .map_err(repository_unavailable)?;
+    connection
+        .execute_batch(MEMORY_SEARCH_PROJECTION_META_SCHEMA)
+        .map_err(repository_unavailable)?;
+    connection
+        .execute(
+            "INSERT INTO memory_search_projection_meta(singleton, normalization_version)
+             VALUES(1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET normalization_version = excluded.normalization_version",
+            [MEMORY_SEARCH_NORMALIZATION_VERSION],
+        )
         .map_err(repository_unavailable)?;
     Ok(())
 }

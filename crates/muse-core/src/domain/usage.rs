@@ -427,6 +427,7 @@ fn inspect_history_database(
                         | "memory_committed_operation"
                         | "memory_management_operation"
                         | "memory_search_projection"
+                        | "memory_search_projection_meta"
                         | "memory_fts"
                         | "memory_fts_data"
                         | "memory_fts_idx"

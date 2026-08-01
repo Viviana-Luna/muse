@@ -147,6 +147,15 @@ fn scope(persona_id: &str) -> crate::domain::memory::MemoryPersonaScope {
     crate::domain::memory::MemoryPersonaScope::new(persona_id).expect("Persona scope 应有效")
 }
 
+/// 精确复刻 2fd7309 写入检索投影时的规范化，供父版本数据库升级夹具使用。
+fn normalize_projection_like_2fd7309(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn staged_create(
     scope: &crate::domain::memory::MemoryPersonaScope,
@@ -3412,6 +3421,111 @@ fn fts_projection可重建且普通写入不强制_truncate_wal() {
             .expect("重建后查询应成功")
             .len(),
         1
+    );
+}
+
+#[test]
+fn 父版本_nfkc_前投影在无删除恢复时也会原子升级() {
+    let root = TestDirectory::new("fts-normalization-upgrade");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let scope = scope("persona-normalization-upgrade");
+    let decomposed = "用户偏好Cafe\u{301}豆";
+    let fullwidth = "用户偏好ＲＵＳＴ语言";
+    commit_create(
+        &repository,
+        &scope,
+        "normalization-create-decomposed",
+        "normalization-conversation-decomposed",
+        "normalization-turn-decomposed",
+        "normalization-operation-decomposed",
+        "normalization-memory-decomposed",
+        "normalization-revision-decomposed",
+        decomposed,
+    );
+    commit_create(
+        &repository,
+        &scope,
+        "normalization-create-fullwidth",
+        "normalization-conversation-fullwidth",
+        "normalization-turn-fullwidth",
+        "normalization-operation-fullwidth",
+        "normalization-memory-fullwidth",
+        "normalization-revision-fullwidth",
+        fullwidth,
+    );
+
+    // 把投影降级成 2fd7309 的真实输出，并移除独立投影版本元数据；删除权威
+    // 此时没有 pending event，升级必须仅由 projection version 触发。
+    let connection = repository.open_connection().expect("应打开父版本夹具连接");
+    connection
+        .execute(
+            "UPDATE memory_search_projection SET content = ?1
+             WHERE persona_id = ?2 AND memory_id = ?3",
+            params![
+                normalize_projection_like_2fd7309(decomposed),
+                scope.persona_id(),
+                "normalization-memory-decomposed"
+            ],
+        )
+        .expect("应写入分解态父版本投影");
+    connection
+        .execute(
+            "UPDATE memory_search_projection SET content = ?1
+             WHERE persona_id = ?2 AND memory_id = ?3",
+            params![
+                normalize_projection_like_2fd7309(fullwidth),
+                scope.persona_id(),
+                "normalization-memory-fullwidth"
+            ],
+        )
+        .expect("应写入全角父版本投影");
+    connection
+        .execute_batch("DROP TABLE memory_search_projection_meta;")
+        .expect("应模拟父版本缺少 projection metadata");
+    drop(connection);
+    assert!(
+        repository
+            .search_current_fts(&scope, "CAFÉ豆", 10)
+            .expect("升级前分解态查询应安全")
+            .is_empty(),
+        "父版本投影不能命中新规范化查询"
+    );
+    assert!(
+        repository
+            .search_current_fts(&scope, "RUST语言", 10)
+            .expect("升级前全角查询应安全")
+            .is_empty(),
+        "父版本投影不能命中新规范化查询"
+    );
+    drop(repository);
+
+    let upgraded =
+        SqliteMemoryRepository::open(root.path()).expect("无 pending 删除时也应完成投影版本升级");
+    assert_eq!(
+        upgraded
+            .search_current_fts(&scope, "CAFÉ豆", 10)
+            .expect("升级后组合态查询应成功")
+            .len(),
+        1
+    );
+    assert_eq!(
+        upgraded
+            .search_current_fts(&scope, "RUST语言", 10)
+            .expect("升级后半角查询应成功")
+            .len(),
+        1
+    );
+    let metadata = upgraded.open_connection().expect("应读取投影版本元数据");
+    assert_eq!(
+        metadata
+            .query_row(
+                "SELECT normalization_version
+                 FROM memory_search_projection_meta WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("升级后应记录投影规范化版本"),
+        2
     );
 }
 

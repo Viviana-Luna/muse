@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use chrono::Utc;
+use rusqlite::{TransactionBehavior, params};
 
 use super::*;
 use crate::domain::memory::{
@@ -749,9 +750,9 @@ fn retrieval_is_pure_and_decay_is_monotonic() {
         .expect("第二次查询应成功");
     assert_eq!(first.items, second.items);
 
-    // 时效衰减纯计算：同龄同衰减，年长者权重低；零龄不衰减，负龄钳制。
+    // 时效衰减纯计算：同龄同衰减，年长者权重低；未来记录不能利用负 age 获得加权。
     assert_eq!(freshness_decay(0), 1.0);
-    assert_eq!(freshness_decay(-1), 1.0);
+    assert_eq!(freshness_decay(-1), 0.0);
     let half_life_micros = (FRESHNESS_HALF_LIFE_SECONDS * 1_000_000.0) as i64;
     assert!((freshness_decay(half_life_micros) - 0.5).abs() < 1e-9);
     assert!(freshness_decay(AGE_60D_MICROS) < freshness_decay(AGE_3D_MICROS));
@@ -1650,6 +1651,91 @@ fn as_of_relevance_uses_revision_body_from_that_instant() {
 }
 
 #[test]
+fn future_updates_do_not_reorder_the_same_as_of_query() {
+    let directory = TestDirectory::new("as-of-stable-order");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("历史排序-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-as-of-older",
+        "r-as-of-older",
+        MemoryCategory::UserFact,
+        "历史排序锚点：较早事实",
+        MemoryImportance::Normal,
+        T1,
+    );
+    create_memory(
+        &repository,
+        &scope,
+        "m-as-of-newer",
+        "r-as-of-newer",
+        MemoryCategory::UserFact,
+        "历史排序锚点：较新事实",
+        MemoryImportance::Normal,
+        T2,
+    );
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+    let historical_request = || {
+        request(
+            &scope,
+            "历史排序锚点",
+            None,
+            None,
+            Some("2026-07-30T02:30:00Z"),
+            None,
+            false,
+        )
+    };
+    let before = retriever
+        .retrieve(&historical_request())
+        .expect("未来更新前的历史查询应成功");
+    assert_eq!(before.items[0].memory_id.0, "m-as-of-newer");
+
+    update_memory(
+        &repository,
+        &scope,
+        "m-as-of-older",
+        "r-as-of-older",
+        "r-as-of-older-future",
+        "历史排序锚点：未来改写较早事实",
+        false,
+        "2026-07-31T04:00:00Z",
+    );
+    update_memory(
+        &repository,
+        &scope,
+        "m-as-of-newer",
+        "r-as-of-newer",
+        "r-as-of-newer-future",
+        "历史排序锚点：未来改写较新事实",
+        false,
+        "2026-07-31T03:00:00Z",
+    );
+
+    let after = retriever
+        .retrieve(&historical_request())
+        .expect("未来更新后的同一历史查询应成功");
+    let stable_identity = |page: &MemoryQueryPageReceipt| {
+        page.items
+            .iter()
+            .map(|item| {
+                (
+                    item.memory_id.0.clone(),
+                    item.revision_id.0.clone(),
+                    item.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        stable_identity(&after),
+        stable_identity(&before),
+        "未来 update 的 current freshness 不得改变同一 as_of 的正文与排序"
+    );
+}
+
+#[test]
 fn iterative_candidate_scan_reaches_hard_match_beyond_first_hundred() {
     let directory = TestDirectory::new("candidate-pressure");
     let repository = open_repository(&directory);
@@ -1695,6 +1781,126 @@ fn iterative_candidate_scan_reaches_hard_match_beyond_first_hundred() {
         vec!["z-pressure-target"],
         "硬门候选位于首批 100 条之后也不得被永久截断"
     );
+}
+
+#[test]
+fn fts_candidate_cap_refuses_a_silent_omission() {
+    let directory = TestDirectory::new("candidate-hard-cap");
+    let repository = open_repository(&directory);
+    let scope = scope("候选硬上限-persona");
+    let turn_id = unique("turn-hard-cap");
+    let mut mutations = Vec::with_capacity(MAX_CANDIDATES_SCANNED + 1);
+    for index in 0..MAX_CANDIDATES_SCANNED {
+        mutations.push(stage_create(
+            &scope,
+            "conv-hard-cap",
+            &turn_id,
+            &unique("op-hard-cap"),
+            &format!("a-hard-cap-{index:04}"),
+            &format!("r-hard-cap-{index:04}"),
+            MemoryCategory::UserPreference,
+            "abcdefghi 是命中 FTS 但被 category 硬门排除的候选",
+            MemoryImportance::High,
+            FRESH,
+        ));
+    }
+    mutations.push(stage_create(
+        &scope,
+        "conv-hard-cap",
+        &turn_id,
+        &unique("op-hard-cap-target"),
+        "z-hard-cap-target",
+        "z-hard-cap-target-revision",
+        MemoryCategory::UserFact,
+        "abcdefghi 是第 513 个唯一通过硬门的目标",
+        MemoryImportance::Low,
+        FRESH,
+    ));
+    commit_batch(&repository, &scope, "conv-hard-cap", &turn_id, mutations);
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+
+    for _ in 0..2 {
+        assert_eq!(
+            error_code(
+                retriever.retrieve(&request_for_turn_and_filters(
+                    &scope,
+                    "abcdefghi",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    &MemoryRetrievalTurn::from_runtime(
+                        "turn-hard-cap-query",
+                        "nonce-hard-cap-query"
+                    )
+                    .expect("压力查询 Turn 应有效"),
+                    MemoryRetrievalFilters::new(Some(MemoryCategory::UserFact), None),
+                ))
+            ),
+            MemoryErrorCode::QueryBudgetExceeded,
+            "无法证明第 513 个候选不影响结果时必须稳定拒绝"
+        );
+        assert!(retriever.lock_snapshots().expect("快照锁应可用").is_empty());
+    }
+}
+
+#[test]
+fn as_of_candidate_cap_refuses_unrelated_active_prefix() {
+    let directory = TestDirectory::new("as-of-hard-cap");
+    let repository = open_repository(&directory);
+    let scope = scope("时间点硬上限-persona");
+    let turn_id = unique("turn-as-of-hard-cap");
+    let mut mutations = Vec::with_capacity(MAX_CANDIDATES_SCANNED + 1);
+    for index in 0..MAX_CANDIDATES_SCANNED {
+        mutations.push(stage_create(
+            &scope,
+            "conv-as-of-hard-cap",
+            &turn_id,
+            &unique("op-as-of-hard-cap"),
+            &format!("a-as-of-hard-cap-{index:04}"),
+            &format!("r-as-of-hard-cap-{index:04}"),
+            MemoryCategory::UserFact,
+            "与查询完全无关的活跃记忆",
+            MemoryImportance::High,
+            T1,
+        ));
+    }
+    mutations.push(stage_create(
+        &scope,
+        "conv-as-of-hard-cap",
+        &turn_id,
+        &unique("op-as-of-hard-cap-target"),
+        "z-as-of-hard-cap-target",
+        "z-as-of-hard-cap-target-revision",
+        MemoryCategory::UserFact,
+        "时间点候选压力唯一目标",
+        MemoryImportance::Low,
+        T1,
+    ));
+    commit_batch(
+        &repository,
+        &scope,
+        "conv-as-of-hard-cap",
+        &turn_id,
+        mutations,
+    );
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+
+    assert_eq!(
+        error_code(retriever.retrieve(&request(
+            &scope,
+            "时间点候选压力唯一目标",
+            None,
+            None,
+            Some("2026-07-30T01:30:00Z"),
+            None,
+            false,
+        ))),
+        MemoryErrorCode::QueryBudgetExceeded,
+        "前 512 条无关 active entry 不得掩盖第 513 条历史真命中"
+    );
+    assert!(retriever.lock_snapshots().expect("快照锁应可用").is_empty());
 }
 
 #[test]
@@ -1793,6 +1999,100 @@ fn corrected_never_enters_model_surface() {
         .expect("as_of 查询应成功");
     assert!(at_corrected.items.is_empty());
     assert!(!at_corrected.has_more);
+}
+
+#[test]
+fn large_single_memory_history_is_bounded_but_as_of_selects_one_revision() {
+    let directory = TestDirectory::new("large-revision-chain");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("大历史-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-large-history",
+        "r-large-history-current",
+        MemoryCategory::UserFact,
+        "大历史时间点仍应精确命中当前正文",
+        MemoryImportance::Normal,
+        T1,
+    );
+
+    // 模拟单条 memory 的超长纠正链。测试夹具直接写底层，是为了只测读取侧
+    // 的 keyset/字节预算，不让 512 次产品写路径掩盖复杂度证据。
+    let mut connection = repository.open_connection().expect("应打开压力夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启压力夹具事务");
+    let large_content = "🦀".repeat(MAX_MEMORY_CONTENT_CHARS);
+    for index in 0..MAX_REVISIONS_SCANNED {
+        let revision_id = format!("r-large-history-corrected-{index:04}");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?7, 'correct',
+                          '压力夹具纠正', '测试策略-v1', 'corrected')",
+                params![
+                    scope.persona_id(),
+                    "m-large-history",
+                    revision_id,
+                    large_content,
+                    vec![index as u8; 32],
+                    T1,
+                    T2,
+                ],
+            )
+            .expect("应插入压力 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'user_confirmation',
+                          'conv-large-history', 'turn-large-history', NULL, NULL)",
+                params![scope.persona_id(), "m-large-history", revision_id],
+            )
+            .expect("应插入压力 revision source");
+    }
+    transaction.commit().expect("压力夹具应原子提交");
+    drop(connection);
+
+    let retriever = SqliteMemoryRetriever::new(Arc::clone(&repository));
+    for _ in 0..2 {
+        assert_eq!(
+            error_code(retriever.retrieve(&request(
+                &scope,
+                "大历史时间点",
+                None,
+                None,
+                None,
+                Some("m-large-history"),
+                true,
+            ))),
+            MemoryErrorCode::QueryBudgetExceeded,
+            "超出 revision 字节/数量预算必须稳定无正文拒绝"
+        );
+        assert!(
+            retriever.lock_snapshots().expect("快照锁应可用").is_empty(),
+            "资源拒绝不得遗留部分历史快照"
+        );
+    }
+
+    let at_time = retriever
+        .retrieve(&request(
+            &scope,
+            "大历史时间点仍应精确命中",
+            None,
+            None,
+            Some("2026-07-30T01:30:00Z"),
+            None,
+            false,
+        ))
+        .expect("as_of 应在 SQL 层只选中一条可读 revision");
+    assert_eq!(at_time.items.len(), 1);
+    assert_eq!(at_time.items[0].revision_id.0, "r-large-history-current");
 }
 
 #[test]

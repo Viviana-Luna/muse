@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Row, TransactionBehavior, functions::FunctionFlags, params,
+};
 use unicode_normalization::UnicodeNormalization;
 
 use super::authority::{
@@ -29,6 +31,9 @@ use crate::domain::memory::{
     MemoryRevisionId, MemoryRevisionState, MemorySensitivityPolicy, MemorySourceEvidence,
     MemorySourceKind,
 };
+
+const REVISION_HISTORY_STORAGE_BATCH_SIZE: usize = 64;
+const RFC3339_MICROS_SQL_FUNCTION: &str = "muse_rfc3339_micros";
 use crate::domain::memory::{
     MAX_MEMORY_QUERY_CHARS, validate_memory_change_reason, validate_memory_content,
     validate_memory_query_text,
@@ -215,79 +220,88 @@ impl SqliteMemoryRepository {
         load_current(connection, scope, memory_id)
     }
 
+    /// as_of 候选只读取稳定条目元数据，避免先把 current revision 正文载入内存。
+    pub(crate) fn load_active_entry_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+    ) -> Result<Option<MemoryEntry>, MemoryError> {
+        let row = connection
+            .query_row(
+                "SELECT category, current_revision_id, importance, freshness_at,
+                        created_at, state
+                 FROM memory_entry
+                 WHERE persona_id = ?1
+                   AND memory_id = ?2
+                   AND state = 'active'",
+                params![scope.persona_id(), memory_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(repository_unavailable)?;
+        let Some((category, revision_id, importance, freshness_at, created_at, state)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(MemoryEntry {
+            memory_id: memory_id.clone(),
+            persona_id: scope.persona_id().to_string(),
+            category: parse_category(&category)?,
+            current_revision_id: MemoryRevisionId(revision_id),
+            importance: parse_importance(&importance)?,
+            freshness_at,
+            created_at,
+            state: parse_entry_state(&state)?,
+        }))
+    }
+
     /// 在调用方持有的读快照连接上加载完整 revision 链（含 corrected），
     /// 按 valid_from、recorded_at、revision_id 升序保证确定顺序。
+    ///
+    /// 管理审计端口沿用完整返回契约，但底层按固定 keyset 页读取并在同一 SQL
+    /// 联结 source，避免一次无界 `collect` 和逐 revision 的 source N+1。
     pub(crate) fn revision_history_on(
         &self,
         connection: &Connection,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
     ) -> Result<Vec<MemoryRevision>, MemoryError> {
-        let mut statement = connection
-            .prepare(
-                "SELECT revision_id, content, event_time, recorded_at, valid_from,
-                        valid_to, change_type, change_reason, safety_policy_version, state
-                 FROM memory_revision
-                 WHERE persona_id = ?1 AND memory_id = ?2",
-            )
-            .map_err(repository_unavailable)?;
-        let rows = statement
-            .query_map(params![scope.persona_id(), memory_id.0], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                ))
-            })
-            .map_err(repository_unavailable)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(repository_unavailable)?;
-        drop(statement);
-
-        let mut revisions = Vec::with_capacity(rows.len());
-        for (
-            revision_id,
-            content,
-            event_time,
-            recorded_at,
-            valid_from,
-            valid_to,
-            change_type,
-            change_reason,
-            safety_policy_version,
-            state,
-        ) in rows
-        {
-            let revision_id = MemoryRevisionId(revision_id);
-            let source = load_revision_source(connection, scope, memory_id, &revision_id)?;
-            revisions.push(MemoryRevision {
-                revision_id,
-                memory_id: memory_id.clone(),
-                content,
-                event_time,
-                recorded_at,
-                valid_from,
-                valid_to,
-                change_type: parse_change_type(&change_type)?,
-                change_reason,
-                source,
-                safety_policy_version,
-                state: parse_revision_state(&state)?,
-            });
+        let mut revisions = Vec::new();
+        let mut after: Option<MemoryRevision> = None;
+        loop {
+            let mut page = self.revision_history_page_on(
+                connection,
+                scope,
+                memory_id,
+                after.as_ref(),
+                REVISION_HISTORY_STORAGE_BATCH_SIZE,
+            )?;
+            let fetched = page.len();
+            if fetched == 0 {
+                break;
+            }
+            after = page.last().cloned();
+            revisions.append(&mut page);
+            if fetched < REVISION_HISTORY_STORAGE_BATCH_SIZE {
+                break;
+            }
         }
-        // RFC3339 允许不同时区与可选小数秒，词法排序不可靠，必须按解析后的时间排序。
         let mut keyed = Vec::with_capacity(revisions.len());
         for revision in revisions {
-            let valid_from_micros = rfc3339_micros(&revision.valid_from)?;
-            let recorded_at_micros = rfc3339_micros(&revision.recorded_at)?;
-            keyed.push((valid_from_micros, recorded_at_micros, revision));
+            keyed.push((
+                rfc3339_micros(&revision.valid_from)?,
+                rfc3339_micros(&revision.recorded_at)?,
+                revision,
+            ));
         }
         keyed.sort_by(|left, right| {
             left.0
@@ -296,6 +310,197 @@ impl SqliteMemoryRepository {
                 .then_with(|| left.2.revision_id.0.cmp(&right.2.revision_id.0))
         });
         Ok(keyed.into_iter().map(|(_, _, revision)| revision).collect())
+    }
+
+    /// 按 as_of 时点在 SQL 层最多选出两条可读 revision；两条同时有效说明
+    /// 时间区间损坏，调用方必须 fail closed。
+    pub(crate) fn revision_at_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        at_micros: i64,
+    ) -> Result<Option<MemoryRevision>, MemoryError> {
+        let mut statement = connection
+            .prepare(
+                "SELECT revision.revision_id, revision.content, revision.event_time,
+                        revision.recorded_at, revision.valid_from, revision.valid_to,
+                        revision.change_type, revision.change_reason,
+                        revision.safety_policy_version, revision.state,
+                        source.source_kind, source.conversation_id, source.turn_id,
+                        source.action_id, source.authorized_at
+                 FROM memory_revision AS revision
+                 LEFT JOIN memory_revision_source AS source
+                   ON source.persona_id = revision.persona_id
+                  AND source.memory_id = revision.memory_id
+                  AND source.revision_id = revision.revision_id
+                  AND source.source_ordinal = 0
+                 WHERE revision.persona_id = ?1
+                   AND revision.memory_id = ?2
+                   AND revision.state IN ('current', 'superseded')
+                   AND muse_rfc3339_micros(revision.valid_from) <= ?3
+                   AND (
+                       revision.valid_to IS NULL
+                       OR muse_rfc3339_micros(revision.valid_to) > ?3
+                   )
+                 ORDER BY muse_rfc3339_micros(revision.valid_from) DESC,
+                          muse_rfc3339_micros(revision.recorded_at) DESC,
+                          revision.revision_id DESC
+                 LIMIT 2",
+            )
+            .map_err(repository_unavailable)?;
+        let raw = statement
+            .query_map(
+                params![scope.persona_id(), memory_id.0, at_micros],
+                raw_revision_from_row,
+            )
+            .map_err(repository_unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_unavailable)?;
+        let revisions = raw
+            .into_iter()
+            .map(|row| revision_from_raw(memory_id, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        match revisions.as_slice() {
+            [] => Ok(None),
+            [revision] => Ok(Some(revision.clone())),
+            _ => Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable)),
+        }
+    }
+
+    /// 续页失效检查只按稳定 revision_id 精确取一条，并在同一 SQL 读取 source。
+    pub(crate) fn revision_by_id_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        revision_id: &MemoryRevisionId,
+    ) -> Result<Option<MemoryRevision>, MemoryError> {
+        let raw = connection
+            .query_row(
+                "SELECT revision.revision_id, revision.content, revision.event_time,
+                        revision.recorded_at, revision.valid_from, revision.valid_to,
+                        revision.change_type, revision.change_reason,
+                        revision.safety_policy_version, revision.state,
+                        source.source_kind, source.conversation_id, source.turn_id,
+                        source.action_id, source.authorized_at
+                 FROM memory_revision AS revision
+                 LEFT JOIN memory_revision_source AS source
+                   ON source.persona_id = revision.persona_id
+                  AND source.memory_id = revision.memory_id
+                  AND source.revision_id = revision.revision_id
+                  AND source.source_ordinal = 0
+                 WHERE revision.persona_id = ?1
+                   AND revision.memory_id = ?2
+                   AND revision.revision_id = ?3
+                 LIMIT 1",
+                params![scope.persona_id(), memory_id.0, revision_id.0],
+                raw_revision_from_row,
+            )
+            .optional()
+            .map_err(repository_unavailable)?;
+        raw.map(|row| revision_from_raw(memory_id, row)).transpose()
+    }
+
+    /// 模型历史读取使用的固定大小 keyset 页；内部按唯一 revision_id 遍历，
+    /// 调用方物化到预算内后再按解析时间形成产品顺序。
+    pub(crate) fn revision_history_page_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        after: Option<&MemoryRevision>,
+        limit: usize,
+    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        if limit == 0 || limit > REVISION_HISTORY_STORAGE_BATCH_SIZE {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        let (sql, cursor) = match after {
+            Some(revision) => (
+                "SELECT revision.revision_id, revision.content, revision.event_time,
+                        revision.recorded_at, revision.valid_from, revision.valid_to,
+                        revision.change_type, revision.change_reason,
+                        revision.safety_policy_version, revision.state,
+                        source.source_kind, source.conversation_id, source.turn_id,
+                        source.action_id, source.authorized_at
+                 FROM memory_revision AS revision
+                 LEFT JOIN memory_revision_source AS source
+                   ON source.persona_id = revision.persona_id
+                  AND source.memory_id = revision.memory_id
+                  AND source.revision_id = revision.revision_id
+                  AND source.source_ordinal = 0
+                 WHERE revision.persona_id = ?1
+                   AND revision.memory_id = ?2
+                   AND revision.revision_id < ?3
+                 ORDER BY revision.revision_id DESC
+                 LIMIT ?4",
+                Some(revision.revision_id.0.as_str()),
+            ),
+            None => (
+                "SELECT revision.revision_id, revision.content, revision.event_time,
+                        revision.recorded_at, revision.valid_from, revision.valid_to,
+                        revision.change_type, revision.change_reason,
+                        revision.safety_policy_version, revision.state,
+                        source.source_kind, source.conversation_id, source.turn_id,
+                        source.action_id, source.authorized_at
+                 FROM memory_revision AS revision
+                 LEFT JOIN memory_revision_source AS source
+                   ON source.persona_id = revision.persona_id
+                  AND source.memory_id = revision.memory_id
+                  AND source.revision_id = revision.revision_id
+                  AND source.source_ordinal = 0
+                 WHERE revision.persona_id = ?1
+                   AND revision.memory_id = ?2
+                 ORDER BY revision.revision_id DESC
+                 LIMIT ?3",
+                None,
+            ),
+        };
+        let mut statement = connection.prepare(sql).map_err(repository_unavailable)?;
+        let raw = match cursor {
+            Some(revision_id) => statement
+                .query_map(
+                    params![scope.persona_id(), memory_id.0, revision_id, limit as i64],
+                    raw_revision_from_row,
+                )
+                .map_err(repository_unavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(repository_unavailable)?,
+            None => statement
+                .query_map(
+                    params![scope.persona_id(), memory_id.0, limit as i64],
+                    raw_revision_from_row,
+                )
+                .map_err(repository_unavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(repository_unavailable)?,
+        };
+        raw.into_iter()
+            .map(|row| revision_from_raw(memory_id, row))
+            .collect()
+    }
+
+    pub(crate) fn revision_history_has_more_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        after: &MemoryRevision,
+    ) -> Result<bool, MemoryError> {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM memory_revision AS revision
+                    WHERE revision.persona_id = ?1
+                      AND revision.memory_id = ?2
+                      AND revision.revision_id < ?3
+                    LIMIT 1
+                 )",
+                params![scope.persona_id(), memory_id.0, after.revision_id.0],
+                |row| row.get(0),
+            )
+            .map_err(repository_unavailable)
     }
 
     pub(crate) fn open_connection(&self) -> Result<Connection, MemoryError> {
@@ -843,12 +1048,92 @@ pub(crate) fn canonicalize_derivation_content(value: &str) -> String {
     value.trim().chars().flat_map(char::to_lowercase).collect()
 }
 
+struct RawRevisionRow {
+    revision_id: String,
+    content: String,
+    event_time: Option<String>,
+    recorded_at: String,
+    valid_from: String,
+    valid_to: Option<String>,
+    change_type: String,
+    change_reason: String,
+    safety_policy_version: String,
+    state: String,
+    source_kind: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
+    action_id: Option<String>,
+    authorized_at: Option<String>,
+}
+
+fn raw_revision_from_row(row: &Row<'_>) -> rusqlite::Result<RawRevisionRow> {
+    Ok(RawRevisionRow {
+        revision_id: row.get(0)?,
+        content: row.get(1)?,
+        event_time: row.get(2)?,
+        recorded_at: row.get(3)?,
+        valid_from: row.get(4)?,
+        valid_to: row.get(5)?,
+        change_type: row.get(6)?,
+        change_reason: row.get(7)?,
+        safety_policy_version: row.get(8)?,
+        state: row.get(9)?,
+        source_kind: row.get(10)?,
+        conversation_id: row.get(11)?,
+        turn_id: row.get(12)?,
+        action_id: row.get(13)?,
+        authorized_at: row.get(14)?,
+    })
+}
+
+fn revision_from_raw(
+    memory_id: &MemoryId,
+    row: RawRevisionRow,
+) -> Result<MemoryRevision, MemoryError> {
+    let source = parse_revision_source(
+        row.source_kind,
+        row.conversation_id,
+        row.turn_id,
+        row.action_id,
+        row.authorized_at,
+    )?;
+    Ok(MemoryRevision {
+        revision_id: MemoryRevisionId(row.revision_id),
+        memory_id: memory_id.clone(),
+        content: row.content,
+        event_time: row.event_time,
+        recorded_at: row.recorded_at,
+        valid_from: row.valid_from,
+        valid_to: row.valid_to,
+        change_type: parse_change_type(&row.change_type)?,
+        change_reason: row.change_reason,
+        source,
+        safety_policy_version: row.safety_policy_version,
+        state: parse_revision_state(&row.state)?,
+    })
+}
+
 fn configure_memory_connection(connection: &Connection) -> Result<(), MemoryError> {
     connection
         .pragma_update(None, "secure_delete", "ON")
         .map_err(repository_unavailable)?;
     connection
         .pragma_update(None, "synchronous", "FULL")
+        .map_err(repository_unavailable)?;
+    connection
+        .create_scalar_function(
+            RFC3339_MICROS_SQL_FUNCTION,
+            1,
+            FunctionFlags::SQLITE_UTF8
+                | FunctionFlags::SQLITE_DETERMINISTIC
+                | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let value = context.get::<String>(0)?;
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.timestamp_micros())
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+            },
+        )
         .map_err(repository_unavailable)?;
     Ok(())
 }
@@ -979,15 +1264,25 @@ fn load_revision_source(
             },
         )
         .map_err(repository_unavailable)?;
-    match source {
-        (kind, Some(conversation_id), Some(turn_id), None, None) => {
+    parse_revision_source(Some(source.0), source.1, source.2, source.3, source.4)
+}
+
+fn parse_revision_source(
+    kind: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
+    action_id: Option<String>,
+    authorized_at: Option<String>,
+) -> Result<MemorySourceEvidence, MemoryError> {
+    match (kind, conversation_id, turn_id, action_id, authorized_at) {
+        (Some(kind), Some(conversation_id), Some(turn_id), None, None) => {
             Ok(MemorySourceEvidence::ConversationTurn {
                 conversation_id,
                 turn_id,
                 kind: parse_source_kind(&kind)?,
             })
         }
-        (kind, None, None, Some(action_id), Some(authorized_at))
+        (Some(kind), None, None, Some(action_id), Some(authorized_at))
             if kind == "persona_management" =>
         {
             Ok(MemorySourceEvidence::PersonaManagement {
