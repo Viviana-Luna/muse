@@ -302,9 +302,7 @@ fn validate_simple_direct_user_predicate(value: &str) -> Option<()> {
 fn validate_direct_user_complement(value: &str, kind: DirectUserComplementKind) -> Option<()> {
     if value.is_empty()
         || has_direct_user_clause_boundary(value)
-        || has_structured_clause_connector(value)
         || has_structured_external_source(value)
-        || has_third_party_subject(value)
     {
         return None;
     }
@@ -330,8 +328,8 @@ fn validate_direct_user_preference(value: &str) -> Option<()> {
         return Some(());
     }
     if starts_direct_user_negation(value)
-        || contains_non_nominalized_action_predicate(value)
-        || !is_typed_preference_object(value)
+        || has_structured_clause_connector(value)
+        || contains_non_nominalized_clause_predicate(value)
     {
         return None;
     }
@@ -345,7 +343,6 @@ fn validate_positive_action_phrase(value: &str) -> Option<()> {
     if action.is_empty()
         || starts_direct_user_negation(action)
         || starts_structured_external_source(action)
-        || has_third_party_subject(action)
     {
         return None;
     }
@@ -369,9 +366,8 @@ fn validate_positive_action_phrase(value: &str) -> Option<()> {
 fn validate_direct_user_action_object(value: &str) -> bool {
     !starts_direct_user_negation(value)
         && !starts_structured_external_source(value)
-        && !has_third_party_subject(value)
         && !has_structured_clause_connector(value)
-        && !contains_non_nominalized_action_predicate(value)
+        && !contains_non_nominalized_clause_predicate(value)
 }
 
 fn direct_user_action_predicates() -> &'static [(&'static str, DirectUserActionTail)] {
@@ -479,12 +475,7 @@ fn has_structured_clause_connector(value: &str) -> bool {
             let after = connector_start + connector.len();
             let prefix = &value[..connector_start];
             let suffix = &value[after..];
-            let joins_typed_objects =
-                is_typed_preference_object_atom(prefix) && is_typed_preference_object_atom(suffix);
-            if !prefix.is_empty()
-                && !suffix.is_empty()
-                && (starts_direct_user_clause(suffix) || joins_typed_objects)
-            {
+            if is_structural_connector_occurrence(connector, prefix, suffix) {
                 return true;
             }
             search_from = after;
@@ -493,75 +484,39 @@ fn has_structured_clause_connector(value: &str) -> bool {
     false
 }
 
+fn is_structural_connector_occurrence(connector: &str, prefix: &str, suffix: &str) -> bool {
+    if prefix.is_empty() || suffix.is_empty() {
+        return false;
+    }
+    if starts_direct_user_clause(suffix) {
+        return true;
+    }
+
+    match connector {
+        // 转折、因果或时序词只有位于已形成的成分之后，且后半段具备最小从句
+        // 长度时才算连接位置；词首及“合并请求”这类词内片段仍按名词处理。
+        "并且" | "而且" | "同时" | "但是" | "不过" | "因为" | "所以" | "由于" | "因此" | "否则"
+        | "然后" | "接着" | "另外" | "还有" => true,
+        "并" | "又" | "但" | "却" | "也" => {
+            looks_like_unmarked_clause_after_connector(prefix, suffix)
+        }
+        // “和、与、或、以及”可以连接同一名词短语，只有后半段满足正向从句骨架
+        // 时才拒绝；普通并列名词本身仍是一项偏好对象。
+        "和" | "与" | "或" | "以及" => false,
+        _ => false,
+    }
+}
+
+fn looks_like_unmarked_clause_after_connector(prefix: &str, suffix: &str) -> bool {
+    prefix.chars().count() >= 2 && suffix.chars().count() >= 3
+}
+
 fn starts_direct_user_clause(value: &str) -> bool {
-    const SUBJECT_STARTERS: [&str; 40] = [
-        "我",
-        "用户",
-        "他",
-        "她",
-        "它",
-        "他们",
-        "妈妈",
-        "爸爸",
-        "祖父",
-        "祖母",
-        "爷爷",
-        "奶奶",
-        "外公",
-        "外婆",
-        "朋友",
-        "同事",
-        "同学",
-        "领导",
-        "丈夫",
-        "妻子",
-        "孩子",
-        "儿子",
-        "女儿",
-        "哥哥",
-        "弟弟",
-        "姐姐",
-        "妹妹",
-        "舅舅",
-        "姑姑",
-        "叔叔",
-        "阿姨",
-        "邻居",
-        "室友",
-        "网页",
-        "文件",
-        "assistant",
-        "tool",
-        "mcp",
-        "system",
-        "reasoning",
-    ];
-    const OUTER_PREDICATES: [&str; 15] = [
-        "喜欢",
-        "偏好",
-        "习惯",
-        "希望",
-        "计划",
-        "正在学习",
-        "正在工作",
-        "学习",
-        "工作",
-        "来自",
-        "从事",
-        "住在",
-        "知道",
-        "得知",
-        "认为",
-    ];
-    SUBJECT_STARTERS
-        .iter()
-        .any(|starter| value.starts_with(starter))
-        || OUTER_PREDICATES
-            .iter()
-            .any(|predicate| value.starts_with(predicate))
+    starts_direct_user_outer_predicate(value)
         || starts_direct_user_negation(value)
         || starts_structured_external_source(value)
         || starts_positive_action_predicate(value)
+        || contains_non_nominalized_clause_predicate(value)
 }
 
 fn starts_positive_action_predicate(value: &str) -> bool {
@@ -617,74 +572,17 @@ fn starts_structured_external_source(value: &str) -> bool {
     false
 }
 
-fn has_third_party_subject(value: &str) -> bool {
-    const SUBJECTS: [&str; 48] = [
-        "妈妈",
-        "爸爸",
-        "父亲",
-        "母亲",
-        "祖父",
-        "祖母",
-        "爷爷",
-        "奶奶",
-        "外公",
-        "外婆",
-        "曾祖父",
-        "曾祖母",
-        "哥哥",
-        "弟弟",
-        "姐姐",
-        "妹妹",
-        "兄弟",
-        "姐妹",
-        "叔叔",
-        "阿姨",
-        "伯父",
-        "伯母",
-        "舅舅",
-        "舅妈",
-        "姑姑",
-        "姑父",
-        "姨妈",
-        "姨父",
-        "表哥",
-        "表弟",
-        "表姐",
-        "表妹",
-        "堂哥",
-        "堂弟",
-        "堂姐",
-        "堂妹",
-        "家人",
-        "朋友",
-        "同事",
-        "同学",
-        "领导",
-        "丈夫",
-        "妻子",
-        "孩子",
-        "儿子",
-        "女儿",
-        "邻居",
-        "室友",
-    ];
-    const PRONOUNS: [&str; 7] = ["用户", "他们", "她们", "它们", "他", "她", "它"];
-    for subject in SUBJECTS.iter().chain(PRONOUNS.iter()).copied() {
-        let mut search_from = 0;
-        while let Some(relative) = value[search_from..].find(subject) {
-            let after = search_from + relative + subject.len();
-            let suffix = &value[after..];
-            if !suffix.is_empty() && !suffix.starts_with('的') {
-                return true;
-            }
-            search_from = after;
-        }
-    }
-    false
+fn contains_direct_user_predicate(value: &str) -> bool {
+    value.char_indices().any(|(index, _)| {
+        let tail = &value[index..];
+        starts_direct_user_outer_predicate(tail) || starts_positive_action_predicate(tail)
+    })
 }
 
-fn contains_direct_user_predicate(value: &str) -> bool {
-    const OUTER_PREDICATES: [&str; 17] = [
+fn direct_user_outer_predicates() -> &'static [&'static str] {
+    &[
+        "正在学习",
+        "正在工作",
         "倾向于",
         "喜欢",
         "偏好",
@@ -702,59 +600,33 @@ fn contains_direct_user_predicate(value: &str) -> bool {
         "得知",
         "认为",
         "推测",
-    ];
+    ]
+}
+
+fn starts_direct_user_outer_predicate(value: &str) -> bool {
+    direct_user_outer_predicates()
+        .iter()
+        .any(|predicate| value.starts_with(predicate))
+}
+
+fn contains_non_nominalized_clause_predicate(value: &str) -> bool {
     value.char_indices().any(|(index, _)| {
         let tail = &value[index..];
-        OUTER_PREDICATES
+        let predicate = direct_user_outer_predicates()
             .iter()
-            .any(|predicate| tail.starts_with(predicate))
-            || direct_user_action_predicates()
-                .iter()
-                .any(|(predicate, _)| tail.starts_with(predicate))
+            .copied()
+            .find(|predicate| tail.starts_with(predicate))
+            .or_else(|| {
+                direct_user_action_predicates()
+                    .iter()
+                    .map(|(predicate, _)| *predicate)
+                    .find(|predicate| tail.starts_with(predicate))
+            });
+        predicate.is_some_and(|predicate| {
+            let prefix = &value[..index];
+            !(prefix.ends_with('的') && matches!(predicate, "回答" | "回复" | "工作" | "学习"))
+        })
     })
-}
-
-fn contains_non_nominalized_action_predicate(value: &str) -> bool {
-    value.char_indices().any(|(index, _)| {
-        let tail = &value[index..];
-        direct_user_action_predicates()
-            .iter()
-            .any(|(predicate, _)| {
-                if !tail.starts_with(predicate) {
-                    return false;
-                }
-                let prefix = &value[..index];
-                !(prefix.ends_with('的') && matches!(*predicate, "回答" | "回复" | "工作" | "学习"))
-            })
-    })
-}
-
-fn is_typed_preference_object(value: &str) -> bool {
-    is_typed_preference_object_atom(value)
-        || (value.is_ascii()
-            && value
-                .chars()
-                .any(|character| character.is_ascii_alphanumeric())
-            && value.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '-' | '_' | '/' | '+' | '.')
-            }))
-}
-
-fn is_typed_preference_object_atom(value: &str) -> bool {
-    const OBJECT_HEADS: [&str; 32] = [
-        "咖啡", "饮品", "红茶", "绿茶", "茶", "回答", "回复", "歌曲", "音乐", "小说", "电影", "书",
-        "歌", "食物", "早餐", "午餐", "晚餐", "甜点", "水果", "菜", "颜色", "语言", "工具", "风格",
-        "方式", "方案", "界面", "主题", "游戏", "运动", "工作", "记忆",
-    ];
-    const DESCRIPTORS: [&str; 10] = [
-        "简洁", "简短", "直接", "详细", "正式", "随意", "异步", "同步", "远程", "本地",
-    ];
-    !value.is_empty()
-        && (OBJECT_HEADS.iter().any(|head| value.ends_with(head))
-            || DESCRIPTORS
-                .iter()
-                .any(|descriptor| value.ends_with(descriptor)))
 }
 
 /// `我的` 只接受与偏好、习惯、计划、学习、工作、时区或昵称直接相关的有限
