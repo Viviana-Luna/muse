@@ -222,28 +222,116 @@ pub(in crate::runtime_support) fn runtime_session_list_for_active(
     rows
 }
 
-pub(in crate::runtime_support) fn compact_source_line(
-    message: &muse_core::domain::conversation::Message,
-) -> String {
+/// `session_compact` 唯一允许读取的会话投影。
+///
+/// 三个记忆 Tool 在投影构造时就被替换为 streaming canonical 收据、哈希
+/// call_id 与固定结果占位；后续规则和模型摘要接口只接受该类型，不能误传原始
+/// `Conversation`。
+pub(in crate::runtime_support) struct CompactConversationProjection {
+    conversation: Conversation,
+}
+
+impl CompactConversationProjection {
+    pub(in crate::runtime_support) fn from_conversation(source: &Conversation) -> Self {
+        let mut projection = Conversation::new(String::new(), usize::MAX);
+        projection.messages.clear();
+
+        for original in &source.messages {
+            let mut message = original.clone();
+            let original_call_id = message.tool_call_id.clone();
+            let result_is_error = original_call_id
+                .as_deref()
+                .is_some_and(|call_id| source.tool_result_is_error(call_id));
+
+            if let Some(tool_name) = message.tool_name.as_deref()
+                && is_memory_session_redacted_tool(tool_name)
+            {
+                message.tool_call_id = original_call_id.as_deref().map(memory_session_call_id);
+                message.reasoning_content = None;
+                match message.role {
+                    Role::Assistant => {
+                        let receipt = message
+                            .tool_arguments
+                            .as_ref()
+                            .and_then(|arguments| memory_session_call_receipt(tool_name, arguments))
+                            .unwrap_or_else(|| memory_session_invalid_call_receipt(tool_name));
+                        message.content.clear();
+                        message.tool_arguments = Some(receipt.to_compact_json());
+                    }
+                    Role::Tool => {
+                        message.content = MEMORY_SESSION_REPLAY_PLACEHOLDER.to_string();
+                        message.tool_arguments = None;
+                    }
+                    Role::System | Role::User => {
+                        // 畸形消息也不能借 tool_name 把自由字符串带入压缩链路。
+                        message.content = MEMORY_SESSION_REPLAY_PLACEHOLDER.to_string();
+                        message.tool_arguments = None;
+                    }
+                }
+            }
+
+            if message.role == Role::Tool
+                && let (Some(call_id), Some(tool_name)) =
+                    (message.tool_call_id.clone(), message.tool_name.clone())
+            {
+                projection.add_tool_result_with_status(
+                    call_id,
+                    tool_name,
+                    message.content,
+                    result_is_error,
+                );
+            } else {
+                projection.messages.push(message);
+            }
+        }
+
+        projection.max_history = source.max_history;
+        projection.trim_to_budget();
+        Self {
+            conversation: projection,
+        }
+    }
+
+    fn messages(&self) -> &[muse_core::domain::conversation::Message] {
+        &self.conversation.messages
+    }
+
+    fn into_conversation(self) -> Conversation {
+        self.conversation
+    }
+}
+
+fn compact_source_line(message: &muse_core::domain::conversation::Message) -> String {
     let role = message.role.to_string();
     if let Some(tool_name) = message.tool_name.as_deref()
         && message.tool_call_id.is_some()
     {
+        let content =
+            if is_memory_session_redacted_tool(tool_name) && message.role == Role::Assistant {
+                message
+                    .tool_arguments
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "{}".to_string())
+            } else {
+                truncate_text(&message.content, 800)
+            };
         return format!(
             "{} tool={} call_id={}: {}",
             role,
             tool_name,
             message.tool_call_id.as_deref().unwrap_or(""),
-            truncate_text(&message.content, 800)
+            content
         );
     }
     format!("{}: {}", role, truncate_text(&message.content, 800))
 }
 
 pub(in crate::runtime_support) fn build_rule_compact_summary(
-    messages: &[muse_core::domain::conversation::Message],
+    projection: &CompactConversationProjection,
 ) -> String {
-    let body = messages
+    let body = projection
+        .messages()
         .iter()
         .filter(|message| message.role != Role::System)
         .map(compact_source_line)
@@ -260,9 +348,10 @@ pub(in crate::runtime_support) fn build_rule_compact_summary(
 }
 
 pub(in crate::runtime_support) fn build_compact_prompt(
-    messages: &[muse_core::domain::conversation::Message],
+    projection: &CompactConversationProjection,
 ) -> String {
-    let transcript = messages
+    let transcript = projection
+        .messages()
         .iter()
         .filter(|message| message.role != Role::System)
         .map(compact_source_line)
@@ -280,13 +369,13 @@ pub(in crate::runtime_support) fn build_compact_prompt(
 
 pub(in crate::runtime_support) async fn generate_model_compact_summary(
     provider: &Arc<dyn muse_core::model::provider::ChatModelProvider>,
-    messages: &[muse_core::domain::conversation::Message],
+    projection: &CompactConversationProjection,
 ) -> Result<String, String> {
     let mut compact_conversation = Conversation::new(
         "你是 agent harness 的会话压缩器，只输出可恢复 compact summary。".to_string(),
         4,
     );
-    compact_conversation.add_user_message(build_compact_prompt(messages));
+    compact_conversation.add_user_message(build_compact_prompt(projection));
     let reply = provider
         .chat(&compact_conversation)
         .await
@@ -299,16 +388,13 @@ pub(in crate::runtime_support) async fn generate_model_compact_summary(
     }
 }
 
-pub(in crate::runtime_support) fn compact_conversation_in_place(
-    conversation: &mut Conversation,
-    summary: &str,
-) -> usize {
-    let original_messages = conversation.messages.clone();
+fn compact_projected_conversation_in_place(projected: &mut Conversation, summary: &str) -> usize {
+    let original_messages = projected.messages.clone();
     let system_message = original_messages
         .iter()
         .find(|message| message.role == Role::System)
         .cloned();
-    let recent_messages = conversation.recent_turn_frame_messages(6);
+    let recent_messages = projected.recent_turn_frame_messages(6);
     let compact_message = muse_core::domain::conversation::Message {
         role: Role::Assistant,
         content: format!("[会话压缩摘要]\n{summary}"),
@@ -324,8 +410,21 @@ pub(in crate::runtime_support) fn compact_conversation_in_place(
     }
     compacted_messages.push(compact_message);
     compacted_messages.extend(recent_messages);
-    conversation.replace_messages(compacted_messages);
-    conversation.messages.len()
+    projected.replace_messages(compacted_messages);
+    projected.messages.len()
+}
+
+pub(in crate::runtime_support) fn compact_conversation_in_place(
+    conversation: &mut Conversation,
+    summary: &str,
+) -> usize {
+    // 先构造完整安全投影，再选择最近消息。这样 durable delete 后即使当前
+    // 内存 Conversation 仍含旧查询正文，也不会被最近帧重新复制。
+    let mut projected =
+        CompactConversationProjection::from_conversation(conversation).into_conversation();
+    let compacted_len = compact_projected_conversation_in_place(&mut projected, summary);
+    *conversation = projected;
+    compacted_len
 }
 
 pub(in crate::runtime_support) fn apply_session_compaction_result(
@@ -349,17 +448,18 @@ pub(in crate::runtime_support) async fn tool_session_compact(
     conversation: &Conversation,
 ) -> ToolResult {
     let conversation_id = active_conversation_id(state);
-    let original_messages = conversation.messages.clone();
-    let original_len = original_messages.len();
-    let fallback_summary = build_rule_compact_summary(&original_messages);
+    // summarizer 接口只接收专用投影；构造完成后不再读取原 Conversation。
+    let projection = CompactConversationProjection::from_conversation(conversation);
+    let original_len = projection.messages().len();
+    let fallback_summary = build_rule_compact_summary(&projection);
     let (summary, strategy, error) =
-        match generate_model_compact_summary(provider, &original_messages).await {
+        match generate_model_compact_summary(provider, &projection).await {
             Ok(summary) => (summary, "model", None),
             Err(err) => (fallback_summary, "rule_fallback", Some(err)),
         };
 
-    let mut compacted = conversation.clone();
-    let compacted_len = compact_conversation_in_place(&mut compacted, &summary);
+    let mut compacted = projection.into_conversation();
+    let compacted_len = compact_projected_conversation_in_place(&mut compacted, &summary);
 
     report_transcript_failure(
         append_transcript_record(

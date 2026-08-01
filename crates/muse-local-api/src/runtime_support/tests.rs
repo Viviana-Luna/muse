@@ -24,7 +24,9 @@ use muse_core::domain::tool::{
 use muse_core::domain::turn::TurnContext;
 use muse_core::model::catalog::ModelCatalogModelDraft;
 use muse_core::model::profile::model_capability_defaults;
-use muse_core::model::provider::{ChatModelProvider, ChatModelResult, ChatStreamResult};
+use muse_core::model::provider::{
+    ChatModelError, ChatModelProvider, ChatModelResult, ChatStreamResult,
+};
 use muse_runtime::interactions::{PendingApproval, PendingUserQuestion};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +36,36 @@ use tokio::io::AsyncReadExt as _;
 struct PendingHandshakeProvider {
     entered: Arc<tokio::sync::Notify>,
     dropped: Arc<AtomicBool>,
+}
+
+struct CompactProjectionProvider {
+    captured: Arc<std::sync::Mutex<Vec<String>>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl ChatModelProvider for CompactProjectionProvider {
+    async fn chat(&self, conversation: &Conversation) -> ChatModelResult {
+        let received =
+            serde_json::to_string(&conversation.messages).expect("模型 compact 测试输入应可序列化");
+        self.captured.lock().unwrap().push(received.clone());
+        if self.fail {
+            Err(ChatModelError::ApiError(
+                "注入 compact summarizer 失败".to_string(),
+            ))
+        } else {
+            // 恶意摘要器原样回显收到的全部输入；安全边界必须保证它从未收到正文。
+            Ok(format!("## 恶意回显摘要\n{received}"))
+        }
+    }
+
+    async fn chat_stream(&self, _conversation: &Conversation) -> ChatStreamResult {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn name(&self) -> &'static str {
+        "compact_projection_test"
+    }
 }
 
 struct HandshakeDropFlag(Arc<AtomicBool>);
@@ -358,6 +390,90 @@ fn test_message(role: Role, content: &str) -> Message {
         tool_arguments: None,
         reasoning_content: None,
     }
+}
+
+const COMPACT_MEMORY_BODY_SENTINEL: &str = "COMPACT_MEMORY_BODY_SENTINEL_SECRET";
+const COMPACT_MEMORY_QUERY_SENTINEL: &str = "COMPACT_MEMORY_QUERY_SENTINEL_SECRET";
+const COMPACT_MEMORY_REASON_SENTINEL: &str = "COMPACT_MEMORY_REASON_SENTINEL_SECRET";
+const COMPACT_MEMORY_CURSOR_SENTINEL: &str = "COMPACT_MEMORY_CURSOR_SENTINEL_SECRET";
+const COMPACT_MEMORY_SOURCE_SENTINEL: &str = "COMPACT_MEMORY_SOURCE_SENTINEL_SECRET";
+const COMPACT_MEMORY_PROVIDER_CALL_SENTINEL: &str = "COMPACT_MEMORY_PROVIDER_CALL_SENTINEL_SECRET";
+const COMPACT_MEMORY_ID: &str = "memory-1767225600000-501";
+const COMPACT_MEMORY_REVISION_ID: &str = "memory-rev-1767225600000-502";
+
+fn memory_compact_test_conversation() -> Conversation {
+    let mut conversation = Conversation::new("安全系统提示".to_string(), 40);
+    conversation.add_user_message("请完成记忆查询、变更和删除后压缩会话。".to_string());
+    conversation.add_assistant_tool_call_with_reasoning(
+        format!("query-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_query".to_string(),
+        serde_json::json!({
+            "query": COMPACT_MEMORY_QUERY_SENTINEL,
+            "limit": 5,
+            "cursor": COMPACT_MEMORY_CURSOR_SENTINEL,
+            "include_history": true,
+        }),
+        Some(COMPACT_MEMORY_SOURCE_SENTINEL.to_string()),
+    );
+    conversation.add_tool_result(
+        format!("query-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_query".to_string(),
+        format!(
+            "正文={COMPACT_MEMORY_BODY_SENTINEL}; memory_id={COMPACT_MEMORY_ID}; revision_id={COMPACT_MEMORY_REVISION_ID}; score=0.998877; source={COMPACT_MEMORY_SOURCE_SENTINEL}"
+        ),
+    );
+    conversation.add_assistant_tool_call_with_reasoning(
+        format!("mutate-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_mutate".to_string(),
+        serde_json::json!({
+            "operation": "create",
+            "category": "user_fact",
+            "content": COMPACT_MEMORY_BODY_SENTINEL,
+            "importance": "high",
+            "event_time": null,
+            "change_reason": COMPACT_MEMORY_REASON_SENTINEL,
+        }),
+        Some(COMPACT_MEMORY_BODY_SENTINEL.to_string()),
+    );
+    conversation.add_tool_result(
+        format!("mutate-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_mutate".to_string(),
+        format!(
+            "已暂存 {COMPACT_MEMORY_BODY_SENTINEL}，memory_id={COMPACT_MEMORY_ID}，revision_id={COMPACT_MEMORY_REVISION_ID}"
+        ),
+    );
+    conversation.add_assistant_tool_call_with_reasoning(
+        format!("delete-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_delete".to_string(),
+        serde_json::json!({
+            "scope": "memory",
+            "memory_id": COMPACT_MEMORY_ID,
+        }),
+        Some(COMPACT_MEMORY_REASON_SENTINEL.to_string()),
+    );
+    // 成功删除收据代表 durable delete 已完成；旧 query/mutate ToolResult 仍故意
+    // 留在当前内存 Conversation，用来证明 compact 不会复制或复活旧正文。
+    conversation.add_tool_result(
+        format!("delete-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"),
+        "memory_delete".to_string(),
+        format!("已 durable 删除 {COMPACT_MEMORY_ID}：{COMPACT_MEMORY_BODY_SENTINEL}"),
+    );
+    conversation.add_assistant_message("删除已经完成，现在压缩会话。".to_string());
+    conversation
+}
+
+fn compact_memory_forbidden_values() -> [&'static str; 9] {
+    [
+        COMPACT_MEMORY_BODY_SENTINEL,
+        COMPACT_MEMORY_QUERY_SENTINEL,
+        COMPACT_MEMORY_REASON_SENTINEL,
+        COMPACT_MEMORY_CURSOR_SENTINEL,
+        COMPACT_MEMORY_SOURCE_SENTINEL,
+        COMPACT_MEMORY_PROVIDER_CALL_SENTINEL,
+        COMPACT_MEMORY_ID,
+        COMPACT_MEMORY_REVISION_ID,
+        "0.998877",
+    ]
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -929,7 +1045,10 @@ fn compact_prompt_requires_recoverable_summary_sections() {
         test_message(Role::Assistant, "已经补齐工具 handler registry。"),
     ];
 
-    let prompt = super::build_compact_prompt(&messages);
+    let mut conversation = Conversation::new("系统提示".to_string(), 20);
+    conversation.messages = messages;
+    let projection = super::CompactConversationProjection::from_conversation(&conversation);
+    let prompt = super::build_compact_prompt(&projection);
 
     assert!(prompt.contains("用户原始需求"));
     assert!(prompt.contains("当前任务状态"));
@@ -950,12 +1069,51 @@ fn rule_compact_summary_preserves_tool_results_and_next_step() {
         test_message(Role::Assistant, "下一步需要更新文档和验证。"),
     ];
 
-    let summary = super::build_rule_compact_summary(&messages);
+    let mut conversation = Conversation::new("系统提示".to_string(), 20);
+    conversation.messages = messages;
+    let projection = super::CompactConversationProjection::from_conversation(&conversation);
+    let summary = super::build_rule_compact_summary(&projection);
 
     assert!(summary.contains("继续实现模型生成式 compact"));
     assert!(summary.contains("tool=command_run"));
     assert!(summary.contains("cargo test --workspace 通过"));
     assert!(summary.contains("下一步"));
+}
+
+fn compact_projection_keeps_non_memory_tool_behavior_unchanged() {
+    const ARGUMENT_SENTINEL: &str = "NON_MEMORY_ARGUMENT_SENTINEL";
+    const RESULT_SENTINEL: &str = "NON_MEMORY_RESULT_SENTINEL";
+    const CALL_ID: &str = "non-memory-provider-call-id";
+
+    let mut conversation = Conversation::new("系统提示".to_string(), 20);
+    conversation.add_user_message("执行非记忆工具并保留完整结果。".to_string());
+    conversation.add_assistant_tool_call_with_reasoning(
+        CALL_ID.to_string(),
+        "command_run".to_string(),
+        serde_json::json!({ "command": ARGUMENT_SENTINEL }),
+        Some("非记忆 reasoning 保持原样".to_string()),
+    );
+    conversation.add_tool_result_with_status(
+        CALL_ID.to_string(),
+        "command_run".to_string(),
+        RESULT_SENTINEL.to_string(),
+        true,
+    );
+
+    let projection = super::CompactConversationProjection::from_conversation(&conversation);
+    let prompt = super::build_compact_prompt(&projection);
+    let summary = super::build_rule_compact_summary(&projection);
+    assert!(prompt.contains(RESULT_SENTINEL));
+    assert!(summary.contains(RESULT_SENTINEL));
+    assert!(summary.contains(CALL_ID));
+
+    super::compact_conversation_in_place(&mut conversation, "非记忆压缩摘要");
+    let compacted = serde_json::to_string(&conversation.messages).unwrap();
+    assert!(compacted.contains(ARGUMENT_SENTINEL));
+    assert!(compacted.contains(RESULT_SENTINEL));
+    assert!(compacted.contains(CALL_ID));
+    assert!(conversation.tool_result_is_error(CALL_ID));
+    assert!(conversation.validate_tool_protocol().is_ok());
 }
 
 fn runtime_tool_registry_contains_migrated_handlers() {
@@ -3480,6 +3638,186 @@ async fn canonical_tool_events_survive_store_reopen_with_equivalent_provider_fra
     let _ = std::fs::remove_dir_all(config_dir);
 }
 
+async fn assert_memory_safe_session_compact_case(model_succeeds: bool) {
+    use axum::response::IntoResponse as _;
+
+    let case = if model_succeeds { "model" } else { "rule" };
+    let config_dir = unique_temp_dir(&format!("memory-safe-compact-{case}"));
+    let state = build_test_state(&config_dir);
+    let conversation = memory_compact_test_conversation();
+    let original = serde_json::to_string(&conversation.messages).unwrap();
+    assert!(original.contains(COMPACT_MEMORY_BODY_SENTINEL));
+    assert!(original.contains(COMPACT_MEMORY_ID));
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider: Arc<dyn ChatModelProvider> = Arc::new(CompactProjectionProvider {
+        captured: Arc::clone(&captured),
+        fail: !model_succeeds,
+    });
+    let mut turn = test_turn_context(&format!("turn-memory-safe-compact-{case}"));
+    turn.conversation_id = super::DEFAULT_CONVERSATION_ID.to_string();
+    let compact_call = ToolCall {
+        call_id: format!("session-compact-{case}"),
+        name: "session_compact".to_string(),
+        arguments: serde_json::json!({}),
+        source: ToolCallSource::Native,
+    };
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(8);
+    super::emit_and_record_tool_call(
+        &state,
+        Some(&event_tx),
+        &turn,
+        &compact_call,
+        "medium",
+        None,
+        super::RuntimeToolExecutionPolicy::unknown(),
+    )
+    .await
+    .expect("应能记录真实 session_compact 调用");
+    let result = super::tool_session_compact(&state, &provider, &conversation).await;
+    let result =
+        super::emit_and_record_tool_result(&state, Some(&event_tx), &turn, &compact_call, &result)
+            .await
+            .expect("应能记录真实 session_compact 结果");
+    super::append_transcript_record(
+        &state,
+        "turn_committed",
+        serde_json::json!({
+            "conversation_id": turn.conversation_id,
+            "turn_id": turn.turn_id,
+            "outcome": "committed",
+        }),
+    )
+    .await
+    .expect("应能提交 session_compact 测试 Turn");
+    drop(event_tx);
+    let sse_response =
+        axum::response::sse::Sse::new(tokio_stream::wrappers::ReceiverStream::new(event_rx))
+            .into_response();
+    let sse_bytes = axum::body::to_bytes(sse_response.into_body(), usize::MAX)
+        .await
+        .expect("应能消费 session_compact SSE");
+    let sse_text = String::from_utf8(sse_bytes.to_vec()).expect("SSE 应为 UTF-8");
+    assert!(result.is_success());
+    assert_eq!(
+        result.structured.as_ref().unwrap()["strategy"],
+        if model_succeeds {
+            "model"
+        } else {
+            "rule_fallback"
+        }
+    );
+
+    let captured = captured.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "模型摘要入口应只调用一次");
+    let received = &captured[0];
+    let received_messages = serde_json::from_str::<Vec<Message>>(received)
+        .expect("summarizer 输入应保持 Conversation 消息结构");
+    let compact_input = received_messages
+        .last()
+        .map(|message| message.content.as_str())
+        .expect("summarizer 应收到 compact prompt");
+    let result_text = format!(
+        "{}{}",
+        result.content,
+        result
+            .structured
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default()
+    );
+    let canonical_call_id = super::memory_session_call_id(&format!(
+        "query-call/{COMPACT_MEMORY_PROVIDER_CALL_SENTINEL}"
+    ));
+    assert!(received.contains(&canonical_call_id));
+    for receipt in ["memory_query", "memory_mutate", "memory_delete"] {
+        assert!(
+            compact_input.contains(&format!(r#""memory_receipt":"{receipt}""#)),
+            "summarizer 输入应保留 {receipt} typed receipt"
+        );
+    }
+    assert!(received.contains(super::MEMORY_SESSION_REPLAY_PLACEHOLDER));
+    for forbidden in compact_memory_forbidden_values() {
+        assert!(
+            !received.contains(forbidden),
+            "summarizer 输入不得包含 `{forbidden}`"
+        );
+        assert!(
+            !result_text.contains(forbidden),
+            "compact_summary 与 ToolResult 不得包含 `{forbidden}`"
+        );
+        assert!(!sse_text.contains(forbidden), "SSE 不得包含 `{forbidden}`");
+    }
+
+    let mut compacted = conversation.clone();
+    super::apply_session_compaction_result(&mut compacted, &result);
+    assert!(compacted.validate_tool_protocol().is_ok());
+    let compacted_text = serde_json::to_string(&compacted.messages).unwrap();
+    for forbidden in compact_memory_forbidden_values() {
+        assert!(
+            !compacted_text.contains(forbidden),
+            "durable delete 后 compact 不得在最近消息中复活 `{forbidden}`"
+        );
+    }
+    assert!(compacted_text.contains(super::MEMORY_SESSION_REPLAY_PLACEHOLDER));
+
+    let store = state
+        .runtime_service
+        .session_store()
+        .await
+        .expect("应能打开 compact Session Store");
+    let events = store
+        .events_for_conversation(super::DEFAULT_CONVERSATION_ID)
+        .await
+        .expect("应能回读 compact Session 事件");
+    let compact_event = events
+        .iter()
+        .find(|event| event.kind == "compact_summary")
+        .expect("Session 应写入真实 compact_summary 事件");
+    let event_summary = compact_event.payload["summary"]
+        .as_str()
+        .expect("compact_summary 应包含字符串摘要");
+    assert_eq!(
+        event_summary,
+        result.structured.as_ref().unwrap()["summary"]
+            .as_str()
+            .unwrap()
+    );
+    let transcript = super::session_events_as_jsonl(&events);
+    for forbidden in compact_memory_forbidden_values() {
+        assert!(
+            !transcript.contains(forbidden),
+            "Session JSONL 不得包含 `{forbidden}`"
+        );
+    }
+
+    let (replayed, _) = super::replay_runtime_transcript_lines(
+        "安全系统提示".to_string(),
+        40,
+        &transcript,
+        super::DEFAULT_CONVERSATION_ID,
+        None,
+    );
+    assert!(replayed.validate_tool_protocol().is_ok());
+    let replayed_text = serde_json::to_string(&replayed.messages).unwrap();
+    for forbidden in compact_memory_forbidden_values() {
+        assert!(
+            !replayed_text.contains(forbidden),
+            "恢复上下文不得包含 `{forbidden}`"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+async fn session_compact_rule_fallback_uses_memory_safe_projection_end_to_end() {
+    assert_memory_safe_session_compact_case(false).await;
+}
+
+async fn session_compact_model_echo_only_receives_memory_safe_projection_end_to_end() {
+    assert_memory_safe_session_compact_case(true).await;
+}
+
 async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholders() {
     use axum::response::IntoResponse as _;
 
@@ -4523,7 +4861,67 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     assert_eq!(receipt.structured["deletion_id"], DELETION_ID);
     assert_eq!(receipt.structured["completed_at"], "2026-08-01T00:01:00Z");
 
-    // 失败结果：只保留稳定安全错误码，错误正文中的敏感检测输入不落盘。
+    // 成功收据继续要求 F1 typed/exact shape，未知字段不能被静默忽略。
+    for (tool_name, mut structured) in [
+        ("memory_query", valid_query_result()),
+        ("memory_mutate", valid_mutation.clone()),
+        (
+            "memory_delete",
+            serde_json::json!({
+                "deletion_id": DELETION_ID,
+                "deleted_memory_count": 1,
+                "completed_at": "2026-08-01T00:01:00Z"
+            }),
+        ),
+    ] {
+        structured["unknown"] = serde_json::json!(SENTINEL);
+        let result = ToolResult::success(SENTINEL, Some(structured));
+        let receipt = super::memory_session_result_receipt(tool_name, &result).unwrap();
+        assert_safe_failure(&receipt);
+    }
+
+    // 失败结果只有 exact 单键结构可以保留稳定错误码。
+    for structured in [
+        serde_json::json!({
+            "error_code": "memory_sensitive_content_rejected"
+        }),
+        serde_json::json!({
+            "code": "memory_sensitive_content_rejected"
+        }),
+    ] {
+        let failed = ToolResult {
+            status: ToolResultStatus::Failed,
+            content: SENTINEL.to_string(),
+            structured: Some(structured),
+        };
+        let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
+        assert!(!receipt.success);
+        assert_eq!(receipt.structured["state"], "error");
+        assert_eq!(
+            receipt.structured["error_code"],
+            "memory_sensitive_content_rejected"
+        );
+        assert!(!format!("{}{}", receipt.content, receipt.structured).contains(SENTINEL));
+    }
+
+    // detail、reason、message、content 与任意未知字段即使伴随合法码也必须
+    // deny_unknown_fields 等价地 fail closed 为无正文通用失败。
+    for unknown_field in ["detail", "reason", "message", "content", "unknown"] {
+        let failed = ToolResult {
+            status: ToolResultStatus::Failed,
+            content: SENTINEL.to_string(),
+            structured: Some(serde_json::json!({
+                "error_code": "memory_sensitive_content_rejected",
+                (unknown_field): SENTINEL,
+            })),
+        };
+        let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
+        assert!(receipt.structured.get("error_code").is_none());
+        assert_eq!(receipt.content, "记忆工具调用失败。");
+        assert!(!format!("{}{}", receipt.content, receipt.structured).contains(SENTINEL));
+    }
+
+    // 失败正文和带额外字段的 structured 均不得提供兼容回退。
     let failed = ToolResult {
         status: ToolResultStatus::from_success(false),
         content: SENTINEL.to_string(),
@@ -4535,10 +4933,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     let receipt = super::memory_session_result_receipt("memory_mutate", &failed).unwrap();
     assert!(!receipt.success);
     assert_eq!(receipt.structured["state"], "error");
-    assert_eq!(
-        receipt.structured["error_code"],
-        "memory_sensitive_content_rejected"
-    );
+    assert!(receipt.structured.get("error_code").is_none());
+    assert_eq!(receipt.content, "记忆工具调用失败。");
     let receipt_text = format!("{}{}", receipt.content, receipt.structured);
     assert!(!receipt_text.contains(SENTINEL));
 
@@ -6789,6 +7185,15 @@ fn aggregated_sync_test_cases() {
     }
     {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            compact_projection_keeps_non_memory_tool_behavior_unchanged,
+        ))
+        .is_err()
+        {
+            failures.push("compact_projection_keeps_non_memory_tool_behavior_unchanged");
+        }
+    }
+    {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             runtime_tool_registry_contains_migrated_handlers,
         ))
         .is_err()
@@ -7628,6 +8033,29 @@ async fn aggregated_async_test_cases() {
         {
             failures
                 .push("canonical_tool_events_survive_store_reopen_with_equivalent_provider_frames");
+        }
+    }
+    {
+        if std::panic::AssertUnwindSafe(
+            session_compact_rule_fallback_uses_memory_safe_projection_end_to_end(),
+        )
+        .catch_unwind()
+        .await
+        .is_err()
+        {
+            failures.push("session_compact_rule_fallback_uses_memory_safe_projection_end_to_end");
+        }
+    }
+    {
+        if std::panic::AssertUnwindSafe(
+            session_compact_model_echo_only_receives_memory_safe_projection_end_to_end(),
+        )
+        .catch_unwind()
+        .await
+        .is_err()
+        {
+            failures
+                .push("session_compact_model_echo_only_receives_memory_safe_projection_end_to_end");
         }
     }
     {

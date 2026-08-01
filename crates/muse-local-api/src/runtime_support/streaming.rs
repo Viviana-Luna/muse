@@ -759,6 +759,7 @@ pub(super) fn replay_runtime_transcript_lines(
 
     let mut restored_fork_snapshots = BTreeSet::<String>::new();
     let mut recovered_interrupted_turns = BTreeSet::<String>::new();
+    let mut deferred_compact_summaries = Vec::<String>::new();
     for record in records {
         let Some(kind) = record.get("kind").and_then(|value| value.as_str()) else {
             stats.skipped_records += 1;
@@ -862,14 +863,38 @@ pub(super) fn replay_runtime_transcript_lines(
             stats.records += 1;
             continue;
         }
+        if kind == "compact_summary"
+            && conv.validate_tool_protocol().is_err()
+            && conv.validate_tool_protocol_prefix().is_ok()
+        {
+            stats.records += 1;
+            match transcript_payload_string(payload, "summary") {
+                Some(summary) => deferred_compact_summaries.push(summary),
+                None => stats.skipped_records += 1,
+            }
+            continue;
+        }
         stats.records += 1;
         if replay_runtime_transcript_record(&mut conv, kind, payload) {
             stats.restored_messages += 1;
             trim_replayed_conversation(&mut conv);
+            if kind == "tool_result"
+                && conv.validate_tool_protocol().is_ok()
+                && !deferred_compact_summaries.is_empty()
+            {
+                for summary in std::mem::take(&mut deferred_compact_summaries) {
+                    conv.add_assistant_message(format!("[会话压缩摘要]\n{summary}"));
+                    stats.restored_messages += 1;
+                    trim_replayed_conversation(&mut conv);
+                }
+            }
         } else {
             stats.skipped_records += 1;
         }
     }
+    stats.skipped_records = stats
+        .skipped_records
+        .saturating_add(deferred_compact_summaries.len());
     if let Some(payload) = latest_task_state_payload
         && let Some(summary) = task_state_summary_for_replay(&payload)
     {
@@ -2831,6 +2856,45 @@ impl MemorySessionCallReceipt {
         })
     }
 
+    /// 会话压缩只需要保留工具调用的封闭语义，不需要保留任何记忆标识。
+    ///
+    /// 该投影继续由 Session canonical 收据枚举生成，避免压缩链路重新解析
+    /// provider 自由字符串；memory_id 与 revision_id 即使格式合法也不会进入
+    /// summarizer 或压缩后的最近消息。
+    pub(super) fn to_compact_json(&self) -> serde_json::Value {
+        match self {
+            Self::Query {
+                query_kind,
+                include_history,
+                ..
+            } => serde_json::json!({
+                "memory_receipt": MEMORY_QUERY_TOOL_NAME,
+                "query_kind": query_kind,
+                "include_history": include_history,
+            }),
+            Self::Mutate { operation, .. } => serde_json::json!({
+                "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
+                "operation": memory_change_type_name(*operation),
+            }),
+            Self::Delete { scope } => serde_json::json!({
+                "memory_receipt": MEMORY_DELETE_TOOL_NAME,
+                "scope": scope,
+            }),
+            Self::InvalidQuery { error_code } => serde_json::json!({
+                "memory_receipt": MEMORY_QUERY_TOOL_NAME,
+                "error_code": error_code,
+            }),
+            Self::InvalidMutate { error_code } => serde_json::json!({
+                "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
+                "error_code": error_code,
+            }),
+            Self::InvalidDelete { error_code } => serde_json::json!({
+                "memory_receipt": MEMORY_DELETE_TOOL_NAME,
+                "error_code": error_code,
+            }),
+        }
+    }
+
     /// 审批说明只由收据枚举决定，绝不拼接 provider 参数或 memory_id。
     pub(super) const fn approval_summary(&self) -> &'static str {
         match self {
@@ -2962,7 +3026,7 @@ impl MemorySessionCallReceipt {
     }
 }
 
-fn memory_session_invalid_call_receipt(tool_name: &'static str) -> MemorySessionCallReceipt {
+pub(super) fn memory_session_invalid_call_receipt(tool_name: &str) -> MemorySessionCallReceipt {
     match tool_name {
         MEMORY_QUERY_TOOL_NAME => MemorySessionCallReceipt::InvalidQuery {
             error_code: MemoryErrorCode::InvalidRequest,
@@ -3101,15 +3165,23 @@ fn memory_session_failure_receipt(
 }
 
 fn memory_error_code_from_source(source: Option<&serde_json::Value>) -> Option<MemoryErrorCode> {
-    let source = source?.as_object()?;
-    let mut candidates = ["error_code", "code"]
-        .into_iter()
-        .filter_map(|key| source.get(key));
-    let candidate = candidates.next()?;
-    if candidates.next().is_some() {
-        return None;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ErrorCodeOnly {
+        error_code: MemoryErrorCode,
     }
-    serde_json::from_value::<MemoryErrorCode>(candidate.clone()).ok()
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CodeOnly {
+        code: MemoryErrorCode,
+    }
+
+    let source = source?.clone();
+    serde_json::from_value::<ErrorCodeOnly>(source.clone())
+        .map(|receipt| receipt.error_code)
+        .or_else(|_| serde_json::from_value::<CodeOnly>(source).map(|receipt| receipt.code))
+        .ok()
 }
 
 fn validate_memory_query_page_receipt(receipt: &MemoryQueryPageReceipt) -> bool {
