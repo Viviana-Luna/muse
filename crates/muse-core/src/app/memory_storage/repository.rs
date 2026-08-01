@@ -175,7 +175,7 @@ impl SqliteMemoryRepository {
             return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
         }
         let normalized = normalize_memory_fts_query(query)?;
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let exhausted = install_revision_progress_handler(&connection);
         let result = (|| {
@@ -243,7 +243,12 @@ impl SqliteMemoryRepository {
                 materialized_bytes = materialized_bytes
                     .checked_add(bounded.materialized_bytes)
                     .ok_or_else(query_budget_exceeded)?;
-                if record_is_blocked(&authority_guard, &self.authority, scope, &bounded.record)? {
+                if record_is_blocked(
+                    &mut authority_guard,
+                    &self.authority,
+                    scope,
+                    &bounded.record,
+                )? {
                     continue;
                 }
                 records.push(bounded.record);
@@ -274,7 +279,7 @@ impl SqliteMemoryRepository {
         if limit == 0 || limit > MAX_REVISION_HISTORY_PAGE_SIZE {
             return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
         }
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let exhausted = install_revision_progress_handler(&connection);
         let result = (|| {
@@ -339,7 +344,7 @@ impl SqliteMemoryRepository {
     /// 删除权威在计数期间变化或任一预算耗尽时保守返回错误，调用方不得用不完整
     /// 计数放行破坏性操作。
     pub fn active_memory_count(&self, scope: &MemoryPersonaScope) -> Result<u64, MemoryError> {
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let exhausted = install_revision_progress_handler(&connection);
         let result = (|| {
@@ -416,7 +421,12 @@ impl SqliteMemoryRepository {
                 materialized_bytes = materialized_bytes
                     .checked_add(bounded.materialized_bytes)
                     .ok_or_else(query_budget_exceeded)?;
-                if !record_is_blocked(&authority_guard, &self.authority, scope, &bounded.record)? {
+                if !record_is_blocked(
+                    &mut authority_guard,
+                    &self.authority,
+                    scope,
+                    &bounded.record,
+                )? {
                     count = count
                         .checked_add(1)
                         .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
@@ -657,7 +667,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
     ) -> Result<Option<MemoryRecord>, MemoryError> {
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -666,7 +676,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             .map(|bounded| bounded.record);
         let result = match record {
             Some(record)
-                if record_is_blocked(&authority_guard, &self.authority, scope, &record)? =>
+                if record_is_blocked(&mut authority_guard, &self.authority, scope, &record)? =>
             {
                 None
             }
@@ -686,7 +696,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             mutation.params().validate()?;
         }
         let digest = envelope_digest(&self.authority, envelope)?;
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -802,7 +812,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         mutation.params().validate()?;
         let scope = mutation.binding().scope();
         let digest = management_content_digest(&self.authority, mutation)?;
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -864,7 +874,7 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> Result<MemoryImportanceAdjustmentReceipt, MemoryError> {
         let scope = adjustment.binding().scope();
         let digest = importance_digest(&self.authority, adjustment);
-        let authority_guard = self.authority.begin_guard()?;
+        let mut authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -882,7 +892,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         )?
         .map(|bounded| bounded.record)
         .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
-        if record_is_blocked(&authority_guard, &self.authority, scope, &current)? {
+        if record_is_blocked(&mut authority_guard, &self.authority, scope, &current)? {
             return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
         }
         let adjusted = adjustment.apply_to(&current)?;
@@ -2257,7 +2267,7 @@ fn mutation_deletion_check(
 }
 
 fn record_is_blocked(
-    guard: &super::authority::CanonicalAuthorityGuard<'_>,
+    guard: &mut super::authority::CanonicalAuthorityGuard<'_>,
     authority: &SqliteMemoryDeletionAuthority,
     scope: &MemoryPersonaScope,
     record: &MemoryRecord,

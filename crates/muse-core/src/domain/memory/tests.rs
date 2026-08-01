@@ -1629,6 +1629,30 @@ fn deletion_authority_validates_subjects_and_requires_fixed_length_derivation_di
         turn_id: "turn-1".to_string(),
     }]);
     assert!(MemoryDeletionCheckRequest::new(invalid).is_err());
+
+    let oversized_field = BTreeSet::from([MemoryDeletionSubject::Memory {
+        persona_id: "persona-1".to_string(),
+        memory_id: MemoryId("x".repeat(MAX_MEMORY_DELETION_FIELD_BYTES + 1)),
+    }]);
+    assert_eq!(
+        MemoryDeletionCheckRequest::new(oversized_field)
+            .expect_err("删除权威字段超过字节上限时必须拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+
+    let too_many = (0..=MAX_MEMORY_DELETION_SUBJECTS)
+        .map(|index| MemoryDeletionSubject::Memory {
+            persona_id: "persona-1".to_string(),
+            memory_id: MemoryId(format!("memory-{index:04}")),
+        })
+        .collect();
+    assert_eq!(
+        MemoryDeletionCheckRequest::new(too_many)
+            .expect_err("513 个删除 subject 必须在领域构造时拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
 }
 
 #[test]

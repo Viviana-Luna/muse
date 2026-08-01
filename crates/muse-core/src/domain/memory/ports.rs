@@ -333,31 +333,40 @@ pub enum MemoryDeletionSubject {
     },
 }
 
+/// 单次删除恢复允许物化的最大 subject 数量。
+///
+/// 该上限与恢复读取的总行数门禁一致，既约束公开请求构造，也约束从独立
+/// authority SQLite 恢复出的领域事件，避免旁路数据库绕过领域容量契约。
+pub const MAX_MEMORY_DELETION_SUBJECTS: usize = 512;
+
+/// 删除权威标识字段的最大 UTF-8 字节数。
+pub const MAX_MEMORY_DELETION_FIELD_BYTES: usize = 1024;
+
 impl MemoryDeletionSubject {
     pub fn validate(&self) -> Result<(), MemoryError> {
         match self {
-            Self::Persona { persona_id } => require_non_empty(persona_id),
+            Self::Persona { persona_id } => validate_deletion_field(persona_id),
             Self::Memory {
                 persona_id,
                 memory_id,
             } => {
-                require_non_empty(persona_id)?;
-                require_non_empty(&memory_id.0)
+                validate_deletion_field(persona_id)?;
+                validate_deletion_field(&memory_id.0)
             }
             Self::SourceTurn {
                 persona_id,
                 conversation_id,
                 turn_id,
             } => {
-                require_non_empty(persona_id)?;
-                require_non_empty(conversation_id)?;
-                require_non_empty(turn_id)
+                validate_deletion_field(persona_id)?;
+                validate_deletion_field(conversation_id)?;
+                validate_deletion_field(turn_id)
             }
             Self::Derivation {
                 persona_id,
                 derivation_key: _,
             } => {
-                require_non_empty(persona_id)?;
+                validate_deletion_field(persona_id)?;
                 Ok(())
             }
         }
@@ -505,11 +514,19 @@ pub trait MemoryRepository: Send + Sync {
 fn validate_deletion_subjects(
     subjects: &BTreeSet<MemoryDeletionSubject>,
 ) -> Result<(), MemoryError> {
-    if subjects.is_empty() {
+    if subjects.is_empty() || subjects.len() > MAX_MEMORY_DELETION_SUBJECTS {
         return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
     }
     for subject in subjects {
         subject.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_deletion_field(value: &str) -> Result<(), MemoryError> {
+    require_non_empty(value)?;
+    if value.len() > MAX_MEMORY_DELETION_FIELD_BYTES {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
     }
     Ok(())
 }

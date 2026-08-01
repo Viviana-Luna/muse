@@ -297,14 +297,14 @@ impl SqliteMemoryRetriever {
         // 普通 update 会把旧 revision 置为 superseded，仍保留冻结分页语义；
         // correct 会置为 corrected，delete 会命中权威，二者都必须在发送前失效。
         let authority = self.repository.deletion_authority();
-        let authority_guard = authority.begin_guard()?;
+        let mut authority_guard = authority.begin_guard()?;
         let mut connection = self.repository.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(repository_unavailable)?;
         let pending_valid = self.pending_items_still_readable(
             &transaction,
-            &authority_guard,
+            &mut authority_guard,
             authority,
             scope,
             &pending,
@@ -363,7 +363,7 @@ impl SqliteMemoryRetriever {
         let filters = request.filters();
         let authority = self.repository.deletion_authority();
         // 锁序与 Repository 一致：先 authority 后主库，持有期间不重取。
-        let authority_guard = authority.begin_guard()?;
+        let mut authority_guard = authority.begin_guard()?;
         let mut connection = self.repository.open_connection()?;
         // SQLite VM 指令预算覆盖 as_of 时间筛选与历史 keyset 查询；回调触发后
         // 当前连接被中断，外层统一映射为无正文资源错误。
@@ -390,7 +390,7 @@ impl SqliteMemoryRetriever {
             let items = match &params.memory_id {
                 Some(memory_id) if params.include_history => self.history_items(
                     &transaction,
-                    &authority_guard,
+                    &mut authority_guard,
                     authority,
                     scope,
                     memory_id,
@@ -399,7 +399,7 @@ impl SqliteMemoryRetriever {
                 )?,
                 Some(memory_id) => self.direct_items(
                     &transaction,
-                    &authority_guard,
+                    &mut authority_guard,
                     authority,
                     scope,
                     memory_id,
@@ -409,7 +409,7 @@ impl SqliteMemoryRetriever {
                 )?,
                 None => self.relevance_items(
                     &transaction,
-                    &authority_guard,
+                    &mut authority_guard,
                     authority,
                     scope,
                     normalized,
@@ -435,7 +435,7 @@ impl SqliteMemoryRetriever {
     fn relevance_items(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        authority_guard: &CanonicalAuthorityGuard<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         normalized: &str,
@@ -562,7 +562,7 @@ impl SqliteMemoryRetriever {
     fn as_of_relevance_items(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        authority_guard: &CanonicalAuthorityGuard<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         normalized: &str,
@@ -694,7 +694,7 @@ impl SqliteMemoryRetriever {
     fn direct_items(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        authority_guard: &CanonicalAuthorityGuard<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
@@ -803,7 +803,7 @@ impl SqliteMemoryRetriever {
     fn history_items(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        authority_guard: &CanonicalAuthorityGuard<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         memory_id: &MemoryId,
@@ -906,7 +906,7 @@ impl SqliteMemoryRetriever {
     fn pending_items_still_readable(
         &self,
         transaction: &rusqlite::Transaction<'_>,
-        authority_guard: &CanonicalAuthorityGuard<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         pending: &[FrozenItem],
@@ -1531,7 +1531,7 @@ fn freshness_decay(age_micros: i64) -> f64 {
 /// 读取路径的删除权威阻断检查，与 Repository 读取口径一致：
 /// Persona、memory 与该条正文派生键任一被阻断即不可读。
 fn candidate_blocked(
-    authority_guard: &CanonicalAuthorityGuard<'_>,
+    authority_guard: &mut CanonicalAuthorityGuard<'_>,
     authority: &SqliteMemoryDeletionAuthority,
     scope: &MemoryPersonaScope,
     memory_id: &MemoryId,

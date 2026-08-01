@@ -20,10 +20,11 @@ pub use model::{
     MemorySourceKind,
 };
 pub use ports::{
-    MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt, MemoryDeletionAuthorityRequest,
-    MemoryDeletionCheckRequest, MemoryDeletionDecision, MemoryDeletionSubject, MemoryDerivationKey,
-    MemoryRepository, MemoryRetriever, MemorySafetyAssessment, MemorySafetyFailure,
-    MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest,
+    MAX_MEMORY_DELETION_FIELD_BYTES, MAX_MEMORY_DELETION_SUBJECTS, MemoryDeletionAuthority,
+    MemoryDeletionAuthorityReceipt, MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest,
+    MemoryDeletionDecision, MemoryDeletionSubject, MemoryDerivationKey, MemoryRepository,
+    MemoryRetriever, MemorySafetyAssessment, MemorySafetyFailure, MemorySafetyStage,
+    MemorySensitivityPolicy, MemorySensitivityRequest,
 };
 pub use runtime_binding::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,

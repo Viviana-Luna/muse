@@ -12,12 +12,12 @@ use super::authority::{AuthorityAnchor, open_authority_for_anchor};
 use super::repository::normalize_search_text;
 use crate::app::storage::RuntimeStorageError;
 use crate::domain::memory::{
-    MAX_MEMORY_CONTENT_BYTES, MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryId,
-    MemoryPersonaScope,
+    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_DELETION_SUBJECTS, MemoryDeletionSubject, MemoryError,
+    MemoryErrorCode, MemoryId, MemoryPersonaScope,
 };
 
 const MAX_RECOVERY_ROWS: usize = 512;
-const MAX_RECOVERY_SUBJECTS: usize = MAX_RECOVERY_ROWS * 3;
+const MAX_RECOVERY_SUBJECTS: usize = MAX_MEMORY_DELETION_SUBJECTS;
 const MAX_RECOVERY_MATERIALIZED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECOVERY_TEXT_FIELD_BYTES: usize = 1024;
 const MAX_RECOVERY_PROJECTION_ROW_BYTES: usize =
@@ -155,7 +155,7 @@ pub(crate) fn reconcile_runtime_memory(
             RuntimeStorageError::Integrity("运行时数据库无法定位记忆删除权威恢复域".to_string())
         })?;
     let authority = open_authority_for_anchor(base_dir, &anchor).map_err(recovery_storage_error)?;
-    let guard = authority.begin_guard().map_err(recovery_storage_error)?;
+    let mut guard = authority.begin_guard().map_err(recovery_storage_error)?;
     let events = guard
         .pending_events(anchor.last_applied_revision)
         .map_err(recovery_storage_error)?;
@@ -545,6 +545,11 @@ pub(crate) fn memory_ids_for_subjects(
                     )
                     .map_err(repository_unavailable)?;
                 if exists {
+                    let memory_id_bytes = memory_id.0.len();
+                    if memory_id_bytes > MAX_RECOVERY_TEXT_FIELD_BYTES {
+                        return Err(query_budget_exceeded());
+                    }
+                    budget.consume_row(&[memory_id_bytes], MAX_RECOVERY_TEXT_FIELD_BYTES)?;
                     memory_ids.insert(memory_id.0.clone());
                 }
             }

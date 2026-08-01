@@ -9,18 +9,22 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-use super::authority::{fail_next_authority_syncs_for_test, pause_after_authority_commit_for_test};
+use super::authority::{
+    SqliteMemoryDeletionAuthority, fail_next_authority_syncs_for_test,
+    pause_after_authority_commit_for_test,
+};
 use super::{SqliteMemoryRepository, normalize_memory_fts_query};
 use crate::app::storage::{backup_runtime_database, open_runtime_database};
 use crate::domain::memory::{
-    ConfirmedMemoryDeleteRequest, MemoryCategory, MemoryCommitEnvelope, MemoryDeleteConfirmation,
-    MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeletionAuthority,
-    MemoryDeletionAuthorityReceipt, MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest,
-    MemoryDeletionDecision, MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryId,
-    MemoryImportance, MemoryImportanceAdjustment, MemoryManagementAuthorization,
-    MemoryManagementBinding, MemoryManagementContentMutation, MemoryManagementContentParams,
-    MemoryMutateParams, MemoryRepository, MemoryRevisionId, MemorySafetyAssessment,
-    MemorySafetyFailure, MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest,
+    ConfirmedMemoryDeleteRequest, MAX_MEMORY_DELETION_FIELD_BYTES, MAX_MEMORY_DELETION_SUBJECTS,
+    MemoryCategory, MemoryCommitEnvelope, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
+    MemoryDeleteParams, MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt,
+    MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest, MemoryDeletionDecision,
+    MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
+    MemoryImportanceAdjustment, MemoryManagementAuthorization, MemoryManagementBinding,
+    MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutateParams,
+    MemoryRepository, MemoryRevisionId, MemorySafetyAssessment, MemorySafetyFailure,
+    MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceKind,
     MemorySourceEligibility, MemoryStagedMutation,
 };
 
@@ -3921,6 +3925,224 @@ fn rebuild与reopen对行数和累计字节均有硬上限() {
             SqliteMemoryRepository::open(root.path()).expect_err("reopen 也不得越过相同恢复预算");
         assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
     }
+}
+
+#[test]
+fn 公开authority_open在物化前拒绝主库anchor超长_text与_blob() {
+    for (label, injected) in [
+        (
+            "text",
+            rusqlite::types::Value::Text("x".repeat(MAX_MEMORY_DELETION_FIELD_BYTES + 1)),
+        ),
+        (
+            "blob",
+            rusqlite::types::Value::Blob(vec![7_u8; MAX_MEMORY_DELETION_FIELD_BYTES + 1]),
+        ),
+    ] {
+        let root = TestDirectory::new(&format!("authority-open-anchor-{label}"));
+        drop(SqliteMemoryRepository::open(root.path()).expect("应初始化 Repository"));
+        let main_path = root.path().join("runtime/muse.sqlite");
+        let connection = Connection::open(&main_path).expect("应打开真实 runtime SQLite");
+        let original_authority_id: String = connection
+            .query_row(
+                "SELECT authority_id FROM memory_authority_anchor WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取原始 authority_id");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE memory_authority_anchor SET authority_id = ?1 WHERE singleton = 1",
+                    params![injected],
+                )
+                .expect("应旁路写入超长 anchor 字段"),
+            1
+        );
+        drop(connection);
+
+        let error = SqliteMemoryDeletionAuthority::open(root.path())
+            .expect_err("公开 authority open 必须在 String 物化前拒绝超长 anchor");
+        assert_eq!(error.code(), MemoryErrorCode::DeletionAuthorityUnavailable);
+
+        let connection = Connection::open(&main_path).expect("应重新打开 runtime SQLite");
+        connection
+            .execute(
+                "UPDATE memory_authority_anchor SET authority_id = ?1 WHERE singleton = 1",
+                [original_authority_id],
+            )
+            .expect("应修复测试 anchor");
+        drop(connection);
+        drop(
+            SqliteMemoryDeletionAuthority::open(root.path())
+                .expect("错误退出清理 handler 后应允许修复重开"),
+        );
+    }
+}
+
+#[test]
+fn authority_sqlite超长_text与_blob均回滚且不签收pending事件() {
+    for target in ["meta", "event", "subject"] {
+        for storage_class in ["text", "blob"] {
+            let root = TestDirectory::new(&format!("authority-bounded-{target}-{storage_class}"));
+            let repository =
+                SqliteMemoryRepository::open(root.path()).expect("应初始化 Repository");
+            let scope = scope("persona-authority-bounded");
+            let deletion_id = "authority-bounded-pending";
+            let request = MemoryDeletionAuthorityRequest::new(
+                deletion_id,
+                BTreeSet::from([MemoryDeletionSubject::Memory {
+                    persona_id: scope.persona_id().to_string(),
+                    memory_id: MemoryId("authority-bounded-memory".to_string()),
+                }]),
+                TIME_3,
+            )
+            .expect("pending authority 请求应有效");
+            repository
+                .deletion_authority()
+                .record(&request)
+                .expect("pending authority 事件应 durable");
+            drop(repository);
+
+            let injected = match storage_class {
+                "text" => {
+                    rusqlite::types::Value::Text("x".repeat(MAX_MEMORY_DELETION_FIELD_BYTES + 1))
+                }
+                "blob" => rusqlite::types::Value::Blob(vec![8_u8; 1025]),
+                _ => unreachable!(),
+            };
+            let authority_path = root.path().join("privacy/memory-deletion-authority.sqlite");
+            let authority = Connection::open(&authority_path).expect("应打开真实 authority SQLite");
+            let updated = match target {
+                "meta" => authority.execute(
+                    "UPDATE authority_meta SET created_at = ?1 WHERE singleton = 1",
+                    params![injected],
+                ),
+                "event" => authority.execute(
+                    "UPDATE deletion_event SET recorded_at = ?1 WHERE deletion_id = ?2",
+                    params![injected, deletion_id],
+                ),
+                "subject" => authority.execute(
+                    "UPDATE deletion_subject SET memory_id = ?1 WHERE deletion_id = ?2",
+                    params![injected, deletion_id],
+                ),
+                _ => unreachable!(),
+            }
+            .expect("应旁路写入 authority 超长字段");
+            assert_eq!(updated, 1);
+            drop(authority);
+
+            let error = SqliteMemoryRepository::open(root.path())
+                .expect_err("authority 超长 TEXT/BLOB 必须在物化前 fail closed");
+            assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+
+            let main = Connection::open(root.path().join("runtime/muse.sqlite"))
+                .expect("失败后应核对主库 anchor");
+            assert_eq!(
+                main.query_row(
+                    "SELECT last_applied_revision
+                     FROM memory_authority_anchor WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("应读取失败后的 anchor"),
+                0,
+                "authority 校验失败不得前移主库 anchor"
+            );
+            drop(main);
+            let authority = Connection::open(&authority_path).expect("应核对 pending 事件状态");
+            assert_eq!(
+                authority
+                    .query_row(
+                        "SELECT COUNT(*) FROM deletion_event
+                         WHERE deletion_id = ?1 AND cleanup_completed_at IS NOT NULL",
+                        [deletion_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("应读取 cleanup 状态"),
+                0,
+                "失败不得把 pending 事件标记为 cleanup completed"
+            );
+        }
+    }
+}
+
+#[test]
+fn pending_replay累计513个直接_memory时整次回滚() {
+    let root = TestDirectory::new("authority-pending-513-direct-memory");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应初始化 Repository");
+    let scope = scope("persona-authority-pending-513");
+    seed_projection_recovery_rows(
+        &repository,
+        &scope,
+        MAX_MEMORY_DELETION_SUBJECTS + 1,
+        "短正文",
+    );
+
+    let first_subjects = (0..MAX_MEMORY_DELETION_SUBJECTS)
+        .map(|index| MemoryDeletionSubject::Memory {
+            persona_id: scope.persona_id().to_string(),
+            memory_id: MemoryId(format!("recovery-budget-memory-{index:04}")),
+        })
+        .collect();
+    let first =
+        MemoryDeletionAuthorityRequest::new("authority-pending-first-512", first_subjects, TIME_2)
+            .expect("512 个 direct Memory subject 应满足单事件上限");
+    repository
+        .deletion_authority()
+        .record(&first)
+        .expect("首批 512 个 subject 应 durable");
+    let last = MemoryDeletionAuthorityRequest::new(
+        "authority-pending-last-1",
+        BTreeSet::from([MemoryDeletionSubject::Memory {
+            persona_id: scope.persona_id().to_string(),
+            memory_id: MemoryId(format!(
+                "recovery-budget-memory-{MAX_MEMORY_DELETION_SUBJECTS:04}"
+            )),
+        }]),
+        TIME_3,
+    )
+    .expect("第 513 个 direct Memory subject 应可作为下一事件记录");
+    repository
+        .deletion_authority()
+        .record(&last)
+        .expect("第二个 pending 事件应 durable");
+    drop(repository);
+
+    let error = SqliteMemoryRepository::open(root.path())
+        .expect_err("pending replay 累计第 513 个主库行时必须 fail closed");
+    assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+
+    let main =
+        Connection::open(root.path().join("runtime/muse.sqlite")).expect("失败后应核对真实主库");
+    let (entry_count, anchor_revision): (i64, i64) = main
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM memory_entry WHERE persona_id = ?1),
+                (SELECT last_applied_revision
+                 FROM memory_authority_anchor WHERE singleton = 1)",
+            [scope.persona_id()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("应读取失败后的主库状态");
+    assert_eq!(entry_count, 513, "失败 replay 不得留下部分删除");
+    assert_eq!(anchor_revision, 0, "失败 replay 不得前移 anchor");
+    drop(main);
+
+    let authority = Connection::open(root.path().join("privacy/memory-deletion-authority.sqlite"))
+        .expect("应核对 pending authority 状态");
+    assert_eq!(
+        authority
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_event
+                 WHERE cleanup_completed_at IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("应读取 cleanup 状态"),
+        0,
+        "资源失败不得把任何 pending 事件标记为 cleanup completed"
+    );
 }
 
 #[test]
