@@ -121,6 +121,178 @@ impl SqliteMemoryRepository {
         Ok(records)
     }
 
+    /// 管理审计专用的完整 revision 链只读读取（含 corrected），仅供管理 API。
+    ///
+    /// 模型读取面不得使用本方法；被删除权威阻断的 revision 与空历史一样按
+    /// 不存在处理，与 `current` 的读取口径保持一致。
+    pub fn revision_history(
+        &self,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        let authority_guard = self.authority.begin_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(repository_unavailable)?;
+        let revisions = self.revision_history_on(&transaction, scope, memory_id)?;
+        if revisions.is_empty() {
+            return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
+        }
+        let mut readable = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let check = read_deletion_check(&self.authority, scope, memory_id, &revision.content)?;
+            if matches!(
+                authority_guard.check(&check)?,
+                MemoryDeletionDecision::Blocked { .. }
+            ) {
+                continue;
+            }
+            readable.push(revision);
+        }
+        if readable.is_empty() {
+            return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
+        }
+        transaction.commit().map_err(repository_unavailable)?;
+        authority_guard.finish()?;
+        Ok(readable)
+    }
+
+    /// 返回指定 Persona 当前仍可读取的有效记忆数量，供删除影响预览使用。
+    ///
+    /// 计数沿用 `current` 的 Persona、当前 revision 与删除权威口径；不向调用方
+    /// 返回任何记忆正文。删除权威在计数期间变化时保守返回错误，调用方不得用
+    /// 不完整计数放行破坏性操作。
+    pub fn active_memory_count(&self, scope: &MemoryPersonaScope) -> Result<u64, MemoryError> {
+        let authority_guard = self.authority.begin_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(repository_unavailable)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT memory_id
+                 FROM memory_entry
+                 WHERE persona_id = ?1
+                   AND state = 'active'
+                 ORDER BY memory_id",
+            )
+            .map_err(repository_unavailable)?;
+        let memory_ids = statement
+            .query_map(params![scope.persona_id()], |row| row.get::<_, String>(0))
+            .map_err(repository_unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_unavailable)?;
+        drop(statement);
+
+        let mut count = 0_u64;
+        for memory_id in memory_ids {
+            let record = load_current(&transaction, scope, &MemoryId(memory_id))?
+                .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+            if !record_is_blocked(&authority_guard, &self.authority, scope, &record)? {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+            }
+        }
+        transaction.commit().map_err(repository_unavailable)?;
+        authority_guard.finish()?;
+        Ok(count)
+    }
+
+    /// 在调用方持有的读快照连接上加载当前一致记录，供 Retriever 冻结查询页复用。
+    pub(crate) fn load_current_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        load_current(connection, scope, memory_id)
+    }
+
+    /// 在调用方持有的读快照连接上加载完整 revision 链（含 corrected），
+    /// 按 valid_from、recorded_at、revision_id 升序保证确定顺序。
+    pub(crate) fn revision_history_on(
+        &self,
+        connection: &Connection,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+    ) -> Result<Vec<MemoryRevision>, MemoryError> {
+        let mut statement = connection
+            .prepare(
+                "SELECT revision_id, content, event_time, recorded_at, valid_from,
+                        valid_to, change_type, change_reason, safety_policy_version, state
+                 FROM memory_revision
+                 WHERE persona_id = ?1 AND memory_id = ?2",
+            )
+            .map_err(repository_unavailable)?;
+        let rows = statement
+            .query_map(params![scope.persona_id(), memory_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(repository_unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(repository_unavailable)?;
+        drop(statement);
+
+        let mut revisions = Vec::with_capacity(rows.len());
+        for (
+            revision_id,
+            content,
+            event_time,
+            recorded_at,
+            valid_from,
+            valid_to,
+            change_type,
+            change_reason,
+            safety_policy_version,
+            state,
+        ) in rows
+        {
+            let revision_id = MemoryRevisionId(revision_id);
+            let source = load_revision_source(connection, scope, memory_id, &revision_id)?;
+            revisions.push(MemoryRevision {
+                revision_id,
+                memory_id: memory_id.clone(),
+                content,
+                event_time,
+                recorded_at,
+                valid_from,
+                valid_to,
+                change_type: parse_change_type(&change_type)?,
+                change_reason,
+                source,
+                safety_policy_version,
+                state: parse_revision_state(&state)?,
+            });
+        }
+        // RFC3339 允许不同时区与可选小数秒，词法排序不可靠，必须按解析后的时间排序。
+        let mut keyed = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let valid_from_micros = rfc3339_micros(&revision.valid_from)?;
+            let recorded_at_micros = rfc3339_micros(&revision.recorded_at)?;
+            keyed.push((valid_from_micros, recorded_at_micros, revision));
+        }
+        keyed.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.revision_id.0.cmp(&right.2.revision_id.0))
+        });
+        Ok(keyed.into_iter().map(|(_, _, revision)| revision).collect())
+    }
+
     pub(crate) fn open_connection(&self) -> Result<Connection, MemoryError> {
         let connection =
             open_initialized_runtime_database(&self.base_dir).map_err(repository_unavailable)?;
@@ -1547,4 +1719,11 @@ fn parse_source_kind(value: &str) -> Result<MemorySourceKind, MemoryError> {
 
 fn repository_unavailable<T>(_error: T) -> MemoryError {
     MemoryError::new(MemoryErrorCode::RepositoryUnavailable)
+}
+
+/// 存储侧时间解析失败一律视为数据损坏，不向调用方暴露解析细节。
+pub(crate) fn rfc3339_micros(value: &str) -> Result<i64, MemoryError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.timestamp_micros())
+        .map_err(|_| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
 }
