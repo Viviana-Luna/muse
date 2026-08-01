@@ -117,7 +117,7 @@ Skill `revision` 同时覆盖 `SKILL.md` 字节与当前启停状态。手工编
 
 ## Persona 长期记忆管理
 
-Persona 记忆管理接口挂在角色路径下，全部经过统一的请求安全边界；Persona scope 只能由路径 `{id}` 绑定，请求体不接受也不能切换 Persona。请求 DTO 一律 `deny_unknown_fields`。记忆服务未接线时，本节所有管理路由固定返回 HTTP 503 与对应 `memory_*` 稳定码，不存在旁路直写表的路径。
+Persona 记忆管理接口挂在角色路径下，全部经过统一的请求安全边界；Persona scope 只能由路径 `{id}` 绑定，请求体不接受也不能切换 Persona。请求 DTO 一律 `deny_unknown_fields`，未知字段、错误 JSON 和查询提取失败都返回既有扁平错误结构与 `memory_invalid_request`，不暴露 Axum 默认拒绝响应。记忆服务未接线时，本节所有合法管理请求固定返回 HTTP 503 与对应 `memory_*` 稳定码，不存在旁路直写表的路径。
 
 | 接口 | 用途 |
 |---|---|
@@ -127,14 +127,14 @@ Persona 记忆管理接口挂在角色路径下，全部经过统一的请求安
 | `POST /api/personas/{id}/memories` | 手工新增；经 `apply_management_content_mutation` 与同一敏感双门策略，成功返回 durable 收据 |
 | `POST /api/personas/{id}/memories/{memory_id}/correct` | 纠正记忆；`expected_revision_id` 并发校验失败返回 HTTP 409 与 `memory_revision_conflict` |
 | `POST /api/personas/{id}/memories/{memory_id}/importance` | 调整重要程度；只更新逻辑 entry，不创建内容 revision |
-| `DELETE /api/personas/{id}/memories/{memory_id}` | 删除单条记忆 |
-| `DELETE /api/personas/{id}/memories` | 清空该 Persona 的全部记忆 |
+| `DELETE /api/personas/{id}/memories/{memory_id}` | 删除单条记忆；JSON 请求体必须携带稳定 `operation_id` |
+| `DELETE /api/personas/{id}/memories` | 清空该 Persona 的全部记忆；JSON 请求体必须携带稳定 `operation_id` |
 
-手工新增、纠正和重要程度调整接受可选 `operation_id`：同一 operation 重放由 Repository 幂等识别或稳定拒绝，绝不产生重复记忆。删除确认证据由服务端以 Persona 管理来源构造，删除统一先写独立删除权威再清主库，durable 后不回滚。
+手工新增、纠正和重要程度调整接受可选 `operation_id`；需要重试时客户端必须生成并复用该 ID。删除请求必须使用 JSON 请求体 `{"operation_id":"<客户端操作 ID>"}`，同一次操作的全部重试保持不变。写命令接缝会持久化首次绑定的运行时身份、目标与收据：同一 Persona 下相同 ID、相同请求返回原收据，相同 ID、不同请求稳定拒绝；`PersonaAll` 删除重放不得重新选择 subjects，因此不会删除首次成功后新创建的记忆。删除统一先写独立删除权威再清主库，durable 后不回滚。
 
 错误响应沿用扁平错误结构，`code` 为 16 个 `memory_*` 稳定码之一（与 `MemoryErrorCode` 一一对应）：`memory_invalid_request`（400）、`memory_cursor_invalid`（400）、`memory_query_rejected`（400）、`memory_cursor_expired`（410）、`memory_invalid_state_transition`（409）、`memory_revision_conflict`（409）、`memory_delete_confirmation_required`（409）、`memory_not_found`（404）、`memory_persona_scope_mismatch`（403）、`memory_source_ineligible`（403）、`memory_sensitive_content_rejected`（422）、`memory_query_budget_exceeded`（429）、`memory_sensitivity_unavailable`（503）、`memory_deletion_authority_unavailable`（503）、`memory_repository_unavailable`（503）、`memory_deletion_incomplete`（500）。
 
-`GET /api/personas/{id}/deletion-impact` 的响应新增 `memory_count` 字段：已接线时返回该 Persona 当前有效记忆条数；未接线或计数不可用为 `null`，前端必须保持删除确认按钮禁用，不得按零条处理。删除角色时，服务端先完成该 Persona 的记忆删除（同一 Repository 与删除权威），再提交 Persona JSON；记忆删除失败则整个删除不提交，不会出现角色已删而记忆仍在的孤儿状态。
+`GET /api/personas/{id}/deletion-impact` 的响应新增 `memory_count` 字段：已接线时返回该 Persona 当前有效记忆条数；未接线或计数不可用为 `null`，前端必须保持删除确认按钮禁用，不得按零条处理。删除角色复用 `persona-deletion-recovery.json` 与 `personas.json` 提交点：提交前任何 Persona 文件、VisualPack 或 SQLite 失败都不得触碰记忆；提交后才以恢复记录中的稳定 operation 身份清理 Persona 全部记忆。提交后清理失败时角色保持已删除、记忆保持待收敛，启动恢复幂等重试；不得回滚成“角色仍在但记忆已经永久丢失”。
 
 ## WebSocket
 

@@ -15,6 +15,9 @@ struct PersonaDeletionRecoveryFile {
 struct PendingPersonaDeletion {
     persona_id: String,
     previous_visual_pack: Option<VisualPack>,
+    /// Persona 定义提交后才允许执行的记忆清理操作；缺失表示旧版恢复记录。
+    #[serde(default)]
+    memory_delete_operation_id: Option<String>,
 }
 
 /// 查询角色列表。
@@ -396,6 +399,10 @@ pub(crate) async fn handle_delete_persona(
         .session_repository()
         .await
         .map_err(|error| internal_error(error.to_string()))?;
+    let memory_services = memory_services();
+    let memory_delete_operation_id = memory_services
+        .as_ref()
+        .map(|_| next_runtime_id("persona-memory-delete"));
     let (deleted_active, deleted_persona, stale_asset_candidates) = {
         let mut personas = state.personas.lock().await;
         let deleted_active = personas.active_persona_id() == Some(id.as_str());
@@ -412,13 +419,6 @@ pub(crate) async fn handle_delete_persona(
         let previous_visual_packs = visual_packs.clone();
         let mut persona_candidate = previous_personas.clone();
         let mut visual_pack_candidate = previous_visual_packs.clone();
-
-        // 记忆删除必须先于 Persona JSON 提交点完成：失败时角色定义保持完整，
-        // 绝不出现 Persona JSON 已删而记忆仍在的孤儿态。已删记忆由独立删除
-        // 权威保证不可复活；后续阶段失败导致角色文件回滚时，记忆不随回滚恢复。
-        if let Some(services) = memory_services() {
-            delete_all_persona_memories(&services, &id).map_err(memory_error_response)?;
-        }
 
         if !persona_candidate.delete(&id) {
             return Err((
@@ -441,6 +441,7 @@ pub(crate) async fn handle_delete_persona(
             Some(PendingPersonaDeletion {
                 persona_id: id.clone(),
                 previous_visual_pack: previous_generated_visual_pack,
+                memory_delete_operation_id: memory_delete_operation_id.clone(),
             }),
         )
         .map_err(internal_error)?;
@@ -509,6 +510,22 @@ pub(crate) async fn handle_delete_persona(
         *personas = persona_candidate;
         (deleted_active, deleted_persona, stale_asset_candidates)
     };
+
+    // 只有 Persona 文件、展示包与运行时 SQLite 已完成同一删除决议后，才执行
+    // 不可回滚的记忆清理。失败时角色定义保持已删除，恢复记录携带同一 operation
+    // 身份，后续重试只能返回首次收据，不能重新选取并误删后来创建的记忆。
+    if let (Some(services), Some(operation_id)) = (
+        memory_services.as_ref(),
+        memory_delete_operation_id.as_deref(),
+    ) && let Err(error) = delete_all_persona_memories(services, &id, operation_id)
+    {
+        cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
+        if deleted_active {
+            reset_conversation_for_active_persona(&state).await;
+        }
+        finish_runtime_idle_lease(idle_lease)?;
+        return Err(memory_error_response(error));
+    }
     clear_persona_deletion_recovery_best_effort(
         state.runtime_service.data_dir(),
         &id,
@@ -584,6 +601,7 @@ pub(crate) fn persist_persona_deletion_recovery_for_test(
         Some(PendingPersonaDeletion {
             persona_id: persona_id.to_string(),
             previous_visual_pack,
+            memory_delete_operation_id: None,
         }),
     )
 }
@@ -654,9 +672,36 @@ pub(super) async fn reconcile_pending_persona_deletion(state: &Arc<AppState>) {
             return;
         }
     };
+    let persona_exists = state
+        .personas
+        .lock()
+        .await
+        .get(&pending.persona_id)
+        .is_some();
+    if !persona_exists && let Some(operation_id) = pending.memory_delete_operation_id.as_deref() {
+        let Some(services) = memory_services() else {
+            tracing::warn!(
+                target: "muse::persona_delete",
+                persona_id = %pending.persona_id,
+                "Persona 已提交删除，但记忆服务尚未接线；保留恢复记录等待接线后重试"
+            );
+            return;
+        };
+        if let Err(error) =
+            delete_all_persona_memories(&services, &pending.persona_id, operation_id)
+        {
+            tracing::warn!(
+                target: "muse::persona_delete",
+                persona_id = %pending.persona_id,
+                %error,
+                "启动收敛 Persona 记忆失败，保留恢复记录等待下次重试"
+            );
+            return;
+        }
+    }
+
     let reconciliation = async {
         let personas = state.personas.lock().await;
-        let persona_exists = personas.get(&pending.persona_id).is_some();
         let mut visual_packs = state.visual_packs.lock().await;
         let mut candidate = visual_packs.clone();
         let mut stale_asset_candidates = Vec::new();

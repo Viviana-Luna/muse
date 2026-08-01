@@ -1,4 +1,5 @@
 use super::*;
+use crate::dto::{MemoryCorrectRequest, MemoryCreateRequest, MemoryImportanceAdjustRequest};
 use crate::state::{AppState, MemoryRuntimeServices};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -873,6 +874,7 @@ async fn provider_model_list_requires_key_before_network_and_asset_route_is_gone
 
 #[tokio::test]
 async fn persona_update_removes_only_unreferenced_uploaded_asset() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("persona-asset-cleanup");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -1693,6 +1695,7 @@ async fn persona_list_returns_flat_summaries_with_stable_visual_previews() {
 
 #[tokio::test]
 async fn deleting_active_persona_does_not_activate_remaining_persona() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-active-persona");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -1766,6 +1769,7 @@ async fn deleting_active_persona_does_not_activate_remaining_persona() {
 
 #[tokio::test]
 async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("deleted-persona-session");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -1938,10 +1942,93 @@ async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn persona_file_write_failure_keeps_persona_memory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("delete-persona-file-failure");
+    let memory_dir = unique_temp_dir("delete-persona-file-failure-memory");
+    let memory_repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 1,
+            revisions: Vec::new(),
+        },
+    );
+    let (memory_id, _) = seed_test_memory(
+        &memory_repository,
+        "router-test-persona",
+        "角色文件失败时必须保留",
+    );
+    let state = build_test_state(&config_dir);
+    state
+        .personas
+        .lock()
+        .await
+        .save()
+        .expect("应先保存 Persona 文件以注入目录故障");
+    let persona_dir = config_dir.join("personas");
+    std::fs::set_permissions(&persona_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("应注入 Persona 目录只读故障");
+    let response = api_routes()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应构造角色文件失败请求"),
+        )
+        .await
+        .expect("角色文件失败应返回响应");
+    std::fs::set_permissions(&persona_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("应恢复 Persona 目录权限");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        state
+            .personas
+            .lock()
+            .await
+            .get("router-test-persona")
+            .is_some(),
+        "Persona 提交前失败时内存角色必须保留"
+    );
+    assert!(
+        memory_repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("应读取 Persona 文件失败后的记忆")
+            .is_some(),
+        "Persona 提交前失败不得清理记忆"
+    );
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn visual_pack_write_failure_rolls_back_persona_deletion() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-persona-visual-pack-failure");
+    let memory_dir = unique_temp_dir("delete-persona-visual-pack-failure-memory");
+    let memory_repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 1,
+            revisions: Vec::new(),
+        },
+    );
+    let (memory_id, _) = seed_test_memory(
+        &memory_repository,
+        "router-test-persona",
+        "展示包失败时必须保留",
+    );
     let state = build_test_state(&config_dir);
     {
         let mut personas = state.personas.lock().await;
@@ -2016,12 +2103,36 @@ async fn visual_pack_write_failure_rolls_back_persona_deletion() {
             .expect("应读取回滚后的工作区状态"),
         "展示包写入失败不得提前清理 SQLite"
     );
+    assert!(
+        memory_repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("应读取展示包失败后的记忆")
+            .is_some(),
+        "展示包失败并回滚 Persona 时不得清理记忆"
+    );
+    clear_memory_services_for_test();
     let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
 }
 
 #[tokio::test]
 async fn sqlite_cleanup_failure_rolls_back_persona_and_visual_pack() {
+    let _guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-persona-sqlite-failure");
+    let memory_dir = unique_temp_dir("delete-persona-sqlite-failure-memory");
+    let memory_repository = install_test_memory_services(
+        open_test_memory_repository(&memory_dir),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 1,
+            revisions: Vec::new(),
+        },
+    );
+    let (memory_id, _) = seed_test_memory(
+        &memory_repository,
+        "router-test-persona",
+        "SQLite 失败时必须保留",
+    );
     let state = build_test_state(&config_dir);
     {
         let mut personas = state.personas.lock().await;
@@ -2103,11 +2214,21 @@ async fn sqlite_cleanup_failure_rolls_back_persona_and_visual_pack() {
             .expect("应读取回滚后的工作区状态"),
         "SQLite 事务失败时工作区状态必须保持"
     );
+    assert!(
+        memory_repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("应读取 SQLite 失败后的记忆")
+            .is_some(),
+        "SQLite 清理失败并回滚 Persona 时不得清理记忆"
+    );
+    clear_memory_services_for_test();
     let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
 }
 
 #[tokio::test]
 async fn deleting_inactive_persona_returns_active_persona_visual_snapshot() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-inactive-persona");
     let state = build_test_state(&config_dir);
     {
@@ -2696,6 +2817,7 @@ async fn optional_visual_recovery_failure_does_not_block_startup_and_retries() {
 
 #[tokio::test]
 async fn accepted_chat_turn_atomically_wins_concurrent_persona_delete() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("chat-delete-chat-wins");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -2778,6 +2900,7 @@ async fn accepted_chat_turn_atomically_wins_concurrent_persona_delete() {
 
 #[tokio::test]
 async fn concurrent_persona_delete_rejects_chat_before_request_id_registration() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("chat-delete-delete-wins");
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
@@ -3952,16 +4075,19 @@ async fn persona_asset_upload_accepts_files_above_axum_default_body_limit() {
 // ---- Persona 长期记忆管理路由契约 ----
 
 use crate::runtime_support::{
-    MemoryManagementAudit, MemoryServices, clear_memory_services_for_test, install_memory_services,
-    memory_services_test_guard,
+    MemoryManagementAudit, MemoryManagementCommands, MemoryServices,
+    clear_memory_services_for_test, install_memory_services, memory_services_test_guard,
 };
 use muse_core::app::memory_storage::SqliteMemoryRepository;
 use muse_core::domain::memory::{
-    MemoryCategory, MemoryChangeType, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
-    MemoryManagementAuthorization, MemoryManagementBinding, MemoryManagementContentMutation,
-    MemoryManagementContentParams, MemoryPersonaScope, MemoryQueryItem, MemoryQueryPageReceipt,
-    MemoryRepository, MemoryRetrievalRequest, MemoryRetriever, MemoryRevision, MemoryRevisionId,
-    MemoryRevisionState, MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest,
+    ConfirmedMemoryDeleteRequest, MemoryCategory, MemoryChangeType, MemoryDeleteConfirmation,
+    MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt, MemoryError,
+    MemoryErrorCode, MemoryId, MemoryImportance, MemoryImportanceAdjustment,
+    MemoryImportanceAdjustmentReceipt, MemoryManagementAuthorization, MemoryManagementBinding,
+    MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutationReceipt,
+    MemoryPersonaScope, MemoryQueryItem, MemoryQueryPageReceipt, MemoryRepository,
+    MemoryRetrievalRequest, MemoryRetriever, MemoryRevision, MemoryRevisionId, MemoryRevisionState,
+    MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest,
     MemorySourceEvidence,
 };
 
@@ -3974,6 +4100,141 @@ impl MemorySensitivityPolicy for AllowAllMemorySensitivity {
             stage: request.stage,
             policy_version: "test-policy/v1".to_string(),
         }
+    }
+}
+
+/// 用真实 Repository 实现测试命令端口；稳定身份模拟集成层的持久幂等绑定。
+struct RepositoryMemoryCommands {
+    repository: Arc<SqliteMemoryRepository>,
+    delete_failures_remaining: AtomicU64,
+}
+
+impl RepositoryMemoryCommands {
+    fn new(repository: Arc<SqliteMemoryRepository>, delete_failures: u64) -> Self {
+        Self {
+            repository,
+            delete_failures_remaining: AtomicU64::new(delete_failures),
+        }
+    }
+
+    fn binding(
+        scope: &MemoryPersonaScope,
+        operation_id: &str,
+    ) -> Result<MemoryManagementBinding, MemoryError> {
+        let stable_time = "2099-01-01T00:00:00+00:00";
+        let authorization = MemoryManagementAuthorization::from_runtime(
+            scope.clone(),
+            format!("memory-action-{operation_id}"),
+            stable_time,
+        )?;
+        MemoryManagementBinding::bind(
+            authorization,
+            operation_id,
+            stable_time,
+            stable_time,
+            stable_time,
+        )
+    }
+}
+
+impl MemoryManagementCommands for RepositoryMemoryCommands {
+    fn create(
+        &self,
+        scope: &MemoryPersonaScope,
+        operation_id: &str,
+        request: &MemoryCreateRequest,
+    ) -> Result<MemoryMutationReceipt, MemoryError> {
+        let mutation = MemoryManagementContentMutation::bind(
+            MemoryManagementContentParams::Create {
+                category: request.category,
+                content: request.content.clone(),
+                importance: request.importance,
+                event_time: request.event_time.clone(),
+                change_reason: request.change_reason.clone(),
+            },
+            Self::binding(scope, operation_id)?,
+            MemoryId(format!("memory-{operation_id}")),
+            MemoryRevisionId(format!("memory-revision-{operation_id}")),
+            &AllowAllMemorySensitivity,
+        )?;
+        self.repository
+            .apply_management_content_mutation(&mutation, &AllowAllMemorySensitivity)
+    }
+
+    fn correct(
+        &self,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        operation_id: &str,
+        request: &MemoryCorrectRequest,
+    ) -> Result<MemoryMutationReceipt, MemoryError> {
+        let mutation = MemoryManagementContentMutation::bind(
+            MemoryManagementContentParams::Correct {
+                memory_id: memory_id.clone(),
+                expected_revision_id: request.expected_revision_id.clone(),
+                category: request.category,
+                content: request.content.clone(),
+                event_time: request.event_time.clone(),
+                change_reason: request.change_reason.clone(),
+            },
+            Self::binding(scope, operation_id)?,
+            memory_id.clone(),
+            MemoryRevisionId(format!("memory-revision-{operation_id}")),
+            &AllowAllMemorySensitivity,
+        )?;
+        self.repository
+            .apply_management_content_mutation(&mutation, &AllowAllMemorySensitivity)
+    }
+
+    fn adjust_importance(
+        &self,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        operation_id: &str,
+        request: &MemoryImportanceAdjustRequest,
+    ) -> Result<MemoryImportanceAdjustmentReceipt, MemoryError> {
+        let adjustment = MemoryImportanceAdjustment::bind(
+            Self::binding(scope, operation_id)?,
+            memory_id.clone(),
+            request.expected_revision_id.clone(),
+            request.expected_importance,
+            request.importance,
+        )?;
+        self.repository.adjust_importance(&adjustment)
+    }
+
+    fn delete(
+        &self,
+        scope: &MemoryPersonaScope,
+        operation_id: &str,
+        params: &MemoryDeleteParams,
+    ) -> Result<MemoryDeleteReceipt, MemoryError> {
+        if self
+            .delete_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(MemoryError::new(
+                MemoryErrorCode::DeletionAuthorityUnavailable,
+            ));
+        }
+        let confirmation = MemoryDeleteConfirmation::new(
+            operation_id,
+            "2099-01-01T00:00:00+00:00",
+            MemoryDeleteConfirmationSource::PersonaManagement {
+                action_id: format!("memory-action-{operation_id}"),
+            },
+        )?;
+        let request =
+            ConfirmedMemoryDeleteRequest::bind(params.clone(), scope.clone(), confirmation)?;
+        self.repository
+            .delete_confirmed(&request, self.repository.deletion_authority())
     }
 }
 
@@ -4022,16 +4283,29 @@ fn install_test_memory_services(
     retriever_items: Vec<MemoryQueryItem>,
     audit: StubMemoryAudit,
 ) -> Arc<SqliteMemoryRepository> {
+    install_test_memory_services_with_delete_failures(repository, retriever_items, audit, 0).0
+}
+
+fn install_test_memory_services_with_delete_failures(
+    repository: SqliteMemoryRepository,
+    retriever_items: Vec<MemoryQueryItem>,
+    audit: StubMemoryAudit,
+    delete_failures: u64,
+) -> (Arc<SqliteMemoryRepository>, Arc<RepositoryMemoryCommands>) {
     let repository = Arc::new(repository);
+    let commands = Arc::new(RepositoryMemoryCommands::new(
+        Arc::clone(&repository),
+        delete_failures,
+    ));
     install_memory_services(MemoryServices {
         repository: Arc::clone(&repository),
         retriever: Arc::new(StubMemoryRetriever {
             items: retriever_items,
         }),
-        sensitivity: Arc::new(AllowAllMemorySensitivity),
+        commands: commands.clone(),
         audit: Arc::new(audit),
     });
-    repository
+    (repository, commands)
 }
 
 fn open_test_memory_repository(dir: &Path) -> SqliteMemoryRepository {
@@ -4182,12 +4456,12 @@ async fn persona_memory_routes_return_stable_503_when_unwired() {
         (
             "DELETE",
             "/personas/router-test-persona/memories/memory-x".to_string(),
-            None,
+            Some(serde_json::json!({"operation_id": "delete-memory-x"})),
         ),
         (
             "DELETE",
             "/personas/router-test-persona/memories".to_string(),
-            None,
+            Some(serde_json::json!({"operation_id": "clear-persona-x"})),
         ),
     ];
     for (method, uri, body) in cases {
@@ -4231,6 +4505,75 @@ async fn persona_memory_routes_return_stable_503_when_unwired() {
     assert_eq!(impact.status(), StatusCode::OK);
     let impact_payload = response_json(impact).await;
     assert!(impact_payload["memory_count"].is_null());
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn persona_memory_strict_dto_rejections_use_flat_stable_errors() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-strict-dto");
+    let app = api_routes().with_state(build_test_state(&config_dir));
+    let cases = [
+        (
+            "POST",
+            "/personas/router-test-persona/memories",
+            "{".to_string(),
+        ),
+        (
+            "POST",
+            "/personas/router-test-persona/memories",
+            serde_json::json!({
+                "category": "user_fact",
+                "content": "用户喜欢绿茶",
+                "importance": "normal",
+                "change_reason": "用户明确告知",
+                "unexpected": true
+            })
+            .to_string(),
+        ),
+        (
+            "DELETE",
+            "/personas/router-test-persona/memories",
+            serde_json::json!({
+                "operation_id": "strict-delete",
+                "unexpected": true
+            })
+            .to_string(),
+        ),
+    ];
+    for (method, uri, body) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("应能构造严格 DTO 失败请求"),
+            )
+            .await
+            .expect("严格 DTO 失败应返回响应");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_flat_api_error(&payload);
+        assert_eq!(payload["code"], "memory_invalid_request");
+    }
+
+    let query = app
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?query=用户&unexpected=true")
+                .body(Body::empty())
+                .expect("应能构造未知查询字段请求"),
+        )
+        .await
+        .expect("未知查询字段应返回响应");
+    assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+    let payload = response_json(query).await;
+    assert_flat_api_error(&payload);
+    assert_eq!(payload["code"], "memory_invalid_request");
 
     let _ = std::fs::remove_dir_all(config_dir);
 }
@@ -4293,7 +4636,7 @@ async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
         .expect("新增收据应带 revision_id")
         .to_string();
 
-    // 相同 operation_id 的重放被 Repository 稳定拒绝，绝不产生重复记忆。
+    // 相同 operation_id 的重放返回同一 durable 收据，绝不产生重复记忆。
     let replayed = app
         .clone()
         .oneshot(
@@ -4315,10 +4658,35 @@ async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
         )
         .await
         .expect("重放新增应返回响应");
-    assert_eq!(replayed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(replayed.status(), StatusCode::CREATED);
     let replay_payload = response_json(replayed).await;
-    assert_flat_api_error(&replay_payload);
-    assert_eq!(replay_payload["code"], "memory_invalid_request");
+    assert_eq!(replay_payload, created_payload);
+
+    let conflicting_replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/personas/router-test-persona/memories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "category": "user_preference",
+                        "content": "同一 operation 伪造了不同内容",
+                        "importance": "normal",
+                        "change_reason": "冲突重放",
+                        "operation_id": "client-op-create-1"
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造冲突重放请求"),
+        )
+        .await
+        .expect("冲突重放应返回响应");
+    assert_eq!(conflicting_replay.status(), StatusCode::BAD_REQUEST);
+    let conflicting_payload = response_json(conflicting_replay).await;
+    assert_flat_api_error(&conflicting_payload);
+    assert_eq!(conflicting_payload["code"], "memory_invalid_request");
 
     // 详情：管理来源没有对话跳转索引。
     let detail = app
@@ -4490,7 +4858,10 @@ async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
                 .uri(format!(
                     "/personas/router-test-persona/memories/{memory_id}"
                 ))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"operation_id": "delete-memory-roundtrip"}).to_string(),
+                ))
                 .expect("应能构造单条删除请求"),
         )
         .await
@@ -4509,21 +4880,61 @@ async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
         "删除后记忆不得再可读"
     );
 
-    // 空 Persona 全清返回成功且条数为零。
+    // Persona 全清后使用同一 operation 重放，必须返回首次收据且不删除中间新建记忆。
+    seed_test_memory(
+        &repository,
+        "router-test-persona",
+        "首次全清应删除的测试记忆",
+    );
     let cleared = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri("/personas/router-test-persona/memories")
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"operation_id": "clear-memory-roundtrip"}).to_string(),
+                ))
                 .expect("应能构造全清请求"),
         )
         .await
         .expect("全清应返回响应");
     assert_eq!(cleared.status(), StatusCode::OK);
     let cleared_payload = response_json(cleared).await;
-    assert_eq!(cleared_payload["deleted_memory_count"], 0);
+    assert_eq!(cleared_payload["deleted_memory_count"], 1);
+
+    let (created_between_retries, _) = seed_test_memory(
+        &repository,
+        "router-test-persona",
+        "首次全清成功后新创建的记忆",
+    );
+    let replayed_clear = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona/memories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"operation_id": "clear-memory-roundtrip"}).to_string(),
+                ))
+                .expect("应能构造全清重放请求"),
+        )
+        .await
+        .expect("全清重放应返回响应");
+    assert_eq!(replayed_clear.status(), StatusCode::OK);
+    assert_eq!(response_json(replayed_clear).await, cleared_payload);
+    assert!(
+        repository
+            .current(
+                &memory_scope("router-test-persona"),
+                &created_between_retries,
+            )
+            .expect("重放后读取中间新建记忆不应失败")
+            .is_some(),
+        "同一 PersonaAll operation 重放不得重新选取首次成功后新建的记忆"
+    );
 
     clear_memory_services_for_test();
     let _ = std::fs::remove_dir_all(config_dir);
@@ -4714,7 +5125,7 @@ async fn persona_memory_history_and_deletion_impact_use_audit_port() {
 }
 
 #[tokio::test]
-async fn delete_persona_removes_memories_before_commit_point() {
+async fn delete_persona_removes_memories_after_commit_point() {
     let _guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("memory-persona-delete");
     let memory_dir = unique_temp_dir("memory-persona-delete-store");
@@ -4755,24 +5166,23 @@ async fn delete_persona_removes_memories_before_commit_point() {
 }
 
 #[tokio::test]
-async fn delete_persona_aborts_without_orphan_when_memory_deletion_fails() {
+async fn delete_persona_memory_failure_keeps_recovery_and_converges_after_restart() {
     let _guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("memory-persona-delete-fail");
     let memory_dir = unique_temp_dir("memory-persona-delete-fail-store");
-    let repository = install_test_memory_services(
+    let (repository, _) = install_test_memory_services_with_delete_failures(
         open_test_memory_repository(&memory_dir),
         Vec::new(),
         StubMemoryAudit {
             count: 1,
             revisions: Vec::new(),
         },
+        1,
     );
-    seed_test_memory(&repository, "router-test-persona", "用户喜欢喝绿茶");
-    drop(repository);
-    // 注入确定性失败：移除整个记忆存储目录，删除权威与主库写入必失败。
-    std::fs::remove_dir_all(&memory_dir).expect("应能移除测试记忆目录");
+    let (memory_id, _) = seed_test_memory(&repository, "router-test-persona", "用户喜欢喝绿茶");
 
-    let app = api_routes().with_state(build_test_state(&config_dir));
+    let state = build_test_state(&config_dir);
+    let app = api_routes().with_state(state.clone());
     let deleted = app
         .clone()
         .oneshot(
@@ -4787,13 +5197,13 @@ async fn delete_persona_aborts_without_orphan_when_memory_deletion_fails() {
     assert_eq!(
         deleted.status(),
         StatusCode::SERVICE_UNAVAILABLE,
-        "记忆删除失败时整个角色删除不得提交"
+        "提交后的记忆清理失败应返回稳定可重试错误"
     );
     let payload = response_json(deleted).await;
     assert_flat_api_error(&payload);
     assert_eq!(payload["code"], "memory_deletion_authority_unavailable");
 
-    // 孤儿态检查：角色定义必须保持完整可读。
+    // personas.json 已是提交点；失败后不得回滚角色并形成“角色仍在但记忆已丢失”。
     let detail = app
         .clone()
         .oneshot(
@@ -4806,12 +5216,31 @@ async fn delete_persona_aborts_without_orphan_when_memory_deletion_fails() {
         .expect("角色详情应返回响应");
     assert_eq!(
         detail.status(),
-        StatusCode::OK,
-        "记忆删除失败时角色 JSON 不得被删除"
+        StatusCode::NOT_FOUND,
+        "记忆清理失败时角色删除提交点必须保持"
+    );
+    assert!(
+        repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("失败后读取记忆不应失败")
+            .is_some(),
+        "首次记忆清理失败时明文必须保持，等待恢复记录重试"
+    );
+
+    crate::runtime_support::initialize_active_persona_session(&state)
+        .await
+        .expect("重启恢复应重试 Persona 记忆清理");
+    assert!(
+        repository
+            .current(&memory_scope("router-test-persona"), &memory_id)
+            .expect("恢复后读取记忆不应失败")
+            .is_none(),
+        "恢复记录应使用同一 operation 身份幂等收敛记忆清理"
     );
 
     clear_memory_services_for_test();
     let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
 }
 
 #[test]

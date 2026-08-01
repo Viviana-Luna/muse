@@ -1,20 +1,18 @@
 //! Persona 长期记忆管理 API 的适配实现。
 //!
-//! 所有读取经 `MemoryRetriever` 与 `MemoryRepository::current` 端口，内容写入经
-//! `apply_management_content_mutation`（敏感双门），重要程度经 `adjust_importance`
-//! （不创建内容 revision），删除经 `delete_confirmed`（先删除权威后主库）。
+//! 所有读取经 `MemoryRetriever` 与 `MemoryRepository::current` 端口，写操作统一
+//! 交给 `MemoryManagementCommands`，由集成层持久化客户端 operation 身份并复用
+//! Repository 的敏感双门、重要程度与删除权威能力。
 //! 本工作树未接线真实实例，管理路由一律返回 503 与对应 `memory_*` 稳定码；
 //! 真实实例由协调者在临时集成分支通过 `install_memory_services` 注入。
 
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use muse_core::app::memory_storage::SqliteMemoryRepository;
 use muse_core::domain::memory::{
-    ConfirmedMemoryDeleteRequest, MemoryCursor, MemoryDeleteConfirmation,
-    MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt, MemoryError,
-    MemoryErrorCode, MemoryId, MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt,
-    MemoryManagementAuthorization, MemoryManagementBinding, MemoryManagementContentMutation,
-    MemoryManagementContentParams, MemoryMutationReceipt, MemoryPersonaScope,
+    MemoryCursor, MemoryDeleteParams, MemoryDeleteReceipt, MemoryError, MemoryErrorCode, MemoryId,
+    MemoryImportanceAdjustmentReceipt, MemoryMutationReceipt, MemoryPersonaScope,
     MemoryQueryPageReceipt, MemoryQueryParams, MemoryRepository, MemoryRetrievalRequest,
-    MemoryRetriever, MemoryRevision, MemoryRevisionId, MemorySensitivityPolicy,
+    MemoryRetriever, MemoryRevision,
 };
 
 use super::*;
@@ -36,15 +34,52 @@ pub trait MemoryManagementAudit: Send + Sync {
     fn active_memory_count(&self, scope: &MemoryPersonaScope) -> Result<u64, MemoryError>;
 }
 
+/// Persona 记忆管理写命令端口。
+///
+/// `operation_id` 是客户端操作的持久幂等身份：实现方必须把首次绑定的运行时
+/// 身份、目标与收据持久化，同一 Persona 下相同 ID、相同请求的重放必须返回原
+/// 收据，相同 ID、不同请求必须稳定拒绝。尤其是 `PersonaAll` 删除不得在重放时
+/// 重新选取 subjects，否则会误删首次成功之后新创建的记忆。
+pub trait MemoryManagementCommands: Send + Sync {
+    fn create(
+        &self,
+        scope: &MemoryPersonaScope,
+        operation_id: &str,
+        request: &MemoryCreateRequest,
+    ) -> Result<MemoryMutationReceipt, MemoryError>;
+
+    fn correct(
+        &self,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        operation_id: &str,
+        request: &MemoryCorrectRequest,
+    ) -> Result<MemoryMutationReceipt, MemoryError>;
+
+    fn adjust_importance(
+        &self,
+        scope: &MemoryPersonaScope,
+        memory_id: &MemoryId,
+        operation_id: &str,
+        request: &MemoryImportanceAdjustRequest,
+    ) -> Result<MemoryImportanceAdjustmentReceipt, MemoryError>;
+
+    fn delete(
+        &self,
+        scope: &MemoryPersonaScope,
+        operation_id: &str,
+        params: &MemoryDeleteParams,
+    ) -> Result<MemoryDeleteReceipt, MemoryError>;
+}
+
 /// 记忆管理 API 的运行时服务接缝；真实实例由协调者在集成分支启动流程注入。
 ///
-/// Repository 使用具体的 SQLite 实现：`delete_confirmed` 要求删除权威与
-/// Repository 内部实例同一指针，因此删除调用一律携带 `repository.deletion_authority()`，
-/// 不单独持有权威句柄，避免跨实例被判为不可用。
+/// Repository 使用具体 SQLite 实现供详情读取；写命令由 `commands` 负责稳定
+/// operation 绑定与 Repository 调用，防止 HTTP 重试重新生成领域身份。
 pub struct MemoryServices {
     pub repository: Arc<SqliteMemoryRepository>,
     pub retriever: Arc<dyn MemoryRetriever>,
-    pub sensitivity: Arc<dyn MemorySensitivityPolicy>,
+    pub commands: Arc<dyn MemoryManagementCommands>,
     pub audit: Arc<dyn MemoryManagementAudit>,
 }
 
@@ -72,6 +107,14 @@ fn require_memory_services() -> Result<Arc<MemoryServices>, (StatusCode, Json<Er
     memory_services().ok_or_else(|| {
         memory_error_response(MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
     })
+}
+
+fn memory_json_rejection(_: JsonRejection) -> (StatusCode, Json<ErrorResponse>) {
+    memory_error_response(MemoryError::new(MemoryErrorCode::InvalidRequest))
+}
+
+fn memory_query_rejection(_: QueryRejection) -> (StatusCode, Json<ErrorResponse>) {
+    memory_error_response(MemoryError::new(MemoryErrorCode::InvalidRequest))
 }
 
 /// MemoryError 到稳定 HTTP 响应的唯一映射；错误体前缀即 16 个 memory_* 稳定码。
@@ -122,72 +165,35 @@ async fn require_existing_persona_scope(
     MemoryPersonaScope::new(persona_id).map_err(memory_error_response)
 }
 
-fn management_binding(
-    scope: MemoryPersonaScope,
-    operation_id: Option<String>,
-) -> Result<MemoryManagementBinding, (StatusCode, Json<ErrorResponse>)> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let authorization = MemoryManagementAuthorization::from_runtime(
-        scope,
-        next_runtime_id("memory-action"),
-        now.clone(),
-    )
-    .map_err(memory_error_response)?;
-    MemoryManagementBinding::bind(
-        authorization,
-        operation_id.unwrap_or_else(|| next_runtime_id("memory-op")),
-        now.clone(),
-        now.clone(),
-        now,
-    )
-    .map_err(memory_error_response)
-}
-
-fn apply_management_content(
-    services: &MemoryServices,
-    params: MemoryManagementContentParams,
-    binding: MemoryManagementBinding,
-    assigned_memory_id: MemoryId,
-) -> Result<MemoryMutationReceipt, (StatusCode, Json<ErrorResponse>)> {
-    let mutation = MemoryManagementContentMutation::bind(
-        params,
-        binding,
-        assigned_memory_id,
-        MemoryRevisionId(next_runtime_id("memory-rev")),
-        services.sensitivity.as_ref(),
-    )
-    .map_err(memory_error_response)?;
-    // Repository 在事务内重跑 RepositoryCommit 敏感门，双门不旁路。
-    services
-        .repository
-        .apply_management_content_mutation(&mutation, services.sensitivity.as_ref())
-        .map_err(memory_error_response)
-}
-
-fn confirmed_delete_request(
-    scope: MemoryPersonaScope,
-    params: MemoryDeleteParams,
-) -> Result<ConfirmedMemoryDeleteRequest, MemoryError> {
-    let confirmation = MemoryDeleteConfirmation::new(
-        next_runtime_id("memory-confirm"),
-        chrono::Utc::now().to_rfc3339(),
-        MemoryDeleteConfirmationSource::PersonaManagement {
-            action_id: next_runtime_id("memory-action"),
-        },
-    )?;
-    ConfirmedMemoryDeleteRequest::bind(params, scope, confirmation)
+fn resolve_operation_id(
+    operation_id: Option<&str>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let operation_id = operation_id
+        .map(str::to_string)
+        .unwrap_or_else(|| next_runtime_id("memory-op"));
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(memory_error_response(MemoryError::new(
+            MemoryErrorCode::InvalidRequest,
+        )));
+    }
+    Ok(operation_id)
 }
 
 /// 清空指定 Persona 的全部记忆；handle_delete_persona 与全清路由共用同一删除权威链路。
 pub(super) fn delete_all_persona_memories(
     services: &MemoryServices,
     persona_id: &str,
+    operation_id: &str,
 ) -> Result<MemoryDeleteReceipt, MemoryError> {
     let scope = MemoryPersonaScope::new(persona_id)?;
-    let request = confirmed_delete_request(scope, MemoryDeleteParams::PersonaAll)?;
     services
-        .repository
-        .delete_confirmed(&request, services.repository.deletion_authority())
+        .commands
+        .delete(&scope, operation_id, &MemoryDeleteParams::PersonaAll)
 }
 
 /// 删除影响评估的记忆条数；只在已接线时可用。
@@ -203,9 +209,10 @@ pub(super) fn persona_memory_count(
 /// 查询当前有效记忆列表（query/category/importance/cursor 筛选）。
 pub(crate) async fn handle_persona_memories(
     Path(persona_id): Path<String>,
-    Query(query): Query<MemoryListQuery>,
+    query: Result<Query<MemoryListQuery>, QueryRejection>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MemoryQueryPageReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let Query(query) = query.map_err(memory_query_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
     let cursor = query
@@ -292,24 +299,16 @@ pub(crate) async fn handle_persona_memory_history(
 pub(crate) async fn handle_create_persona_memory(
     Path(persona_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<MemoryCreateRequest>,
+    request: Result<Json<MemoryCreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<MemoryMutationReceipt>), (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(memory_json_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
-    let binding = management_binding(scope, request.operation_id)?;
-    let params = MemoryManagementContentParams::Create {
-        category: request.category,
-        content: request.content,
-        importance: request.importance,
-        event_time: request.event_time,
-        change_reason: request.change_reason,
-    };
-    let receipt = apply_management_content(
-        &services,
-        params,
-        binding,
-        MemoryId(next_runtime_id("memory")),
-    )?;
+    let operation_id = resolve_operation_id(request.operation_id.as_deref())?;
+    let receipt = services
+        .commands
+        .create(&scope, &operation_id, &request)
+        .map_err(memory_error_response)?;
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 
@@ -317,21 +316,17 @@ pub(crate) async fn handle_create_persona_memory(
 pub(crate) async fn handle_correct_persona_memory(
     Path((persona_id, memory_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<MemoryCorrectRequest>,
+    request: Result<Json<MemoryCorrectRequest>, JsonRejection>,
 ) -> Result<Json<MemoryMutationReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(memory_json_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
     let memory_id = MemoryId(memory_id);
-    let binding = management_binding(scope, request.operation_id)?;
-    let params = MemoryManagementContentParams::Correct {
-        memory_id: memory_id.clone(),
-        expected_revision_id: request.expected_revision_id,
-        category: request.category,
-        content: request.content,
-        event_time: request.event_time,
-        change_reason: request.change_reason,
-    };
-    let receipt = apply_management_content(&services, params, binding, memory_id)?;
+    let operation_id = resolve_operation_id(request.operation_id.as_deref())?;
+    let receipt = services
+        .commands
+        .correct(&scope, &memory_id, &operation_id, &request)
+        .map_err(memory_error_response)?;
     Ok(Json(receipt))
 }
 
@@ -339,22 +334,16 @@ pub(crate) async fn handle_correct_persona_memory(
 pub(crate) async fn handle_adjust_persona_memory_importance(
     Path((persona_id, memory_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<MemoryImportanceAdjustRequest>,
+    request: Result<Json<MemoryImportanceAdjustRequest>, JsonRejection>,
 ) -> Result<Json<MemoryImportanceAdjustmentReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(memory_json_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
-    let binding = management_binding(scope, request.operation_id)?;
-    let adjustment = MemoryImportanceAdjustment::bind(
-        binding,
-        MemoryId(memory_id),
-        request.expected_revision_id,
-        request.expected_importance,
-        request.importance,
-    )
-    .map_err(memory_error_response)?;
+    let memory_id = MemoryId(memory_id);
+    let operation_id = resolve_operation_id(request.operation_id.as_deref())?;
     let receipt = services
-        .repository
-        .adjust_importance(&adjustment)
+        .commands
+        .adjust_importance(&scope, &memory_id, &operation_id, &request)
         .map_err(memory_error_response)?;
     Ok(Json(receipt))
 }
@@ -363,19 +352,21 @@ pub(crate) async fn handle_adjust_persona_memory_importance(
 pub(crate) async fn handle_delete_persona_memory(
     Path((persona_id, memory_id)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
+    request: Result<Json<MemoryDeleteRequest>, JsonRejection>,
 ) -> Result<Json<MemoryDeleteReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(memory_json_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
-    let request = confirmed_delete_request(
-        scope,
-        MemoryDeleteParams::Memory {
-            memory_id: MemoryId(memory_id),
-        },
-    )
-    .map_err(memory_error_response)?;
+    let operation_id = resolve_operation_id(Some(&request.operation_id))?;
     let receipt = services
-        .repository
-        .delete_confirmed(&request, services.repository.deletion_authority())
+        .commands
+        .delete(
+            &scope,
+            &operation_id,
+            &MemoryDeleteParams::Memory {
+                memory_id: MemoryId(memory_id),
+            },
+        )
         .map_err(memory_error_response)?;
     Ok(Json(receipt))
 }
@@ -384,14 +375,15 @@ pub(crate) async fn handle_delete_persona_memory(
 pub(crate) async fn handle_clear_persona_memories(
     Path(persona_id): Path<String>,
     State(state): State<Arc<AppState>>,
+    request: Result<Json<MemoryDeleteRequest>, JsonRejection>,
 ) -> Result<Json<MemoryDeleteReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let Json(request) = request.map_err(memory_json_rejection)?;
     let scope = require_existing_persona_scope(&state, &persona_id).await?;
     let services = require_memory_services()?;
-    let request = confirmed_delete_request(scope, MemoryDeleteParams::PersonaAll)
-        .map_err(memory_error_response)?;
+    let operation_id = resolve_operation_id(Some(&request.operation_id))?;
     let receipt = services
-        .repository
-        .delete_confirmed(&request, services.repository.deletion_authority())
+        .commands
+        .delete(&scope, &operation_id, &MemoryDeleteParams::PersonaAll)
         .map_err(memory_error_response)?;
     Ok(Json(receipt))
 }

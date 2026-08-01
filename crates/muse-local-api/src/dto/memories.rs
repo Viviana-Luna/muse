@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 管理读取与模型读取共用检索语义：`query` 必填非空，`category`/`importance`
 /// 为页内过滤条件，`cursor` 只能原样回传上一页收据中的不透明游标。
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryListQuery {
     pub query: String,
@@ -26,7 +26,7 @@ pub struct MemoryListQuery {
 ///
 /// `operation_id` 可选；客户端携带时同一 operation 重放会被 Repository 幂等
 /// 识别或稳定拒绝，绝不产生重复记忆。缺省时由服务端生成。
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryCreateRequest {
     pub category: MemoryCategory,
@@ -40,7 +40,7 @@ pub struct MemoryCreateRequest {
 }
 
 /// 纠正记忆请求体；memory_id 只来自路径，请求体不能跨记忆写入。
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryCorrectRequest {
     pub expected_revision_id: MemoryRevisionId,
@@ -54,7 +54,7 @@ pub struct MemoryCorrectRequest {
 }
 
 /// 重要程度调整请求体；只更新逻辑 entry，不创建内容 revision。
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryImportanceAdjustRequest {
     pub expected_revision_id: MemoryRevisionId,
@@ -62,6 +62,13 @@ pub struct MemoryImportanceAdjustRequest {
     pub importance: MemoryImportance,
     #[serde(default)]
     pub operation_id: Option<String>,
+}
+
+/// 删除请求体；`operation_id` 必须由客户端在一次操作的所有重试中保持不变。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDeleteRequest {
+    pub operation_id: String,
 }
 
 /// 记忆详情响应体。
