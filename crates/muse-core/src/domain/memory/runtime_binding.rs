@@ -253,6 +253,12 @@ enum DirectUserComplementKind {
     Intent,
 }
 
+#[derive(Clone, Copy)]
+enum DirectUserActionTail {
+    Optional,
+    Required,
+}
+
 /// 只接受一个主谓骨架；谓词和补语形态均由正向语法声明。
 fn validate_simple_direct_user_predicate(value: &str) -> Option<()> {
     if let Some(location) = value
@@ -269,6 +275,9 @@ fn validate_simple_direct_user_predicate(value: &str) -> Option<()> {
         if let Some(fact) = value.strip_prefix(prefix) {
             return validate_direct_user_complement(fact, DirectUserComplementKind::Nominal);
         }
+    }
+    if has_leading_direct_user_action_modifier(value) {
+        return validate_positive_action_phrase(value);
     }
 
     const PREDICATES: [(&str, DirectUserComplementKind); 10] = [
@@ -294,37 +303,126 @@ fn validate_direct_user_complement(value: &str, kind: DirectUserComplementKind) 
     if value.is_empty()
         || has_direct_user_clause_boundary(value)
         || has_structured_clause_connector(value)
-        || has_structured_negation(value)
         || has_structured_external_source(value)
         || has_third_party_subject(value)
     {
         return None;
     }
 
-    let predicate_spans = embedded_predicate_spans(value);
-    let permits_single_action =
-        |span: &(usize, usize)| span.0 == 0 || has_direct_user_action_modifier(&value[..span.0]);
     match kind {
-        DirectUserComplementKind::Nominal if predicate_spans.is_empty() => Some(()),
-        DirectUserComplementKind::Preference | DirectUserComplementKind::Habit
-            if predicate_spans.is_empty()
-                || (predicate_spans.len() == 1 && permits_single_action(&predicate_spans[0])) =>
-        {
-            Some(())
+        DirectUserComplementKind::Nominal => validate_direct_user_nominal(value),
+        DirectUserComplementKind::Preference => validate_direct_user_preference(value),
+        DirectUserComplementKind::Habit | DirectUserComplementKind::Intent => {
+            validate_positive_action_phrase(value)
         }
-        DirectUserComplementKind::Intent
-            if predicate_spans.is_empty()
-                || (predicate_spans.len() == 1 && permits_single_action(&predicate_spans[0])) =>
-        {
-            Some(())
-        }
-        _ => None,
     }
 }
 
-fn has_direct_user_action_modifier(value: &str) -> bool {
-    const MODIFIERS: [&str; 20] = [
-        "在",
+fn validate_direct_user_nominal(value: &str) -> Option<()> {
+    if starts_direct_user_negation(value) || contains_direct_user_predicate(value) {
+        return None;
+    }
+    Some(())
+}
+
+fn validate_direct_user_preference(value: &str) -> Option<()> {
+    if validate_positive_action_phrase(value).is_some() {
+        return Some(());
+    }
+    if starts_direct_user_negation(value)
+        || contains_non_nominalized_action_predicate(value)
+        || !is_typed_preference_object(value)
+    {
+        return None;
+    }
+    Some(())
+}
+
+/// 动作补语只接受“有限修饰语 + 正向动作 + 单一宾语”结构。是否存在未知
+/// 谓词不再成为放行依据，新增表达必须显式归入动作或名词槽位。
+fn validate_positive_action_phrase(value: &str) -> Option<()> {
+    let (action, _) = strip_direct_user_action_modifiers(value);
+    if action.is_empty()
+        || starts_direct_user_negation(action)
+        || starts_structured_external_source(action)
+        || has_third_party_subject(action)
+    {
+        return None;
+    }
+
+    direct_user_action_predicates()
+        .iter()
+        .find_map(|(predicate, tail_policy)| {
+            action.strip_prefix(predicate).and_then(|tail| {
+                if matches!(tail_policy, DirectUserActionTail::Required) && tail.is_empty() {
+                    return None;
+                }
+                if tail.is_empty() || validate_direct_user_action_object(tail) {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn validate_direct_user_action_object(value: &str) -> bool {
+    !starts_direct_user_negation(value)
+        && !starts_structured_external_source(value)
+        && !has_third_party_subject(value)
+        && !has_structured_clause_connector(value)
+        && !contains_non_nominalized_action_predicate(value)
+}
+
+fn direct_user_action_predicates() -> &'static [(&'static str, DirectUserActionTail)] {
+    use DirectUserActionTail::{Optional, Required};
+
+    &[
+        ("回答保持", Required),
+        ("整理", Required),
+        ("收藏", Required),
+        ("联系", Required),
+        ("使用", Required),
+        ("阅读", Required),
+        ("回复", Required),
+        ("回答", Required),
+        ("保持", Required),
+        ("调整", Required),
+        ("完成", Required),
+        ("接受", Required),
+        ("学习", Optional),
+        ("工作", Optional),
+        ("散步", Optional),
+        ("跑步", Optional),
+        ("运动", Optional),
+        ("睡觉", Optional),
+        ("起床", Optional),
+        ("养花", Optional),
+        ("提神", Optional),
+        ("喝", Required),
+        ("吃", Required),
+        ("写", Required),
+        ("做", Required),
+        ("去", Required),
+        ("骑", Required),
+    ]
+}
+
+fn direct_user_action_modifiers() -> &'static [&'static str] {
+    &[
+        "在工作日",
+        "在周末",
+        "在早上",
+        "在上午",
+        "在中午",
+        "在下午",
+        "在晚上",
+        "在夜间",
+        "工作日",
+        "通常",
+        "经常",
+        "偶尔",
+        "总是",
         "每天",
         "每周",
         "每月",
@@ -337,35 +435,56 @@ fn has_direct_user_action_modifier(value: &str) -> bool {
         "夜里",
         "夜间",
         "周末",
-        "工作日",
         "今天",
         "明天",
         "后天",
         "今晚",
         "明年",
         "下周",
-    ];
-    MODIFIERS.iter().any(|modifier| value.starts_with(modifier))
+        "正在",
+        "继续",
+        "开始",
+        "先",
+    ]
+}
+
+fn strip_direct_user_action_modifiers(mut value: &str) -> (&str, bool) {
+    let mut stripped = false;
+    while let Some(rest) = direct_user_action_modifiers()
+        .iter()
+        .find_map(|modifier| value.strip_prefix(modifier))
+    {
+        if rest.is_empty() {
+            break;
+        }
+        value = rest;
+        stripped = true;
+    }
+    (value, stripped)
+}
+
+fn has_leading_direct_user_action_modifier(value: &str) -> bool {
+    strip_direct_user_action_modifiers(value).1
 }
 
 fn has_structured_clause_connector(value: &str) -> bool {
-    const MULTI_CHARACTER_CONNECTORS: [&str; 15] = [
-        "另外", "还有", "并且", "而且", "以及", "同时", "但是", "不过", "因为", "所以", "由于",
-        "因此", "否则", "然后", "接着",
+    const CONNECTORS: [&str; 23] = [
+        "并且", "而且", "以及", "同时", "但是", "不过", "因为", "所以", "由于", "因此", "否则",
+        "然后", "接着", "另外", "还有", "并", "也", "又", "但", "却", "和", "与", "或",
     ];
-    if MULTI_CHARACTER_CONNECTORS
-        .iter()
-        .any(|connector| value.contains(connector))
-    {
-        return true;
-    }
-
-    const SINGLE_CHARACTER_CONNECTORS: [&str; 4] = ["也", "又", "但", "却"];
-    for connector in SINGLE_CHARACTER_CONNECTORS {
+    for connector in CONNECTORS {
         let mut search_from = 0;
         while let Some(relative) = value[search_from..].find(connector) {
-            let after = search_from + relative + connector.len();
-            if starts_direct_user_clause(&value[after..]) {
+            let connector_start = search_from + relative;
+            let after = connector_start + connector.len();
+            let prefix = &value[..connector_start];
+            let suffix = &value[after..];
+            let joins_typed_objects =
+                is_typed_preference_object_atom(prefix) && is_typed_preference_object_atom(suffix);
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && (starts_direct_user_clause(suffix) || joins_typed_objects)
+            {
                 return true;
             }
             search_from = after;
@@ -375,7 +494,7 @@ fn has_structured_clause_connector(value: &str) -> bool {
 }
 
 fn starts_direct_user_clause(value: &str) -> bool {
-    const CLAUSE_STARTERS: [&str; 36] = [
+    const SUBJECT_STARTERS: [&str; 40] = [
         "我",
         "用户",
         "他",
@@ -384,8 +503,31 @@ fn starts_direct_user_clause(value: &str) -> bool {
         "他们",
         "妈妈",
         "爸爸",
+        "祖父",
+        "祖母",
+        "爷爷",
+        "奶奶",
+        "外公",
+        "外婆",
         "朋友",
         "同事",
+        "同学",
+        "领导",
+        "丈夫",
+        "妻子",
+        "孩子",
+        "儿子",
+        "女儿",
+        "哥哥",
+        "弟弟",
+        "姐姐",
+        "妹妹",
+        "舅舅",
+        "姑姑",
+        "叔叔",
+        "阿姨",
+        "邻居",
+        "室友",
         "网页",
         "文件",
         "assistant",
@@ -393,74 +535,55 @@ fn starts_direct_user_clause(value: &str) -> bool {
         "mcp",
         "system",
         "reasoning",
-        "从",
-        "据",
-        "根据",
-        "不",
-        "没",
-        "未",
-        "无",
+    ];
+    const OUTER_PREDICATES: [&str; 15] = [
         "喜欢",
         "偏好",
         "习惯",
         "希望",
-        "使用",
         "计划",
+        "正在学习",
+        "正在工作",
         "学习",
         "工作",
-        "喝",
+        "来自",
+        "从事",
+        "住在",
         "知道",
         "得知",
         "认为",
     ];
-    CLAUSE_STARTERS
+    SUBJECT_STARTERS
         .iter()
         .any(|starter| value.starts_with(starter))
+        || OUTER_PREDICATES
+            .iter()
+            .any(|predicate| value.starts_with(predicate))
+        || starts_direct_user_negation(value)
+        || starts_structured_external_source(value)
+        || starts_positive_action_predicate(value)
 }
 
-fn has_structured_negation(value: &str) -> bool {
-    const NEGATED_PREDICATES: [&str; 30] = [
-        "不喝",
-        "不吃",
-        "不用",
-        "不去",
-        "不做",
-        "不爱",
-        "不喜欢",
-        "不偏好",
-        "不习惯",
-        "不希望",
-        "不计划",
-        "不学习",
-        "不工作",
-        "不使用",
-        "不需要",
-        "不想",
-        "不会",
-        "不能",
-        "不是",
-        "没有",
-        "没喝",
-        "没吃",
-        "没做",
-        "没用",
-        "未使用",
-        "未完成",
-        "未学习",
-        "未工作",
-        "无需",
-        "无意",
-    ];
-    const NEGATION_PHRASES: [&str; 8] = [
-        "从不", "并非", "未曾", "尚未", "不要", "不再", "没再", "否认",
-    ];
-    NEGATED_PREDICATES
+fn starts_positive_action_predicate(value: &str) -> bool {
+    let (action, _) = strip_direct_user_action_modifiers(value);
+    direct_user_action_predicates()
         .iter()
-        .chain(NEGATION_PHRASES.iter())
-        .any(|negation| value.contains(negation))
+        .any(|(predicate, _)| action.starts_with(predicate))
+}
+
+fn starts_direct_user_negation(value: &str) -> bool {
+    const NEGATIONS: [&str; 16] = [
+        "从不", "并非", "未曾", "尚未", "不要", "不再", "没再", "无需", "无意", "不能", "不会",
+        "没有", "别", "不", "没", "未",
+    ];
+    NEGATIONS.iter().any(|negation| value.starts_with(negation))
 }
 
 fn has_structured_external_source(value: &str) -> bool {
+    starts_structured_external_source(value)
+}
+
+fn starts_structured_external_source(value: &str) -> bool {
     const SOURCES: [&str; 7] = [
         "网页",
         "文件",
@@ -474,41 +597,79 @@ fn has_structured_external_source(value: &str) -> bool {
     const REPORTING_PREDICATES: [&str; 11] = [
         "称", "说", "写着", "显示", "返回", "报告", "推测", "得知", "指出", "要求", "推荐",
     ];
-    const RELAY_MARKERS: [&str; 13] = [
-        "知道", "得知", "听说", "据说", "声称", "转述", "报道", "推测", "推断", "猜测", "认为",
-        "引用", "获悉",
-    ];
-    if RELAY_MARKERS.iter().any(|marker| value.contains(marker)) {
-        return true;
-    }
     for source in SOURCES {
-        let mut search_from = 0;
-        while let Some(relative) = value[search_from..].find(source) {
-            let source_start = search_from + relative;
-            let source_end = source_start + source.len();
-            let prefix = &value[..source_start];
-            let suffix = &value[source_end..];
-            if SOURCE_PREFIXES
+        if let Some(suffix) = value.strip_prefix(source)
+            && REPORTING_PREDICATES
                 .iter()
-                .any(|marker| prefix.ends_with(marker))
-                || REPORTING_PREDICATES
-                    .iter()
-                    .any(|predicate| suffix.starts_with(predicate))
-            {
-                return true;
-            }
-            search_from = source_end;
+                .any(|predicate| suffix.starts_with(predicate))
+        {
+            return true;
+        }
+        if SOURCE_PREFIXES.iter().any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(source))
+                .is_some()
+        }) {
+            return true;
         }
     }
     false
 }
 
 fn has_third_party_subject(value: &str) -> bool {
-    const SUBJECTS: [&str; 22] = [
-        "妈妈", "爸爸", "父亲", "母亲", "家人", "朋友", "同事", "同学", "领导", "丈夫", "妻子",
-        "孩子", "儿子", "女儿", "邻居", "室友", "用户", "他", "她", "他们", "她们", "它们",
+    const SUBJECTS: [&str; 48] = [
+        "妈妈",
+        "爸爸",
+        "父亲",
+        "母亲",
+        "祖父",
+        "祖母",
+        "爷爷",
+        "奶奶",
+        "外公",
+        "外婆",
+        "曾祖父",
+        "曾祖母",
+        "哥哥",
+        "弟弟",
+        "姐姐",
+        "妹妹",
+        "兄弟",
+        "姐妹",
+        "叔叔",
+        "阿姨",
+        "伯父",
+        "伯母",
+        "舅舅",
+        "舅妈",
+        "姑姑",
+        "姑父",
+        "姨妈",
+        "姨父",
+        "表哥",
+        "表弟",
+        "表姐",
+        "表妹",
+        "堂哥",
+        "堂弟",
+        "堂姐",
+        "堂妹",
+        "家人",
+        "朋友",
+        "同事",
+        "同学",
+        "领导",
+        "丈夫",
+        "妻子",
+        "孩子",
+        "儿子",
+        "女儿",
+        "邻居",
+        "室友",
     ];
-    for subject in SUBJECTS {
+    const PRONOUNS: [&str; 7] = ["用户", "他们", "她们", "它们", "他", "她", "它"];
+    for subject in SUBJECTS.iter().chain(PRONOUNS.iter()).copied() {
         let mut search_from = 0;
         while let Some(relative) = value[search_from..].find(subject) {
             let after = search_from + relative + subject.len();
@@ -522,26 +683,8 @@ fn has_third_party_subject(value: &str) -> bool {
     false
 }
 
-fn embedded_predicate_spans(value: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut cursor = 0_usize;
-    while cursor < value.len() {
-        let tail = &value[cursor..];
-        if let Some(predicate) = embedded_predicates()
-            .iter()
-            .find(|predicate| tail.starts_with(**predicate))
-        {
-            spans.push((cursor, cursor + predicate.len()));
-            cursor += predicate.len();
-        } else {
-            cursor += tail.chars().next().map(char::len_utf8).unwrap_or(1);
-        }
-    }
-    spans
-}
-
-fn embedded_predicates() -> &'static [&'static str] {
-    &[
+fn contains_direct_user_predicate(value: &str) -> bool {
+    const OUTER_PREDICATES: [&str; 17] = [
         "倾向于",
         "喜欢",
         "偏好",
@@ -551,29 +694,67 @@ fn embedded_predicates() -> &'static [&'static str] {
         "打算",
         "想要",
         "需要",
-        "使用",
         "选择",
         "从事",
-        "工作",
-        "学习",
-        "关注",
         "住在",
         "来自",
-        "散步",
         "知道",
         "得知",
         "认为",
         "推测",
-        "声称",
-        "显示",
-        "返回",
-        "写着",
-        "喝",
-        "吃",
-        "做",
-        "是",
-        "有",
-    ]
+    ];
+    value.char_indices().any(|(index, _)| {
+        let tail = &value[index..];
+        OUTER_PREDICATES
+            .iter()
+            .any(|predicate| tail.starts_with(predicate))
+            || direct_user_action_predicates()
+                .iter()
+                .any(|(predicate, _)| tail.starts_with(predicate))
+    })
+}
+
+fn contains_non_nominalized_action_predicate(value: &str) -> bool {
+    value.char_indices().any(|(index, _)| {
+        let tail = &value[index..];
+        direct_user_action_predicates()
+            .iter()
+            .any(|(predicate, _)| {
+                if !tail.starts_with(predicate) {
+                    return false;
+                }
+                let prefix = &value[..index];
+                !(prefix.ends_with('的') && matches!(*predicate, "回答" | "回复" | "工作" | "学习"))
+            })
+    })
+}
+
+fn is_typed_preference_object(value: &str) -> bool {
+    is_typed_preference_object_atom(value)
+        || (value.is_ascii()
+            && value
+                .chars()
+                .any(|character| character.is_ascii_alphanumeric())
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '/' | '+' | '.')
+            }))
+}
+
+fn is_typed_preference_object_atom(value: &str) -> bool {
+    const OBJECT_HEADS: [&str; 32] = [
+        "咖啡", "饮品", "红茶", "绿茶", "茶", "回答", "回复", "歌曲", "音乐", "小说", "电影", "书",
+        "歌", "食物", "早餐", "午餐", "晚餐", "甜点", "水果", "菜", "颜色", "语言", "工具", "风格",
+        "方式", "方案", "界面", "主题", "游戏", "运动", "工作", "记忆",
+    ];
+    const DESCRIPTORS: [&str; 10] = [
+        "简洁", "简短", "直接", "详细", "正式", "随意", "异步", "同步", "远程", "本地",
+    ];
+    !value.is_empty()
+        && (OBJECT_HEADS.iter().any(|head| value.ends_with(head))
+            || DESCRIPTORS
+                .iter()
+                .any(|descriptor| value.ends_with(descriptor)))
 }
 
 /// `我的` 只接受与偏好、习惯、计划、学习、工作、时区或昵称直接相关的有限

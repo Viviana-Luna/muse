@@ -830,11 +830,23 @@ fn contains_street_house_number(canonical: &str, compact: &str) -> bool {
         return true;
     }
 
-    const ASCII_STREET_MARKERS: [&str; 6] =
-        ["street", "road", "avenue", "lane", "drive", "boulevard"];
+    const ASCII_STREET_MARKERS: [&str; 12] = [
+        "street",
+        "road",
+        "avenue",
+        "lane",
+        "drive",
+        "boulevard",
+        "st",
+        "rd",
+        "ave",
+        "ln",
+        "dr",
+        "blvd",
+    ];
     let words = ascii_words(canonical);
     for (index, word) in words.iter().enumerate() {
-        let marker = word.trim_matches(['.', '-']);
+        let marker = word.strip_suffix('.').unwrap_or(word);
         if !ASCII_STREET_MARKERS.contains(&marker) {
             continue;
         }
@@ -892,11 +904,6 @@ fn contains_structured_cjk_address(text: &str) -> bool {
             continue;
         };
 
-        let suffix = &text[number_end + unit.len()..];
-        if unit == "号" && starts_with_non_address_numbering_tail(suffix) {
-            continue;
-        }
-
         let prefix = text[..number_start].trim_end_matches(is_cjk_house_designator);
         let has_immediate_address_marker = ADDRESS_MARKERS.iter().any(|marker| {
             prefix.ends_with(marker) && !has_non_address_marker_suffix(prefix, marker)
@@ -906,6 +913,11 @@ fn contains_structured_cjk_address(text: &str) -> bool {
             || has_structured_address_context(prefix)
         {
             return true;
+        }
+
+        let suffix = &text[number_end + unit.len()..];
+        if unit == "号" && starts_with_non_address_numbering_tail(suffix) {
+            continue;
         }
     }
     false
@@ -1372,6 +1384,7 @@ mod tests {
         assert_rejected("实时位置分享给你了，在北门");
         assert_rejected("我家在幸福路 88 号");
         assert_rejected("幸福路88号");
+        assert_rejected("幸福路88号方案");
         assert_rejected("小区3号楼");
         for designator in ["甲", "乙", "丙", "丁", "之"] {
             assert_rejected(&format!("我住在幸福路{designator}88号"));
@@ -1384,6 +1397,13 @@ mod tests {
         assert_rejected("幸福小区2单元");
         assert_rejected("幸福小区五〇一室");
         assert_rejected("收件地点是 123 Main Street");
+        assert_rejected("221B Baker Street");
+        assert_rejected("221B Baker St.");
+        for marker in [
+            "St", "st.", "RD", "Rd.", "Ave", "AVE.", "Ln", "ln.", "Dr", "DR.", "Blvd", "blvd.",
+        ] {
+            assert_rejected(&format!("221B Baker {marker}"));
+        }
     }
 
     #[test]
@@ -1451,6 +1471,10 @@ mod tests {
         assert_allowed("我喜欢公路自行车，计划周末骑20公里");
         assert_allowed("用户采用思路3号方案");
         assert_allowed("用户采用思路3号楼方案");
+        assert_allowed("思路3号方案");
+        assert_allowed("思路3号楼方案");
+        assert_allowed("221B Baker Staging");
+        assert_allowed("221B Baker St.example");
         assert_allowed("用户在北京市朝阳区统一室内设计公司工作");
         assert_allowed("公路自行车20公里");
         assert_allowed("用户选择技术路线2");
