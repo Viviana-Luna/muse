@@ -556,6 +556,50 @@ fn replace_revision_row_in_wal(
     transaction.commit().expect("WAL 替换攻击应提交");
 }
 
+fn replace_revision_timestamp_in_wal(
+    repository: &SqliteMemoryRepository,
+    scope: &MemoryPersonaScope,
+    memory_id: &str,
+    revision_id: &str,
+    column: &str,
+    replacement: rusqlite::types::Value,
+) {
+    let sql = match column {
+        "valid_from" => {
+            "UPDATE memory_revision SET valid_from = ?1
+             WHERE persona_id = ?2 AND memory_id = ?3 AND revision_id = ?4"
+        }
+        "valid_to" => {
+            "UPDATE memory_revision SET valid_to = ?1
+             WHERE persona_id = ?2 AND memory_id = ?3 AND revision_id = ?4"
+        }
+        "recorded_at" => {
+            "UPDATE memory_revision SET recorded_at = ?1
+             WHERE persona_id = ?2 AND memory_id = ?3 AND revision_id = ?4"
+        }
+        _ => panic!("测试只允许替换 as_of 使用的时间字段"),
+    };
+    let connection = repository
+        .open_connection()
+        .expect("应打开 WAL 时间字段攻击连接");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("应读取真实 SQLite journal_mode");
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .expect("时间字段旁路攻击应关闭 CHECK 约束");
+    assert_eq!(
+        connection
+            .execute(
+                sql,
+                params![replacement, scope.persona_id(), memory_id, revision_id],
+            )
+            .expect("应在 WAL 中替换时间字段"),
+        1
+    );
+}
+
 /// 固定中文语料：覆盖中文、混合语言、标点、emoji、同音干扰、散乱凑字与无关干扰项。
 /// 任何语料调整都会改变评估输出，必须与评估报告同步更新。
 fn seed_eval_corpus(repository: &SqliteMemoryRepository, scope: &MemoryPersonaScope) {
@@ -2070,6 +2114,98 @@ fn future_category_and_importance_updates_do_not_change_as_of_filters_order_or_p
 }
 
 #[test]
+fn public_history_and_as_of_keep_each_revision_category_and_importance_snapshot() {
+    let directory = TestDirectory::new("history-versioned-attributes");
+    let repository = Arc::new(open_repository(&directory));
+    let scope = scope("逐版本属性-persona");
+    create_memory(
+        &repository,
+        &scope,
+        "m-versioned-attributes",
+        "r-versioned-attributes-old",
+        MemoryCategory::UserFact,
+        "逐版本属性锚点：旧事实",
+        MemoryImportance::High,
+        T1,
+    );
+    update_memory_with_attributes(
+        &repository,
+        &scope,
+        "m-versioned-attributes",
+        "r-versioned-attributes-old",
+        "r-versioned-attributes-current",
+        "逐版本属性锚点：新剧情",
+        MemoryCategory::StoryState,
+        MemoryImportance::Low,
+        T2,
+    );
+    let retriever = SqliteMemoryRetriever::new(repository);
+
+    let history = retriever
+        .retrieve(&request(
+            &scope,
+            "逐版本属性锚点",
+            None,
+            None,
+            None,
+            Some("m-versioned-attributes"),
+            true,
+        ))
+        .expect("公开 history 应返回逐 revision 属性快照");
+    assert_eq!(history.items.len(), 2);
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .map(|item| (item.revision_id.0.as_str(), item.category, item.importance,))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "r-versioned-attributes-current",
+                MemoryCategory::StoryState,
+                MemoryImportance::Low,
+            ),
+            (
+                "r-versioned-attributes-old",
+                MemoryCategory::UserFact,
+                MemoryImportance::High,
+            ),
+        ]
+    );
+
+    for (as_of, revision_id, category, importance) in [
+        (
+            "2026-07-30T01:30:00Z",
+            "r-versioned-attributes-old",
+            MemoryCategory::UserFact,
+            MemoryImportance::High,
+        ),
+        (
+            "2026-07-30T02:30:00Z",
+            "r-versioned-attributes-current",
+            MemoryCategory::StoryState,
+            MemoryImportance::Low,
+        ),
+    ] {
+        let page = retriever
+            .retrieve(&request(
+                &scope,
+                "逐版本属性锚点",
+                None,
+                None,
+                Some(as_of),
+                Some("m-versioned-attributes"),
+                false,
+            ))
+            .expect("公开 as_of 应返回对应 revision 属性快照");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].revision_id.0, revision_id);
+        assert_eq!(page.items[0].category, category);
+        assert_eq!(page.items[0].importance, importance);
+    }
+}
+
+#[test]
 fn iterative_candidate_scan_reaches_hard_match_beyond_first_hundred() {
     let directory = TestDirectory::new("candidate-pressure");
     let repository = open_repository(&directory);
@@ -3201,6 +3337,76 @@ fn public_as_of_keeps_wal_snapshot_and_rejects_same_identity_oversized_replaceme
         MemoryErrorCode::QueryBudgetExceeded,
         "同 revision 身份替换后的超长正文必须在新快照物化前拒绝"
     );
+}
+
+#[test]
+fn public_as_of_bounds_timestamp_text_and_blob_before_chrono_parsing() {
+    for column in ["valid_from", "valid_to", "recorded_at"] {
+        for kind in ["text", "blob"] {
+            let directory = TestDirectory::new(&format!("wal-as-of-{column}-{kind}"));
+            let repository = Arc::new(open_repository(&directory));
+            let scope = scope("wal-as-of-time-persona");
+            create_memory(
+                &repository,
+                &scope,
+                "m-wal-as-of-time",
+                "r-wal-as-of-time",
+                MemoryCategory::UserFact,
+                "用户早餐时间字段旧快照事实",
+                MemoryImportance::Normal,
+                T1,
+            );
+            let replacement = match kind {
+                "text" => {
+                    rusqlite::types::Value::Text("2".repeat(MAX_REVISION_METADATA_FIELD_BYTES + 1))
+                }
+                "blob" => {
+                    rusqlite::types::Value::Blob(vec![b'2'; MAX_REVISION_METADATA_FIELD_BYTES + 1])
+                }
+                _ => unreachable!(),
+            };
+            let writer_repository = Arc::clone(&repository);
+            let writer_scope = scope.clone();
+            install_revision_materialization_test_hook(move || {
+                replace_revision_timestamp_in_wal(
+                    &writer_repository,
+                    &writer_scope,
+                    "m-wal-as-of-time",
+                    "r-wal-as-of-time",
+                    column,
+                    replacement,
+                );
+            });
+            let retriever = SqliteMemoryRetriever::new(repository);
+
+            let old_snapshot = retriever
+                .retrieve(&request(
+                    &scope,
+                    "用户早餐",
+                    None,
+                    None,
+                    Some(T1),
+                    Some("m-wal-as-of-time"),
+                    false,
+                ))
+                .expect("as_of 旧 WAL 快照必须只见替换前时间字段");
+            assert_eq!(old_snapshot.items.len(), 1);
+            assert_eq!(old_snapshot.items[0].content, "用户早餐时间字段旧快照事实");
+            assert_eq!(
+                error_code(retriever.retrieve(&request(
+                    &scope,
+                    "用户早餐",
+                    None,
+                    None,
+                    Some(T1),
+                    Some("m-wal-as-of-time"),
+                    false,
+                ))),
+                MemoryErrorCode::QueryBudgetExceeded,
+                "{column} 的超长 {kind} 必须在 chrono 解析前按资源边界拒绝"
+            );
+        }
+    }
 }
 
 #[test]

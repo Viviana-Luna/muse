@@ -822,9 +822,6 @@ impl SqliteMemoryRetriever {
             .ok_or_else(|| MemoryError::new(MemoryErrorCode::MemoryNotFound))?;
         budget.consume_materialized_revisions(1, bounded_current.materialized_bytes)?;
         let entry = bounded_current.record.entry;
-        if !entry_matches_filters(&entry, filters) {
-            return Err(MemoryError::new(MemoryErrorCode::MemoryNotFound));
-        }
         let mut items = Vec::new();
         let mut after: Option<MemoryRevisionId> = None;
         loop {
@@ -859,9 +856,14 @@ impl SqliteMemoryRetriever {
             after = page
                 .revisions
                 .last()
-                .map(|revision| revision.revision_id.clone());
+                .map(|snapshot| snapshot.revision.revision_id.clone());
             budget.consume_materialized_revisions(fetched, page.materialized_bytes)?;
-            for revision in page.revisions {
+            for snapshot in page.revisions {
+                let historical_entry = historical_entry(&entry, &snapshot);
+                if !entry_matches_filters(&historical_entry, filters) {
+                    continue;
+                }
+                let revision = snapshot.revision;
                 validate_revision_fields(&revision)?;
                 if !revision.state.is_model_readable()
                     || candidate_blocked(
@@ -876,7 +878,7 @@ impl SqliteMemoryRetriever {
                 }
                 let freshness_micros = rfc3339_micros(&revision.recorded_at)?;
                 items.push(FrozenItem::new(
-                    &entry,
+                    &historical_entry,
                     revision,
                     0.0,
                     0.0,

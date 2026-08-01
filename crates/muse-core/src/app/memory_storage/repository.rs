@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use chrono::Utc;
 use rusqlite::{
     Connection, OptionalExtension, Row, TransactionBehavior, functions::FunctionFlags, params,
+    types::ValueRef,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -18,8 +19,9 @@ use super::authority::{
     AuthorityDeleteIntent, AuthorityDeletionEvent, SqliteMemoryDeletionAuthority,
 };
 use super::recovery::{
-    checkpoint_runtime_memory, collect_delete_subjects, delete_memory_ids, memory_ids_for_subjects,
-    rebuild_search_projection,
+    RecoveryReadBudget, checkpoint_runtime_memory, clear_recovery_progress_handler,
+    collect_delete_subjects, delete_memory_ids, install_recovery_progress_handler,
+    memory_ids_for_subjects, rebuild_search_projection,
 };
 use crate::app::storage::{open_initialized_runtime_database, open_runtime_database};
 use crate::domain::memory::{
@@ -106,7 +108,7 @@ pub(crate) struct BoundedRevisionSnapshot {
 }
 
 pub(crate) struct BoundedRevisionPage {
-    pub revisions: Vec<MemoryRevision>,
+    pub revisions: Vec<BoundedRevisionSnapshot>,
     pub materialized_bytes: usize,
 }
 
@@ -143,13 +145,23 @@ impl SqliteMemoryRepository {
     pub fn rebuild_search_index(&self) -> Result<(), MemoryError> {
         let authority_guard = self.authority.begin_guard()?;
         let mut connection = self.open_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(repository_unavailable)?;
-        rebuild_search_projection(&transaction)?;
-        transaction.commit().map_err(repository_unavailable)?;
-        authority_guard.finish()?;
-        checkpoint_runtime_memory(&connection)
+        let exhausted = install_recovery_progress_handler(&connection);
+        let mut budget = RecoveryReadBudget::new();
+        let result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(repository_unavailable)?;
+            rebuild_search_projection(&transaction, &mut budget)?;
+            transaction.commit().map_err(repository_unavailable)?;
+            authority_guard.finish()?;
+            checkpoint_runtime_memory(&connection)
+        })();
+        clear_recovery_progress_handler(&connection);
+        if exhausted.load(Ordering::Relaxed) {
+            Err(query_budget_exceeded())
+        } else {
+            result
+        }
     }
 
     /// 提供给后续 Retriever 的 storage-level trigram 候选，不实现 Wave 3 排序或游标。
@@ -283,7 +295,7 @@ impl SqliteMemoryRepository {
             let raw_cursor = page
                 .revisions
                 .last()
-                .map(|revision| revision.revision_id.clone());
+                .map(|snapshot| snapshot.revision.revision_id.clone());
             let has_more = match raw_cursor.as_ref() {
                 Some(cursor) => {
                     self.revision_history_has_more_on(&transaction, scope, memory_id, cursor)?
@@ -291,7 +303,8 @@ impl SqliteMemoryRepository {
                 None => false,
             };
             let mut readable = Vec::with_capacity(page.revisions.len());
-            for revision in page.revisions {
+            for snapshot in page.revisions {
+                let revision = snapshot.revision;
                 let check =
                     read_deletion_check(&self.authority, scope, memory_id, &revision.content)?;
                 if matches!(
@@ -452,6 +465,7 @@ impl SqliteMemoryRepository {
         at_micros: i64,
         max_materialized_bytes: usize,
     ) -> Result<Option<BoundedRevisionSnapshot>, MemoryError> {
+        authorize_revision_timestamp_scan(connection, scope, memory_id)?;
         let mut statement = connection
             .prepare(
                 "SELECT revision.row_id,
@@ -589,8 +603,15 @@ impl SqliteMemoryRepository {
         let revisions = raw
             .into_iter()
             .map(|row| {
-                load_revision_snapshot_by_identity(connection, scope, memory_id, &row)
-                    .map(|snapshot| snapshot.revision)
+                let materialized_bytes = row.materialized_bytes()?;
+                let snapshot =
+                    load_revision_snapshot_by_identity(connection, scope, memory_id, &row)?;
+                Ok(BoundedRevisionSnapshot {
+                    revision: snapshot.revision,
+                    category: snapshot.category,
+                    importance: snapshot.importance,
+                    materialized_bytes,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BoundedRevisionPage {
@@ -965,132 +986,153 @@ impl MemoryRepository for SqliteMemoryRepository {
         // 此处绝不能先开启主库 IMMEDIATE，否则 durable authority COMMIT 后重锁
         // 会与另一进程形成 main -> authority / authority -> main 的 ABBA 环。
         let mut connection = self.open_connection()?;
-        let (mut subjects, target_count) = if let Some(event) = &existing {
-            let count = match event.target_memory_count {
-                Some(count) => count,
-                None => {
-                    memory_ids_for_subjects(&connection, persona_id, &event.subjects)?.len() as u64
+        let exhausted = install_recovery_progress_handler(&connection);
+        let mut recovery_budget = RecoveryReadBudget::new();
+        let result = (|| {
+            let (mut subjects, target_count) = if let Some(event) = &existing {
+                let count = match event.target_memory_count {
+                    Some(count) => count,
+                    None => memory_ids_for_subjects(
+                        &connection,
+                        persona_id,
+                        &event.subjects,
+                        &mut recovery_budget,
+                    )?
+                    .len() as u64,
+                };
+                (event.subjects.clone(), count)
+            } else {
+                match request.params() {
+                    MemoryDeleteParams::Memory { memory_id } => collect_delete_subjects(
+                        &connection,
+                        scope,
+                        Some(memory_id),
+                        &mut recovery_budget,
+                    )?,
+                    MemoryDeleteParams::PersonaAll => {
+                        collect_delete_subjects(&connection, scope, None, &mut recovery_budget)?
+                    }
                 }
             };
-            (event.subjects.clone(), count)
-        } else {
-            match request.params() {
-                MemoryDeleteParams::Memory { memory_id } => {
-                    collect_delete_subjects(&connection, scope, Some(memory_id))?
-                }
-                MemoryDeleteParams::PersonaAll => {
-                    collect_delete_subjects(&connection, scope, None)?
-                }
-            }
-        };
-        subjects.insert(confirmation_subject.clone());
+            subjects.insert(confirmation_subject.clone());
 
-        // 删除事件、具体 subjects 与 intent 全部由当前 guard 连接一次 durable 发布；
-        // 重取 authority IMMEDIATE 成功之后才允许开启主库 IMMEDIATE。
-        let authority_receipt = authority_guard.record_delete_intent_durable(
-            persona_id,
-            deletion_id,
-            recorded_at,
-            &subjects,
-            AuthorityDeleteIntent {
+            // 删除事件、具体 subjects 与 intent 全部由当前 guard 连接一次 durable 发布；
+            // 重取 authority IMMEDIATE 成功之后才允许开启主库 IMMEDIATE。
+            let authority_receipt = authority_guard.record_delete_intent_durable(
+                persona_id,
+                deletion_id,
+                recorded_at,
+                &subjects,
+                AuthorityDeleteIntent {
+                    request_kind,
+                    requested_memory_id,
+                    target_memory_count: target_count,
+                },
+            )?;
+            validate_authority_receipt(&authority_receipt, deletion_id, &subjects)?;
+
+            // 固定锁序从这里开始始终为 authority -> main；持有 main 期间不再释放或
+            // 重取 authority，commit/relock 窗口中的并发删除因此不会形成锁环。
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(repository_unavailable)?;
+            let canonical_event = authority_guard
+                .event(persona_id, deletion_id)?
+                .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionAuthorityUnavailable))?;
+            validate_delete_event(
+                &canonical_event,
+                recorded_at,
                 request_kind,
                 requested_memory_id,
-                target_memory_count: target_count,
-            },
-        )?;
-        validate_authority_receipt(&authority_receipt, deletion_id, &subjects)?;
-
-        // 固定锁序从这里开始始终为 authority -> main；持有 main 期间不再释放或
-        // 重取 authority，commit/relock 窗口中的并发删除因此不会形成锁环。
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(repository_unavailable)?;
-        let canonical_event = authority_guard
-            .event(persona_id, deletion_id)?
-            .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionAuthorityUnavailable))?;
-        validate_delete_event(
-            &canonical_event,
-            recorded_at,
-            request_kind,
-            requested_memory_id,
-            &confirmation_subject,
-        )?;
-        if canonical_event.subjects != subjects
-            || canonical_event.target_memory_count != Some(target_count)
-        {
-            return Err(MemoryError::new(
-                MemoryErrorCode::DeletionAuthorityUnavailable,
-            ));
-        }
-        if !subjects.is_empty() {
-            let check = MemoryDeletionCheckRequest::new(subjects.clone())?;
-            match authority_guard.check(&check)? {
-                MemoryDeletionDecision::Blocked { matched } if matched == subjects => {}
-                _ => {
-                    return Err(MemoryError::new(
-                        MemoryErrorCode::DeletionAuthorityUnavailable,
-                    ));
+                &confirmation_subject,
+            )?;
+            if canonical_event.subjects != subjects
+                || canonical_event.target_memory_count != Some(target_count)
+            {
+                return Err(MemoryError::new(
+                    MemoryErrorCode::DeletionAuthorityUnavailable,
+                ));
+            }
+            if !subjects.is_empty() {
+                let check = MemoryDeletionCheckRequest::new(subjects.clone())?;
+                match authority_guard.check(&check)? {
+                    MemoryDeletionDecision::Blocked { matched } if matched == subjects => {}
+                    _ => {
+                        return Err(MemoryError::new(
+                            MemoryErrorCode::DeletionAuthorityUnavailable,
+                        ));
+                    }
                 }
             }
-        }
 
-        let anchor = super::recovery::load_anchor(&transaction)?;
-        let mut events = authority_guard.pending_events(anchor.last_applied_revision)?;
-        if !events
-            .iter()
-            .any(|event| event.persona_id == persona_id && event.deletion_id == deletion_id)
-        {
-            events.push(canonical_event.clone());
-            events.sort_by_key(|event| event.authority_revision);
-        }
-        for event in &events {
-            let memory_ids =
-                memory_ids_for_subjects(&transaction, &event.persona_id, &event.subjects)?;
-            delete_memory_ids(&transaction, &event.persona_id, &memory_ids)?;
-        }
-        rebuild_search_projection(&transaction)?;
-        let max_revision = authority_guard.max_revision()?;
-        let updated = transaction
-            .execute(
-                "UPDATE memory_authority_anchor
+            let anchor = super::recovery::load_anchor(&transaction)?;
+            let mut events = authority_guard.pending_events(anchor.last_applied_revision)?;
+            if !events
+                .iter()
+                .any(|event| event.persona_id == persona_id && event.deletion_id == deletion_id)
+            {
+                events.push(canonical_event.clone());
+                events.sort_by_key(|event| event.authority_revision);
+            }
+            for event in &events {
+                let memory_ids = memory_ids_for_subjects(
+                    &transaction,
+                    &event.persona_id,
+                    &event.subjects,
+                    &mut recovery_budget,
+                )?;
+                delete_memory_ids(&transaction, &event.persona_id, &memory_ids)?;
+            }
+            rebuild_search_projection(&transaction, &mut recovery_budget)?;
+            let max_revision = authority_guard.max_revision()?;
+            let updated = transaction
+                .execute(
+                    "UPDATE memory_authority_anchor
                  SET last_applied_revision = ?1
                  WHERE singleton = 1
                    AND authority_id = ?2
                    AND initialized_at = ?3
                    AND last_applied_revision <= ?1",
-                params![max_revision, anchor.authority_id, anchor.initialized_at],
-            )
-            .map_err(repository_unavailable)?;
-        if updated != 1 {
-            return Err(MemoryError::new(MemoryErrorCode::DeletionIncomplete));
-        }
-        transaction.commit().map_err(repository_unavailable)?;
-        checkpoint_runtime_memory(&connection)?;
+                    params![max_revision, anchor.authority_id, anchor.initialized_at],
+                )
+                .map_err(repository_unavailable)?;
+            if updated != 1 {
+                return Err(MemoryError::new(MemoryErrorCode::DeletionIncomplete));
+            }
+            transaction.commit().map_err(repository_unavailable)?;
+            checkpoint_runtime_memory(&connection)?;
 
-        let completed_at = Utc::now().to_rfc3339();
-        for event in &events {
-            let Some(count) = event.target_memory_count else {
-                continue;
-            };
-            authority_guard.mark_cleanup_completed(
-                &event.persona_id,
-                &event.deletion_id,
-                count,
-                &completed_at,
-            )?;
+            let completed_at = Utc::now().to_rfc3339();
+            for event in &events {
+                let Some(count) = event.target_memory_count else {
+                    continue;
+                };
+                authority_guard.mark_cleanup_completed(
+                    &event.persona_id,
+                    &event.deletion_id,
+                    count,
+                    &completed_at,
+                )?;
+            }
+            let completed_event = authority_guard
+                .event(persona_id, deletion_id)?
+                .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionIncomplete))?;
+            let completed_at = completed_event
+                .cleanup_completed_at
+                .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionIncomplete))?;
+            authority_guard.finish_durable()?;
+            Ok(MemoryDeleteReceipt {
+                deletion_id: deletion_id.to_string(),
+                deleted_memory_count: target_count,
+                completed_at,
+            })
+        })();
+        clear_recovery_progress_handler(&connection);
+        if exhausted.load(Ordering::Relaxed) {
+            Err(query_budget_exceeded())
+        } else {
+            result
         }
-        let completed_event = authority_guard
-            .event(persona_id, deletion_id)?
-            .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionIncomplete))?;
-        let completed_at = completed_event
-            .cleanup_completed_at
-            .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionIncomplete))?;
-        authority_guard.finish_durable()?;
-        Ok(MemoryDeleteReceipt {
-            deletion_id: deletion_id.to_string(),
-            deleted_memory_count: target_count,
-            completed_at,
-        })
     }
 }
 
@@ -1682,6 +1724,56 @@ fn revision_lengths_by_id(
         .map_err(repository_unavailable)
 }
 
+fn authorize_revision_timestamp_scan(
+    connection: &Connection,
+    scope: &MemoryPersonaScope,
+    memory_id: &MemoryId,
+) -> Result<(), MemoryError> {
+    let (oversized, invalid_type): (bool, bool) = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM memory_revision
+                 WHERE persona_id = ?1
+                   AND memory_id = ?2
+                   AND state IN ('current', 'superseded')
+                   AND (
+                       length(CAST(valid_from AS BLOB)) > ?3
+                       OR length(CAST(recorded_at AS BLOB)) > ?3
+                       OR (valid_to IS NOT NULL AND length(CAST(valid_to AS BLOB)) > ?3)
+                   )
+                 LIMIT 1
+             ),
+             EXISTS(
+                 SELECT 1
+                 FROM memory_revision
+                 WHERE persona_id = ?1
+                   AND memory_id = ?2
+                   AND state IN ('current', 'superseded')
+                   AND (
+                       typeof(valid_from) <> 'text'
+                       OR typeof(recorded_at) <> 'text'
+                       OR (valid_to IS NOT NULL AND typeof(valid_to) <> 'text')
+                   )
+                 LIMIT 1
+             )",
+            params![
+                scope.persona_id(),
+                memory_id.0,
+                MAX_REVISION_METADATA_FIELD_BYTES as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(repository_unavailable)?;
+    if oversized {
+        return Err(query_budget_exceeded());
+    }
+    if invalid_type {
+        return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+    }
+    Ok(())
+}
+
 fn load_revision_snapshot_by_identity(
     connection: &Connection,
     scope: &MemoryPersonaScope,
@@ -1741,8 +1833,19 @@ fn configure_memory_connection(connection: &Connection) -> Result<(), MemoryErro
                 | FunctionFlags::SQLITE_DETERMINISTIC
                 | FunctionFlags::SQLITE_INNOCUOUS,
             |context| {
-                let value = context.get::<String>(0)?;
-                chrono::DateTime::parse_from_rfc3339(&value)
+                let bytes = match context.get_raw(0) {
+                    ValueRef::Text(bytes) if bytes.len() <= MAX_REVISION_METADATA_FIELD_BYTES => {
+                        bytes
+                    }
+                    _ => {
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::other("记忆时间字段类型或长度超出资源边界"),
+                        )));
+                    }
+                };
+                let value = std::str::from_utf8(bytes)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                chrono::DateTime::parse_from_rfc3339(value)
                     .map(|value| value.timestamp_micros())
                     .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
             },

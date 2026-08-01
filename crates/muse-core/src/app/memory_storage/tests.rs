@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::authority::{fail_next_authority_syncs_for_test, pause_after_authority_commit_for_test};
 use super::{SqliteMemoryRepository, normalize_memory_fts_query};
@@ -326,6 +326,63 @@ fn confirmed_delete(
     )
     .expect("删除确认应有效");
     ConfirmedMemoryDeleteRequest::bind(params, scope.clone(), confirmation).expect("删除请求应有效")
+}
+
+fn seed_projection_recovery_rows(
+    repository: &SqliteMemoryRepository,
+    scope: &crate::domain::memory::MemoryPersonaScope,
+    count: usize,
+    content: &str,
+) {
+    let mut connection = repository
+        .open_connection()
+        .expect("应打开恢复预算夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启恢复预算夹具事务");
+    for index in 0..count {
+        let memory_id = format!("recovery-budget-memory-{index:04}");
+        let revision_id = format!("recovery-budget-revision-{index:04}");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, NULL, 'create',
+                          '恢复预算夹具', '测试策略-v1', 'current',
+                          'user_preference', 'normal')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    content,
+                    vec![(index % 251) as u8; 32],
+                    TIME_1,
+                ],
+            )
+            .expect("应插入恢复预算 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_entry(
+                    persona_id, memory_id, category, current_revision_id,
+                    importance, freshness_at, created_at, state
+                 ) VALUES(?1, ?2, 'user_preference', ?3,
+                          'normal', ?4, ?4, 'active')",
+                params![scope.persona_id(), memory_id, revision_id, TIME_1],
+            )
+            .expect("应插入恢复预算 entry");
+    }
+    transaction.commit().expect("恢复预算夹具应原子提交");
+}
+
+fn force_projection_recovery_on_reopen(repository: &SqliteMemoryRepository) {
+    let connection = repository
+        .open_connection()
+        .expect("应打开投影版本夹具连接");
+    connection
+        .execute_batch("DROP TABLE memory_search_projection_meta;")
+        .expect("应移除投影版本元数据以强制 reopen 重建");
 }
 
 fn management_binding(
@@ -3639,6 +3696,231 @@ fn 父版本_nfkc_前投影在无删除恢复时也会原子升级() {
             .expect("升级后应记录投影规范化版本"),
         2
     );
+}
+
+#[test]
+fn reopen重建在物化前拒绝超长_entry与revision字段() {
+    for target in ["entry", "revision"] {
+        let root = TestDirectory::new(&format!("reopen-bounded-{target}"));
+        let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+        let scope = scope("persona-reopen-bounded");
+        commit_create(
+            &repository,
+            &scope,
+            "reopen-bounded-create",
+            "reopen-bounded-conversation",
+            "reopen-bounded-turn",
+            "reopen-bounded-operation",
+            "reopen-bounded-memory",
+            "reopen-bounded-revision",
+            "重建前仍然有效的正文",
+        );
+        let connection = repository.open_connection().expect("应打开真实旁路 SQLite");
+        connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("旁路夹具应关闭 CHECK 约束");
+        match target {
+            "entry" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE memory_entry SET category = ?1
+                             WHERE persona_id = ?2 AND memory_id = ?3",
+                            params![
+                                rusqlite::types::Value::Blob(vec![7_u8; 1025]),
+                                scope.persona_id(),
+                                "reopen-bounded-memory"
+                            ],
+                        )
+                        .expect("应旁路写入超长 entry BLOB"),
+                    1
+                );
+            }
+            "revision" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE memory_revision SET content = ?1
+                             WHERE persona_id = ?2 AND memory_id = ?3",
+                            params![
+                                "x".repeat(crate::domain::memory::MAX_MEMORY_CONTENT_BYTES + 1),
+                                scope.persona_id(),
+                                "reopen-bounded-memory"
+                            ],
+                        )
+                        .expect("应旁路写入超长 revision TEXT"),
+                    1
+                );
+            }
+            _ => unreachable!(),
+        }
+        connection
+            .execute_batch("DROP TABLE memory_search_projection_meta;")
+            .expect("应强制 reopen 走 NFKC 投影重建");
+        drop(connection);
+        drop(repository);
+
+        let error = SqliteMemoryRepository::open(root.path())
+            .expect_err("损坏字段必须在 reopen 物化前 fail closed");
+        assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+    }
+}
+
+#[test]
+fn 删除subject收集在物化前拒绝超长revision_source() {
+    let root = TestDirectory::new("delete-subject-bounded-source");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let scope = scope("persona-delete-source-bounded");
+    commit_create(
+        &repository,
+        &scope,
+        "delete-source-create",
+        "delete-source-conversation",
+        "delete-source-turn",
+        "delete-source-operation",
+        "delete-source-memory",
+        "delete-source-revision",
+        "删除 subject 来源字段必须有界",
+    );
+    let connection = repository.open_connection().expect("应打开真实旁路 SQLite");
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .expect("旁路夹具应关闭 CHECK 约束");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE memory_revision_source SET turn_id = ?1
+                 WHERE persona_id = ?2 AND memory_id = ?3",
+                params![
+                    rusqlite::types::Value::Blob(vec![8_u8; 1025]),
+                    scope.persona_id(),
+                    "delete-source-memory"
+                ],
+            )
+            .expect("应旁路写入超长 source BLOB"),
+        1
+    );
+    drop(connection);
+
+    let request = confirmed_delete(
+        &scope,
+        "delete-source-bounded",
+        MemoryDeleteParams::Memory {
+            memory_id: MemoryId("delete-source-memory".to_string()),
+        },
+    );
+    let error = repository
+        .delete_confirmed(&request, repository.deletion_authority())
+        .expect_err("超长 source 不得被静默跳过或写入删除权威");
+    assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+    let connection = repository.open_connection().expect("拒绝后应核对主库");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_entry
+                 WHERE persona_id = ?1 AND memory_id = ?2",
+                params![scope.persona_id(), "delete-source-memory"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("拒绝后应保留原 entry"),
+        1
+    );
+}
+
+#[test]
+fn 权威replay遇到超长删除subject目标时拒绝开放且不前移anchor() {
+    let root = TestDirectory::new("authority-replay-bounded-subject");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let scope = scope("persona-authority-replay-bounded");
+    commit_create(
+        &repository,
+        &scope,
+        "authority-bounded-create",
+        "authority-bounded-conversation",
+        "authority-bounded-turn",
+        "authority-bounded-operation",
+        "authority-bounded-memory",
+        "authority-bounded-revision",
+        "权威重放损坏目标不得静默跳过",
+    );
+    let authority_request = MemoryDeletionAuthorityRequest::new(
+        "authority-bounded-delete",
+        BTreeSet::from([MemoryDeletionSubject::Persona {
+            persona_id: scope.persona_id().to_string(),
+        }]),
+        TIME_3,
+    )
+    .expect("Persona 权威请求应有效");
+    repository
+        .deletion_authority()
+        .record(&authority_request)
+        .expect("Persona tombstone 应先 durable");
+    drop(repository);
+
+    let main_path = root.path().join("runtime/muse.sqlite");
+    let connection = Connection::open(&main_path).expect("应打开真实 runtime SQLite");
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("旁路夹具应关闭外键");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE memory_entry SET memory_id = ?1
+                 WHERE persona_id = ?2 AND memory_id = ?3",
+                params![
+                    rusqlite::types::Value::Blob(vec![9_u8; 1025]),
+                    scope.persona_id(),
+                    "authority-bounded-memory"
+                ],
+            )
+            .expect("应旁路写入超长删除目标 BLOB"),
+        1
+    );
+    drop(connection);
+
+    let error = SqliteMemoryRepository::open(root.path())
+        .expect_err("权威 replay 遇到超长目标必须拒绝开放");
+    assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+    let connection = Connection::open(main_path).expect("失败后应只读核对主库");
+    let (entry_count, anchor_revision): (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM memory_entry WHERE persona_id = ?1),
+                (SELECT last_applied_revision FROM memory_authority_anchor WHERE singleton = 1)",
+            [scope.persona_id()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("应读取失败后的权威恢复状态");
+    assert_eq!(entry_count, 1, "失败重放不得部分删除主库");
+    assert_eq!(anchor_revision, 0, "失败重放不得签收 authority revision");
+}
+
+#[test]
+fn rebuild与reopen对行数和累计字节均有硬上限() {
+    let cases = [
+        ("rows", 513, "短正文".to_string()),
+        (
+            "bytes",
+            512,
+            "x".repeat(crate::domain::memory::MAX_MEMORY_CONTENT_BYTES),
+        ),
+    ];
+    for (label, count, content) in cases {
+        let root = TestDirectory::new(&format!("recovery-budget-{label}"));
+        let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+        let scope = scope(&format!("persona-recovery-budget-{label}"));
+        seed_projection_recovery_rows(&repository, &scope, count, &content);
+
+        let error = repository
+            .rebuild_search_index()
+            .expect_err("重建不得越过行数或累计字节硬上限");
+        assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+        force_projection_recovery_on_reopen(&repository);
+        drop(repository);
+        let error =
+            SqliteMemoryRepository::open(root.path()).expect_err("reopen 也不得越过相同恢复预算");
+        assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+    }
 }
 
 #[test]
