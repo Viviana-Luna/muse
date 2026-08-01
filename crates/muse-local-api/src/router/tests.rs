@@ -44,6 +44,26 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+fn snapshot_regular_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut files = std::fs::read_dir(dir)
+        .expect("应能读取测试文件目录")
+        .map(|entry| {
+            let entry = entry.expect("测试文件目录项应可读取");
+            let file_type = entry.file_type().expect("应能读取测试文件类型");
+            assert!(file_type.is_file(), "测试快照目录只能包含普通文件");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("应能读取测试快照文件"),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 struct ScriptedChatProvider {
     calls: AtomicUsize,
 }
@@ -876,6 +896,7 @@ async fn provider_model_list_requires_key_before_network_and_asset_route_is_gone
 async fn persona_update_removes_only_unreferenced_uploaded_asset() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("persona-asset-cleanup");
+    install_empty_test_memory_services(&config_dir);
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
         previous: std::env::var_os("MUSE_DATA_DIR"),
@@ -1694,9 +1715,130 @@ async fn persona_list_returns_flat_summaries_with_stable_visual_previews() {
 }
 
 #[tokio::test]
+async fn delete_persona_without_memory_services_fails_before_state_changes() {
+    let _memory_guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("delete-persona-without-memory-services");
+    let state = build_test_state(&config_dir);
+    state
+        .personas
+        .lock()
+        .await
+        .save()
+        .expect("应先保存 Persona 文件基线");
+    let repository = state
+        .runtime_service
+        .session_repository()
+        .await
+        .expect("应能打开会话仓储");
+    repository
+        .ensure_persona_binding(
+            "memory-service-missing-chat",
+            "router-test-persona",
+            "测试角色 router-test-persona",
+            "1.0.0",
+        )
+        .await
+        .expect("应能建立待保护的会话绑定");
+    repository
+        .append_event(
+            "memory-service-missing-chat",
+            Some("turn-memory-service-missing".to_string()),
+            "user",
+            serde_json::json!({"content": "记忆服务缺失时不得改变会话"}),
+        )
+        .await
+        .expect("应能写入待保护的会话事件");
+    repository
+        .set_workspace_state("router-test-persona", "memory-service-missing-chat")
+        .expect("应能写入待保护的工作区状态");
+
+    let persona_file = config_dir.join("personas/personas.json");
+    let persona_file_before = std::fs::read(&persona_file).expect("应读取 Persona 文件基线");
+    let sessions_before = repository
+        .list_sessions()
+        .await
+        .expect("应读取会话列表基线");
+    let session_files_before = snapshot_regular_files(&config_dir.join("sessions/conversations"));
+    let runtime_snapshot_before = state
+        .runtime_service
+        .snapshot()
+        .expect("应读取运行时事实基线");
+    let active_conversation_before = state
+        .runtime_service
+        .active_conversation_id()
+        .expect("应读取活动会话基线");
+    let recovery_path = config_dir.join("runtime/persona-deletion-recovery.json");
+    assert!(!recovery_path.exists(), "测试开始前不应存在删除恢复记录");
+
+    let response = api_routes()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/personas/router-test-persona")
+                .body(Body::empty())
+                .expect("应能构造记忆服务缺失的角色删除请求"),
+        )
+        .await
+        .expect("记忆服务缺失应返回稳定失败响应");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = response_json(response).await;
+    assert_flat_api_error(&payload);
+    assert_eq!(payload["code"], "memory_repository_unavailable");
+    let personas = state.personas.lock().await;
+    assert!(personas.get("router-test-persona").is_some());
+    assert_eq!(personas.active_persona_id(), Some("router-test-persona"));
+    drop(personas);
+    assert_eq!(
+        std::fs::read(&persona_file).expect("应读取拒绝删除后的 Persona 文件"),
+        persona_file_before,
+        "记忆服务缺失不得改变 Persona 文件"
+    );
+    assert_eq!(
+        repository
+            .list_sessions()
+            .await
+            .expect("应读取拒绝删除后的会话列表"),
+        sessions_before,
+        "记忆服务缺失不得改变会话事实"
+    );
+    assert_eq!(
+        snapshot_regular_files(&config_dir.join("sessions/conversations")),
+        session_files_before,
+        "记忆服务缺失不得改写 Session JSONL"
+    );
+    assert!(
+        repository
+            .workspace_state_exists("router-test-persona")
+            .expect("应读取拒绝删除后的工作区状态"),
+        "记忆服务缺失不得清理 Persona 工作区状态"
+    );
+    assert_eq!(
+        state
+            .runtime_service
+            .snapshot()
+            .expect("应读取拒绝删除后的运行时事实"),
+        runtime_snapshot_before,
+        "记忆服务缺失不得改变活动运行时事实"
+    );
+    assert_eq!(
+        state
+            .runtime_service
+            .active_conversation_id()
+            .expect("应读取拒绝删除后的活动会话"),
+        active_conversation_before
+    );
+    assert!(!recovery_path.exists(), "拒绝删除不得创建 pending 恢复证据");
+
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
 async fn deleting_active_persona_does_not_activate_remaining_persona() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-active-persona");
+    install_empty_test_memory_services(&config_dir);
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
         previous: std::env::var_os("MUSE_DATA_DIR"),
@@ -1771,6 +1913,7 @@ async fn deleting_active_persona_does_not_activate_remaining_persona() {
 async fn deleted_persona_sessions_remain_exportable_but_cannot_resume() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("deleted-persona-session");
+    install_empty_test_memory_services(&config_dir);
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
         previous: std::env::var_os("MUSE_DATA_DIR"),
@@ -2230,6 +2373,7 @@ async fn sqlite_cleanup_failure_rolls_back_persona_and_visual_pack() {
 async fn deleting_inactive_persona_returns_active_persona_visual_snapshot() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("delete-inactive-persona");
+    install_empty_test_memory_services(&config_dir);
     let state = build_test_state(&config_dir);
     {
         let mut personas = state.personas.lock().await;
@@ -2633,7 +2777,8 @@ async fn startup_restores_active_persona_workspace_session() {
 }
 
 #[tokio::test]
-async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() {
+async fn startup_keeps_pending_persona_deletion_without_memory_services() {
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("startup-finish-persona-deletion");
     let state = build_test_state(&config_dir);
     {
@@ -2699,6 +2844,7 @@ async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() 
         &config_dir,
         "deleted-persona",
         Some(deleted_visual_pack),
+        Some("pending-memory-delete"),
     )
     .expect("应写入删除提交前的恢复记录");
     {
@@ -2709,7 +2855,7 @@ async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() 
 
     crate::runtime_support::initialize_active_persona_session(&state)
         .await
-        .expect("启动应收敛中断的 Persona 删除");
+        .expect("记忆服务缺失时应保留恢复证据且不阻断启动");
 
     assert!(
         state
@@ -2717,8 +2863,8 @@ async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() 
             .lock()
             .await
             .get("visual-deleted-persona")
-            .is_none(),
-        "启动后不得遗留孤立的生成展示包"
+            .is_some(),
+        "记忆服务缺失时不得推进到展示包收敛完成"
     );
     assert!(
         state
@@ -2756,7 +2902,51 @@ async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() 
             .any(|session| session.conversation_id == "deleted-persona-chat"),
         "关联 Session 必须继续作为只读历史保留"
     );
+    let recovery: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(config_dir.join("runtime/persona-deletion-recovery.json"))
+            .expect("记忆服务缺失后必须保留 pending 恢复证据"),
+    )
+    .expect("pending 恢复证据应保持可解析");
+    assert_eq!(recovery["pending"]["persona_id"], "deleted-persona");
+    assert_eq!(
+        recovery["pending"]["memory_delete_operation_id"],
+        "pending-memory-delete"
+    );
     drop(connection);
+    let _ = std::fs::remove_dir_all(config_dir);
+}
+
+#[tokio::test]
+async fn startup_keeps_legacy_pending_persona_deletion_without_operation_id() {
+    let _memory_guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("startup-legacy-persona-deletion");
+    install_empty_test_memory_services(&config_dir);
+    let state = build_test_state(&config_dir);
+    {
+        let mut personas = state.personas.lock().await;
+        assert!(personas.delete("router-test-persona"));
+        personas.save().expect("应模拟旧版 Persona 已提交删除");
+    }
+    crate::runtime_support::persist_persona_deletion_recovery_for_test(
+        &config_dir,
+        "router-test-persona",
+        None,
+        None,
+    )
+    .expect("应写入缺少 operation ID 的旧版恢复记录");
+
+    crate::runtime_support::initialize_active_persona_session(&state)
+        .await
+        .expect("旧版恢复记录应稳定保留而不是阻断启动");
+
+    let recovery: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(config_dir.join("runtime/persona-deletion-recovery.json"))
+            .expect("缺少 operation ID 时必须保留 pending 恢复证据"),
+    )
+    .expect("旧版 pending 恢复证据应保持可解析");
+    assert_eq!(recovery["pending"]["persona_id"], "router-test-persona");
+    assert!(recovery["pending"]["memory_delete_operation_id"].is_null());
+
     let _ = std::fs::remove_dir_all(config_dir);
 }
 
@@ -2765,7 +2955,9 @@ async fn startup_finishes_interrupted_persona_deletion_without_reviving_state() 
 async fn optional_visual_recovery_failure_does_not_block_startup_and_retries() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("startup-optional-visual-retry");
+    install_empty_test_memory_services(&config_dir);
     let state = build_test_state(&config_dir);
     let deleted_visual_pack = test_visual_pack("visual-deleted-persona", "#d8596f");
     {
@@ -2779,6 +2971,7 @@ async fn optional_visual_recovery_failure_does_not_block_startup_and_retries() {
         &config_dir,
         "deleted-persona",
         Some(deleted_visual_pack),
+        Some("optional-visual-memory-delete"),
     )
     .expect("应写入待重试的删除恢复记录");
     let visual_pack_dir = config_dir.join("visual_packs");
@@ -2819,6 +3012,7 @@ async fn optional_visual_recovery_failure_does_not_block_startup_and_retries() {
 async fn accepted_chat_turn_atomically_wins_concurrent_persona_delete() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("chat-delete-chat-wins");
+    install_empty_test_memory_services(&config_dir);
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
         previous: std::env::var_os("MUSE_DATA_DIR"),
@@ -2902,6 +3096,7 @@ async fn accepted_chat_turn_atomically_wins_concurrent_persona_delete() {
 async fn concurrent_persona_delete_rejects_chat_before_request_id_registration() {
     let _memory_guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("chat-delete-delete-wins");
+    install_empty_test_memory_services(&config_dir);
     let _env_guard = ENV_LOCK.lock().await;
     let _data_dir_guard = MuseDataDirEnvGuard {
         previous: std::env::var_os("MUSE_DATA_DIR"),
@@ -4286,6 +4481,17 @@ fn install_test_memory_services(
     install_test_memory_services_with_delete_failures(repository, retriever_items, audit, 0).0
 }
 
+fn install_empty_test_memory_services(config_dir: &Path) {
+    install_test_memory_services(
+        open_test_memory_repository(&config_dir.join("memory-test-store")),
+        Vec::new(),
+        StubMemoryAudit {
+            count: 0,
+            revisions: Vec::new(),
+        },
+    );
+}
+
 fn install_test_memory_services_with_delete_failures(
     repository: SqliteMemoryRepository,
     retriever_items: Vec<MemoryQueryItem>,
@@ -5226,6 +5432,21 @@ async fn delete_persona_memory_failure_keeps_recovery_and_converges_after_restar
             .is_some(),
         "首次记忆清理失败时明文必须保持，等待恢复记录重试"
     );
+    let recovery_path = config_dir.join("runtime/persona-deletion-recovery.json");
+    let pending_after_failure: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&recovery_path).expect("记忆清理失败后必须保留 pending 恢复证据"),
+    )
+    .expect("记忆清理失败后的 pending 恢复证据应可解析");
+    assert_eq!(
+        pending_after_failure["pending"]["persona_id"],
+        "router-test-persona"
+    );
+    assert!(
+        pending_after_failure["pending"]["memory_delete_operation_id"]
+            .as_str()
+            .is_some_and(|operation_id| !operation_id.is_empty()),
+        "记忆清理失败后必须保留原 operation 身份"
+    );
 
     crate::runtime_support::initialize_active_persona_session(&state)
         .await
@@ -5236,6 +5457,14 @@ async fn delete_persona_memory_failure_keeps_recovery_and_converges_after_restar
             .expect("恢复后读取记忆不应失败")
             .is_none(),
         "恢复记录应使用同一 operation 身份幂等收敛记忆清理"
+    );
+    let recovery_after_retry: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&recovery_path).expect("恢复完成后应保留可解析的空恢复文件"),
+    )
+    .expect("恢复完成后的恢复文件应可解析");
+    assert!(
+        recovery_after_retry["pending"].is_null(),
+        "只有记忆清理成功后才允许删除 pending 恢复证据"
     );
 
     clear_memory_services_for_test();

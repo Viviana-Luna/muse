@@ -103,7 +103,8 @@ pub(super) fn memory_services() -> Option<Arc<MemoryServices>> {
         .clone()
 }
 
-fn require_memory_services() -> Result<Arc<MemoryServices>, (StatusCode, Json<ErrorResponse>)> {
+pub(super) fn require_memory_services()
+-> Result<Arc<MemoryServices>, (StatusCode, Json<ErrorResponse>)> {
     memory_services().ok_or_else(|| {
         memory_error_response(MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
     })

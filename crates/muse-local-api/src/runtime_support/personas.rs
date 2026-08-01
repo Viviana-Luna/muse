@@ -390,6 +390,10 @@ pub(crate) async fn handle_delete_persona(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PersonaMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Persona 删除只能在已经取得记忆命令端口后开始。未接线时必须在空闲租约、
+    // 运行时切换、Session Repository 和任何恢复记录或 Persona 文件变化前拒绝请求。
+    let memory_services = require_memory_services()?;
+    let memory_delete_operation_id = next_runtime_id("persona-memory-delete");
     let _transition = state.persona_runtime_transition_gate.lock().await;
     let idle_lease = acquire_runtime_idle_lease(&state, "delete_persona")?;
     ensure_persona_deletion_recovery_slot_available(state.runtime_service.data_dir())
@@ -399,10 +403,6 @@ pub(crate) async fn handle_delete_persona(
         .session_repository()
         .await
         .map_err(|error| internal_error(error.to_string()))?;
-    let memory_services = memory_services();
-    let memory_delete_operation_id = memory_services
-        .as_ref()
-        .map(|_| next_runtime_id("persona-memory-delete"));
     let (deleted_active, deleted_persona, stale_asset_candidates) = {
         let mut personas = state.personas.lock().await;
         let deleted_active = personas.active_persona_id() == Some(id.as_str());
@@ -441,7 +441,7 @@ pub(crate) async fn handle_delete_persona(
             Some(PendingPersonaDeletion {
                 persona_id: id.clone(),
                 previous_visual_pack: previous_generated_visual_pack,
-                memory_delete_operation_id: memory_delete_operation_id.clone(),
+                memory_delete_operation_id: Some(memory_delete_operation_id.clone()),
             }),
         )
         .map_err(internal_error)?;
@@ -514,10 +514,8 @@ pub(crate) async fn handle_delete_persona(
     // 只有 Persona 文件、展示包与运行时 SQLite 已完成同一删除决议后，才执行
     // 不可回滚的记忆清理。失败时角色定义保持已删除，恢复记录携带同一 operation
     // 身份，后续重试只能返回首次收据，不能重新选取并误删后来创建的记忆。
-    if let (Some(services), Some(operation_id)) = (
-        memory_services.as_ref(),
-        memory_delete_operation_id.as_deref(),
-    ) && let Err(error) = delete_all_persona_memories(services, &id, operation_id)
+    if let Err(error) =
+        delete_all_persona_memories(&memory_services, &id, &memory_delete_operation_id)
     {
         cleanup_unreferenced_uploaded_assets(&state, stale_asset_candidates).await;
         if deleted_active {
@@ -595,13 +593,14 @@ pub(crate) fn persist_persona_deletion_recovery_for_test(
     data_dir: &StdPath,
     persona_id: &str,
     previous_visual_pack: Option<VisualPack>,
+    memory_delete_operation_id: Option<&str>,
 ) -> Result<(), String> {
     persist_persona_deletion_recovery(
         data_dir,
         Some(PendingPersonaDeletion {
             persona_id: persona_id.to_string(),
             previous_visual_pack,
-            memory_delete_operation_id: None,
+            memory_delete_operation_id: memory_delete_operation_id.map(str::to_string),
         }),
     )
 }
@@ -672,32 +671,42 @@ pub(super) async fn reconcile_pending_persona_deletion(state: &Arc<AppState>) {
             return;
         }
     };
+    let Some(services) = memory_services() else {
+        tracing::warn!(
+            target: "muse::persona_delete",
+            persona_id = %pending.persona_id,
+            code = muse_core::domain::memory::MemoryErrorCode::RepositoryUnavailable.as_str(),
+            "Persona 删除恢复无法取得记忆服务；保留恢复记录等待服务接线后重试"
+        );
+        return;
+    };
+    let Some(operation_id) = pending.memory_delete_operation_id.as_deref() else {
+        tracing::warn!(
+            target: "muse::persona_delete",
+            persona_id = %pending.persona_id,
+            code = muse_core::domain::memory::MemoryErrorCode::DeletionAuthorityUnavailable.as_str(),
+            "Persona 删除恢复记录缺少记忆删除操作身份；保留恢复记录等待显式修复"
+        );
+        return;
+    };
     let persona_exists = state
         .personas
         .lock()
         .await
         .get(&pending.persona_id)
         .is_some();
-    if !persona_exists && let Some(operation_id) = pending.memory_delete_operation_id.as_deref() {
-        let Some(services) = memory_services() else {
-            tracing::warn!(
-                target: "muse::persona_delete",
-                persona_id = %pending.persona_id,
-                "Persona 已提交删除，但记忆服务尚未接线；保留恢复记录等待接线后重试"
-            );
-            return;
-        };
-        if let Err(error) =
+    if !persona_exists
+        && let Err(error) =
             delete_all_persona_memories(&services, &pending.persona_id, operation_id)
-        {
-            tracing::warn!(
-                target: "muse::persona_delete",
-                persona_id = %pending.persona_id,
-                %error,
-                "启动收敛 Persona 记忆失败，保留恢复记录等待下次重试"
-            );
-            return;
-        }
+    {
+        tracing::warn!(
+            target: "muse::persona_delete",
+            persona_id = %pending.persona_id,
+            code = error.stable_code(),
+            %error,
+            "启动收敛 Persona 记忆失败，保留恢复记录等待下次重试"
+        );
+        return;
     }
 
     let reconciliation = async {
