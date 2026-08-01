@@ -19,9 +19,9 @@ use super::authority::{
     AuthorityDeleteIntent, AuthorityDeletionEvent, SqliteMemoryDeletionAuthority,
 };
 use super::recovery::{
-    RecoveryReadBudget, checkpoint_runtime_memory, clear_recovery_progress_handler,
-    collect_delete_subjects, delete_memory_ids, install_recovery_progress_handler,
-    memory_ids_for_subjects, rebuild_search_projection,
+    RecoveryReadBudget, authorize_recovery_snapshot, checkpoint_runtime_memory,
+    clear_recovery_progress_handler, collect_delete_subjects, delete_memory_ids,
+    install_recovery_progress_handler, memory_ids_for_subjects, rebuild_search_projection,
 };
 use crate::app::storage::{open_initialized_runtime_database, open_runtime_database};
 use crate::domain::memory::{
@@ -46,7 +46,7 @@ pub(crate) const MAX_REVISION_METADATA_FIELD_BYTES: usize = 1024;
 const MEMORY_ENTRY_TEXT_FIELD_COUNT: usize = 8;
 const MAX_MEMORY_ENTRY_ROW_BYTES: usize =
     MAX_REVISION_METADATA_FIELD_BYTES * MEMORY_ENTRY_TEXT_FIELD_COUNT;
-const MAX_REVISION_SOURCE_FIELD_BYTES: usize = 256;
+pub(crate) const MAX_REVISION_SOURCE_FIELD_BYTES: usize = 256;
 const MAX_REVISION_SOURCE_BYTES: usize = MAX_REVISION_SOURCE_FIELD_BYTES * 5;
 const MAX_REVISION_ROW_BYTES: usize = MAX_MEMORY_CONTENT_BYTES
     + MAX_MEMORY_CHANGE_REASON_BYTES
@@ -127,6 +127,7 @@ impl fmt::Debug for SqliteMemoryRepository {
 impl SqliteMemoryRepository {
     pub fn open(base_dir: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let base_dir = base_dir.as_ref().to_path_buf();
+        preflight_existing_runtime_anchor(&base_dir)?;
         let (_, connection) = open_runtime_database(&base_dir).map_err(repository_unavailable)?;
         configure_memory_connection(&connection)?;
         drop(connection);
@@ -1075,7 +1076,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 }
             }
 
-            let anchor = super::recovery::load_anchor(&transaction)?;
+            let anchor = authorize_recovery_snapshot(&transaction, &mut recovery_budget)?;
             let mut events = authority_guard.pending_events(anchor.last_applied_revision)?;
             if !events
                 .iter()
@@ -1826,6 +1827,26 @@ fn load_revision_snapshot_by_identity(
         .map_err(repository_unavailable)?
         .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
     revision_snapshot_from_raw(scope, memory_id, revision_id, raw)
+}
+
+fn preflight_existing_runtime_anchor(base_dir: &Path) -> Result<(), MemoryError> {
+    let connection = open_initialized_runtime_database(base_dir).map_err(repository_unavailable)?;
+    let anchor_exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'memory_authority_anchor'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(repository_unavailable)?;
+    if anchor_exists {
+        let mut budget = RecoveryReadBudget::new();
+        let _ = super::recovery::load_anchor(&connection, &mut budget)
+            .map_err(repository_unavailable)?;
+    }
+    Ok(())
 }
 
 fn configure_memory_connection(connection: &Connection) -> Result<(), MemoryError> {

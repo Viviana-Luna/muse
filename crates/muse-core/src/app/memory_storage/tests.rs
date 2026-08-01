@@ -7,12 +7,13 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params, types::Value};
 
 use super::authority::{
     SqliteMemoryDeletionAuthority, fail_next_authority_syncs_for_test,
     pause_after_authority_commit_for_test,
 };
+use super::recovery::limit_next_recovery_progress_callbacks_for_test;
 use super::{SqliteMemoryRepository, normalize_memory_fts_query};
 use crate::app::storage::{backup_runtime_database, open_runtime_database};
 use crate::domain::memory::{
@@ -376,8 +377,102 @@ fn seed_projection_recovery_rows(
                 params![scope.persona_id(), memory_id, revision_id, TIME_1],
             )
             .expect("应插入恢复预算 entry");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'direct_user_message', ?4, ?5, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    format!("recovery-budget-conversation-{index:04}"),
+                    format!("recovery-budget-turn-{index:04}"),
+                ],
+            )
+            .expect("应插入恢复预算 source");
     }
     transaction.commit().expect("恢复预算夹具应原子提交");
+}
+
+fn seed_wide_recovery_rows(
+    repository: &SqliteMemoryRepository,
+    scope: &crate::domain::memory::MemoryPersonaScope,
+    count: usize,
+) {
+    let mut connection = repository
+        .open_connection()
+        .expect("应打开累计字节夹具连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启累计字节夹具事务");
+    let long_event_time = "e".repeat(1000);
+    let long_recorded_at = "r".repeat(1000);
+    let long_valid_from = "v".repeat(1000);
+    let long_reason = "c".repeat(crate::domain::memory::MAX_MEMORY_CHANGE_REASON_BYTES);
+    let long_policy = "p".repeat(1000);
+    let long_freshness = "f".repeat(1000);
+    let long_created_at = "a".repeat(1000);
+    let long_conversation = "o".repeat(256);
+    let long_turn = "t".repeat(256);
+    for index in 0..count {
+        let memory_id = format!("{}-{index:04}", "m".repeat(900));
+        let revision_id = format!("{}-{index:04}", "q".repeat(900));
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'create',
+                          ?9, ?10, 'current', 'user_preference', 'normal')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    "x".repeat(crate::domain::memory::MAX_MEMORY_CONTENT_BYTES),
+                    vec![(index % 251) as u8; 32],
+                    long_event_time,
+                    long_recorded_at,
+                    long_valid_from,
+                    long_reason,
+                    long_policy,
+                ],
+            )
+            .expect("应插入累计字节 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_entry(
+                    persona_id, memory_id, category, current_revision_id,
+                    importance, freshness_at, created_at, state
+                 ) VALUES(?1, ?2, 'user_preference', ?3, 'normal', ?4, ?5, 'active')",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    long_freshness,
+                    long_created_at,
+                ],
+            )
+            .expect("应插入累计字节 entry");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, ?2, ?3, 0, 'direct_user_message', ?4, ?5, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    memory_id,
+                    revision_id,
+                    long_conversation,
+                    long_turn,
+                ],
+            )
+            .expect("应插入累计字节 source");
+    }
+    transaction.commit().expect("累计字节夹具应原子提交");
 }
 
 fn force_projection_recovery_on_reopen(repository: &SqliteMemoryRepository) {
@@ -387,6 +482,358 @@ fn force_projection_recovery_on_reopen(repository: &SqliteMemoryRepository) {
     connection
         .execute_batch("DROP TABLE memory_search_projection_meta;")
         .expect("应移除投影版本元数据以强制 reopen 重建");
+}
+
+fn seed_authoritative_recovery_matrix(
+    repository: &SqliteMemoryRepository,
+    scope: &crate::domain::memory::MemoryPersonaScope,
+) {
+    let mut connection = repository.open_connection().expect("应打开字段矩阵连接");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("应开启字段矩阵事务");
+    let revisions = [
+        (
+            "matrix-revision-superseded",
+            "superseded",
+            "create",
+            Some(TIME_2),
+            "direct_user_message",
+            "matrix-conversation-superseded",
+            "matrix-turn-superseded",
+            11_u8,
+        ),
+        (
+            "matrix-revision-corrected",
+            "corrected",
+            "update",
+            Some(TIME_3),
+            "user_confirmation",
+            "matrix-conversation-corrected",
+            "matrix-turn-corrected",
+            12_u8,
+        ),
+        (
+            "matrix-revision-current",
+            "current",
+            "correct",
+            None,
+            "deterministic_local_event",
+            "matrix-conversation-current",
+            "matrix-turn-current",
+            13_u8,
+        ),
+    ];
+    for (
+        revision_id,
+        state,
+        change_type,
+        valid_to,
+        source_kind,
+        conversation_id,
+        turn_id,
+        digest_byte,
+    ) in revisions
+    {
+        transaction
+            .execute(
+                "INSERT INTO memory_revision(
+                    persona_id, memory_id, revision_id, content, derivation_key,
+                    event_time, recorded_at, valid_from, valid_to, change_type,
+                    change_reason, safety_policy_version, state, category, importance
+                 ) VALUES(?1, 'matrix-memory', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                          ?9, ?10, ?11, ?12, 'user_preference', 'high')",
+                params![
+                    scope.persona_id(),
+                    revision_id,
+                    format!("字段矩阵正文-{revision_id}"),
+                    vec![digest_byte; 32],
+                    TIME_1,
+                    TIME_2,
+                    TIME_1,
+                    valid_to,
+                    change_type,
+                    format!("字段矩阵原因-{revision_id}"),
+                    "字段矩阵策略-v1",
+                    state,
+                ],
+            )
+            .expect("应插入三态 revision");
+        transaction
+            .execute(
+                "INSERT INTO memory_revision_source(
+                    persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                    conversation_id, turn_id, action_id, authorized_at
+                 ) VALUES(?1, 'matrix-memory', ?2, 0, ?3, ?4, ?5, NULL, NULL)",
+                params![
+                    scope.persona_id(),
+                    revision_id,
+                    source_kind,
+                    conversation_id,
+                    turn_id,
+                ],
+            )
+            .expect("应插入三态来源");
+    }
+    transaction
+        .execute(
+            "INSERT INTO memory_entry(
+                persona_id, memory_id, category, current_revision_id,
+                importance, freshness_at, created_at, state
+             ) VALUES(?1, 'matrix-memory', 'user_preference',
+                      'matrix-revision-current', 'high', ?2, ?3, 'active')",
+            params![scope.persona_id(), TIME_3, TIME_1],
+        )
+        .expect("应插入三态 entry");
+    transaction
+        .execute(
+            "INSERT INTO memory_revision(
+                persona_id, memory_id, revision_id, content, derivation_key,
+                event_time, recorded_at, valid_from, valid_to, change_type,
+                change_reason, safety_policy_version, state, category, importance
+             ) VALUES(?1, 'matrix-management-memory', 'matrix-management-revision',
+                      '管理来源字段矩阵正文', ?2, NULL, ?3, ?3, NULL, 'create',
+                      '管理来源字段矩阵原因', '字段矩阵策略-v1', 'current',
+                      'user_fact', 'normal')",
+            params![scope.persona_id(), vec![14_u8; 32], TIME_2],
+        )
+        .expect("应插入管理来源 revision");
+    transaction
+        .execute(
+            "INSERT INTO memory_revision_source(
+                persona_id, memory_id, revision_id, source_ordinal, source_kind,
+                conversation_id, turn_id, action_id, authorized_at
+             ) VALUES(?1, 'matrix-management-memory', 'matrix-management-revision', 0,
+                      'persona_management', NULL, NULL, 'matrix-action', ?2)",
+            params![scope.persona_id(), TIME_2],
+        )
+        .expect("应插入管理来源关系");
+    transaction
+        .execute(
+            "INSERT INTO memory_entry(
+                persona_id, memory_id, category, current_revision_id,
+                importance, freshness_at, created_at, state
+             ) VALUES(?1, 'matrix-management-memory', 'user_fact',
+                      'matrix-management-revision', 'normal', ?2, ?2, 'active')",
+            params![scope.persona_id(), TIME_2],
+        )
+        .expect("应插入管理来源 entry");
+    transaction
+        .execute(
+            "INSERT INTO memory_search_projection(
+                row_id, persona_id, memory_id, revision_id, content, category
+             )
+             SELECT row_id, persona_id, memory_id, revision_id, content, category
+             FROM memory_revision WHERE state = 'current'",
+            [],
+        )
+        .expect("应建立字段矩阵原始投影");
+    transaction.commit().expect("字段矩阵应原子提交");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryPersistentState {
+    entry_count: i64,
+    revision_count: i64,
+    source_count: i64,
+    authoritative_bytes: i64,
+    projection_count: i64,
+    projection_row_sum: i64,
+    projection_bytes: i64,
+    anchor_count: i64,
+    anchor_bytes: i64,
+    anchor_integer_revisions: i64,
+    anchor_revision_sum: i64,
+    authority_event_count: i64,
+    authority_completion_count: i64,
+}
+
+fn recovery_persistent_state(root: &Path) -> RecoveryPersistentState {
+    let main = Connection::open(root.join("runtime/muse.sqlite")).expect("应打开主库状态快照");
+    let (
+        entry_count,
+        revision_count,
+        source_count,
+        authoritative_bytes,
+        projection_count,
+        projection_row_sum,
+        projection_bytes,
+        anchor_count,
+        anchor_bytes,
+        anchor_integer_revisions,
+        anchor_revision_sum,
+    ) = main
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM memory_entry),
+                (SELECT COUNT(*) FROM memory_revision),
+                (SELECT COUNT(*) FROM memory_revision_source),
+                COALESCE((SELECT SUM(
+                    length(CAST(persona_id AS BLOB)) + length(CAST(memory_id AS BLOB))
+                    + length(CAST(category AS BLOB))
+                    + length(CAST(current_revision_id AS BLOB))
+                    + length(CAST(importance AS BLOB))
+                    + length(CAST(freshness_at AS BLOB))
+                    + length(CAST(created_at AS BLOB)) + length(CAST(state AS BLOB))
+                ) FROM memory_entry), 0)
+                + COALESCE((SELECT SUM(
+                    length(CAST(persona_id AS BLOB)) + length(CAST(memory_id AS BLOB))
+                    + length(CAST(revision_id AS BLOB)) + length(CAST(content AS BLOB))
+                    + length(CAST(derivation_key AS BLOB))
+                    + COALESCE(length(CAST(event_time AS BLOB)), 0)
+                    + length(CAST(recorded_at AS BLOB)) + length(CAST(valid_from AS BLOB))
+                    + COALESCE(length(CAST(valid_to AS BLOB)), 0)
+                    + length(CAST(change_type AS BLOB)) + length(CAST(change_reason AS BLOB))
+                    + length(CAST(safety_policy_version AS BLOB)) + length(CAST(state AS BLOB))
+                    + length(CAST(category AS BLOB)) + length(CAST(importance AS BLOB))
+                ) FROM memory_revision), 0)
+                + COALESCE((SELECT SUM(
+                    length(CAST(persona_id AS BLOB)) + length(CAST(memory_id AS BLOB))
+                    + length(CAST(revision_id AS BLOB)) + length(CAST(source_kind AS BLOB))
+                    + COALESCE(length(CAST(conversation_id AS BLOB)), 0)
+                    + COALESCE(length(CAST(turn_id AS BLOB)), 0)
+                    + COALESCE(length(CAST(action_id AS BLOB)), 0)
+                    + COALESCE(length(CAST(authorized_at AS BLOB)), 0)
+                ) FROM memory_revision_source), 0),
+                (SELECT COUNT(*) FROM memory_search_projection),
+                COALESCE((SELECT SUM(row_id) FROM memory_search_projection), 0),
+                COALESCE((SELECT SUM(
+                    length(CAST(persona_id AS BLOB)) + length(CAST(memory_id AS BLOB))
+                    + length(CAST(revision_id AS BLOB)) + length(CAST(content AS BLOB))
+                    + length(CAST(category AS BLOB))
+                ) FROM memory_search_projection), 0),
+                (SELECT COUNT(*) FROM memory_authority_anchor),
+                COALESCE((SELECT SUM(
+                    length(CAST(authority_id AS BLOB))
+                    + length(CAST(initialized_at AS BLOB))
+                ) FROM memory_authority_anchor), 0),
+                (SELECT COUNT(*) FROM memory_authority_anchor
+                 WHERE typeof(last_applied_revision) = 'integer'),
+                COALESCE((SELECT SUM(CASE
+                    WHEN typeof(last_applied_revision) = 'integer'
+                    THEN last_applied_revision ELSE 0 END)
+                 FROM memory_authority_anchor), 0)
+             ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .expect("应读取主库状态快照");
+    drop(main);
+    let authority = Connection::open(root.join("privacy/memory-deletion-authority.sqlite"))
+        .expect("应打开权威状态快照");
+    let (authority_event_count, authority_completion_count) = authority
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cleanup_completed_at IS NOT NULL), 0)
+             FROM deletion_event",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("应读取权威完成状态");
+    RecoveryPersistentState {
+        entry_count,
+        revision_count,
+        source_count,
+        authoritative_bytes,
+        projection_count,
+        projection_row_sum,
+        projection_bytes,
+        anchor_count,
+        anchor_bytes,
+        anchor_integer_revisions,
+        anchor_revision_sum,
+        authority_event_count,
+        authority_completion_count,
+    }
+}
+
+fn corrupt_recovery_field(
+    repository: &SqliteMemoryRepository,
+    table: &str,
+    column: &str,
+    predicate: &str,
+    value: Value,
+) {
+    let connection = repository.open_connection().expect("应打开真实攻击连接");
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .expect("字段矩阵应关闭外键");
+    connection
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .expect("字段矩阵应关闭 CHECK");
+    let sql = format!("UPDATE {table} SET {column} = ?1 WHERE {predicate}");
+    assert_eq!(
+        connection
+            .execute(&sql, [value])
+            .expect("字段攻击应写入一行"),
+        1,
+        "字段攻击必须精确命中：{table}.{column}"
+    );
+}
+
+fn assert_rebuild_and_reopen_fail_without_mutation(
+    root: &TestDirectory,
+    repository: SqliteMemoryRepository,
+    label: &str,
+) {
+    let before = recovery_persistent_state(root.path());
+    let rebuild_error = repository
+        .rebuild_search_index()
+        .expect_err("全字段损坏必须阻止显式 rebuild");
+    assert!(
+        matches!(
+            rebuild_error.code(),
+            MemoryErrorCode::RepositoryUnavailable | MemoryErrorCode::QueryBudgetExceeded
+        ),
+        "{label} rebuild 返回了错误边界：{rebuild_error:?}"
+    );
+    assert_eq!(
+        recovery_persistent_state(root.path()),
+        before,
+        "{label} rebuild 失败不得修改 entry、projection、anchor 或权威完成态"
+    );
+    drop(repository);
+    let reopen_error =
+        SqliteMemoryRepository::open(root.path()).expect_err("全字段损坏必须阻止正常 reopen");
+    assert_eq!(
+        reopen_error.code(),
+        MemoryErrorCode::RepositoryUnavailable,
+        "{label} reopen 必须稳定 fail closed"
+    );
+    assert_eq!(
+        recovery_persistent_state(root.path()),
+        before,
+        "{label} reopen 失败不得修改 entry、projection、anchor 或权威完成态"
+    );
+}
+
+fn run_recovery_field_attack(
+    label: &str,
+    table: &str,
+    column: &str,
+    predicate: &str,
+    value: Value,
+) {
+    let root = TestDirectory::new(&format!("authority-field-{label}"));
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应初始化字段矩阵库");
+    let scope = scope("persona-authoritative-field-matrix");
+    seed_authoritative_recovery_matrix(&repository, &scope);
+    corrupt_recovery_field(&repository, table, column, predicate, value);
+    assert_rebuild_and_reopen_fail_without_mutation(&root, repository, label);
 }
 
 fn management_binding(
@@ -3703,6 +4150,278 @@ fn 父版本_nfkc_前投影在无删除恢复时也会原子升级() {
 }
 
 #[test]
+fn reopen与rebuild逐字段授权entry三态revision全部source与anchor() {
+    let entry_fields = [
+        ("persona_id", "memory_id = 'matrix-memory'"),
+        ("memory_id", "memory_id = 'matrix-memory'"),
+        ("category", "memory_id = 'matrix-memory'"),
+        ("current_revision_id", "memory_id = 'matrix-memory'"),
+        ("importance", "memory_id = 'matrix-memory'"),
+        ("freshness_at", "memory_id = 'matrix-memory'"),
+        ("created_at", "memory_id = 'matrix-memory'"),
+        ("state", "memory_id = 'matrix-memory'"),
+    ];
+    for (column, predicate) in entry_fields {
+        run_recovery_field_attack(
+            &format!("entry-{column}-blob"),
+            "memory_entry",
+            column,
+            predicate,
+            Value::Blob(vec![7_u8; 32]),
+        );
+        run_recovery_field_attack(
+            &format!("entry-{column}-oversized-text"),
+            "memory_entry",
+            column,
+            predicate,
+            Value::Text("x".repeat(1025)),
+        );
+    }
+
+    let revision_fields = [
+        ("persona_id", "state = 'superseded'", 1024),
+        ("memory_id", "state = 'corrected'", 1024),
+        (
+            "revision_id",
+            "revision_id = 'matrix-revision-current'",
+            1024,
+        ),
+        ("content", "state = 'superseded'", 4096),
+        ("event_time", "state = 'corrected'", 1024),
+        (
+            "recorded_at",
+            "revision_id = 'matrix-revision-current'",
+            1024,
+        ),
+        ("valid_from", "state = 'superseded'", 1024),
+        ("valid_to", "state = 'corrected'", 1024),
+        (
+            "change_type",
+            "revision_id = 'matrix-revision-current'",
+            1024,
+        ),
+        ("change_reason", "state = 'superseded'", 1024),
+        ("safety_policy_version", "state = 'corrected'", 1024),
+        ("state", "revision_id = 'matrix-revision-current'", 1024),
+        ("category", "state = 'superseded'", 1024),
+        ("importance", "state = 'corrected'", 1024),
+    ];
+    for (column, predicate, maximum_bytes) in revision_fields {
+        run_recovery_field_attack(
+            &format!("revision-{column}-blob"),
+            "memory_revision",
+            column,
+            predicate,
+            Value::Blob(vec![8_u8; 32]),
+        );
+        run_recovery_field_attack(
+            &format!("revision-{column}-oversized-text"),
+            "memory_revision",
+            column,
+            predicate,
+            Value::Text("x".repeat(maximum_bytes + 1)),
+        );
+    }
+    run_recovery_field_attack(
+        "revision-derivation-key-text",
+        "memory_revision",
+        "derivation_key",
+        "state = 'superseded'",
+        Value::Text("d".repeat(32)),
+    );
+    run_recovery_field_attack(
+        "revision-derivation-key-oversized-blob",
+        "memory_revision",
+        "derivation_key",
+        "state = 'corrected'",
+        Value::Blob(vec![9_u8; 33]),
+    );
+
+    let source_fields = [
+        (
+            "persona_id",
+            "revision_id = 'matrix-revision-superseded'",
+            1024,
+        ),
+        (
+            "memory_id",
+            "revision_id = 'matrix-revision-corrected'",
+            1024,
+        ),
+        (
+            "revision_id",
+            "revision_id = 'matrix-revision-current'",
+            1024,
+        ),
+        (
+            "source_kind",
+            "revision_id = 'matrix-revision-superseded'",
+            256,
+        ),
+        (
+            "conversation_id",
+            "revision_id = 'matrix-revision-corrected'",
+            256,
+        ),
+        ("turn_id", "revision_id = 'matrix-revision-current'", 256),
+        (
+            "action_id",
+            "revision_id = 'matrix-management-revision'",
+            256,
+        ),
+        (
+            "authorized_at",
+            "revision_id = 'matrix-management-revision'",
+            256,
+        ),
+    ];
+    for (column, predicate, maximum_bytes) in source_fields {
+        run_recovery_field_attack(
+            &format!("source-{column}-blob"),
+            "memory_revision_source",
+            column,
+            predicate,
+            Value::Blob(vec![10_u8; 32]),
+        );
+        run_recovery_field_attack(
+            &format!("source-{column}-oversized-text"),
+            "memory_revision_source",
+            column,
+            predicate,
+            Value::Text("x".repeat(maximum_bytes + 1)),
+        );
+    }
+    run_recovery_field_attack(
+        "source-ordinal-blob",
+        "memory_revision_source",
+        "source_ordinal",
+        "revision_id = 'matrix-revision-superseded'",
+        Value::Blob(vec![1_u8]),
+    );
+    run_recovery_field_attack(
+        "source-ordinal-negative",
+        "memory_revision_source",
+        "source_ordinal",
+        "revision_id = 'matrix-revision-corrected'",
+        Value::Integer(-1),
+    );
+
+    for column in ["authority_id", "initialized_at"] {
+        run_recovery_field_attack(
+            &format!("anchor-{column}-blob"),
+            "memory_authority_anchor",
+            column,
+            "singleton = 1",
+            Value::Blob(vec![11_u8; 32]),
+        );
+        run_recovery_field_attack(
+            &format!("anchor-{column}-oversized-text"),
+            "memory_authority_anchor",
+            column,
+            "singleton = 1",
+            Value::Text("x".repeat(1025)),
+        );
+    }
+    run_recovery_field_attack(
+        "anchor-revision-blob",
+        "memory_authority_anchor",
+        "last_applied_revision",
+        "singleton = 1",
+        Value::Blob(vec![1_u8]),
+    );
+    run_recovery_field_attack(
+        "anchor-revision-negative",
+        "memory_authority_anchor",
+        "last_applied_revision",
+        "singleton = 1",
+        Value::Integer(-1),
+    );
+}
+
+#[test]
+fn pending删除与过期投影遇到历史source损坏时不签收任何状态() {
+    let root = TestDirectory::new("pending-outdated-history-source");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应初始化恢复矩阵库");
+    let scope = scope("persona-pending-outdated-history-source");
+    seed_authoritative_recovery_matrix(&repository, &scope);
+    let authority_request = MemoryDeletionAuthorityRequest::new(
+        "pending-outdated-history-delete",
+        BTreeSet::from([MemoryDeletionSubject::Persona {
+            persona_id: scope.persona_id().to_string(),
+        }]),
+        TIME_3,
+    )
+    .expect("应构造 pending 删除权威");
+    repository
+        .deletion_authority()
+        .record(&authority_request)
+        .expect("pending 删除权威应先 durable");
+    corrupt_recovery_field(
+        &repository,
+        "memory_revision_source",
+        "turn_id",
+        "revision_id = 'matrix-revision-corrected'",
+        Value::Blob(vec![12_u8; 1025]),
+    );
+    force_projection_recovery_on_reopen(&repository);
+    let before = recovery_persistent_state(root.path());
+    assert_eq!(before.authority_event_count, 1);
+    assert_eq!(before.authority_completion_count, 0);
+    drop(repository);
+
+    let error = SqliteMemoryRepository::open(root.path())
+        .expect_err("历史 source 损坏必须先于 pending replay 与过期投影重建失败");
+    assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+    assert_eq!(
+        recovery_persistent_state(root.path()),
+        before,
+        "失败必须保留 entry、projection、anchor 与 authority completion"
+    );
+}
+
+#[test]
+fn reopen与rebuild拒绝静默跳过历史source或接受失配关系() {
+    let cases = [
+        (
+            "missing-historical-source",
+            "DELETE FROM memory_revision_source
+             WHERE revision_id = 'matrix-revision-superseded'",
+        ),
+        (
+            "orphan-source",
+            "UPDATE memory_revision_source
+             SET revision_id = 'matrix-revision-missing'
+             WHERE revision_id = 'matrix-revision-corrected'",
+        ),
+        (
+            "mismatched-source-shape",
+            "UPDATE memory_revision_source
+             SET source_kind = 'persona_management'
+             WHERE revision_id = 'matrix-revision-current'",
+        ),
+    ];
+    for (label, attack_sql) in cases {
+        let root = TestDirectory::new(label);
+        let repository = SqliteMemoryRepository::open(root.path()).expect("应初始化关系矩阵库");
+        let scope = scope("persona-recovery-relation-matrix");
+        seed_authoritative_recovery_matrix(&repository, &scope);
+        let connection = repository.open_connection().expect("应打开关系攻击连接");
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("关系攻击应关闭外键");
+        connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("关系攻击应关闭 CHECK");
+        assert_eq!(
+            connection.execute(attack_sql, []).expect("关系攻击应成功"),
+            1
+        );
+        drop(connection);
+        assert_rebuild_and_reopen_fail_without_mutation(&root, repository, label);
+    }
+}
+
+#[test]
 fn reopen重建在物化前拒绝超长_entry与revision字段() {
     for target in ["entry", "revision"] {
         let root = TestDirectory::new(&format!("reopen-bounded-{target}"));
@@ -3901,29 +4620,37 @@ fn 权威replay遇到超长删除subject目标时拒绝开放且不前移anchor(
 
 #[test]
 fn rebuild与reopen对行数和累计字节均有硬上限() {
-    let cases = [
-        ("rows", 513, "短正文".to_string()),
-        (
-            "bytes",
-            512,
-            "x".repeat(crate::domain::memory::MAX_MEMORY_CONTENT_BYTES),
-        ),
-    ];
-    for (label, count, content) in cases {
+    for label in ["rows", "bytes"] {
         let root = TestDirectory::new(&format!("recovery-budget-{label}"));
         let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
         let scope = scope(&format!("persona-recovery-budget-{label}"));
-        seed_projection_recovery_rows(&repository, &scope, count, &content);
+        if label == "rows" {
+            seed_projection_recovery_rows(&repository, &scope, 171, "短正文");
+        } else {
+            seed_wide_recovery_rows(&repository, &scope, 125);
+        }
 
+        let before_rebuild = recovery_persistent_state(root.path());
         let error = repository
             .rebuild_search_index()
             .expect_err("重建不得越过行数或累计字节硬上限");
         assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+        assert_eq!(
+            recovery_persistent_state(root.path()),
+            before_rebuild,
+            "资源越界不得部分重建投影"
+        );
         force_projection_recovery_on_reopen(&repository);
+        let before_reopen = recovery_persistent_state(root.path());
         drop(repository);
         let error =
             SqliteMemoryRepository::open(root.path()).expect_err("reopen 也不得越过相同恢复预算");
         assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+        assert_eq!(
+            recovery_persistent_state(root.path()),
+            before_reopen,
+            "资源越界 reopen 不得修改 entry、projection、anchor 或权威完成态"
+        );
     }
 }
 
@@ -4142,6 +4869,38 @@ fn pending_replay累计513个直接_memory时整次回滚() {
             .expect("应读取 cleanup 状态"),
         0,
         "资源失败不得把任何 pending 事件标记为 cleanup completed"
+    );
+}
+
+#[test]
+fn rebuild与reopen在sqlite_progress耗尽时原子回滚() {
+    let root = TestDirectory::new("recovery-progress-budget");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let scope = scope("persona-recovery-progress-budget");
+    seed_projection_recovery_rows(&repository, &scope, 100, "progress 攻击夹具正文");
+
+    let before_rebuild = recovery_persistent_state(root.path());
+    limit_next_recovery_progress_callbacks_for_test(0);
+    let error = repository
+        .rebuild_search_index()
+        .expect_err("SQLite progress 耗尽必须阻止 rebuild");
+    assert_eq!(error.code(), MemoryErrorCode::QueryBudgetExceeded);
+    assert_eq!(
+        recovery_persistent_state(root.path()),
+        before_rebuild,
+        "progress 中断不得部分重建投影"
+    );
+
+    drop(repository);
+    let before_reopen = recovery_persistent_state(root.path());
+    limit_next_recovery_progress_callbacks_for_test(0);
+    let error = SqliteMemoryRepository::open(root.path())
+        .expect_err("SQLite progress 耗尽必须阻止正常 reopen");
+    assert_eq!(error.code(), MemoryErrorCode::RepositoryUnavailable);
+    assert_eq!(
+        recovery_persistent_state(root.path()),
+        before_reopen,
+        "progress 中断 reopen 不得修改 entry、projection、anchor 或权威完成态"
     );
 }
 

@@ -1,25 +1,35 @@
 //! 删除权威重放、FTS 投影重建与 WAL 收口。
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::authority::{AuthorityAnchor, open_authority_for_anchor};
-use super::repository::normalize_search_text;
+use super::repository::{MAX_REVISION_SOURCE_FIELD_BYTES, normalize_search_text};
 use crate::app::storage::RuntimeStorageError;
 use crate::domain::memory::{
-    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_DELETION_SUBJECTS, MemoryDeletionSubject, MemoryError,
-    MemoryErrorCode, MemoryId, MemoryPersonaScope,
+    MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_DELETION_SUBJECTS,
+    MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryId, MemoryPersonaScope,
 };
 
 const MAX_RECOVERY_ROWS: usize = 512;
 const MAX_RECOVERY_SUBJECTS: usize = MAX_MEMORY_DELETION_SUBJECTS;
 const MAX_RECOVERY_MATERIALIZED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECOVERY_TEXT_FIELD_BYTES: usize = 1024;
+const MAX_RECOVERY_ANCHOR_ROW_BYTES: usize = MAX_RECOVERY_TEXT_FIELD_BYTES * 2;
+const MAX_RECOVERY_ENTRY_ROW_BYTES: usize = MAX_RECOVERY_TEXT_FIELD_BYTES * 8;
+const MAX_RECOVERY_REVISION_ROW_BYTES: usize = MAX_MEMORY_CONTENT_BYTES
+    + MAX_MEMORY_CHANGE_REASON_BYTES
+    + MAX_RECOVERY_TEXT_FIELD_BYTES * 12
+    + 32;
+const MAX_RECOVERY_SOURCE_ROW_BYTES: usize =
+    MAX_RECOVERY_TEXT_FIELD_BYTES * 3 + MAX_REVISION_SOURCE_FIELD_BYTES * 5;
 const MAX_RECOVERY_PROJECTION_ROW_BYTES: usize =
     MAX_MEMORY_CONTENT_BYTES + MAX_RECOVERY_TEXT_FIELD_BYTES * 4;
 const RECOVERY_REBUILD_BATCH_SIZE: usize = 64;
@@ -29,6 +39,7 @@ const MAX_RECOVERY_SQLITE_PROGRESS_CALLBACKS: usize = 20_000;
 pub(crate) struct RecoveryReadBudget {
     rows: usize,
     materialized_bytes: usize,
+    snapshot_authorized: bool,
 }
 
 impl RecoveryReadBudget {
@@ -36,6 +47,7 @@ impl RecoveryReadBudget {
         Self {
             rows: 0,
             materialized_bytes: 0,
+            snapshot_authorized: false,
         }
     }
 
@@ -64,7 +76,28 @@ impl RecoveryReadBudget {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_RECOVERY_PROGRESS_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn limit_next_recovery_progress_callbacks_for_test(maximum_callbacks: usize) {
+    NEXT_RECOVERY_PROGRESS_LIMIT.with(|slot| {
+        assert!(slot.replace(Some(maximum_callbacks)).is_none());
+    });
+}
+
+fn recovery_progress_callback_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = NEXT_RECOVERY_PROGRESS_LIMIT.with(Cell::take) {
+        return limit;
+    }
+    MAX_RECOVERY_SQLITE_PROGRESS_CALLBACKS
+}
+
 pub(crate) fn install_recovery_progress_handler(connection: &Connection) -> Arc<AtomicBool> {
+    let maximum_callbacks = recovery_progress_callback_limit();
     let callbacks = Arc::new(AtomicUsize::new(0));
     let exhausted = Arc::new(AtomicBool::new(false));
     let callback_count = Arc::clone(&callbacks);
@@ -72,8 +105,8 @@ pub(crate) fn install_recovery_progress_handler(connection: &Connection) -> Arc<
     connection.progress_handler(
         RECOVERY_SQLITE_PROGRESS_INTERVAL_OPS,
         Some(move || {
-            let should_interrupt = callback_count.fetch_add(1, Ordering::Relaxed) + 1
-                > MAX_RECOVERY_SQLITE_PROGRESS_CALLBACKS;
+            let should_interrupt =
+                callback_count.fetch_add(1, Ordering::Relaxed) + 1 > maximum_callbacks;
             if should_interrupt {
                 callback_exhausted.store(true, Ordering::Relaxed);
             }
@@ -147,23 +180,20 @@ pub(crate) fn reconcile_runtime_memory(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<(), RuntimeStorageError> {
-    let anchor = load_anchor(connection).map_err(recovery_storage_error)?;
+    // storage migration 的既有 anchor 核对尚需使用具体身份打开独立权威；这里先用
+    // 同一套类型与长度门禁做一次有界预读，随后仍会在主库恢复事务快照内重新授权。
+    let mut preflight_budget = RecoveryReadBudget::new();
+    let preflight_anchor =
+        load_anchor(connection, &mut preflight_budget).map_err(recovery_storage_error)?;
     let base_dir = database_path
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| {
             RuntimeStorageError::Integrity("运行时数据库无法定位记忆删除权威恢复域".to_string())
         })?;
-    let authority = open_authority_for_anchor(base_dir, &anchor).map_err(recovery_storage_error)?;
+    let authority =
+        open_authority_for_anchor(base_dir, &preflight_anchor).map_err(recovery_storage_error)?;
     let mut guard = authority.begin_guard().map_err(recovery_storage_error)?;
-    let events = guard
-        .pending_events(anchor.last_applied_revision)
-        .map_err(recovery_storage_error)?;
-    let projection_outdated = search_projection_requires_rebuild(connection)?;
-    if events.is_empty() && !projection_outdated {
-        guard.finish().map_err(recovery_storage_error)?;
-        return Ok(());
-    }
 
     connection
         .pragma_update(None, "secure_delete", "ON")
@@ -171,17 +201,34 @@ pub(crate) fn reconcile_runtime_memory(
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(RuntimeStorageError::Sqlite)?;
-    let max_revision = if events.is_empty() {
-        anchor.last_applied_revision
-    } else {
-        guard.max_revision().map_err(recovery_storage_error)?
-    };
     let exhausted = install_recovery_progress_handler(connection);
     let mut budget = RecoveryReadBudget::new();
     let recovery_result = (|| {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(RuntimeStorageError::Sqlite)?;
+        let anchor = authorize_recovery_snapshot(&transaction, &mut budget)
+            .map_err(recovery_storage_error)?;
+        if anchor.authority_id != preflight_anchor.authority_id
+            || anchor.initialized_at != preflight_anchor.initialized_at
+        {
+            return Err(RuntimeStorageError::Integrity(
+                "记忆删除权威 anchor 在恢复事务建立前发生替换".to_string(),
+            ));
+        }
+        let events = guard
+            .pending_events(anchor.last_applied_revision)
+            .map_err(recovery_storage_error)?;
+        let projection_outdated = search_projection_requires_rebuild(&transaction)?;
+        if events.is_empty() && !projection_outdated {
+            transaction.commit().map_err(RuntimeStorageError::Sqlite)?;
+            return Ok((events, false));
+        }
+        let max_revision = if events.is_empty() {
+            anchor.last_applied_revision
+        } else {
+            guard.max_revision().map_err(recovery_storage_error)?
+        };
         for event in &events {
             let memory_ids = memory_ids_for_subjects(
                 &transaction,
@@ -214,14 +261,17 @@ pub(crate) fn reconcile_runtime_memory(
                 ));
             }
         }
-        transaction.commit().map_err(RuntimeStorageError::Sqlite)
+        transaction.commit().map_err(RuntimeStorageError::Sqlite)?;
+        Ok((events, true))
     })();
     clear_recovery_progress_handler(connection);
     if exhausted.load(Ordering::Relaxed) {
         return Err(recovery_storage_error(query_budget_exceeded()));
     }
-    recovery_result?;
-    checkpoint_runtime_memory(connection).map_err(recovery_storage_error)?;
+    let (events, changed) = recovery_result?;
+    if changed {
+        checkpoint_runtime_memory(connection).map_err(recovery_storage_error)?;
+    }
     // FULL 只覆盖恢复事务与随后的 durable checkpoint；正式连接仍回到统一的
     // NORMAL 运行参数，避免一次投影升级永久改变调用方连接语义。
     connection
@@ -285,22 +335,398 @@ fn search_projection_requires_rebuild(
     }
 }
 
-pub(crate) fn load_anchor(connection: &Connection) -> Result<AuthorityAnchor, MemoryError> {
-    connection
-        .query_row(
-            "SELECT authority_id, initialized_at, last_applied_revision
-             FROM memory_authority_anchor
-             WHERE singleton = 1",
-            [],
-            |row| {
-                Ok(AuthorityAnchor {
-                    authority_id: row.get(0)?,
-                    initialized_at: row.get(1)?,
-                    last_applied_revision: row.get(2)?,
-                })
-            },
+pub(crate) fn load_anchor(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<AuthorityAnchor, MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT typeof(singleton) = 'integer' AND singleton = 1,
+                    CASE
+                        WHEN typeof(authority_id) = 'text'
+                         AND length(CAST(authority_id AS BLOB)) <= ?1
+                        THEN authority_id
+                    END,
+                    typeof(authority_id) = 'text',
+                    length(CAST(authority_id AS BLOB)),
+                    CASE
+                        WHEN typeof(initialized_at) = 'text'
+                         AND length(CAST(initialized_at AS BLOB)) <= ?1
+                        THEN initialized_at
+                    END,
+                    typeof(initialized_at) = 'text',
+                    length(CAST(initialized_at AS BLOB)),
+                    CASE
+                        WHEN typeof(last_applied_revision) = 'integer'
+                        THEN last_applied_revision
+                    END,
+                    typeof(last_applied_revision) = 'integer'
+                        AND last_applied_revision >= 0
+             FROM memory_authority_anchor",
         )
-        .map_err(repository_unavailable)
+        .map_err(repository_unavailable)?;
+    let mut rows = statement
+        .query([MAX_RECOVERY_TEXT_FIELD_BYTES as i64])
+        .map_err(repository_unavailable)?;
+    let mut anchor = None;
+    while let Some(row) = rows.next().map_err(repository_unavailable)? {
+        if anchor.is_some() || !row.get::<_, bool>(0).map_err(repository_unavailable)? {
+            return Err(repository_unavailable_marker());
+        }
+        let (authority_id, authority_id_bytes) = required_bounded_text(
+            row.get(1).map_err(repository_unavailable)?,
+            row.get(2).map_err(repository_unavailable)?,
+            row.get(3).map_err(repository_unavailable)?,
+            MAX_RECOVERY_TEXT_FIELD_BYTES,
+        )?;
+        let (initialized_at, initialized_at_bytes) = required_bounded_text(
+            row.get(4).map_err(repository_unavailable)?,
+            row.get(5).map_err(repository_unavailable)?,
+            row.get(6).map_err(repository_unavailable)?,
+            MAX_RECOVERY_TEXT_FIELD_BYTES,
+        )?;
+        let last_applied_revision = row
+            .get::<_, Option<i64>>(7)
+            .map_err(repository_unavailable)?;
+        if !row.get::<_, bool>(8).map_err(repository_unavailable)? {
+            return Err(repository_unavailable_marker());
+        }
+        let last_applied_revision =
+            last_applied_revision.ok_or_else(repository_unavailable_marker)?;
+        budget.consume_row(
+            &[authority_id_bytes, initialized_at_bytes],
+            MAX_RECOVERY_ANCHOR_ROW_BYTES,
+        )?;
+        anchor = Some(AuthorityAnchor {
+            authority_id,
+            initialized_at,
+            last_applied_revision,
+        });
+    }
+    anchor.ok_or_else(repository_unavailable_marker)
+}
+
+pub(crate) fn authorize_recovery_snapshot(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<AuthorityAnchor, MemoryError> {
+    if budget.snapshot_authorized {
+        return Err(repository_unavailable_marker());
+    }
+    let anchor = load_anchor(connection, budget)?;
+    authorize_all_memory_entries(connection, budget)?;
+    authorize_all_memory_revisions(connection, budget)?;
+    authorize_all_revision_sources(connection, budget)?;
+    authorize_memory_relationships(connection)?;
+    budget.snapshot_authorized = true;
+    Ok(anchor)
+}
+
+fn ensure_recovery_snapshot_authorized(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<(), MemoryError> {
+    if !budget.snapshot_authorized {
+        let _ = authorize_recovery_snapshot(connection, budget)?;
+    }
+    Ok(())
+}
+
+fn authorize_all_memory_entries(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<(), MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT typeof(persona_id) = 'text', length(CAST(persona_id AS BLOB)),
+                    typeof(memory_id) = 'text', length(CAST(memory_id AS BLOB)),
+                    typeof(category) = 'text', length(CAST(category AS BLOB)),
+                    typeof(current_revision_id) = 'text',
+                        length(CAST(current_revision_id AS BLOB)),
+                    typeof(importance) = 'text', length(CAST(importance AS BLOB)),
+                    typeof(freshness_at) = 'text', length(CAST(freshness_at AS BLOB)),
+                    typeof(created_at) = 'text', length(CAST(created_at AS BLOB)),
+                    typeof(state) = 'text', length(CAST(state AS BLOB)),
+                    category IN (
+                        'user_fact', 'user_preference', 'shared_experience',
+                        'commitment', 'story_state'
+                    ),
+                    importance IN ('low', 'normal', 'high'),
+                    state IN ('active', 'deleted')
+             FROM memory_entry",
+        )
+        .map_err(repository_unavailable)?;
+    let mut rows = statement.query([]).map_err(repository_unavailable)?;
+    while let Some(row) = rows.next().map_err(repository_unavailable)? {
+        let lengths = [
+            required_stored_text_length(row, 0, 1, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 2, 3, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 4, 5, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 6, 7, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 8, 9, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 10, 11, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 12, 13, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 14, 15, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+        ];
+        if !row.get::<_, bool>(16).map_err(repository_unavailable)?
+            || !row.get::<_, bool>(17).map_err(repository_unavailable)?
+            || !row.get::<_, bool>(18).map_err(repository_unavailable)?
+        {
+            return Err(repository_unavailable_marker());
+        }
+        budget.consume_row(&lengths, MAX_RECOVERY_ENTRY_ROW_BYTES)?;
+    }
+    Ok(())
+}
+
+fn authorize_all_memory_revisions(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<(), MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT typeof(row_id) = 'integer' AND row_id > 0,
+                    typeof(persona_id) = 'text', length(CAST(persona_id AS BLOB)),
+                    typeof(memory_id) = 'text', length(CAST(memory_id AS BLOB)),
+                    typeof(revision_id) = 'text', length(CAST(revision_id AS BLOB)),
+                    typeof(content) = 'text', length(CAST(content AS BLOB)),
+                    typeof(derivation_key) = 'blob', length(CAST(derivation_key AS BLOB)),
+                    event_time IS NULL, typeof(event_time) = 'text',
+                        length(CAST(event_time AS BLOB)),
+                    typeof(recorded_at) = 'text', length(CAST(recorded_at AS BLOB)),
+                    typeof(valid_from) = 'text', length(CAST(valid_from AS BLOB)),
+                    valid_to IS NULL, typeof(valid_to) = 'text',
+                        length(CAST(valid_to AS BLOB)),
+                    typeof(change_type) = 'text', length(CAST(change_type AS BLOB)),
+                    typeof(change_reason) = 'text', length(CAST(change_reason AS BLOB)),
+                    typeof(safety_policy_version) = 'text',
+                        length(CAST(safety_policy_version AS BLOB)),
+                    typeof(state) = 'text', length(CAST(state AS BLOB)),
+                    typeof(category) = 'text', length(CAST(category AS BLOB)),
+                    typeof(importance) = 'text', length(CAST(importance AS BLOB)),
+                    change_type IN ('create', 'update', 'correct'),
+                    state IN ('current', 'superseded', 'corrected'),
+                    category IN (
+                        'user_fact', 'user_preference', 'shared_experience',
+                        'commitment', 'story_state'
+                    ),
+                    importance IN ('low', 'normal', 'high'),
+                    (state = 'current' AND valid_to IS NULL)
+                        OR (state IN ('superseded', 'corrected')
+                            AND typeof(valid_to) = 'text')
+             FROM memory_revision",
+        )
+        .map_err(repository_unavailable)?;
+    let mut rows = statement.query([]).map_err(repository_unavailable)?;
+    while let Some(row) = rows.next().map_err(repository_unavailable)? {
+        if !row.get::<_, bool>(0).map_err(repository_unavailable)? {
+            return Err(repository_unavailable_marker());
+        }
+        let derivation_bytes = required_stored_blob_length(row, 9, 10, 32)?;
+        let lengths = [
+            required_stored_text_length(row, 1, 2, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 3, 4, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 5, 6, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 7, 8, MAX_MEMORY_CONTENT_BYTES)?,
+            derivation_bytes,
+            optional_stored_text_length(row, 11, 12, 13, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 14, 15, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 16, 17, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            optional_stored_text_length(row, 18, 19, 20, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 21, 22, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 23, 24, MAX_MEMORY_CHANGE_REASON_BYTES)?,
+            required_stored_text_length(row, 25, 26, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 27, 28, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 29, 30, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 31, 32, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+        ];
+        for index in 33..=37 {
+            if !row.get::<_, bool>(index).map_err(repository_unavailable)? {
+                return Err(repository_unavailable_marker());
+            }
+        }
+        budget.consume_row(&lengths, MAX_RECOVERY_REVISION_ROW_BYTES)?;
+    }
+    Ok(())
+}
+
+fn authorize_all_revision_sources(
+    connection: &Connection,
+    budget: &mut RecoveryReadBudget,
+) -> Result<(), MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT typeof(persona_id) = 'text', length(CAST(persona_id AS BLOB)),
+                    typeof(memory_id) = 'text', length(CAST(memory_id AS BLOB)),
+                    typeof(revision_id) = 'text', length(CAST(revision_id AS BLOB)),
+                    typeof(source_ordinal) = 'integer' AND source_ordinal >= 0,
+                    typeof(source_kind) = 'text', length(CAST(source_kind AS BLOB)),
+                    conversation_id IS NULL, typeof(conversation_id) = 'text',
+                        length(CAST(conversation_id AS BLOB)),
+                    turn_id IS NULL, typeof(turn_id) = 'text',
+                        length(CAST(turn_id AS BLOB)),
+                    action_id IS NULL, typeof(action_id) = 'text',
+                        length(CAST(action_id AS BLOB)),
+                    authorized_at IS NULL, typeof(authorized_at) = 'text',
+                        length(CAST(authorized_at AS BLOB)),
+                    source_kind IN (
+                        'direct_user_message', 'user_confirmation',
+                        'deterministic_local_event', 'persona_management'
+                    ),
+                    (
+                        source_kind IN (
+                            'direct_user_message', 'user_confirmation',
+                            'deterministic_local_event'
+                        )
+                        AND typeof(conversation_id) = 'text'
+                        AND typeof(turn_id) = 'text'
+                        AND action_id IS NULL
+                        AND authorized_at IS NULL
+                    ) OR (
+                        source_kind = 'persona_management'
+                        AND conversation_id IS NULL
+                        AND turn_id IS NULL
+                        AND typeof(action_id) = 'text'
+                        AND typeof(authorized_at) = 'text'
+                    )
+             FROM memory_revision_source",
+        )
+        .map_err(repository_unavailable)?;
+    let mut rows = statement.query([]).map_err(repository_unavailable)?;
+    while let Some(row) = rows.next().map_err(repository_unavailable)? {
+        let lengths = [
+            required_stored_text_length(row, 0, 1, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 2, 3, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 4, 5, MAX_RECOVERY_TEXT_FIELD_BYTES)?,
+            required_stored_text_length(row, 7, 8, MAX_REVISION_SOURCE_FIELD_BYTES)?,
+            optional_stored_text_length(row, 9, 10, 11, MAX_REVISION_SOURCE_FIELD_BYTES)?,
+            optional_stored_text_length(row, 12, 13, 14, MAX_REVISION_SOURCE_FIELD_BYTES)?,
+            optional_stored_text_length(row, 15, 16, 17, MAX_REVISION_SOURCE_FIELD_BYTES)?,
+            optional_stored_text_length(row, 18, 19, 20, MAX_REVISION_SOURCE_FIELD_BYTES)?,
+        ];
+        if !row.get::<_, bool>(6).map_err(repository_unavailable)?
+            || !row.get::<_, bool>(21).map_err(repository_unavailable)?
+            || !row.get::<_, bool>(22).map_err(repository_unavailable)?
+        {
+            return Err(repository_unavailable_marker());
+        }
+        budget.consume_row(&lengths, MAX_RECOVERY_SOURCE_ROW_BYTES)?;
+    }
+    Ok(())
+}
+
+fn authorize_memory_relationships(connection: &Connection) -> Result<(), MemoryError> {
+    let invalid = connection
+        .query_row(
+            "SELECT
+                EXISTS(
+                    SELECT 1
+                    FROM memory_entry AS entry
+                    LEFT JOIN memory_revision AS current_revision
+                      ON current_revision.persona_id = entry.persona_id
+                     AND current_revision.memory_id = entry.memory_id
+                     AND current_revision.revision_id = entry.current_revision_id
+                    WHERE current_revision.row_id IS NULL
+                       OR current_revision.state <> 'current'
+                       OR current_revision.valid_to IS NOT NULL
+                       OR current_revision.category <> entry.category
+                    LIMIT 1
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM memory_revision AS revision
+                    LEFT JOIN memory_entry AS entry
+                      ON entry.persona_id = revision.persona_id
+                     AND entry.memory_id = revision.memory_id
+                    WHERE entry.memory_id IS NULL
+                       OR (revision.state = 'current'
+                           AND revision.revision_id <> entry.current_revision_id)
+                       OR (revision.state <> 'current'
+                           AND revision.revision_id = entry.current_revision_id)
+                       OR NOT EXISTS(
+                           SELECT 1
+                           FROM memory_revision_source AS source
+                           WHERE source.persona_id = revision.persona_id
+                             AND source.memory_id = revision.memory_id
+                             AND source.revision_id = revision.revision_id
+                             AND source.source_ordinal = 0
+                       )
+                    LIMIT 1
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM memory_revision_source AS source
+                    LEFT JOIN memory_revision AS revision
+                      ON revision.persona_id = source.persona_id
+                     AND revision.memory_id = source.memory_id
+                     AND revision.revision_id = source.revision_id
+                    WHERE revision.row_id IS NULL
+                    LIMIT 1
+                ) OR EXISTS(
+                    SELECT 1
+                    FROM memory_revision
+                    GROUP BY persona_id, memory_id
+                    HAVING SUM(state = 'current') <> 1
+                    LIMIT 1
+                )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(repository_unavailable)?;
+    if invalid {
+        Err(repository_unavailable_marker())
+    } else {
+        Ok(())
+    }
+}
+
+fn required_stored_text_length(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+    maximum_bytes: usize,
+) -> Result<usize, MemoryError> {
+    let is_text = row
+        .get::<_, bool>(type_index)
+        .map_err(repository_unavailable)?;
+    let byte_length = row
+        .get::<_, Option<i64>>(length_index)
+        .map_err(repository_unavailable)?;
+    let byte_length = required_bounded_length(byte_length, maximum_bytes)?;
+    if is_text {
+        Ok(byte_length)
+    } else {
+        Err(repository_unavailable_marker())
+    }
+}
+
+fn optional_stored_text_length(
+    row: &Row<'_>,
+    null_index: usize,
+    type_index: usize,
+    length_index: usize,
+    maximum_bytes: usize,
+) -> Result<usize, MemoryError> {
+    if row
+        .get::<_, bool>(null_index)
+        .map_err(repository_unavailable)?
+    {
+        return Ok(0);
+    }
+    required_stored_text_length(row, type_index, length_index, maximum_bytes)
+}
+
+fn required_stored_blob_length(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+    expected_bytes: usize,
+) -> Result<usize, MemoryError> {
+    let is_blob = row
+        .get::<_, bool>(type_index)
+        .map_err(repository_unavailable)?;
+    let byte_length = row
+        .get::<_, Option<i64>>(length_index)
+        .map_err(repository_unavailable)?;
+    required_bounded_blob_length(is_blob, byte_length, expected_bytes)
 }
 
 pub(crate) fn collect_delete_subjects(
@@ -773,81 +1199,11 @@ fn authorize_revision_sources(
     Ok(())
 }
 
-fn authorize_projection_source(connection: &Connection) -> Result<(), MemoryError> {
-    let (row_count, oversized, invalid, active_count, joined_count): (i64, bool, bool, i64, i64) =
-        connection
-            .query_row(
-                "SELECT
-                (SELECT COUNT(*) FROM memory_entry),
-                EXISTS(
-                    SELECT 1 FROM memory_entry
-                    WHERE length(CAST(persona_id AS BLOB)) > ?1
-                       OR length(CAST(memory_id AS BLOB)) > ?1
-                       OR length(CAST(category AS BLOB)) > ?1
-                       OR length(CAST(current_revision_id AS BLOB)) > ?1
-                       OR length(CAST(importance AS BLOB)) > ?1
-                       OR length(CAST(freshness_at AS BLOB)) > ?1
-                       OR length(CAST(created_at AS BLOB)) > ?1
-                       OR length(CAST(state AS BLOB)) > ?1
-                    LIMIT 1
-                ),
-                EXISTS(
-                    SELECT 1 FROM memory_entry
-                    WHERE typeof(persona_id) <> 'text'
-                       OR typeof(memory_id) <> 'text'
-                       OR typeof(category) <> 'text'
-                       OR typeof(current_revision_id) <> 'text'
-                       OR typeof(importance) <> 'text'
-                       OR typeof(freshness_at) <> 'text'
-                       OR typeof(created_at) <> 'text'
-                       OR typeof(state) <> 'text'
-                       OR category NOT IN (
-                           'user_fact', 'user_preference', 'shared_experience',
-                           'commitment', 'story_state'
-                       )
-                       OR importance NOT IN ('low', 'normal', 'high')
-                       OR state NOT IN ('active', 'deleted')
-                    LIMIT 1
-                ),
-                (SELECT COUNT(*) FROM memory_entry WHERE state = 'active'),
-                (
-                    SELECT COUNT(*)
-                    FROM memory_entry AS entry
-                    JOIN memory_revision AS revision
-                      ON revision.persona_id = entry.persona_id
-                     AND revision.memory_id = entry.memory_id
-                     AND revision.revision_id = entry.current_revision_id
-                    WHERE entry.state = 'active'
-                      AND revision.state = 'current'
-                      AND revision.valid_to IS NULL
-                )",
-                [MAX_RECOVERY_TEXT_FIELD_BYTES as i64],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .map_err(repository_unavailable)?;
-    let row_count = usize::try_from(row_count).map_err(repository_unavailable)?;
-    if row_count > MAX_RECOVERY_ROWS || oversized {
-        return Err(query_budget_exceeded());
-    }
-    if invalid || active_count != joined_count {
-        return Err(repository_unavailable_marker());
-    }
-    Ok(())
-}
-
 pub(crate) fn rebuild_search_projection(
     connection: &Connection,
     budget: &mut RecoveryReadBudget,
 ) -> Result<(), MemoryError> {
-    authorize_projection_source(connection)?;
+    ensure_recovery_snapshot_authorized(connection, budget)?;
     connection
         .execute_batch(
             "DROP TRIGGER IF EXISTS memory_search_projection_insert;
