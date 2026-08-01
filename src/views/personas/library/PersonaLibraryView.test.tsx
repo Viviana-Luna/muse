@@ -65,6 +65,8 @@ function LibraryHarness({
       controller={controller}
       resourceState={{ status: 'ready', data: snapshot }}
       busy={false}
+      notify={vi.fn()}
+      onOpenMemorySource={vi.fn()}
       onClose={() => undefined}
     />
   );
@@ -87,6 +89,8 @@ function ResourceHarness({
       controller={controller}
       resourceState={resourceState}
       busy={false}
+      notify={vi.fn()}
+      onOpenMemorySource={vi.fn()}
       onClose={onClose}
     />
   );
@@ -148,6 +152,17 @@ describe('PersonaLibraryView', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: '编辑角色' }));
 
     expect(controller.openEditor).toHaveBeenCalledWith('edit', expect.objectContaining({ id: 'persona-2' }));
+  });
+
+  it('可以从角色更多菜单进入并退出长期记忆管理', async () => {
+    render(<LibraryHarness personas={[createPersona(1)]} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '角色 1的更多操作' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '管理记忆' }));
+
+    expect(screen.getByRole('region', { name: '角色 1的长期记忆' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '返回角色库' }));
+    expect(await screen.findByRole('heading', { name: '角色库' })).toBeVisible();
   });
 
   it('搜索无结果时可以一键清除并恢复角色画廊', async () => {

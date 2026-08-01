@@ -322,11 +322,9 @@ impl CanonicalAuthorityGuard<'_> {
         &mut self,
         deletion_id: &str,
     ) -> Result<Option<AuthorityDeletionEvent>, MemoryError> {
-        let Some(persona_id) = event_persona_by_deletion_id(
-            &self.connection,
-            deletion_id,
-            &mut self.budget,
-        )? else {
+        let Some(persona_id) =
+            event_persona_by_deletion_id(&self.connection, deletion_id, &mut self.budget)?
+        else {
             return Ok(None);
         };
         load_event_with_connection(

@@ -68,6 +68,23 @@ export interface ChatProcessStep {
   interactionError?: string;
   questionRequestId?: string;
   questions?: RuntimeUserQuestionItem[];
+  memoryActivity?: ChatMemoryActivity;
+}
+
+export interface ChatMemoryReference {
+  memoryId: string;
+  revisionId: string;
+  category?: string;
+  importance?: string;
+}
+
+export interface ChatMemoryActivity {
+  kind: 'query' | 'staged' | 'commit' | 'delete' | 'failed';
+  label: string;
+  count?: number;
+  hasMore?: boolean;
+  references?: ChatMemoryReference[];
+  errorCode?: string;
 }
 
 export interface ChatMessage extends Message {
@@ -214,6 +231,74 @@ function runtimeArgText(argumentsValue: unknown, key: string) {
   if (typeof value === 'string') return value.trim();
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return '';
+}
+
+function memoryActivityForToolResult(
+  toolName: string | undefined,
+  success: boolean,
+  structuredValue: unknown
+): ChatMemoryActivity | undefined {
+  if (!toolName?.startsWith('memory_')) return undefined;
+  const structured = runtimeRecord(structuredValue);
+  if (!success) {
+    return {
+      kind: 'failed',
+      label: '长期记忆操作未完成',
+      errorCode: runtimeArgText(structured, 'error_code') || undefined
+    };
+  }
+  if (toolName === 'memory_query') {
+    const items = Array.isArray(structured.items) ? structured.items : [];
+    const references = items.flatMap((value) => {
+      const item = runtimeRecord(value);
+      const memoryId = runtimeArgText(item, 'memory_id');
+      const revisionId = runtimeArgText(item, 'revision_id');
+      if (!memoryId || !revisionId) return [];
+      return [{
+        memoryId,
+        revisionId,
+        category: runtimeArgText(item, 'category') || undefined,
+        importance: runtimeArgText(item, 'importance') || undefined
+      }];
+    });
+    return {
+      kind: 'query',
+      label: `本轮读取了 ${references.length} 条相关记忆`,
+      count: references.length,
+      hasMore: structured.has_more === true,
+      references
+    };
+  }
+  if (toolName === 'memory_mutate') {
+    return { kind: 'staged', label: '记忆变更已暂存，等待本轮可靠提交' };
+  }
+  if (toolName === 'memory_delete') {
+    const count = typeof structured.deleted_memory_count === 'number'
+      ? structured.deleted_memory_count
+      : undefined;
+    return { kind: 'delete', label: '长期记忆已永久删除', count };
+  }
+  return undefined;
+}
+
+function memoryCommitActivity(payload: RuntimeEvent): ChatMemoryActivity | undefined {
+  if (payload.type !== 'status') return undefined;
+  if (payload.phase === 'memory_commit_completed') {
+    const count = payload.detail?.match(/(\d+)\s*项/u)?.[1];
+    return {
+      kind: 'commit',
+      label: payload.message || '本次记忆已保存',
+      count: count ? Number(count) : undefined
+    };
+  }
+  if (payload.phase === 'memory_commit_failed') {
+    return {
+      kind: 'failed',
+      label: payload.message || '本次记忆未保存',
+      errorCode: payload.detail || undefined
+    };
+  }
+  return undefined;
 }
 
 function normalizeRuntimeTodoItems(value: unknown): RuntimeTodoItem[] | null {
@@ -669,7 +754,9 @@ export function useRuntimeStream({
           });
         }
         if (payload.type === 'status') {
-          appendChatProcess(currentAssistantId, payload);
+          appendChatProcess(currentAssistantId, payload, {
+            memoryActivity: memoryCommitActivity(payload)
+          });
         }
         if (payload.type === 'reasoning_delta') {
           const chunk = payload.content ?? '';
@@ -752,15 +839,22 @@ export function useRuntimeStream({
           }
           const todos = normalizeRuntimeTodoItems(structured.todos);
           if (todos) onRuntimeTodosChange?.(todos);
+          const memoryActivity = memoryActivityForToolResult(
+            payload.name,
+            payload.success === true,
+            payload.structured
+          );
           appendChatProcess(currentAssistantId, {
             type: 'status',
             phase: payload.success ? 'tool_completed' : 'failed',
-            message: payload.success ? '工具调用已完成。' : '工具调用失败，请查看回复。',
+            message: memoryActivity?.label
+              || (payload.success ? '工具调用已完成。' : '工具调用失败，请查看回复。'),
             detail: payload.content || (payload.name ? `工具：${payload.name}` : undefined),
             state: payload.success ? 'completed' : 'error'
           }, {
             callId: payload.call_id,
-            toolName: payload.name
+            toolName: payload.name,
+            memoryActivity
           });
         }
         if (payload.type === 'tool_output_delta') {

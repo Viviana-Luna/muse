@@ -25,8 +25,8 @@ use crate::domain::memory::{
     MemoryImportanceAdjustment, MemoryManagementAuthorization, MemoryManagementBinding,
     MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutateParams,
     MemoryRepository, MemoryRevisionId, MemorySafetyAssessment, MemorySafetyFailure,
-    MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceKind,
-    MemorySourceEligibility, MemoryStagedMutation,
+    MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceEligibility,
+    MemoryStagedMutation,
 };
 
 const TIME_1: &str = "2026-07-30T01:00:00Z";
@@ -840,14 +840,29 @@ fn management_binding(
     scope: &crate::domain::memory::MemoryPersonaScope,
     operation_id: &str,
 ) -> MemoryManagementBinding {
+    management_binding_at(scope, operation_id, TIME_1, TIME_2)
+}
+
+fn management_binding_at(
+    scope: &crate::domain::memory::MemoryPersonaScope,
+    operation_id: &str,
+    authorized_at: &str,
+    binding_at: &str,
+) -> MemoryManagementBinding {
     let authorization = MemoryManagementAuthorization::from_runtime(
         scope.clone(),
         format!("action-{operation_id}"),
-        TIME_1,
+        authorized_at,
     )
     .expect("管理授权应有效");
-    MemoryManagementBinding::bind(authorization, operation_id, TIME_2, TIME_2, TIME_2)
-        .expect("管理绑定应有效")
+    MemoryManagementBinding::bind(
+        authorization,
+        operation_id,
+        binding_at,
+        binding_at,
+        binding_at,
+    )
+    .expect("管理绑定应有效")
 }
 
 fn management_create(
@@ -1050,6 +1065,33 @@ fn 删除确认只允许同_persona_同目标_同_intent_精确重放() {
         .delete_confirmed(&original, repository.deletion_authority())
         .expect("完全相同的确认应幂等重放");
     assert_eq!(first, replay);
+
+    let replay_params = MemoryDeleteParams::Memory {
+        memory_id: MemoryId("memory-confirm-a".to_string()),
+    };
+    let replay_with_new_audit_time = MemoryDeleteConfirmation::new(
+        "confirmation-global-1",
+        &persona_a,
+        &replay_params,
+        TIME_2,
+        DELETE_EXPIRES_AT,
+        MemoryDeleteConfirmationSource::PersonaManagement {
+            action_id: "confirmation-global-1".to_string(),
+        },
+    )
+    .expect("管理重试可以生成新的墙钟审计时间");
+    let replay_with_new_audit_time = ConfirmedMemoryDeleteRequest::bind(
+        replay_params,
+        persona_a.clone(),
+        replay_with_new_audit_time,
+    )
+    .expect("管理重试应保持相同目标");
+    assert_eq!(
+        repository
+            .delete_confirmed(&replay_with_new_audit_time, repository.deletion_authority(),)
+            .expect("同一管理 operation 的重试不得因墙钟变化而冲突"),
+        first
+    );
 
     let same_target = MemoryDeleteParams::Memory {
         memory_id: MemoryId("memory-confirm-a".to_string()),
@@ -2601,6 +2643,26 @@ fn management_content_双门幂等冲突与_corrected_隔离() {
         repository
             .apply_management_content_mutation(&create, &AllowPolicy)
             .expect("相同管理 operation_id 应幂等"),
+        create_receipt
+    );
+    let retry_with_new_audit_time = MemoryManagementContentMutation::bind(
+        MemoryManagementContentParams::Create {
+            category: MemoryCategory::UserPreference,
+            content: create_sentinel.to_string(),
+            importance: MemoryImportance::Normal,
+            event_time: None,
+            change_reason: "管理页创建".to_string(),
+        },
+        management_binding_at(&scope, "management-create", TIME_3, TIME_3),
+        MemoryId("management-memory".to_string()),
+        MemoryRevisionId("management-revision-1".to_string()),
+        &AllowPolicy,
+    )
+    .expect("相同管理请求应允许使用新的墙钟审计时间重建");
+    assert_eq!(
+        repository
+            .apply_management_content_mutation(&retry_with_new_audit_time, &AllowPolicy)
+            .expect("同一管理 operation 的重试不得因墙钟变化而冲突"),
         create_receipt
     );
     let changed_same_operation = management_create(

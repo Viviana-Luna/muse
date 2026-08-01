@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use muse_core::domain::conversation::{Conversation, Role};
 use muse_core::domain::memory::{
     MEMORY_QUERY_TOOL_NAME, MemoryCommitEnvelope, MemoryDeleteParams, MemoryError, MemoryErrorCode,
-    MemoryId, MemoryPersonaScope, MemoryRuntimeBinding, MemorySourceEligibility,
-    MemoryStagedMutation,
+    MemoryId, MemoryPersonaScope, MemoryRetrievalTurn, MemoryRuntimeBinding,
+    MemorySourceEligibility, MemoryStagedMutation,
 };
 
 /// 一次查询页与工具调用的绑定；durable 删除后按该绑定定位工作副本中的旧结果页。
@@ -39,6 +39,19 @@ struct DirectUserSource {
     conversation_id: String,
     turn_id: String,
     content: String,
+    query_nonce: Option<String>,
+}
+
+fn generate_query_nonce() -> Option<String> {
+    use std::fmt::Write as _;
+
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let mut nonce = String::from("memory-turn-");
+    for byte in bytes {
+        write!(&mut nonce, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    Some(nonce)
 }
 
 impl std::fmt::Debug for MemoryTurnState {
@@ -71,8 +84,21 @@ impl MemoryTurnState {
                 conversation_id: conversation_id.into(),
                 turn_id: turn_id.into(),
                 content: direct_user_message.into(),
+                query_nonce: generate_query_nonce(),
             },
         }
+    }
+
+    /// 为当前真实 Turn 提供一次性检索所有权。系统随机源失败时查询必须关闭，
+    /// 不能退化为可预测 nonce 并允许恢复后的同名 Turn 重放旧游标。
+    pub(crate) fn retrieval_turn(&self) -> Result<MemoryRetrievalTurn, MemoryError> {
+        let nonce = self
+            .direct_user_source
+            .query_nonce
+            .clone()
+            .ok_or_else(|| MemoryError::new(MemoryErrorCode::QueryRejected))?;
+        MemoryRetrievalTurn::from_runtime(self.direct_user_source.turn_id.clone(), nonce)
+            .map_err(|_| MemoryError::new(MemoryErrorCode::QueryRejected))
     }
 
     /// 把候选事实绑定到本 Turn 的直接用户消息；对话副本中的最新用户消息必须与

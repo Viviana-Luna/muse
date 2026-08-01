@@ -155,6 +155,56 @@ describe('SessionsPage', () => {
   });
 
   it('支持重命名、归档与只读上下文检查', async () => {
+    vi.mocked(api.fetchRuntimeSessionContext).mockResolvedValue({
+      conversation_id: 'history',
+      context_snapshot: {
+        conversation_id: 'history',
+        turn_id: 'turn-memory',
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        created_at: '2026-07-13T00:00:00Z',
+        context_window: 100_000,
+        reserved_output_tokens: 1_000,
+        used_input_tokens: 42,
+        used_cache_tokens: 0,
+        used_total_tokens: 42,
+        remaining_tokens: 98_958,
+        usage_percent: 0.042,
+        source: 'local_estimated',
+        compacted: false,
+        externalized_tool_results: false,
+        segments: [
+          {
+            kind: 'memory',
+            label: '长期记忆查询页 1',
+            tokens: 42,
+            source: 'local_estimated',
+            compacted: false,
+            externalized: false,
+            metadata: {
+              query_page: 1,
+              item_count: 1,
+              has_more: false,
+              eviction_reason: null,
+              memories: [
+                {
+                  memory_id: 'memory-1',
+                  revision_id: 'revision-2'
+                }
+              ]
+            }
+          }
+        ]
+      },
+      runtime_policy_snapshot: {
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        persona_version: '1.0.0',
+        policy_version: 'persona-resource-policy/v1',
+        tool_ids: ['skill']
+      },
+      status: 'ok'
+    });
     const runtime = sessionRuntime();
     render(
       <SessionsPage runtime={runtime as never} activePersonaName="洛希" onOpenChat={vi.fn()} />
@@ -176,6 +226,14 @@ describe('SessionsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: '上下文' }));
     expect(await screen.findByText('deepseek / deepseek-chat')).toBeVisible();
     expect(screen.getByText('这里展示回合开始时冻结的事实，不允许编辑。')).toBeVisible();
+    expect(screen.getByText('长期记忆查询页 1')).toBeVisible();
+    expect(screen.getByText('42 Token')).toBeVisible();
+    expect(screen.getByText('1 条记忆')).toBeVisible();
+    expect(screen.getByText('当前末页')).toBeVisible();
+    expect(screen.getByText('保留在快照中')).toBeVisible();
+    fireEvent.click(screen.getByText('查看 memory / revision 来源索引'));
+    expect(screen.getByText('memory-1')).toBeVisible();
+    expect(screen.getByText('revision revision-2')).toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: '归档' }));
     await waitFor(() =>

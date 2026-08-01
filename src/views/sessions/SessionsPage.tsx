@@ -27,7 +27,7 @@ import { GalgameDialogueBox } from '@/views/chat/components/GalgameDialogueBox';
 import { sessionMeta, sessionTitle } from '@/views/chat/components/HistoryRail';
 import type { useChatRuntime } from '@/views/chat/hooks/useChatRuntime';
 import { toChatMessages, type ChatMessage } from '@/hooks/useRuntimeStream';
-import type { RuntimeSessionContextResponse } from '@/types';
+import type { RuntimeContextSegment, RuntimeSessionContextResponse } from '@/types';
 
 type ChatRuntime = ReturnType<typeof useChatRuntime>;
 
@@ -35,6 +35,7 @@ interface SessionsPageProps {
   runtime: ChatRuntime;
   activePersonaId?: string;
   activePersonaName?: string;
+  selectedConversationId?: string;
   onOpenChat: () => void;
 }
 
@@ -45,10 +46,90 @@ function preferenceSourceLabel(value: unknown): string {
   return typeof value === 'string' && value ? value : '未记录';
 }
 
+function contextMetadata(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function memoryReferences(segment: RuntimeContextSegment) {
+  const metadata = contextMetadata(segment.metadata);
+  return Array.isArray(metadata.memories)
+    ? metadata.memories.flatMap((value) => {
+      const reference = contextMetadata(value);
+      const memoryId = typeof reference.memory_id === 'string' ? reference.memory_id : '';
+      const revisionId = typeof reference.revision_id === 'string' ? reference.revision_id : '';
+      return memoryId && revisionId ? [{ memoryId, revisionId }] : [];
+    })
+    : [];
+}
+
+function ContextSegmentList({ segments }: { segments: RuntimeContextSegment[] }) {
+  return (
+    <section className="sessions-context-segments" aria-label="上下文片段明细">
+      <header>
+        <span>
+          <small>真实快照</small>
+          <strong>上下文片段与 Token</strong>
+        </span>
+        <em>{segments.length} 个片段</em>
+      </header>
+      <ol>
+        {segments.map((segment, index) => {
+          const metadata = contextMetadata(segment.metadata);
+          const references = segment.kind === 'memory' ? memoryReferences(segment) : [];
+          return (
+            <li
+              key={`${segment.kind}:${segment.label}:${index}`}
+              className={segment.kind === 'memory' ? 'memory' : ''}
+            >
+              <header>
+                <span>
+                  <strong>{segment.label}</strong>
+                  <small>{segment.kind}</small>
+                </span>
+                <em>{segment.tokens.toLocaleString()} Token</em>
+              </header>
+              {segment.kind === 'memory' && (
+                <div className="sessions-memory-segment-facts">
+                  <span>查询页 {String(metadata.query_page ?? index + 1)}</span>
+                  <span>{String(metadata.item_count ?? references.length)} 条记忆</span>
+                  <span>{metadata.has_more === true ? '还有后续页' : '当前末页'}</span>
+                  <span>
+                    {typeof metadata.eviction_reason === 'string'
+                      ? `淘汰：${metadata.eviction_reason}`
+                      : '保留在快照中'}
+                  </span>
+                </div>
+              )}
+              {references.length > 0 && (
+                <details>
+                  <summary>查看 memory / revision 来源索引</summary>
+                  <ul>
+                    {references.map((reference) => (
+                      <li key={`${reference.memoryId}:${reference.revisionId}`}>
+                        <code>{reference.memoryId}</code>
+                        <small>revision {reference.revisionId}</small>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              {segment.compacted && <p>该片段来自压缩结果。</p>}
+              {segment.externalized && <p>完整工具结果已外置，当前只保留引用。</p>}
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 export function SessionsPage({
   runtime,
   activePersonaId,
   activePersonaName,
+  selectedConversationId: requestedConversationId,
   onOpenChat
 }: SessionsPageProps) {
   const [query, setQuery] = useState('');
@@ -58,7 +139,7 @@ export function SessionsPage({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [context, setContext] = useState<RuntimeSessionContextResponse | null>(null);
   const [selectedConversationId, setSelectedConversationId] = useState(
-    runtime.activeConversationId
+    requestedConversationId || runtime.activeConversationId
   );
   const [previewMessages, setPreviewMessages] = useState<ChatMessage[]>([]);
   const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle');
@@ -79,6 +160,16 @@ export function SessionsPage({
   const hasMessages = previewMessages.some(
     (message) => message.role !== 'system' && Boolean(message.content.trim() || message.streaming)
   );
+
+  useEffect(() => {
+    if (
+      requestedConversationId &&
+      requestedConversationId !== selectedConversationId &&
+      sessions.some((session) => session.conversation_id === requestedConversationId)
+    ) {
+      setSelectedConversationId(requestedConversationId);
+    }
+  }, [requestedConversationId, selectedConversationId, sessions]);
 
   useEffect(() => {
     if (selectedSession || !sessions[0]) return;
@@ -403,45 +494,85 @@ export function SessionsPage({
               {inspectorOpen && (
                 <section className="sessions-context-inspector" aria-label="Context Inspector">
                   <header>
-                    <span><small>只读检查器</small><strong>本轮上下文来源</strong></span>
-                    <button type="button" onClick={() => setInspectorOpen(false)}>关闭</button>
+                    <span>
+                      <small>只读检查器</small>
+                      <strong>本轮上下文来源</strong>
+                    </span>
+                    <button type="button" onClick={() => setInspectorOpen(false)}>
+                      关闭
+                    </button>
                   </header>
                   {context ? (
-                    <div>
-                      <article>
-                        <small>角色与模型</small>
-                        <strong>{String(context.runtime_policy_snapshot?.provider || '未记录')} / {String(context.runtime_policy_snapshot?.model || '未记录')}</strong>
-                        <p>
-                          来源：{preferenceSourceLabel(context.runtime_policy_snapshot?.model_source)}
-                          {context.runtime_policy_snapshot?.model_fallback ? '（已回退）' : ''}
-                          {' · '}角色版本：{String(context.runtime_policy_snapshot?.persona_version || '未记录')}
-                        </p>
-                        {typeof context.runtime_policy_snapshot?.model_fallback_reason === 'string' && (
-                          <p>回退原因：{String(context.runtime_policy_snapshot.model_fallback_reason)}</p>
-                        )}
-                      </article>
-                      <article>
-                        <small>语音</small>
-                        <strong>{String(context.runtime_policy_snapshot?.voice_id || '本轮不可用')}</strong>
-                        <p>
-                          来源：{preferenceSourceLabel(context.runtime_policy_snapshot?.voice_source)}
-                          {context.runtime_policy_snapshot?.voice_fallback ? '（已回退）' : ''}
-                        </p>
-                        {typeof context.runtime_policy_snapshot?.voice_fallback_reason === 'string' && (
-                          <p>说明：{String(context.runtime_policy_snapshot.voice_fallback_reason)}</p>
-                        )}
-                      </article>
-                      <article>
-                        <small>Tool · Skill · MCP</small>
-                        <strong>{Array.isArray(context.runtime_policy_snapshot?.tool_ids) ? context.runtime_policy_snapshot.tool_ids.length : 0} 个冻结工具</strong>
-                        <p>策略版本：{String(context.runtime_policy_snapshot?.policy_version || '未记录')}</p>
-                      </article>
-                      <article>
-                        <small>Token 与片段</small>
-                        <strong>{context.context_snapshot ? '已有上下文快照' : '尚无上下文快照'}</strong>
-                        <p>这里展示回合开始时冻结的事实，不允许编辑。</p>
-                      </article>
-                    </div>
+                    <>
+                      <div className="sessions-context-overview">
+                        <article>
+                          <small>角色与模型</small>
+                          <strong>
+                            {String(context.runtime_policy_snapshot?.provider || '未记录')} /{' '}
+                            {String(context.runtime_policy_snapshot?.model || '未记录')}
+                          </strong>
+                          <p>
+                            来源：
+                            {preferenceSourceLabel(context.runtime_policy_snapshot?.model_source)}
+                            {context.runtime_policy_snapshot?.model_fallback ? '（已回退）' : ''}
+                            {' · '}角色版本：
+                            {String(
+                              context.runtime_policy_snapshot?.persona_version || '未记录'
+                            )}
+                          </p>
+                          {typeof context.runtime_policy_snapshot?.model_fallback_reason ===
+                            'string' && (
+                            <p>
+                              回退原因：
+                              {String(context.runtime_policy_snapshot.model_fallback_reason)}
+                            </p>
+                          )}
+                        </article>
+                        <article>
+                          <small>语音</small>
+                          <strong>
+                            {String(context.runtime_policy_snapshot?.voice_id || '本轮不可用')}
+                          </strong>
+                          <p>
+                            来源：
+                            {preferenceSourceLabel(context.runtime_policy_snapshot?.voice_source)}
+                            {context.runtime_policy_snapshot?.voice_fallback ? '（已回退）' : ''}
+                          </p>
+                          {typeof context.runtime_policy_snapshot?.voice_fallback_reason ===
+                            'string' && (
+                            <p>
+                              说明：
+                              {String(context.runtime_policy_snapshot.voice_fallback_reason)}
+                            </p>
+                          )}
+                        </article>
+                        <article>
+                          <small>Tool · Skill · MCP</small>
+                          <strong>
+                            {Array.isArray(context.runtime_policy_snapshot?.tool_ids)
+                              ? context.runtime_policy_snapshot.tool_ids.length
+                              : 0}{' '}
+                            个冻结工具
+                          </strong>
+                          <p>
+                            策略版本：
+                            {String(context.runtime_policy_snapshot?.policy_version || '未记录')}
+                          </p>
+                        </article>
+                        <article>
+                          <small>Token 与片段</small>
+                          <strong>
+                            {context.context_snapshot ? '已有上下文快照' : '尚无上下文快照'}
+                          </strong>
+                          <p>这里展示回合开始时冻结的事实，不允许编辑。</p>
+                        </article>
+                      </div>
+                      {context.context_snapshot ? (
+                        <ContextSegmentList segments={context.context_snapshot.segments} />
+                      ) : (
+                        <p>该会话还没有可展示的上下文快照。</p>
+                      )}
+                    </>
                   ) : (
                     <SectionLoading label="正在读取上下文来源" variant="inline" />
                   )}

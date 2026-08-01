@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useRef } from 'react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -80,5 +80,42 @@ describe('GalgameDialogueBox', () => {
 
     await waitFor(() => expect(screen.getByText('第 0 条消息')).toBeVisible());
     expect(screen.getByText('第 0 条消息').closest('.message-markdown')).not.toBeNull();
+  });
+
+  it('展示记忆读取数量，并允许展开无正文来源索引', () => {
+    const message: ChatMessage = {
+      id: 'assistant-memory',
+      role: 'assistant',
+      content: '我记得你更喜欢绿茶。',
+      status: 'completed',
+      process: [{
+        id: 'memory-process',
+        phase: 'tool_completed',
+        message: '本轮读取了 1 条相关记忆',
+        state: 'completed',
+        time: '12:00:00',
+        memoryActivity: {
+          kind: 'query',
+          label: '本轮读取了 1 条相关记忆',
+          count: 1,
+          hasMore: false,
+          references: [{
+            memoryId: 'memory-1',
+            revisionId: 'revision-2',
+            category: 'user_preference',
+            importance: 'high'
+          }]
+        }
+      }]
+    };
+
+    render(<GalgameDialogueBox messages={[message]} activePersonaName="雨灵" />);
+    const memoryActivity = screen.getByLabelText('本轮长期记忆活动');
+    const disclosure = within(memoryActivity).getByText('本轮读取了 1 条相关记忆');
+    expect(disclosure).toBeVisible();
+    fireEvent.click(disclosure);
+    expect(screen.getByText('memory-1')).toBeVisible();
+    expect(screen.getByText('revision revision-2')).toBeVisible();
+    expect(screen.getByText('用户偏好 · 高重要度')).toBeVisible();
   });
 });

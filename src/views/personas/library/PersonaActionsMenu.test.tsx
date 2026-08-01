@@ -6,6 +6,7 @@ import { PersonaActionsMenu } from './PersonaActionsMenu';
 function setup() {
   const callbacks = {
     onEdit: vi.fn(),
+    onMemories: vi.fn(),
     onCopy: vi.fn(),
     onExportFull: vi.fn(),
     onExportLight: vi.fn(),
@@ -14,7 +15,8 @@ function setup() {
   const loadDeletionImpact = vi.fn().mockResolvedValue({
     persona_id: 'alice',
     associated_session_count: 0,
-    workspace_state_exists: false
+    workspace_state_exists: false,
+    memory_count: 2
   });
   render(
     <PersonaActionsMenu
@@ -49,12 +51,12 @@ describe('PersonaActionsMenu', () => {
     fireEvent.click(trigger);
 
     const edit = screen.getByRole('menuitem', { name: '编辑角色' });
-    const copy = screen.getByRole('menuitem', { name: '创建副本' });
+    const memories = screen.getByRole('menuitem', { name: '管理记忆' });
     const exportFull = screen.getByRole('menuitem', { name: '导出完整角色卡' });
     await waitFor(() => expect(edit).toHaveFocus());
 
     fireEvent.keyDown(document, { key: 'ArrowDown' });
-    expect(copy).toHaveFocus();
+    expect(memories).toHaveFocus();
     fireEvent.keyDown(document, { key: 'ArrowUp' });
     expect(edit).toHaveFocus();
 
@@ -74,12 +76,16 @@ describe('PersonaActionsMenu', () => {
     expect(trigger).toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('编辑、复制和两种导出操作分别触发对应回调', () => {
+  it('编辑、记忆、复制和两种导出操作分别触发对应回调', () => {
     const { trigger, callbacks } = setup();
 
     fireEvent.click(trigger);
     fireEvent.click(screen.getByRole('menuitem', { name: '编辑角色' }));
     expect(callbacks.onEdit).toHaveBeenCalledOnce();
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole('menuitem', { name: '管理记忆' }));
+    expect(callbacks.onMemories).toHaveBeenCalledOnce();
 
     fireEvent.click(trigger);
     fireEvent.click(screen.getByRole('menuitem', { name: '创建副本' }));
@@ -111,13 +117,15 @@ describe('PersonaActionsMenu', () => {
     const loadDeletionImpact = vi.fn().mockResolvedValue({
       persona_id: 'alice',
       associated_session_count: 3,
-      workspace_state_exists: true
+      workspace_state_exists: true,
+      memory_count: 4
     });
     render(
       <PersonaActionsMenu
         name="爱丽丝"
         busy={false}
         onEdit={vi.fn()}
+        onMemories={vi.fn()}
         onCopy={vi.fn()}
         onExportFull={vi.fn()}
         onExportLight={vi.fn()}
@@ -129,7 +137,8 @@ describe('PersonaActionsMenu', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: '删除角色' }));
 
     expect(loadDeletionImpact).toHaveBeenCalledOnce();
-    expect(await screen.findByText(/3 个关联会话会保留为只读历史/)).toBeVisible();
+    expect(await screen.findByText(/4 条长期记忆将被删除/)).toBeVisible();
+    expect(screen.getByText(/3 个关联会话会保留为只读历史/)).toBeVisible();
   });
 
   it('删除影响获取失败时禁止继续删除', async () => {
@@ -140,6 +149,7 @@ describe('PersonaActionsMenu', () => {
         name="爱丽丝"
         busy={false}
         onEdit={vi.fn()}
+        onMemories={vi.fn()}
         onCopy={vi.fn()}
         onExportFull={vi.fn()}
         onExportLight={vi.fn()}
@@ -153,6 +163,37 @@ describe('PersonaActionsMenu', () => {
     expect(
       await screen.findByText('无法核对删除影响，已禁止继续删除，请关闭后重试。')
     ).toBeVisible();
+    const confirm = screen.getByRole('button', { name: '删除角色' });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(confirm);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it('无法核对记忆数量时禁止删除角色', async () => {
+    const onDelete = vi.fn();
+    render(
+      <PersonaActionsMenu
+        name="爱丽丝"
+        busy={false}
+        onEdit={vi.fn()}
+        onMemories={vi.fn()}
+        onCopy={vi.fn()}
+        onExportFull={vi.fn()}
+        onExportLight={vi.fn()}
+        onDelete={onDelete}
+        loadDeletionImpact={vi.fn().mockResolvedValue({
+          persona_id: 'alice',
+          associated_session_count: 1,
+          workspace_state_exists: false,
+          memory_count: null
+        })}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '爱丽丝的更多操作' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '删除角色' }));
+
+    expect(await screen.findByText('无法核对长期记忆数量，当前禁止继续删除，请关闭后重试。')).toBeVisible();
     const confirm = screen.getByRole('button', { name: '删除角色' });
     expect(confirm).toBeDisabled();
     fireEvent.click(confirm);

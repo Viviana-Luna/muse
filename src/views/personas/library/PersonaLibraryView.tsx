@@ -1,9 +1,12 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
 
 import type { usePersonaController } from '@/views/personas/hooks/usePersonaController';
 import type { UsePersonaStateResult } from '@/views/personas/hooks/usePersonaState';
 import type { ResourceState, StoryPersonaSnapshot } from '@/views/story/types';
+import type { AppToastInput } from '@/hooks/useAppToast';
+import type { PersonaLibraryItem } from '@/types';
+import { PersonaMemoryPanel } from '@/views/personas/memory/PersonaMemoryPanel';
 import { PersonaGrid } from './PersonaGrid';
 import { PersonaImportDialog } from './PersonaImportDialog';
 import { PersonaLibraryToolbar } from './PersonaLibraryToolbar';
@@ -13,6 +16,8 @@ interface PersonaLibraryViewProps {
   controller: ReturnType<typeof usePersonaController>;
   resourceState: ResourceState<StoryPersonaSnapshot>;
   busy: boolean;
+  notify: (input: AppToastInput) => void;
+  onOpenMemorySource: (conversationId: string, turnId: string) => void;
   onClose: () => void;
 }
 
@@ -35,8 +40,11 @@ export function PersonaLibraryView({
   controller,
   resourceState,
   busy,
+  notify,
+  onOpenMemorySource,
   onClose
 }: PersonaLibraryViewProps) {
+  const [memoryPersona, setMemoryPersona] = useState<PersonaLibraryItem | null>(null);
   const loading = resourceState.status === 'initial' || resourceState.status === 'loading';
   const failed = resourceState.status === 'failed';
   const syncing = resourceState.status === 'refreshing';
@@ -55,6 +63,17 @@ export function PersonaLibraryView({
     controller.setPersonaImportError('');
     state.resetImportDraft();
     state.openImportDialog();
+  }
+
+  if (memoryPersona) {
+    return (
+      <PersonaMemoryPanel
+        persona={memoryPersona}
+        notify={notify}
+        onBack={() => setMemoryPersona(null)}
+        onOpenSource={onOpenMemorySource}
+      />
+    );
   }
 
   return (
@@ -122,6 +141,7 @@ export function PersonaLibraryView({
               busy={busy}
               onImport={openImport}
               onCreate={() => void controller.openEditor('create')}
+              onOpenMemories={setMemoryPersona}
             />
           )}
         </div>

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Copy, Download, FileDown, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
+import { BookHeart, Copy, Download, FileDown, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/feedback/ConfirmDialog';
 import type { PersonaDeletionImpactResponse } from '@/types';
@@ -8,6 +8,7 @@ interface PersonaActionsMenuProps {
   name: string;
   busy: boolean;
   onEdit: () => void;
+  onMemories: () => void;
   onCopy: () => void;
   onExportFull: () => void;
   onExportLight: () => void;
@@ -19,6 +20,7 @@ export function PersonaActionsMenu({
   name,
   busy,
   onEdit,
+  onMemories,
   onCopy,
   onExportFull,
   onExportLight,
@@ -104,6 +106,10 @@ export function PersonaActionsMenu({
             <Pencil aria-hidden="true" />
             编辑角色
           </button>
+          <button type="button" role="menuitem" onClick={() => run(onMemories)}>
+            <BookHeart aria-hidden="true" />
+            管理记忆
+          </button>
           <button type="button" role="menuitem" onClick={() => run(onCopy)}>
             <Copy aria-hidden="true" />
             创建副本
@@ -124,14 +130,23 @@ export function PersonaActionsMenu({
                 : impactError
                   ? impactError
                 : deletionImpact
-                  ? `角色配置将被删除；${deletionImpact.associated_session_count} 个关联会话会保留为只读历史。此操作无法撤销。`
+                  ? deletionImpact.memory_count === null
+                    ? '无法核对长期记忆数量，当前禁止继续删除，请关闭后重试。'
+                    : `角色配置和 ${deletionImpact.memory_count} 条长期记忆将被删除；${deletionImpact.associated_session_count} 个关联会话会保留为只读历史。此操作无法撤销。`
                   : '尚未核对删除影响，当前禁止继续删除。'
             }
             confirmLabel="删除角色"
             tone="danger"
-            confirmDisabled={busy || impactLoading || deletionImpact === null}
+            confirmDisabled={
+              busy || impactLoading || deletionImpact === null || deletionImpact.memory_count === null
+            }
             onConfirm={() => {
-              if (busy || impactLoading || deletionImpact === null) return;
+              if (
+                busy ||
+                impactLoading ||
+                deletionImpact === null ||
+                deletionImpact.memory_count === null
+              ) return;
               setOpen(false);
               onDelete();
             }}

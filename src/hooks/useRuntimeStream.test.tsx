@@ -115,6 +115,55 @@ describe('useRuntimeStream 交互恢复', () => {
     expect(step?.detail).toContain('设置中心的“联网搜索”');
   });
 
+  it('把记忆查询数量、来源索引和 durable 结果保留为可见活动', async () => {
+    const { current, emit } = setup();
+    await act(async () => {
+      await current.value?.sendMessage('你还记得我的偏好吗？');
+      emit({ type: 'turn_started', turn_id: 'turn-memory' });
+      emit({
+        type: 'tool_result',
+        call_id: 'call-memory',
+        name: 'memory_query',
+        success: true,
+        content: '查到 1 条相关长期记忆。',
+        structured: {
+          items: [{
+            memory_id: 'memory-1',
+            revision_id: 'revision-2',
+            category: 'user_preference',
+            importance: 'high',
+            content: '正文只交给当前模型，不进入活动索引。'
+          }],
+          has_more: false
+        }
+      });
+      emit({
+        type: 'status',
+        phase: 'memory_commit_completed',
+        message: '本次记忆已保存。',
+        detail: '已提交 1 项记忆变更。',
+        state: 'completed'
+      });
+    });
+
+    const activities = current.value?.messages[1].process.flatMap(
+      (step) => step.memoryActivity ? [step.memoryActivity] : []
+    );
+    expect(activities).toEqual([
+      expect.objectContaining({
+        kind: 'query',
+        count: 1,
+        hasMore: false,
+        references: [expect.objectContaining({
+          memoryId: 'memory-1',
+          revisionId: 'revision-2'
+        })]
+      }),
+      expect.objectContaining({ kind: 'commit', count: 1 })
+    ]);
+    expect(JSON.stringify(activities)).not.toContain('正文只交给当前模型');
+  });
+
   it('成功提交取消后等待后端终态，再将本地流标记为已停止', async () => {
     api.cancelRuntimeTurn.mockResolvedValue({ status: 'ok' });
     const { current, emit } = setup();

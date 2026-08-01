@@ -21,8 +21,8 @@ use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryEntry, MemoryEntryState,
     MemoryMutateParams, MemoryRepository, MemoryRevisionState, MemoryRuntimeBinding,
-    MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceKind,
-    MemoryStagedMutation,
+    MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest,
+    MemorySourceEligibility, MemorySourceKind, MemoryStagedMutation,
 };
 
 const T1: &str = "2026-07-30T01:00:00Z";
@@ -98,17 +98,17 @@ fn stage_create(
     importance: MemoryImportance,
     time: &str,
 ) -> MemoryStagedMutation {
-    let binding = MemoryRuntimeBinding::new(
+    let eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope.clone(),
         conversation_id,
         turn_id,
         operation_id,
-        MemorySourceKind::DirectUserMessage,
-        time,
-        time,
-        time,
+        "请记住我喜欢这条检索测试记忆",
+        "用户喜欢这条检索测试记忆",
     )
-    .expect("runtime binding 应有效");
+    .expect("直接用户来源应可验证");
+    let binding =
+        MemoryRuntimeBinding::new(eligibility, time, time, time).expect("runtime binding 应有效");
     MemoryStagedMutation::stage(
         MemoryMutateParams::Create {
             category,
@@ -169,17 +169,17 @@ fn stage_change_with_attributes(
     correct: bool,
     time: &str,
 ) -> MemoryStagedMutation {
-    let binding = MemoryRuntimeBinding::new(
+    let eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope.clone(),
         conversation_id,
         turn_id,
         operation_id,
-        MemorySourceKind::UserConfirmation,
-        time,
-        time,
-        time,
+        "请记住我喜欢更新后的检索测试记忆",
+        "用户喜欢更新后的检索测试记忆",
     )
-    .expect("runtime binding 应有效");
+    .expect("直接用户来源应可验证");
+    let binding =
+        MemoryRuntimeBinding::new(eligibility, time, time, time).expect("runtime binding 应有效");
     let common = (
         MemoryId(memory_id.to_string()),
         MemoryRevisionId(expected_revision_id.to_string()),
@@ -341,22 +341,23 @@ fn update_memory_with_attributes(
 }
 
 fn delete_memory(repository: &SqliteMemoryRepository, scope: &MemoryPersonaScope, memory_id: &str) {
+    let confirmation_id = unique("delete");
+    let params = MemoryDeleteParams::Memory {
+        memory_id: MemoryId(memory_id.to_string()),
+    };
     let confirmation = MemoryDeleteConfirmation::new(
-        unique("delete"),
+        &confirmation_id,
+        scope,
+        &params,
         T3,
+        "2099-07-30T03:05:00Z",
         MemoryDeleteConfirmationSource::PersonaManagement {
-            action_id: unique("delete-action"),
+            action_id: confirmation_id.clone(),
         },
     )
     .expect("删除确认应有效");
-    let request = ConfirmedMemoryDeleteRequest::bind(
-        MemoryDeleteParams::Memory {
-            memory_id: MemoryId(memory_id.to_string()),
-        },
-        scope.clone(),
-        confirmation,
-    )
-    .expect("删除请求应有效");
+    let request = ConfirmedMemoryDeleteRequest::bind(params, scope.clone(), confirmation)
+        .expect("删除请求应有效");
     repository
         .delete_confirmed(&request, repository.deletion_authority())
         .expect("删除应 durable 成功");

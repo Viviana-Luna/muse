@@ -2,6 +2,7 @@ import { LibraryBig, SearchX } from 'lucide-react';
 
 import type { usePersonaController } from '@/views/personas/hooks/usePersonaController';
 import type { UsePersonaStateResult } from '@/views/personas/hooks/usePersonaState';
+import type { PersonaLibraryItem } from '@/types';
 import { PersonaCard } from './PersonaCard';
 
 interface PersonaGridProps {
@@ -10,9 +11,10 @@ interface PersonaGridProps {
   busy: boolean;
   onImport: () => void;
   onCreate: () => void;
+  onOpenMemories: (persona: PersonaLibraryItem) => void;
 }
 
-export function PersonaGrid({ state, controller, busy, onImport, onCreate }: PersonaGridProps) {
+export function PersonaGrid({ state, controller, busy, onImport, onCreate, onOpenMemories }: PersonaGridProps) {
   if (state.personaList.length === 0) {
     return (
       <section className="persona-library-empty" aria-labelledby="persona-library-empty-title">
@@ -59,6 +61,7 @@ export function PersonaGrid({ state, controller, busy, onImport, onCreate }: Per
           active={persona.id === state.activePersonaId}
           busy={busy}
           controller={controller}
+          onOpenMemories={onOpenMemories}
         />
       ))}
     </div>

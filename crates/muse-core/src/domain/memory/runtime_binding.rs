@@ -1319,16 +1319,6 @@ impl MemoryDeleteConfirmation {
 
     pub(crate) fn intent_digest(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
-        update_length_prefixed(&mut digest, b"muse-memory-delete-confirmation/v1");
-        for field in [
-            self.confirmation_id.as_str(),
-            self.persona_id.as_str(),
-            self.target_digest.as_str(),
-            self.confirmed_at.as_str(),
-            self.expires_at.as_str(),
-        ] {
-            update_length_prefixed(&mut digest, field.as_bytes());
-        }
         match &self.source {
             MemoryDeleteConfirmationSource::ConversationTurn {
                 conversation_id,
@@ -1336,12 +1326,36 @@ impl MemoryDeleteConfirmation {
                 approval_id,
                 call_id,
             } => {
+                // 聊天内删除必须继续把专用审批时效完整绑定进确认摘要。
+                update_length_prefixed(&mut digest, b"muse-memory-delete-confirmation/v1");
+                for field in [
+                    self.confirmation_id.as_str(),
+                    self.persona_id.as_str(),
+                    self.target_digest.as_str(),
+                    self.confirmed_at.as_str(),
+                    self.expires_at.as_str(),
+                ] {
+                    update_length_prefixed(&mut digest, field.as_bytes());
+                }
                 update_length_prefixed(&mut digest, b"conversation_turn");
                 for field in [conversation_id, turn_id, approval_id, call_id] {
                     update_length_prefixed(&mut digest, field.as_bytes());
                 }
             }
             MemoryDeleteConfirmationSource::PersonaManagement { action_id } => {
+                // 管理 API 的显式 DELETE 以持久 operation/action 身份做幂等边界；
+                // 首次请求的墙钟时间只用于审计，不得让响应丢失后的相同重试变成冲突。
+                update_length_prefixed(
+                    &mut digest,
+                    b"muse-memory-delete-confirmation-persona-management/v2",
+                );
+                for field in [
+                    self.confirmation_id.as_str(),
+                    self.persona_id.as_str(),
+                    self.target_digest.as_str(),
+                ] {
+                    update_length_prefixed(&mut digest, field.as_bytes());
+                }
                 update_length_prefixed(&mut digest, b"persona_management");
                 update_length_prefixed(&mut digest, action_id.as_bytes());
             }

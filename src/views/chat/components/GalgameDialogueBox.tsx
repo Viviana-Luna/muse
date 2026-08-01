@@ -1,5 +1,6 @@
 import { lazy, memo, Suspense, useMemo } from 'react';
 import type { RefObject } from 'react';
+import { BookHeart, ChevronDown } from 'lucide-react';
 
 import type { ChatMessage } from '@/hooks/useRuntimeStream';
 import type { Role } from '@/types';
@@ -55,6 +56,67 @@ function actionLabel(message: ChatMessage) {
   return lastStep.message?.trim() || labels[lastStep.phase] || null;
 }
 
+function memoryReferenceLabel(category?: string, importance?: string) {
+  const categories: Record<string, string> = {
+    user_fact: '用户事实',
+    user_preference: '用户偏好',
+    shared_experience: '共同经历',
+    commitment: '约定',
+    story_state: '故事状态'
+  };
+  const importanceLabels: Record<string, string> = { low: '低', normal: '普通', high: '高' };
+  return [
+    category ? categories[category] || category : '',
+    importance ? `${importanceLabels[importance] || importance}重要度` : ''
+  ].filter(Boolean).join(' · ');
+}
+
+function MemoryActivityFeed({ message }: { message: ChatMessage }) {
+  const activities = message.process.flatMap((step) => step.memoryActivity ? [step.memoryActivity] : []);
+  if (activities.length === 0) return null;
+  return (
+    <aside className="story-memory-activity" aria-label="本轮长期记忆活动">
+      {activities.map((activity, index) => {
+        const references = activity.references || [];
+        const key = `${activity.kind}-${index}`;
+        if (activity.kind === 'query') {
+          return (
+            <details key={key}>
+              <summary>
+                <BookHeart aria-hidden="true" />
+                <span>
+                  <strong>{activity.label}</strong>
+                  <small>{activity.hasMore ? '还有后续查询页' : '已到当前查询末页'}</small>
+                </span>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              {references.length > 0 ? (
+                <ol>
+                  {references.map((reference) => (
+                    <li key={`${reference.memoryId}:${reference.revisionId}`}>
+                      <span>{memoryReferenceLabel(reference.category, reference.importance)}</span>
+                      <code title={reference.memoryId}>{reference.memoryId}</code>
+                      <small title={reference.revisionId}>revision {reference.revisionId}</small>
+                    </li>
+                  ))}
+                </ol>
+              ) : <p>这次查询没有返回相关记忆正文。</p>}
+            </details>
+          );
+        }
+        return (
+          <p key={key} className={activity.kind === 'failed' ? 'failed' : ''}>
+            <BookHeart aria-hidden="true" />
+            <span>{activity.label}</span>
+            {typeof activity.count === 'number' && <small>{activity.count} 项</small>}
+            {activity.errorCode && <code>{activity.errorCode}</code>}
+          </p>
+        );
+      })}
+    </aside>
+  );
+}
+
 interface StoryMessageProps {
   message: ChatMessage;
   activePersonaName?: string;
@@ -84,6 +146,7 @@ const StoryMessage = memo(
           )}
           {message.streaming && <span className="message-cursor" aria-hidden="true" />}
         </div>
+        {isAssistant && <MemoryActivityFeed message={message} />}
       </article>
     );
   },

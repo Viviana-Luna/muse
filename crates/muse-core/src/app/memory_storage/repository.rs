@@ -26,11 +26,11 @@ use super::recovery::{
 use crate::app::storage::{open_initialized_runtime_database, open_runtime_database};
 use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCategory, MemoryChangeType,
-    MemoryCommitEnvelope, MemoryDeleteParams, MemoryDeleteReceipt, MemoryDeletionAuthority,
-    MemoryDeletionAuthorityReceipt, MemoryDeletionCheckRequest, MemoryDeletionDecision,
-    MemoryDeletionSubject, MemoryDerivationKey, MemoryEntry, MemoryEntryState, MemoryError,
-    MemoryErrorCode, MemoryId, MemoryImportance, MemoryImportanceAdjustment,
-    MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation,
+    MemoryCommitEnvelope, MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt,
+    MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt, MemoryDeletionCheckRequest,
+    MemoryDeletionDecision, MemoryDeletionSubject, MemoryDerivationKey, MemoryEntry,
+    MemoryEntryState, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
+    MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation,
     MemoryManagementContentParams, MemoryMutationReceipt, MemoryMutationReceiptState,
     MemoryMutationTransition, MemoryPersonaScope, MemoryRecord, MemoryRepository, MemoryRevision,
     MemoryRevisionId, MemoryRevisionState, MemorySensitivityPolicy, MemorySourceEvidence,
@@ -140,6 +140,14 @@ impl SqliteMemoryRepository {
 
     pub fn deletion_authority(&self) -> &SqliteMemoryDeletionAuthority {
         &self.authority
+    }
+
+    /// 返回 Repository 内部删除权威的共享句柄，供同一生产服务束接线。
+    ///
+    /// `delete_confirmed` 会校验调用方传入的权威与 Repository 内部实例完全相同，
+    /// 因此集成层只能克隆这一个 `Arc`，不得另行打开第二个权威对象。
+    pub fn shared_deletion_authority(&self) -> Arc<SqliteMemoryDeletionAuthority> {
+        Arc::clone(&self.authority)
     }
 
     /// 从 current revision 重建 Persona 隔离的 trigram 投影。
@@ -957,6 +965,10 @@ impl MemoryRepository for SqliteMemoryRepository {
         let persona_id = scope.persona_id();
         let deletion_id = request.confirmation().confirmation_id();
         let recorded_at = request.confirmation().confirmed_at();
+        let require_exact_recorded_at = matches!(
+            request.confirmation().source(),
+            MemoryDeleteConfirmationSource::ConversationTurn { .. }
+        );
         let (request_kind, requested_memory_id) = match request.params() {
             MemoryDeleteParams::Memory { memory_id } => ("memory", Some(memory_id.0.as_str())),
             MemoryDeleteParams::PersonaAll => ("persona_all", None),
@@ -989,8 +1001,16 @@ impl MemoryRepository for SqliteMemoryRepository {
                 request_kind,
                 requested_memory_id,
                 &confirmation_subject,
+                require_exact_recorded_at,
             )?;
         }
+        let canonical_recorded_at = if require_exact_recorded_at {
+            recorded_at
+        } else {
+            existing
+                .as_ref()
+                .map_or(recorded_at, |event| event.recorded_at.as_str())
+        };
 
         // authority 首次持锁期间只做主库 autocommit 读取；Repository 的所有记忆
         // 写入也先取 authority，因此 canonical subjects 在该窗口保持稳定。
@@ -1032,7 +1052,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             let authority_receipt = authority_guard.record_delete_intent_durable(
                 persona_id,
                 deletion_id,
-                recorded_at,
+                canonical_recorded_at,
                 &subjects,
                 AuthorityDeleteIntent {
                     request_kind,
@@ -1052,10 +1072,11 @@ impl MemoryRepository for SqliteMemoryRepository {
                 .ok_or_else(|| MemoryError::new(MemoryErrorCode::DeletionAuthorityUnavailable))?;
             validate_delete_event(
                 &canonical_event,
-                recorded_at,
+                canonical_recorded_at,
                 request_kind,
                 requested_memory_id,
                 &confirmation_subject,
+                require_exact_recorded_at,
             )?;
             if canonical_event.subjects != subjects
                 || canonical_event.target_memory_count != Some(target_count)
@@ -1153,8 +1174,11 @@ fn validate_delete_event(
     request_kind: &str,
     requested_memory_id: Option<&str>,
     confirmation_subject: &MemoryDeletionSubject,
+    require_exact_recorded_at: bool,
 ) -> Result<(), MemoryError> {
-    if event.recorded_at != recorded_at || !event.subjects.contains(confirmation_subject) {
+    if (require_exact_recorded_at && event.recorded_at != recorded_at)
+        || !event.subjects.contains(confirmation_subject)
+    {
         return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
     }
     if let Some(stored_kind) = event.request_kind.as_deref()
@@ -2384,13 +2408,15 @@ fn management_content_digest(
     append_canonical(&mut canonical, mutation.assigned_revision_id().0.as_bytes());
     append_canonical(&mut canonical, mutation.staging_policy_version().as_bytes());
     append_management_params(&mut canonical, mutation.params());
-    append_canonical(
-        &mut canonical,
-        &serde_json::to_vec(mutation.binding().source())
-            .map_err(|_| MemoryError::new(MemoryErrorCode::InvalidRequest))?,
-    );
+    let MemorySourceEvidence::PersonaManagement { action_id, .. } = mutation.binding().source()
+    else {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+    };
+    // action_id 是管理鉴权的稳定身份；authorized_at 是首次执行审计时间，
+    // 不属于客户端语义，否则响应丢失后的同 operation 重试会产生不同摘要。
+    append_canonical(&mut canonical, action_id.as_bytes());
     Ok(authority.keyed_digest(
-        b"muse-memory-management-content/v1",
+        b"muse-memory-management-content/v2",
         &[canonical.as_slice()],
     ))
 }

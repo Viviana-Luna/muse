@@ -10,8 +10,8 @@ use muse_core::domain::memory::{
     ConfirmedMemoryDeleteRequest, MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME,
     MEMORY_QUERY_TOOL_NAME, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
     MemoryDeleteParams, MemoryError, MemoryErrorCode, MemoryId, MemoryMutateParams,
-    MemoryPersonaScope, MemoryQueryParams, MemoryRetrievalRequest, MemoryRevisionId,
-    MemoryStagedMutation,
+    MemoryPersonaScope, MemoryQueryParams, MemoryRetrievalFilters, MemoryRetrievalRequest,
+    MemoryRevisionId, MemoryStagedMutation,
 };
 
 pub(in crate::runtime_support) struct MemoryQueryHandler;
@@ -119,7 +119,16 @@ impl RuntimeToolHandler for MemoryQueryHandler {
             if !memory_turn.try_consume_query_budget() {
                 return memory_tool_failed(MemoryError::new(MemoryErrorCode::QueryBudgetExceeded));
             }
-            let request = match MemoryRetrievalRequest::bind(params, scope) {
+            let retrieval_turn = match memory_turn.retrieval_turn() {
+                Ok(turn) => turn,
+                Err(error) => return memory_tool_failed(error),
+            };
+            let request = match MemoryRetrievalRequest::bind(
+                params,
+                scope,
+                retrieval_turn,
+                MemoryRetrievalFilters::none(),
+            ) {
                 Ok(request) => request,
                 Err(error) => return memory_tool_failed(error),
             };
@@ -316,7 +325,8 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
                     conversation_id: turn.conversation_id.clone(),
                     turn_id: turn.turn_id.clone(),
                     approval_id: approval_evidence.approval_id.clone(),
-                    call_id: call.call_id.clone(),
+                    // 供应商返回的调用 ID 属于不可信输入；删除确认必须复用 Session/SSE 的安全规范化口径。
+                    call_id: memory_session_call_id(&call.call_id),
                 },
             ) {
                 Ok(confirmation) => confirmation,

@@ -11,6 +11,15 @@ function read(relativePath) {
   return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
 }
 
+function rustFiles(relativeDirectory) {
+  const directory = path.join(repoRoot, relativeDirectory);
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const relative = path.join(relativeDirectory, entry.name);
+    if (entry.isDirectory()) return rustFiles(relative);
+    return entry.isFile() && entry.name.endsWith('.rs') ? [relative] : [];
+  });
+}
+
 function count(source, needle) {
   return source.split(needle).length - 1;
 }
@@ -130,26 +139,21 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   assert.match(desktop, /hidden_title\(true\)/);
   assert.match(desktop, /window_builder\.decorations\(false\)/);
 
-  const handlerFacade = read('crates/muse-local-api/src/handlers.rs');
-  assert.ok(handlerFacade.split('\n').length <= 100, 'handler façade 只能承担装配与兼容导出。');
   for (const relative of [
-    'crates/muse-local-api/src/handlers/implementation.rs',
-    'crates/muse-local-api/src/handlers/runtime_api.rs',
-    'crates/muse-local-api/src/handlers/api/runtime_assets_voice.rs',
-    'crates/muse-local-api/src/handlers/api/app_preferences.rs',
-    'crates/muse-local-api/src/handlers/api/chat_sessions_models.rs',
-    'crates/muse-local-api/src/handlers/api/personas_stream.rs',
-    'crates/muse-local-api/src/handlers/api/persona_session_binding.rs',
-    'crates/muse-local-api/src/handlers/tools/registry.rs',
-    'crates/muse-local-api/src/handlers/tools/interaction.rs',
-    'crates/muse-local-api/src/handlers/tools/files.rs',
-    'crates/muse-local-api/src/handlers/tools/command.rs',
-    'crates/muse-local-api/src/handlers/tools/network.rs',
-    'crates/muse-local-api/src/handlers/tools/mcp.rs',
-    'crates/muse-local-api/src/handlers/tools/session.rs',
-    'crates/muse-local-api/src/handlers/tools/persona_context.rs',
+    'crates/muse-local-api/src/lib.rs',
+    'crates/muse-local-api/src/api/mod.rs',
+    'crates/muse-local-api/src/dto/mod.rs',
+    'crates/muse-local-api/src/middleware/mod.rs',
+    'crates/muse-local-api/src/runtime_support/tool_adapters/mod.rs',
   ]) {
-    assert.ok(read(relative).split('\n').length <= 3500, `${relative} 超过 3500 行。`);
+    assert.ok(read(relative).split('\n').length <= 120, `${relative} 只能承担装配与兼容导出。`);
+  }
+  for (const relative of rustFiles('crates/muse-local-api/src/api')) {
+    assert.ok(read(relative).split('\n').length <= 1200, `${relative} 超过 1200 行。`);
+  }
+  for (const relative of rustFiles('crates/muse-local-api/src/runtime_support')) {
+    if (relative.endsWith('/tests.rs')) continue;
+    assert.ok(read(relative).split('\n').length <= 4000, `${relative} 超过 4000 行。`);
   }
   const router = read('crates/muse-local-api/src/router.rs');
   assert.doesNotMatch(router.split('#[cfg(test)]')[0], /\/model-assets/);

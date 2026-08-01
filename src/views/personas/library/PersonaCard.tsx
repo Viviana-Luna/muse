@@ -9,9 +9,10 @@ interface PersonaCardProps {
   active: boolean;
   busy: boolean;
   controller: ReturnType<typeof usePersonaController>;
+  onOpenMemories: (persona: PersonaLibraryItem) => void;
 }
 
-export function PersonaCard({ persona, active, busy, controller }: PersonaCardProps) {
+export function PersonaCard({ persona, active, busy, controller, onOpenMemories }: PersonaCardProps) {
   const identityNote = persona.author.trim()
     ? `by ${persona.author.trim()}`
     : persona.version.trim()
@@ -51,6 +52,7 @@ export function PersonaCard({ persona, active, busy, controller }: PersonaCardPr
             name={persona.name}
             busy={busy}
             onEdit={() => void controller.openEditor('edit', persona)}
+            onMemories={() => onOpenMemories(persona)}
             onCopy={() => void controller.openEditor('copy', persona)}
             onExportFull={() => void controller.handleExport(persona.id, 'with_visual_pack_ref')}
             onExportLight={() => void controller.handleExport(persona.id, 'persona_only')}

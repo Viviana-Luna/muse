@@ -164,6 +164,7 @@ export interface PersonaDeletionImpactResponse {
   persona_id: string;
   associated_session_count: number;
   workspace_state_exists: boolean;
+  memory_count: number | null;
 }
 
 export interface PersonaCard {

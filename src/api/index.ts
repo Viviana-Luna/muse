@@ -9,3 +9,4 @@ export * from './webSearch';
 export * from './skills';
 export * from './mcp';
 export * from './preferences';
+export * from './memories';

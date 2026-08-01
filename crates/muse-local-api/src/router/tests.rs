@@ -4275,15 +4275,10 @@ use crate::runtime_support::{
 };
 use muse_core::app::memory_storage::SqliteMemoryRepository;
 use muse_core::domain::memory::{
-    ConfirmedMemoryDeleteRequest, MemoryCategory, MemoryChangeType, MemoryDeleteConfirmation,
-    MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt, MemoryError,
-    MemoryErrorCode, MemoryId, MemoryImportance, MemoryImportanceAdjustment,
-    MemoryImportanceAdjustmentReceipt, MemoryManagementAuthorization, MemoryManagementBinding,
-    MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutationReceipt,
-    MemoryPersonaScope, MemoryQueryItem, MemoryQueryPageReceipt, MemoryRepository,
-    MemoryRetrievalRequest, MemoryRetriever, MemoryRevision, MemoryRevisionId, MemoryRevisionState,
-    MemorySafetyAssessment, MemorySensitivityPolicy, MemorySensitivityRequest,
-    MemorySourceEvidence,
+    MemoryCategory, MemoryChangeType, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
+    MemoryDeleteParams, MemoryImportance, MemoryManagementAuthorization, MemoryManagementBinding,
+    MemoryManagementContentParams, MemoryQueryItem, MemoryRevision, MemoryRevisionId,
+    MemoryRevisionState, MemorySafetyAssessment, MemorySensitivityRequest, MemorySourceEvidence,
 };
 
 /// 测试用敏感策略：两个门阶段一律允许，策略版本固定。
@@ -4421,9 +4416,12 @@ impl MemoryManagementCommands for RepositoryMemoryCommands {
         }
         let confirmation = MemoryDeleteConfirmation::new(
             operation_id,
+            scope,
+            params,
+            "2026-08-02T00:00:00+00:00",
             "2099-01-01T00:00:00+00:00",
             MemoryDeleteConfirmationSource::PersonaManagement {
-                action_id: format!("memory-action-{operation_id}"),
+                action_id: operation_id.to_string(),
             },
         )?;
         let request =
@@ -4440,9 +4438,24 @@ struct StubMemoryRetriever {
 impl MemoryRetriever for StubMemoryRetriever {
     fn retrieve(
         &self,
-        _request: &MemoryRetrievalRequest,
+        request: &MemoryRetrievalRequest,
     ) -> Result<MemoryQueryPageReceipt, MemoryError> {
-        Ok(MemoryQueryPageReceipt::new(self.items.clone(), None))
+        let items = self
+            .items
+            .iter()
+            .filter(|item| {
+                request
+                    .filters()
+                    .category()
+                    .is_none_or(|category| item.category == category)
+                    && request
+                        .filters()
+                        .importance()
+                        .is_none_or(|importance| item.importance == importance)
+            })
+            .cloned()
+            .collect();
+        Ok(MemoryQueryPageReceipt::new(items, None))
     }
 }
 
@@ -5183,9 +5196,9 @@ async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
     assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
     let blank_payload = response_json(blank).await;
     assert_flat_api_error(&blank_payload);
-    assert_eq!(blank_payload["code"], "memory_invalid_request");
+    assert_eq!(blank_payload["code"], "memory_query_rejected");
 
-    // category 与 importance 为页内过滤。
+    // category 与 importance 必须绑定到 Retriever，在分页前完成过滤。
     let filtered = app
         .clone()
         .oneshot(

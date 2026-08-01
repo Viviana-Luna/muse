@@ -472,11 +472,46 @@ pub(in crate::runtime_support) fn tool_context_segment_kind(
     }
 }
 
+fn memory_query_context_metadata(content: &str, page: usize) -> serde_json::Value {
+    const STRUCTURED_MARKER: &str = "结构化结果（供模型继续决策）：";
+    let structured = content
+        .split_once(STRUCTURED_MARKER)
+        .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value.trim()).ok());
+    let items = structured
+        .as_ref()
+        .and_then(|value| value.get("items"))
+        .and_then(serde_json::Value::as_array);
+    let memories = items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some(serde_json::json!({
+                "memory_id": item.get("memory_id")?.as_str()?,
+                "revision_id": item.get("revision_id")?.as_str()?,
+                "category": item.get("category").and_then(serde_json::Value::as_str),
+                "importance": item.get("importance").and_then(serde_json::Value::as_str),
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "query_page": page,
+        "item_count": memories.len(),
+        "has_more": structured
+            .as_ref()
+            .and_then(|value| value.get("has_more"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "memories": memories,
+        "eviction_reason": null,
+    })
+}
+
 pub(in crate::runtime_support) fn runtime_context_segments_from_conversation(
     turn: &TurnContext,
     conversation: &Conversation,
 ) -> Vec<RuntimeContextSegment> {
     let mut segments = BTreeMap::<(String, String, bool, bool), RuntimeContextSegment>::new();
+    let mut memory_query_page = 0_usize;
     let (persona_prompt, runtime_prompt) = split_system_prompt_for_segments(turn);
     if let Some(persona_prompt) = persona_prompt {
         push_estimated_context_segment(
@@ -543,6 +578,28 @@ pub(in crate::runtime_support) fn runtime_context_segments_from_conversation(
                 );
             }
             Role::Tool => {
+                if message.tool_name.as_deref()
+                    == Some(muse_core::domain::memory::MEMORY_QUERY_TOOL_NAME)
+                {
+                    memory_query_page = memory_query_page.saturating_add(1);
+                    let label = format!("长期记忆查询页 {memory_query_page}");
+                    segments.insert(
+                        ("memory".to_string(), label.clone(), false, false),
+                        RuntimeContextSegment {
+                            kind: "memory".to_string(),
+                            label,
+                            tokens: estimate_text_tokens(&message.content),
+                            source: TokenUsageSource::LocalEstimated,
+                            compacted: false,
+                            externalized: false,
+                            metadata: Some(memory_query_context_metadata(
+                                &message.content,
+                                memory_query_page,
+                            )),
+                        },
+                    );
+                    continue;
+                }
                 let externalized = message.content.contains("tool_result_read")
                     || message.content.contains("外置归档");
                 let (kind, label, compacted) =

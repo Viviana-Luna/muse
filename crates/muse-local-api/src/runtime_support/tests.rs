@@ -6,12 +6,19 @@ use crate::dto::{
     ActiveChatModelUpdateRequest, FetchModelCatalogRequest, ModelCatalogDeleteRequest,
     PersonaUpsertRequest, PersonaVisualPackPatch, ProviderStateUpdateRequest,
 };
-use crate::state::{AppState, build_runtime_system_prompt};
+use crate::state::{AppState, MemoryRuntimeServices, build_runtime_system_prompt};
 use axum::{Json, extract::State};
+use muse_core::app::memory_safety::DeterministicMemorySensitivityPolicy;
 use muse_core::config::{AgentConfig, CharacterConfig, Config, ServerConfig};
 use muse_core::domain::conversation::{Conversation, Message, Role};
 use muse_core::domain::memory::{
-    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME, MemoryErrorCode,
+    ConfirmedMemoryDeleteRequest, MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME,
+    MEMORY_QUERY_TOOL_NAME, MemoryBatchCommitReceipt, MemoryCommitEnvelope, MemoryDeleteReceipt,
+    MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt, MemoryDeletionAuthorityRequest,
+    MemoryDeletionCheckRequest, MemoryDeletionDecision, MemoryError, MemoryErrorCode, MemoryId,
+    MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation,
+    MemoryMutationReceipt, MemoryQueryPageReceipt, MemoryRecord, MemoryRepository,
+    MemoryRetrievalRequest, MemoryRetriever, MemorySensitivityPolicy,
 };
 use muse_core::domain::persona::character::store::PersonaStore;
 use muse_core::domain::persona::visual::VisualPack;
@@ -28,6 +35,7 @@ use muse_core::model::provider::{
     ChatModelError, ChatModelProvider, ChatModelResult, ChatStreamResult,
 };
 use muse_runtime::interactions::{PendingApproval, PendingUserQuestion};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -588,6 +596,15 @@ fn runtime_context_snapshot_splits_context_segments() {
         "session_compact".to_string(),
         "会话已完成压缩。摘要正文。".to_string(),
     );
+    conversation.add_tool_result(
+        "call-memory".to_string(),
+        "memory_query".to_string(),
+        concat!(
+            "查到 1 条相关长期记忆。\n\n结构化结果（供模型继续决策）：\n",
+            r#"{"items":[{"memory_id":"memory-1","revision_id":"revision-1","category":"user_preference","content":"不应进入 Inspector 元数据","importance":"high"}],"has_more":true,"next_cursor":"opaque"}"#,
+        )
+        .to_string(),
+    );
 
     let snapshot = super::build_runtime_context_snapshot(
         &turn,
@@ -610,6 +627,27 @@ fn runtime_context_snapshot_splits_context_segments() {
     assert!(kinds.contains("skill"));
     assert!(kinds.contains("task_state"));
     assert!(kinds.contains("compact_summary"));
+    assert!(kinds.contains("memory"));
+    let memory = snapshot
+        .segments
+        .iter()
+        .find(|segment| segment.kind == "memory")
+        .expect("记忆查询应形成独立上下文片段");
+    assert_eq!(memory.metadata.as_ref().unwrap()["query_page"], 1);
+    assert_eq!(memory.metadata.as_ref().unwrap()["item_count"], 1);
+    assert_eq!(memory.metadata.as_ref().unwrap()["has_more"], true);
+    assert_eq!(
+        memory.metadata.as_ref().unwrap()["memories"][0]["revision_id"],
+        "revision-1"
+    );
+    assert!(
+        !memory
+            .metadata
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("不应进入 Inspector 元数据")
+    );
     assert!(snapshot.compacted);
 }
 
@@ -4235,41 +4273,117 @@ async fn memory_delete_registry_approval_chain_is_canonical_and_replay_only() {
     const MEMORY_ID_SENTINEL: &str = "memory-1767225600000-998877665544332211";
     const MANUAL_SUMMARY_SENTINEL: &str = "MANUAL_SUMMARY_SENTINEL_SECRET";
     const RESULT_CONTENT_SENTINEL: &str = "RESULT_CONTENT_SENTINEL_SECRET";
-    const DELETION_ID: &str = "approval-1767225600000-778899";
+
+    struct ApprovalDeleteRepository {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MemoryRepository for ApprovalDeleteRepository {
+        fn current(
+            &self,
+            _scope: &muse_core::domain::memory::MemoryPersonaScope,
+            _memory_id: &MemoryId,
+        ) -> Result<Option<MemoryRecord>, MemoryError> {
+            unreachable!("本测试不读取记忆")
+        }
+
+        fn apply_committed_batch(
+            &self,
+            _envelope: &MemoryCommitEnvelope,
+            _sensitivity: &dyn MemorySensitivityPolicy,
+        ) -> Result<MemoryBatchCommitReceipt, MemoryError> {
+            unreachable!("本测试不提交记忆变更")
+        }
+
+        fn apply_management_content_mutation(
+            &self,
+            _mutation: &MemoryManagementContentMutation,
+            _sensitivity: &dyn MemorySensitivityPolicy,
+        ) -> Result<MemoryMutationReceipt, MemoryError> {
+            unreachable!("本测试不执行管理写入")
+        }
+
+        fn adjust_importance(
+            &self,
+            _adjustment: &MemoryImportanceAdjustment,
+        ) -> Result<MemoryImportanceAdjustmentReceipt, MemoryError> {
+            unreachable!("本测试不调整重要程度")
+        }
+
+        fn delete_confirmed(
+            &self,
+            request: &ConfirmedMemoryDeleteRequest,
+            _authority: &dyn MemoryDeletionAuthority,
+        ) -> Result<MemoryDeleteReceipt, MemoryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MemoryDeleteReceipt {
+                deletion_id: request.confirmation().confirmation_id().to_string(),
+                deleted_memory_count: 1,
+                completed_at: "2026-08-02T00:02:00Z".to_string(),
+            })
+        }
+    }
+
+    struct ApprovalEmptyRetriever;
+
+    impl MemoryRetriever for ApprovalEmptyRetriever {
+        fn retrieve(
+            &self,
+            _request: &MemoryRetrievalRequest,
+        ) -> Result<MemoryQueryPageReceipt, MemoryError> {
+            Ok(MemoryQueryPageReceipt::new(Vec::new(), None))
+        }
+    }
+
+    struct ApprovalDeletionAuthority;
+
+    impl MemoryDeletionAuthority for ApprovalDeletionAuthority {
+        fn record(
+            &self,
+            _request: &MemoryDeletionAuthorityRequest,
+        ) -> Result<MemoryDeletionAuthorityReceipt, MemoryError> {
+            unreachable!("本测试由 Repository 模拟 durable 删除")
+        }
+
+        fn check(
+            &self,
+            _request: &MemoryDeletionCheckRequest,
+        ) -> Result<MemoryDeletionDecision, MemoryError> {
+            Ok(MemoryDeletionDecision::Allowed)
+        }
+    }
 
     let config_dir = unique_temp_dir("memory-delete-registry-approval");
     let dispatch_count = Arc::new(AtomicUsize::new(0));
-    let handler_dispatch_count = Arc::clone(&dispatch_count);
     let mut state = build_test_state(&config_dir);
-    Arc::get_mut(&mut state)
-        .expect("测试状态尚未共享")
-        .tools
-        .register(Tool {
-            name: "memory_delete".to_string(),
-            description: "测试真实 registry 的记忆删除确认链".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-            }),
-            category: "memory".to_string(),
-            risk: ToolRisk::ExternalSideEffect,
-            requires_approval: true,
-            expose_to_model: true,
-            execution_owner: ToolExecutionOwner::Core,
-            available: true,
-            disabled_reason: None,
-            handler: Arc::new(move |_arguments| {
-                handler_dispatch_count.fetch_add(1, Ordering::SeqCst);
-                ToolResult::success(
-                    RESULT_CONTENT_SENTINEL,
-                    Some(serde_json::json!({
-                        "deletion_id": DELETION_ID,
-                        "deleted_memory_count": 1,
-                        "completed_at": "2026-08-01T00:02:00Z",
-                    })),
-                )
-            }),
-        });
+    let state_mut = Arc::get_mut(&mut state).expect("测试状态尚未共享");
+    state_mut.tools.register(Tool {
+        name: "memory_delete".to_string(),
+        description: "测试真实 registry 的记忆删除确认链".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+        }),
+        category: "memory".to_string(),
+        risk: ToolRisk::ExternalSideEffect,
+        requires_approval: true,
+        expose_to_model: true,
+        execution_owner: ToolExecutionOwner::Core,
+        available: true,
+        disabled_reason: None,
+        handler: Arc::new(|_arguments| {
+            ToolResult::success(RESULT_CONTENT_SENTINEL, Some(serde_json::json!({})))
+        }),
+    });
+    state_mut.memory = Some(MemoryRuntimeServices {
+        retriever: Arc::new(ApprovalEmptyRetriever),
+        repository: Arc::new(ApprovalDeleteRepository {
+            calls: Arc::clone(&dispatch_count),
+        }),
+        sensitivity: Arc::new(DeterministicMemorySensitivityPolicy::new()),
+        deletion_authority: Arc::new(ApprovalDeletionAuthority),
+        query_call_budget: NonZeroU32::new(1).expect("测试查询预算必须非零"),
+    });
 
     let roots = vec![
         std::env::current_dir()
@@ -4322,6 +4436,12 @@ async fn memory_delete_registry_approval_chain_is_canonical_and_replay_only() {
     };
     let canonical_call_id = super::memory_session_call_id(PROVIDER_CALL_ID_SENTINEL);
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(32);
+    let memory_turn = super::MemoryTurnState::new(
+        1,
+        conversation_id.clone(),
+        turn_id.clone(),
+        "测试用户请求删除记忆",
+    );
 
     let execute_state = Arc::clone(&state);
     let execute_tx = event_tx.clone();
@@ -4337,6 +4457,7 @@ async fn memory_delete_registry_approval_chain_is_canonical_and_replay_only() {
                 turn: &turn,
                 cancel_token: &cancel_token,
                 conversation: &conversation,
+                memory_turn: &memory_turn,
             },
             call,
         )
@@ -4386,7 +4507,7 @@ async fn memory_delete_registry_approval_chain_is_canonical_and_replay_only() {
         .await
         .expect("registry 执行任务不应 panic")
         .expect("registry 执行链应完成");
-    assert!(result.is_success());
+    assert!(result.is_success(), "真实 registry 删除结果：{result:?}");
     assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
     drop(active_guard);
     drop(event_tx);

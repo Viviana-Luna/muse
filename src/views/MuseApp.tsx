@@ -539,6 +539,7 @@ export function App() {
           runtime={chatRuntime}
           activePersonaId={activePersona?.id}
           activePersonaName={activePersona?.name}
+          selectedConversationId={route.name}
           onOpenChat={() => navigateMuseSection('chat')}
         />
       )}
@@ -549,6 +550,15 @@ export function App() {
           controller={personaController}
           resourceState={storyState.resourceState}
           busy={busy || Boolean(storyState.mutationBlockReason)}
+          notify={notify}
+          onOpenMemorySource={(conversationId, turnId) => {
+            notify({
+              title: '已打开来源会话',
+              description: `来源回合：${turnId}`,
+              tone: 'info'
+            });
+            navigateMuseSection('sessions', undefined, conversationId);
+          }}
           onClose={() => navigateMuseSection('chat')}
         />
       )}

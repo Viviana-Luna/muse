@@ -29,6 +29,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast};
 
+use crate::runtime_support::{build_sqlite_memory_services, install_memory_services};
+
 static RUNTIME_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 const CHAT_REQUEST_REGISTRY_CAPACITY: usize = 4096;
 const CHAT_REQUEST_REGISTRY_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -609,6 +611,7 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
         build_speech_recognition_provider(user_config.speech_recognition());
     let personas = load_runtime_personas(&data_dir)?;
     let visual_packs = VisualPackStore::load_from_dir(Config::config_dir())?;
+    let (memory, memory_management) = build_sqlite_memory_services(&data_dir)?;
 
     let mut tools = ToolRegistry::new();
     builtin::register_all(&mut tools);
@@ -618,6 +621,10 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
     let (emotion_tx, _) = broadcast::channel::<String>(32);
 
     let shared_config = Arc::new(Mutex::new(user_config));
+    let chat_request_ids = ChatRequestRegistry::load_from_dir(Config::config_dir())?;
+    // 管理 API 与 Tool 运行时必须发布同一次构造得到的服务束，确保 Repository、
+    // Retriever、敏感策略和删除权威都只有一个生产实例。
+    install_memory_services(memory_management);
     Ok(Arc::new(AppState {
         config,
         secrets,
@@ -638,10 +645,9 @@ pub fn build_app_state(config: Config) -> Result<Arc<AppState>, Box<dyn std::err
         persona_runtime_transition_gate: Mutex::new(()),
         tools,
         mutating_tool_gate: Mutex::new(()),
-        chat_request_ids: Mutex::new(ChatRequestRegistry::load_from_dir(Config::config_dir())?),
+        chat_request_ids: Mutex::new(chat_request_ids),
         emotion_tx,
-        // 默认未接线；真实记忆服务由协调者集成分支在 AppState 构建阶段注入。
-        memory: None,
+        memory: Some(memory),
     }))
 }
 
