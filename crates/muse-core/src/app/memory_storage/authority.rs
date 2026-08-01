@@ -228,6 +228,23 @@ impl CanonicalAuthorityGuard<'_> {
         )
     }
 
+    /// confirmation ID 在整个删除权威中全局唯一；跨 Persona 复用必须稳定拒绝，
+    /// 不能因旧 schema 的复合唯一键而被当成另一条独立确认。
+    pub(crate) fn event_by_deletion_id(
+        &self,
+        deletion_id: &str,
+    ) -> Result<Option<AuthorityDeletionEvent>, MemoryError> {
+        let Some(persona_id) = event_persona_by_deletion_id(&self.connection, deletion_id)? else {
+            return Ok(None);
+        };
+        load_event_with_connection(
+            &self.authority.derivation_key,
+            &self.connection,
+            &persona_id,
+            deletion_id,
+        )
+    }
+
     pub(crate) fn pending_events(
         &self,
         last_applied_revision: i64,
@@ -586,6 +603,11 @@ fn upsert_event_in_transaction(
                 .map_err(|_| MemoryError::new(MemoryErrorCode::InvalidRequest))
         })
         .transpose()?;
+    if event_persona_by_deletion_id(connection, deletion_id)?
+        .is_some_and(|stored_persona| stored_persona != persona_id)
+    {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+    }
     if let Some(mut existing) = load_stored_event(connection, persona_id, deletion_id)? {
         validate_stored_event(&authority.derivation_key, &existing)?;
         let stored_subjects = load_subjects(
@@ -880,6 +902,33 @@ fn load_event_with_connection(
         target_memory_count,
         cleanup_completed_at: stored.cleanup_completed_at,
     }))
+}
+
+fn event_persona_by_deletion_id(
+    connection: &Connection,
+    deletion_id: &str,
+) -> Result<Option<String>, MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT persona_id
+             FROM deletion_event
+             WHERE deletion_id = ?1
+             ORDER BY authority_revision
+             LIMIT 2",
+        )
+        .map_err(authority_unavailable)?;
+    let personas = statement
+        .query_map([deletion_id], |row| row.get::<_, String>(0))
+        .map_err(authority_unavailable)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(authority_unavailable)?;
+    match personas.as_slice() {
+        [] => Ok(None),
+        [persona_id] => Ok(Some(persona_id.clone())),
+        _ => Err(MemoryError::new(
+            MemoryErrorCode::DeletionAuthorityUnavailable,
+        )),
+    }
 }
 
 fn load_stored_event(

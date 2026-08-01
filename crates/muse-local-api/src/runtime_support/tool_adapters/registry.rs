@@ -220,6 +220,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
     .await?;
 
     let mut approval_obtained = false;
+    let mut approval_evidence = None;
     let mut allow_approved_external_path = false;
     if requires_approval {
         let mut summary = runtime_handler
@@ -245,7 +246,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
         } else {
             def.risk.as_str()
         };
-        let (approved, approval_reason) = wait_for_tool_approval(
+        let (approved, approval_reason, resolved_evidence) = wait_for_tool_approval(
             state,
             ToolApprovalRequest {
                 tx,
@@ -290,6 +291,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
             allow_approved_external_path = true;
         }
         approval_obtained = true;
+        approval_evidence = resolved_evidence;
     }
 
     if cancel_token.is_cancelled() {
@@ -315,6 +317,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
             &def,
             execution_policy,
             approval_obtained,
+            approval_evidence.as_ref(),
             allow_approved_external_path,
         )
         .await
@@ -333,6 +336,7 @@ pub(in crate::runtime_support) async fn execute_runtime_tool(
             &def,
             execution_policy,
             approval_obtained,
+            approval_evidence.as_ref(),
             allow_approved_external_path,
         )
         .await
@@ -385,6 +389,7 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool_with_latest_policy
     definition: &ToolDef,
     execution_policy: RuntimeToolExecutionPolicy,
     approval_obtained: bool,
+    approval_evidence: Option<&ToolApprovalEvidence>,
     allow_approved_external_path: bool,
 ) -> Result<ToolResult, String> {
     // 配置扩大仍受本轮冻结快照限制；配置撤销在真实 dispatch 前最后一次求交，
@@ -425,6 +430,7 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool_with_latest_policy
             conversation,
             memory_turn,
             approval_obtained,
+            approval_evidence,
             allow_approved_external_path,
         },
         call,
@@ -546,6 +552,7 @@ pub(in crate::runtime_support) struct RuntimeToolInvocation<'a> {
     pub(in crate::runtime_support) conversation: &'a Conversation,
     pub(in crate::runtime_support) memory_turn: &'a MemoryTurnState,
     pub(in crate::runtime_support) approval_obtained: bool,
+    pub(in crate::runtime_support) approval_evidence: Option<&'a ToolApprovalEvidence>,
     pub(in crate::runtime_support) allow_approved_external_path: bool,
 }
 
@@ -1957,6 +1964,7 @@ pub(in crate::runtime_support) struct RuntimeToolDispatchContext<'a> {
     conversation: &'a Conversation,
     memory_turn: &'a MemoryTurnState,
     approval_obtained: bool,
+    approval_evidence: Option<&'a ToolApprovalEvidence>,
     allow_approved_external_path: bool,
 }
 
@@ -1975,6 +1983,7 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool(
         conversation,
         memory_turn,
         approval_obtained,
+        approval_evidence,
         allow_approved_external_path,
     } = context;
     if let Some(handler) = runtime_tool_handler(&call.name) {
@@ -1990,6 +1999,7 @@ pub(in crate::runtime_support) async fn dispatch_runtime_tool(
             conversation,
             memory_turn,
             approval_obtained,
+            approval_evidence,
             allow_approved_external_path,
         });
         tokio::pin!(handler_call);

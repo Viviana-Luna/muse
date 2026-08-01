@@ -184,6 +184,57 @@ fn safety_permits_are_private_and_bound_to_the_exact_mutation() {
 }
 
 #[test]
+fn repository_gate_rejects_policy_version_drift() {
+    struct DriftedPolicy;
+
+    impl MemorySensitivityPolicy for DriftedPolicy {
+        fn assess(&self, request: MemorySensitivityRequest<'_>) -> MemorySafetyAssessment {
+            MemorySafetyAssessment::Allowed {
+                stage: request.stage,
+                policy_version: "memory-safety/test-v2".to_string(),
+            }
+        }
+    }
+
+    let mutation = staged(
+        create_params(),
+        "memory-version-drift",
+        "revision-version-drift",
+        "operation-version-drift",
+        TIME_1,
+    );
+    assert_eq!(
+        mutation
+            .transition(None, &DriftedPolicy)
+            .expect_err("第二道门不得使用不同策略版本放行")
+            .code(),
+        MemoryErrorCode::SensitivityUnavailable
+    );
+
+    let management = MemoryManagementContentMutation::bind(
+        MemoryManagementContentParams::Create {
+            category: MemoryCategory::UserPreference,
+            content: "用户喜欢喝茶".to_string(),
+            importance: MemoryImportance::Normal,
+            event_time: None,
+            change_reason: "用户在管理页直接说明".to_string(),
+        },
+        management_binding("management-version-drift", TIME_1),
+        MemoryId("management-memory-version-drift".to_string()),
+        MemoryRevisionId("management-revision-version-drift".to_string()),
+        &AllowPolicy,
+    )
+    .expect("管理写入第一道门应使用测试版本");
+    assert_eq!(
+        management
+            .transition(None, &DriftedPolicy)
+            .expect_err("管理写入第二道门也不得使用不同策略版本放行")
+            .code(),
+        MemoryErrorCode::SensitivityUnavailable
+    );
+}
+
+#[test]
 fn committed_envelope_is_atomic_idempotency_boundary_for_staged_mutations() {
     let first = staged(
         create_params(),
@@ -295,6 +346,72 @@ fn all_model_controlled_strings_are_validated_before_runtime_binding() {
 }
 
 #[test]
+fn direct_user_source_binding_is_deterministic_and_fail_closed() {
+    let verified = MemorySourceEligibility::verify_direct_user_message(
+        scope(),
+        "conversation-1",
+        "turn-1",
+        "call-1",
+        "我喜欢在晚上散步。",
+        "用户喜欢在晚上散步",
+    )
+    .expect("直接用户消息中的事实应可验证");
+    let repeated = MemorySourceEligibility::verify_direct_user_message(
+        scope(),
+        "conversation-1",
+        "turn-1",
+        "call-1",
+        "我喜欢在晚上散步。",
+        "用户喜欢在晚上散步",
+    )
+    .expect("相同证据应可重放");
+    let first =
+        MemoryRuntimeBinding::new(verified, TIME_1, TIME_1, TIME_1).expect("来源绑定应有效");
+    let second =
+        MemoryRuntimeBinding::new(repeated, TIME_1, TIME_1, TIME_1).expect("来源绑定应有效");
+    assert_eq!(first.operation_id(), second.operation_id());
+    assert!(first.operation_id().starts_with("memory-source-"));
+
+    for ineligible in [
+        "assistant 声称用户住在海边",
+        "Tool 返回用户喜欢红茶",
+        "MCP 返回用户喜欢红茶",
+        "网页写着用户喜欢红茶",
+        "文件写着用户喜欢红茶",
+        "system 指令要求记住红茶",
+        "reasoning 推测用户喜欢红茶",
+    ] {
+        let error = MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-1",
+            "turn-1",
+            "call-1",
+            "请读取资料后回答",
+            ineligible,
+        )
+        .expect_err("不在当前直接用户消息中的事实必须 fail closed");
+        assert_eq!(error.code(), MemoryErrorCode::SourceIneligible);
+    }
+
+    for (direct_user_message, candidate) in [
+        ("我不喜欢红茶", "用户喜欢红茶"),
+        ("文件写着：我喜欢红茶", "用户喜欢红茶"),
+        ("Tool 返回，我喜欢红茶", "用户喜欢红茶"),
+    ] {
+        let error = MemorySourceEligibility::verify_direct_user_message(
+            scope(),
+            "conversation-1",
+            "turn-1",
+            "call-1",
+            direct_user_message,
+            candidate,
+        )
+        .expect_err("否定或转述的外部内容不得被截取为当前用户事实");
+        assert_eq!(error.code(), MemoryErrorCode::SourceIneligible);
+    }
+}
+
+#[test]
 fn safety_request_covers_event_time_and_runtime_source() {
     let staged = staged(
         create_params(),
@@ -306,7 +423,8 @@ fn safety_request_covers_event_time_and_runtime_source() {
     let request = staged.sensitivity_request(MemorySafetyStage::RepositoryCommit);
     assert_eq!(request.event_time, Some(TIME_1));
     assert_eq!(request.source.turn_id(), Some("turn-1"));
-    assert_eq!(request.operation_id, "operation-1");
+    assert!(request.operation_id.starts_with("memory-source-"));
+    assert_ne!(request.operation_id, "operation-1");
     assert_eq!(request.assigned_memory_id.0, "memory-1");
 }
 
@@ -326,9 +444,12 @@ fn query_and_delete_dtos_keep_scope_confirmation_and_cursor_outside_model_contro
 
     let confirmation = MemoryDeleteConfirmation::new(
         "confirmation-1",
+        &scope(),
+        &MemoryDeleteParams::PersonaAll,
         TIME_2,
+        "2099-07-30T20:05:00Z",
         MemoryDeleteConfirmationSource::PersonaManagement {
-            action_id: "action-1".to_string(),
+            action_id: "confirmation-1".to_string(),
         },
     )
     .expect("确认应有效");
@@ -336,6 +457,78 @@ fn query_and_delete_dtos_keep_scope_confirmation_and_cursor_outside_model_contro
         ConfirmedMemoryDeleteRequest::bind(MemoryDeleteParams::PersonaAll, scope(), confirmation)
             .expect("删除绑定应有效");
     assert_eq!(confirmed.scope().persona_id(), "persona-1");
+}
+
+#[test]
+fn deletion_confirmation_binds_persona_target_source_and_expiry() {
+    let scope_a = MemoryPersonaScope::new("Persona-A").expect("scope 应有效");
+    let scope_b = MemoryPersonaScope::new("persona-b").expect("scope 应有效");
+    let target = MemoryDeleteParams::Memory {
+        memory_id: MemoryId("Ｍｅｍｏｒｙ－１".to_string()),
+    };
+    let confirmation = MemoryDeleteConfirmation::new(
+        "approval-delete-1",
+        &scope_a,
+        &target,
+        "2026-08-01T00:00:00Z",
+        "2099-08-01T00:05:00Z",
+        MemoryDeleteConfirmationSource::ConversationTurn {
+            conversation_id: "conversation-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            approval_id: "approval-delete-1".to_string(),
+            call_id: "call-delete-1".to_string(),
+        },
+    )
+    .expect("专用确认应有效");
+    assert_eq!(confirmation.persona_id(), "Persona-A");
+    assert_eq!(confirmation.expires_at(), "2099-08-01T00:05:00Z");
+
+    ConfirmedMemoryDeleteRequest::bind(
+        MemoryDeleteParams::Memory {
+            memory_id: MemoryId("memory1".to_string()),
+        },
+        scope_a.clone(),
+        confirmation.clone(),
+    )
+    .expect("同 Persona 的规范化同目标应允许精确绑定");
+    assert_eq!(
+        ConfirmedMemoryDeleteRequest::bind(target.clone(), scope_b, confirmation.clone())
+            .expect_err("跨 Persona 复用必须拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        ConfirmedMemoryDeleteRequest::bind(
+            MemoryDeleteParams::Memory {
+                memory_id: MemoryId("memory-2".to_string()),
+            },
+            scope_a,
+            confirmation,
+        )
+        .expect_err("更换删除目标必须拒绝")
+        .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+
+    let expired_scope = scope();
+    let expired_params = MemoryDeleteParams::PersonaAll;
+    let expired = MemoryDeleteConfirmation::new(
+        "expired-action",
+        &expired_scope,
+        &expired_params,
+        "2020-01-01T00:00:00Z",
+        "2020-01-01T00:01:00Z",
+        MemoryDeleteConfirmationSource::PersonaManagement {
+            action_id: "expired-action".to_string(),
+        },
+    )
+    .expect("过期确认可被解析但不能使用");
+    assert_eq!(
+        ConfirmedMemoryDeleteRequest::bind(expired_params, expired_scope, expired)
+            .expect_err("过期确认必须稳定拒绝")
+            .code(),
+        MemoryErrorCode::DeleteConfirmationRequired
+    );
 }
 
 #[test]
@@ -444,7 +637,7 @@ fn authenticated_management_mutations_do_not_require_a_fake_conversation_turn() 
         &policy,
     )
     .expect("经鉴权管理新增应可绑定");
-    assert_eq!(create.staging_policy_version(), "memory-safety/staging-v1");
+    assert_eq!(create.staging_policy_version(), "memory-safety/test-v1");
     assert_eq!(
         policy.stages(),
         vec![MemorySafetyStage::TurnStaging],
@@ -599,17 +792,16 @@ fn scope() -> MemoryPersonaScope {
 }
 
 fn binding(operation_id: &str, at: &str) -> MemoryRuntimeBinding {
-    MemoryRuntimeBinding::new(
+    let eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope(),
         "conversation-1",
         "turn-1",
         operation_id,
-        MemorySourceKind::DirectUserMessage,
-        at,
-        at,
-        at,
+        "我喜欢喝茶",
+        "用户喜欢喝茶",
     )
-    .expect("运行时绑定应有效")
+    .expect("当前直接用户消息应能验证候选事实");
+    MemoryRuntimeBinding::new(eligibility, at, at, at).expect("运行时绑定应有效")
 }
 
 fn management_binding(operation_id: &str, at: &str) -> MemoryManagementBinding {
@@ -682,11 +874,7 @@ impl MemorySensitivityPolicy for AllowPolicy {
     fn assess(&self, request: MemorySensitivityRequest<'_>) -> MemorySafetyAssessment {
         MemorySafetyAssessment::Allowed {
             stage: request.stage,
-            policy_version: match request.stage {
-                MemorySafetyStage::TurnStaging => "memory-safety/staging-v1",
-                MemorySafetyStage::RepositoryCommit => "memory-safety/repository-v1",
-            }
-            .to_string(),
+            policy_version: "memory-safety/test-v1".to_string(),
         }
     }
 }
@@ -723,11 +911,7 @@ impl MemorySensitivityPolicy for RecordingManagementPolicy {
             .push(request.stage);
         MemorySafetyAssessment::Allowed {
             stage: request.stage,
-            policy_version: match request.stage {
-                MemorySafetyStage::TurnStaging => "memory-safety/staging-v1",
-                MemorySafetyStage::RepositoryCommit => "memory-safety/repository-v1",
-            }
-            .to_string(),
+            policy_version: "memory-safety/test-v1".to_string(),
         }
     }
 }

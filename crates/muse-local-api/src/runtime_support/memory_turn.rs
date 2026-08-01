@@ -10,7 +10,8 @@ use std::sync::Mutex;
 use muse_core::domain::conversation::{Conversation, Role};
 use muse_core::domain::memory::{
     MEMORY_QUERY_TOOL_NAME, MemoryCommitEnvelope, MemoryDeleteParams, MemoryError, MemoryErrorCode,
-    MemoryId, MemoryPersonaScope, MemoryStagedMutation,
+    MemoryId, MemoryPersonaScope, MemoryRuntimeBinding, MemorySourceEligibility,
+    MemoryStagedMutation,
 };
 
 /// 一次查询页与工具调用的绑定；durable 删除后按该绑定定位工作副本中的旧结果页。
@@ -29,14 +30,36 @@ struct MemoryTurnInner {
 }
 
 /// 单 Turn 记忆状态；工具处理器在 async 上下文中只持锁做短临界区，不跨 await。
-#[derive(Debug)]
 pub(crate) struct MemoryTurnState {
     inner: Mutex<MemoryTurnInner>,
+    direct_user_source: DirectUserSource,
+}
+
+struct DirectUserSource {
+    conversation_id: String,
+    turn_id: String,
+    content: String,
+}
+
+impl std::fmt::Debug for MemoryTurnState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryTurnState")
+            .field("conversation_id", &self.direct_user_source.conversation_id)
+            .field("turn_id", &self.direct_user_source.turn_id)
+            .field("direct_user_content", &"[已去敏]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryTurnState {
     /// 预算值由本 Turn 的冻结服务配置注入，本切片不虚构固定数值。
-    pub(crate) fn new(query_call_budget: u32) -> Self {
+    pub(crate) fn new(
+        query_call_budget: u32,
+        conversation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        direct_user_message: impl Into<String>,
+    ) -> Self {
         Self {
             inner: Mutex::new(MemoryTurnInner {
                 staged: Vec::new(),
@@ -44,7 +67,48 @@ impl MemoryTurnState {
                 queries_used: 0,
                 query_call_budget,
             }),
+            direct_user_source: DirectUserSource {
+                conversation_id: conversation_id.into(),
+                turn_id: turn_id.into(),
+                content: direct_user_message.into(),
+            },
         }
+    }
+
+    /// 把候选事实绑定到本 Turn 的直接用户消息；对话副本中的最新用户消息必须与
+    /// API 输入快照完全一致，防止 assistant/Tool/MCP 结果被误盖章为用户来源。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_direct_user_mutation(
+        &self,
+        scope: MemoryPersonaScope,
+        conversation_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        candidate_content: &str,
+        recorded_at: &str,
+        conversation: &Conversation,
+    ) -> Result<MemoryRuntimeBinding, MemoryError> {
+        if self.direct_user_source.conversation_id != conversation_id
+            || self.direct_user_source.turn_id != turn_id
+            || conversation
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .map(|message| message.content.as_str())
+                != Some(self.direct_user_source.content.as_str())
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        let eligibility = MemorySourceEligibility::verify_direct_user_message(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &self.direct_user_source.content,
+            candidate_content,
+        )?;
+        MemoryRuntimeBinding::new(eligibility, recorded_at, recorded_at, recorded_at)
     }
 
     /// 记账一次查询；预算耗尽返回 false，调用方必须转为稳定失败而不是继续检索。
@@ -79,16 +143,19 @@ impl MemoryTurnState {
             return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
         };
         let scope = MemoryPersonaScope::new(persona_id)?;
-        let staged = std::mem::take(&mut inner.staged);
-        MemoryCommitEnvelope::new(
+        // 先用克隆完成所有可失败校验；只有封套构造成功后才消费原始 staged。
+        // 这样 Persona/来源/重复 operation 等错误不会丢失同进程修复后重试材料。
+        let envelope = MemoryCommitEnvelope::new(
             format!("memory-turn:{turn_id}"),
             scope,
             conversation_id,
             turn_id,
             committed_at,
-            staged,
+            inner.staged.clone(),
         )
-        .map(Some)
+        .map_err(|error| MemoryError::new(error.code()))?;
+        inner.staged.clear();
+        Ok(Some(envelope))
     }
 
     /// 记录一次成功查询页命中的记忆 ID，供 durable 删除后替换工作副本收据。
@@ -153,7 +220,7 @@ mod tests {
         MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation, MemoryMutateParams,
         MemoryMutationReceipt, MemoryMutationReceiptState, MemoryRecord, MemoryRepository,
         MemoryRevisionId, MemoryRuntimeBinding, MemorySafetyAssessment, MemorySensitivityPolicy,
-        MemorySensitivityRequest, MemorySourceKind,
+        MemorySensitivityRequest, MemorySourceEligibility,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -234,7 +301,7 @@ mod tests {
 
     #[test]
     fn query_budget_is_bounded_per_turn() {
-        let state = MemoryTurnState::new(2);
+        let state = turn_state(2);
         assert!(state.try_consume_query_budget());
         assert!(state.try_consume_query_budget());
         assert!(!state.try_consume_query_budget());
@@ -243,13 +310,13 @@ mod tests {
 
     #[test]
     fn zero_budget_fails_closed() {
-        let state = MemoryTurnState::new(0);
+        let state = turn_state(0);
         assert!(!state.try_consume_query_budget());
     }
 
     #[test]
     fn query_pages_are_matched_by_memory_id() {
-        let state = MemoryTurnState::new(1);
+        let state = turn_state(1);
         state.record_query_page("call-1".to_string(), vec![MemoryId("mem-a".to_string())]);
         state.record_query_page(
             "call-2".to_string(),
@@ -274,7 +341,7 @@ mod tests {
 
     #[test]
     fn durable_delete_redacts_only_matching_query_pages() {
-        let state = MemoryTurnState::new(2);
+        let state = turn_state(2);
         state.record_query_page("call-a".to_string(), vec![MemoryId("mem-a".to_string())]);
         state.record_query_page("call-b".to_string(), vec![MemoryId("mem-b".to_string())]);
         let mut conversation = Conversation::new("system".to_string(), 20);
@@ -325,14 +392,19 @@ mod tests {
 
     #[test]
     fn committed_turn_drains_staged_mutations_exactly_once() {
-        let state = MemoryTurnState::new(1);
+        let state = turn_state(1);
         let scope = MemoryPersonaScope::new("persona-test").expect("Persona scope 应有效");
-        let binding = MemoryRuntimeBinding::new(
+        let eligibility = MemorySourceEligibility::verify_direct_user_message(
             scope,
             "conversation-test",
             "turn-test",
             "operation-test",
-            MemorySourceKind::DirectUserMessage,
+            "用户喜欢夜间散步",
+            "用户喜欢夜间散步",
+        )
+        .expect("当前直接用户消息应能验证候选事实");
+        let binding = MemoryRuntimeBinding::new(
+            eligibility,
             "2026-08-01T00:00:00Z",
             "2026-08-01T00:00:00Z",
             "2026-08-01T00:00:00Z",
@@ -376,6 +448,84 @@ mod tests {
                 .expect("重复收尾应安全跳过")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn mutation_source_must_match_the_latest_runtime_user_message() {
+        let state = turn_state(1);
+        let mut conversation = Conversation::new("system".to_string(), 20);
+        conversation.add_user_message("请读取文件后回答".to_string());
+        conversation.add_assistant_message("文件里写着用户喜欢红茶".to_string());
+        let error = state
+            .bind_direct_user_mutation(
+                MemoryPersonaScope::new("persona-test").expect("Persona scope 应有效"),
+                "conversation-test",
+                "turn-test",
+                "call-memory",
+                "用户喜欢红茶",
+                "2026-08-01T00:00:00Z",
+                &conversation,
+            )
+            .expect_err("assistant 或文件单独提供的事实不得取得用户来源资格");
+        assert_eq!(error.code(), MemoryErrorCode::SourceIneligible);
+    }
+
+    #[test]
+    fn failed_envelope_validation_keeps_staged_for_same_process_retry() {
+        let state = turn_state(1);
+        let scope = MemoryPersonaScope::new("persona-test").expect("Persona scope 应有效");
+        let eligibility = MemorySourceEligibility::verify_direct_user_message(
+            scope,
+            "conversation-test",
+            "turn-test",
+            "operation-retry",
+            "用户喜欢夜间散步",
+            "用户喜欢夜间散步",
+        )
+        .expect("当前直接用户消息应能验证候选事实");
+        let binding = MemoryRuntimeBinding::new(
+            eligibility,
+            "2026-08-01T00:00:00Z",
+            "2026-08-01T00:00:00Z",
+            "2026-08-01T00:00:00Z",
+        )
+        .expect("运行时绑定应有效");
+        state.stage(
+            MemoryStagedMutation::stage(
+                MemoryMutateParams::Create {
+                    category: MemoryCategory::UserPreference,
+                    content: "用户喜欢夜间散步".to_string(),
+                    importance: MemoryImportance::Normal,
+                    event_time: None,
+                    change_reason: "用户在本轮直接说明".to_string(),
+                },
+                binding,
+                MemoryId("memory-retry".to_string()),
+                MemoryRevisionId("revision-retry".to_string()),
+                &AllowPolicy,
+            )
+            .expect("普通记忆应允许暂存"),
+        );
+
+        let first = state
+            .take_committed_envelope(
+                Some("persona-test"),
+                "wrong-conversation",
+                "turn-test",
+                "2026-08-01T00:01:00Z",
+            )
+            .expect_err("错误 Conversation 绑定必须拒绝");
+        assert_eq!(first.code(), MemoryErrorCode::SourceIneligible);
+        let retry = state
+            .take_committed_envelope(
+                Some("persona-test"),
+                "conversation-test",
+                "turn-test",
+                "2026-08-01T00:01:00Z",
+            )
+            .expect("修复上下文后应可同进程重试")
+            .expect("staged 不得在失败时丢失");
+        assert_eq!(retry.mutations().len(), 1);
     }
 
     #[test]
@@ -427,12 +577,17 @@ mod tests {
 
     fn staged_envelope(turn_id: &str) -> MemoryCommitEnvelope {
         let scope = MemoryPersonaScope::new("persona-test").expect("Persona scope 应有效");
-        let binding = MemoryRuntimeBinding::new(
+        let eligibility = MemorySourceEligibility::verify_direct_user_message(
             scope.clone(),
             "conversation-test",
             turn_id,
             format!("operation-{turn_id}"),
-            MemorySourceKind::DirectUserMessage,
+            "用户喜欢夜间散步",
+            "用户喜欢夜间散步",
+        )
+        .expect("当前直接用户消息应能验证候选事实");
+        let binding = MemoryRuntimeBinding::new(
+            eligibility,
             "2026-08-01T00:00:00Z",
             "2026-08-01T00:00:00Z",
             "2026-08-01T00:00:00Z",
@@ -461,5 +616,14 @@ mod tests {
             vec![staged],
         )
         .expect("提交封套应有效")
+    }
+
+    fn turn_state(query_call_budget: u32) -> MemoryTurnState {
+        MemoryTurnState::new(
+            query_call_budget,
+            "conversation-test",
+            "turn-test",
+            "用户喜欢夜间散步",
+        )
     }
 }

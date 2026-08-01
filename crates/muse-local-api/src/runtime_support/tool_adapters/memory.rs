@@ -11,7 +11,7 @@ use muse_core::domain::memory::{
     MEMORY_QUERY_TOOL_NAME, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
     MemoryDeleteParams, MemoryError, MemoryErrorCode, MemoryId, MemoryMutateParams,
     MemoryPersonaScope, MemoryQueryParams, MemoryRetrievalRequest, MemoryRevisionId,
-    MemoryRuntimeBinding, MemorySourceKind, MemoryStagedMutation,
+    MemoryStagedMutation,
 };
 
 pub(in crate::runtime_support) struct MemoryQueryHandler;
@@ -168,6 +168,7 @@ impl RuntimeToolHandler for MemoryMutateHandler {
                 turn,
                 call,
                 memory_turn,
+                conversation,
                 ..
             } = invocation;
             let Some(services) = state.memory.as_ref() else {
@@ -182,23 +183,21 @@ impl RuntimeToolHandler for MemoryMutateHandler {
                     "memory_mutate 参数不符合冻结 schema。",
                 );
             };
-            // 来源资格在结构上冻结：处理器只能以当前 Turn 直接用户消息构造绑定，
-            // assistant-only 断言、system/reasoning、Tool/MCP 结果、网页文件都无法经
-            // 该入口形成记忆；失败或取消的 Turn 不会走到 committed，暂存随作用域丢弃。
+            // 来源资格由 Turn 开始时冻结的 API 用户输入签发，候选事实还必须能在
+            // 当前最新用户消息的统一规范化正文中确定性验证；模型不能自报来源。
             let scope = match memory_scope_for_turn(turn, MemoryErrorCode::SourceIneligible) {
                 Ok(scope) => scope,
                 Err(result) => return result,
             };
             let now = chrono::Utc::now().to_rfc3339();
-            let binding = match MemoryRuntimeBinding::new(
+            let binding = match memory_turn.bind_direct_user_mutation(
                 scope,
-                turn.conversation_id.clone(),
-                turn.turn_id.clone(),
-                next_runtime_id("memory-op"),
-                MemorySourceKind::DirectUserMessage,
-                now.clone(),
-                now.clone(),
-                now,
+                &turn.conversation_id,
+                &turn.turn_id,
+                &call.call_id,
+                params.content(),
+                &now,
+                conversation,
             ) {
                 Ok(binding) => binding,
                 Err(error) => return memory_tool_failed(error),
@@ -267,11 +266,14 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
                 turn,
                 call,
                 approval_obtained,
+                approval_evidence,
                 ..
             } = invocation;
-            if !approval_obtained {
+            let Some(approval_evidence) = approval_evidence
+                .filter(|evidence| approval_obtained && evidence.call_id == call.call_id)
+            else {
                 return memory_delete_confirmation_required("missing_dedicated_confirmation");
-            }
+            };
             let Some(services) = state.memory.as_ref() else {
                 return memory_tool_failed(MemoryError::new(
                     MemoryErrorCode::RepositoryUnavailable,
@@ -288,13 +290,17 @@ impl RuntimeToolHandler for MemoryDeleteHandler {
                 Ok(scope) => scope,
                 Err(result) => return result,
             };
-            let now = chrono::Utc::now().to_rfc3339();
             let confirmation = match MemoryDeleteConfirmation::new(
-                next_runtime_id("memory-confirm"),
-                now,
+                approval_evidence.approval_id.clone(),
+                &scope,
+                &params,
+                approval_evidence.approved_at.clone(),
+                approval_evidence.expires_at.clone(),
                 MemoryDeleteConfirmationSource::ConversationTurn {
                     conversation_id: turn.conversation_id.clone(),
                     turn_id: turn.turn_id.clone(),
+                    approval_id: approval_evidence.approval_id.clone(),
+                    call_id: call.call_id.clone(),
                 },
             ) {
                 Ok(confirmation) => confirmation,

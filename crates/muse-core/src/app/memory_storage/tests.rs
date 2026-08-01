@@ -21,12 +21,13 @@ use crate::domain::memory::{
     MemoryManagementBinding, MemoryManagementContentMutation, MemoryManagementContentParams,
     MemoryMutateParams, MemoryRepository, MemoryRevisionId, MemorySafetyAssessment,
     MemorySafetyFailure, MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest,
-    MemorySourceKind, MemoryStagedMutation,
+    MemorySourceEligibility, MemoryStagedMutation,
 };
 
 const TIME_1: &str = "2026-07-30T01:00:00Z";
 const TIME_2: &str = "2026-07-30T02:00:00Z";
 const TIME_3: &str = "2026-07-30T03:00:00Z";
+const DELETE_EXPIRES_AT: &str = "2099-07-30T03:05:00Z";
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct TestDirectory(PathBuf);
@@ -64,7 +65,7 @@ impl MemorySensitivityPolicy for AllowPolicy {
 
 struct RejectPolicy {
     stage: MemorySafetyStage,
-    operation_id: Option<&'static str>,
+    operation_id: Option<String>,
 }
 
 impl MemorySensitivityPolicy for RejectPolicy {
@@ -72,6 +73,7 @@ impl MemorySensitivityPolicy for RejectPolicy {
         if request.stage == self.stage
             && self
                 .operation_id
+                .as_deref()
                 .is_none_or(|operation_id| operation_id == request.operation_id)
         {
             MemorySafetyAssessment::Rejected {
@@ -155,17 +157,18 @@ fn staged_create(
     revision_id: &str,
     content: &str,
 ) -> MemoryStagedMutation {
-    let binding = crate::domain::memory::MemoryRuntimeBinding::new(
+    let eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope.clone(),
         conversation_id,
         turn_id,
         operation_id,
-        MemorySourceKind::DirectUserMessage,
-        TIME_1,
-        TIME_1,
-        TIME_1,
+        content,
+        content,
     )
-    .expect("runtime binding 应有效");
+    .expect("直接用户来源应可验证");
+    let binding =
+        crate::domain::memory::MemoryRuntimeBinding::new(eligibility, TIME_1, TIME_1, TIME_1)
+            .expect("runtime binding 应有效");
     MemoryStagedMutation::stage(
         MemoryMutateParams::Create {
             category: MemoryCategory::UserPreference,
@@ -194,17 +197,18 @@ fn staged_change(
     content: &str,
     correct: bool,
 ) -> MemoryStagedMutation {
-    let binding = crate::domain::memory::MemoryRuntimeBinding::new(
+    let eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope.clone(),
         conversation_id,
         turn_id,
         operation_id,
-        MemorySourceKind::UserConfirmation,
-        TIME_2,
-        TIME_2,
-        TIME_2,
+        content,
+        content,
     )
-    .expect("runtime binding 应有效");
+    .expect("直接用户来源应可验证");
+    let binding =
+        crate::domain::memory::MemoryRuntimeBinding::new(eligibility, TIME_2, TIME_2, TIME_2)
+            .expect("runtime binding 应有效");
     let common = (
         MemoryId(memory_id.to_string()),
         MemoryRevisionId(expected_revision_id.to_string()),
@@ -303,9 +307,12 @@ fn confirmed_delete(
 ) -> ConfirmedMemoryDeleteRequest {
     let confirmation = MemoryDeleteConfirmation::new(
         deletion_id,
+        scope,
+        &params,
         TIME_3,
+        DELETE_EXPIRES_AT,
         MemoryDeleteConfirmationSource::PersonaManagement {
-            action_id: format!("action-{deletion_id}"),
+            action_id: deletion_id.to_string(),
         },
     )
     .expect("删除确认应有效");
@@ -466,6 +473,114 @@ fn seed_completed_deletion(
         .expect("应形成正式 tombstone");
     drop(repository);
     (scope, memory_id)
+}
+
+#[test]
+fn 删除确认只允许同_persona_同目标_同_intent_精确重放() {
+    let root = TestDirectory::new("delete-confirmation-binding");
+    let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
+    let persona_a = scope("persona-confirm-a");
+    let persona_b = scope("persona-confirm-b");
+    commit_create(
+        &repository,
+        &persona_a,
+        "batch-confirm-a",
+        "conversation-confirm-a",
+        "turn-confirm-a",
+        "operation-confirm-a",
+        "memory-confirm-a",
+        "revision-confirm-a",
+        "用户喜欢夜间散步",
+    );
+    commit_create(
+        &repository,
+        &persona_b,
+        "batch-confirm-b",
+        "conversation-confirm-b",
+        "turn-confirm-b",
+        "operation-confirm-b",
+        "memory-confirm-b",
+        "revision-confirm-b",
+        "用户喜欢清晨散步",
+    );
+
+    let original = confirmed_delete(
+        &persona_a,
+        "confirmation-global-1",
+        MemoryDeleteParams::Memory {
+            memory_id: MemoryId("memory-confirm-a".to_string()),
+        },
+    );
+    let first = repository
+        .delete_confirmed(&original, repository.deletion_authority())
+        .expect("首次确认删除应成功");
+    let replay = repository
+        .delete_confirmed(&original, repository.deletion_authority())
+        .expect("完全相同的确认应幂等重放");
+    assert_eq!(first, replay);
+
+    let same_target = MemoryDeleteParams::Memory {
+        memory_id: MemoryId("memory-confirm-a".to_string()),
+    };
+    let changed_source = MemoryDeleteConfirmation::new(
+        "confirmation-global-1",
+        &persona_a,
+        &same_target,
+        TIME_3,
+        DELETE_EXPIRES_AT,
+        MemoryDeleteConfirmationSource::ConversationTurn {
+            conversation_id: "conversation-confirm-a".to_string(),
+            turn_id: "turn-confirm-a".to_string(),
+            approval_id: "confirmation-global-1".to_string(),
+            call_id: "call-confirm-conflict".to_string(),
+        },
+    )
+    .expect("换来源的确认本身应可解析");
+    let changed_source =
+        ConfirmedMemoryDeleteRequest::bind(same_target, persona_a.clone(), changed_source)
+            .expect("换来源请求应能进入 Repository 冲突校验");
+    assert_eq!(
+        repository
+            .delete_confirmed(&changed_source, repository.deletion_authority())
+            .expect_err("同确认同目标换来源 call 必须拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+
+    let changed_target = confirmed_delete(
+        &persona_a,
+        "confirmation-global-1",
+        MemoryDeleteParams::PersonaAll,
+    );
+    assert_eq!(
+        repository
+            .delete_confirmed(&changed_target, repository.deletion_authority())
+            .expect_err("同确认换目标必须拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+
+    let cross_persona = confirmed_delete(
+        &persona_b,
+        "confirmation-global-1",
+        MemoryDeleteParams::Memory {
+            memory_id: MemoryId("memory-confirm-b".to_string()),
+        },
+    );
+    assert_eq!(
+        repository
+            .delete_confirmed(&cross_persona, repository.deletion_authority())
+            .expect_err("跨 Persona 复用 confirmation ID 必须拒绝")
+            .code(),
+        MemoryErrorCode::InvalidRequest
+    );
+    assert!(
+        repository
+            .current(&persona_b, &MemoryId("memory-confirm-b".to_string()))
+            .expect("Persona B 查询应成功")
+            .is_some(),
+        "跨 Persona 冲突不得误删另一角色记忆"
+    );
 }
 
 fn seed_used_authority_then_downgrade(
@@ -1246,12 +1361,13 @@ fn 批量第二门故障全回滚且成功重放严格幂等() {
             ),
         ],
     );
+    let rejected_operation_id = batch.mutations()[1].binding().operation_id().to_string();
     let error = repository
         .apply_committed_batch(
             &batch,
             &RejectPolicy {
                 stage: MemorySafetyStage::RepositoryCommit,
-                operation_id: Some("operation-batch-2"),
+                operation_id: Some(rejected_operation_id),
             },
         )
         .expect_err("第二门拒绝应回滚全批");
@@ -1301,6 +1417,7 @@ fn committed_turn_唯一且幂等收据逐_operation_核验() {
         "revision-receipt",
         "需要核验的持久事实",
     );
+    let original_operation_id = original.mutations()[0].binding().operation_id().to_string();
     let duplicate_turn = envelope(
         &scope,
         "receipt-key-2",
@@ -1330,7 +1447,7 @@ fn committed_turn_唯一且幂等收据逐_operation_核验() {
             "memory_committed_operation",
             "operation_id",
             "operation-tampered",
-            "operation-receipt",
+            original_operation_id.as_str(),
         ),
         (
             "operation_ordinal",
@@ -1429,7 +1546,7 @@ fn committed_turn_唯一且幂等收据逐_operation_核验() {
             params![
                 "persona-receipt",
                 "receipt-key-1",
-                "operation-receipt",
+                original_operation_id.as_str(),
                 "memory-receipt",
                 "revision-receipt"
             ],
@@ -1524,6 +1641,25 @@ fn 多op批次_committed收据中间缺行与ordinal乱序拒绝且修复后幂�
         3,
         "首次提交应逐 operation 返回收据"
     );
+    let middle_operation_id = original.mutations()[1].binding().operation_id().to_string();
+    let repair_missing_middle = format!(
+        "INSERT INTO memory_committed_operation(
+            persona_id, idempotency_key, operation_ordinal, operation_id,
+            change_type, memory_id, revision_id
+         ) VALUES(
+            'persona-multi-receipt', 'multi-receipt-key', 1, '{middle_operation_id}',
+            'create', 'multi-memory-1', 'multi-revision-1'
+         )"
+    );
+    let swap_ordinals = "UPDATE memory_committed_operation SET operation_ordinal = 100
+         WHERE persona_id = 'persona-multi-receipt'
+           AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 0;
+         UPDATE memory_committed_operation SET operation_ordinal = 0
+         WHERE persona_id = 'persona-multi-receipt'
+           AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 2;
+         UPDATE memory_committed_operation SET operation_ordinal = 2
+         WHERE persona_id = 'persona-multi-receipt'
+           AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 100";
 
     for (label, tamper_sql, repair_sql) in [
         (
@@ -1532,35 +1668,9 @@ fn 多op批次_committed收据中间缺行与ordinal乱序拒绝且修复后幂�
              WHERE persona_id = 'persona-multi-receipt'
                AND idempotency_key = 'multi-receipt-key'
                AND operation_ordinal = 1",
-            "INSERT INTO memory_committed_operation(
-                persona_id, idempotency_key, operation_ordinal, operation_id,
-                change_type, memory_id, revision_id
-             ) VALUES(
-                'persona-multi-receipt', 'multi-receipt-key', 1, 'multi-operation-1',
-                'create', 'multi-memory-1', 'multi-revision-1'
-             )",
+            repair_missing_middle.as_str(),
         ),
-        (
-            "operation ordinal 乱序",
-            "UPDATE memory_committed_operation SET operation_ordinal = 100
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 0;
-             UPDATE memory_committed_operation SET operation_ordinal = 0
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 2;
-             UPDATE memory_committed_operation SET operation_ordinal = 2
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 100",
-            "UPDATE memory_committed_operation SET operation_ordinal = 100
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 0;
-             UPDATE memory_committed_operation SET operation_ordinal = 0
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 2;
-             UPDATE memory_committed_operation SET operation_ordinal = 2
-             WHERE persona_id = 'persona-multi-receipt'
-               AND idempotency_key = 'multi-receipt-key' AND operation_ordinal = 100",
-        ),
+        ("operation ordinal 乱序", swap_ordinals, swap_ordinals),
     ] {
         let connection = crate::app::storage::open_initialized_runtime_database(root.path())
             .expect("应打开多 op 收据篡改连接");
@@ -1653,17 +1763,18 @@ fn 第一门与第二门拒绝正文不进入任何存储面或_debug() {
     let repository = SqliteMemoryRepository::open(root.path()).expect("应打开 Repository");
     let scope = scope("persona-sensitive");
     let first_sentinel = "拒绝正文FIRST-GATE-847293";
-    let first_binding = crate::domain::memory::MemoryRuntimeBinding::new(
+    let first_eligibility = MemorySourceEligibility::verify_direct_user_message(
         scope.clone(),
         "sensitive-conversation-1",
         "sensitive-turn-1",
         "sensitive-operation-1",
-        MemorySourceKind::DirectUserMessage,
-        TIME_1,
-        TIME_1,
-        TIME_1,
+        first_sentinel,
+        first_sentinel,
     )
-    .expect("binding 应有效");
+    .expect("直接用户来源应可验证");
+    let first_binding =
+        crate::domain::memory::MemoryRuntimeBinding::new(first_eligibility, TIME_1, TIME_1, TIME_1)
+            .expect("binding 应有效");
     let first_params = MemoryMutateParams::Create {
         category: MemoryCategory::UserFact,
         content: first_sentinel.to_string(),
@@ -2601,7 +2712,10 @@ fn persona_all_只清当前具体_subject_未来新记忆仍允许() {
     assert_eq!(subject_counts.0, 0, "PersonaAll 不得写 Persona tombstone");
     assert_eq!(subject_counts.1, 2, "应枚举两条具体 Memory");
     assert_eq!(subject_counts.2, 3, "应枚举全部 revision 来源 Turn");
-    assert_eq!(subject_counts.3, 3, "应枚举全部 revision 派生摘要");
+    assert_eq!(
+        subject_counts.3, 4,
+        "应枚举全部 revision 派生摘要并绑定删除确认 intent"
+    );
     drop(authority);
 
     let main = repository

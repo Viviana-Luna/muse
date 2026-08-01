@@ -1,9 +1,19 @@
 use super::*;
-use crate::state::AppState;
+use crate::state::{AppState, MemoryRuntimeServices};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use futures::StreamExt;
+use muse_core::app::memory_safety::DeterministicMemorySensitivityPolicy;
 use muse_core::domain::conversation::Conversation;
+use muse_core::domain::memory::{
+    ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCommitEnvelope,
+    MemoryDeleteReceipt, MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt,
+    MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest, MemoryDeletionDecision,
+    MemoryError, MemoryErrorCode, MemoryId, MemoryImportanceAdjustment,
+    MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation, MemoryMutationReceipt,
+    MemoryMutationReceiptState, MemoryPersonaScope, MemoryQueryPageReceipt, MemoryRecord,
+    MemoryRepository, MemoryRetrievalRequest, MemoryRetriever, MemorySensitivityPolicy,
+};
 use muse_core::domain::persona::character::store::PersonaStore;
 use muse_core::domain::persona::visual::store::VisualPackStore;
 use muse_core::domain::persona::{Persona, RoleplayStyle, ToolPolicy, VisualPack};
@@ -12,6 +22,7 @@ use muse_core::model::provider::{
     ChatModelError, ChatModelProvider, ChatModelResult, ChatStreamEvent, ChatStreamResult,
 };
 use muse_runtime::interactions::{PendingApproval, PendingUserQuestion};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -77,6 +88,164 @@ impl ChatModelProvider for GatedChatProvider {
 }
 
 struct FailingChatProvider;
+
+#[derive(Clone)]
+enum MemoryProviderFollowup {
+    Success,
+    StreamError,
+    Pending(Arc<Semaphore>),
+}
+
+struct MemoryLifecycleProvider {
+    calls: AtomicUsize,
+    followup: MemoryProviderFollowup,
+}
+
+#[async_trait::async_trait]
+impl ChatModelProvider for MemoryLifecycleProvider {
+    async fn chat(&self, _conversation: &Conversation) -> ChatModelResult {
+        Ok("记忆生命周期测试回复。".to_string())
+    }
+
+    async fn chat_stream(&self, conversation: &Conversation) -> ChatStreamResult {
+        self.chat_stream_with_tools(conversation, &[]).await
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        _conversation: &Conversation,
+        _tools: &[ToolDef],
+    ) -> ChatStreamResult {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Box::pin(futures::stream::iter([
+                Ok(ChatStreamEvent::ToolCall(ToolCall {
+                    call_id: "call-memory-lifecycle".to_string(),
+                    name: "memory_mutate".to_string(),
+                    arguments: serde_json::json!({
+                        "operation": "create",
+                        "category": "user_preference",
+                        "content": "用户喜欢夜间散步",
+                        "importance": "normal",
+                        "event_time": null,
+                        "change_reason": "用户在当前消息中直接说明"
+                    }),
+                    source: ToolCallSource::Native,
+                })),
+                Ok(ChatStreamEvent::Done),
+            ]));
+        }
+
+        match &self.followup {
+            MemoryProviderFollowup::Success => Box::pin(futures::stream::iter([
+                Ok(ChatStreamEvent::Text("已经记下。".to_string())),
+                Ok(ChatStreamEvent::Done),
+            ])),
+            MemoryProviderFollowup::StreamError => Box::pin(futures::stream::iter([Err(
+                ChatModelError::ApiError("注入续写断流".to_string()),
+            )])),
+            MemoryProviderFollowup::Pending(entered) => {
+                let entered = Arc::clone(entered);
+                Box::pin(futures::stream::once(async move {
+                    entered.add_permits(1);
+                    std::future::pending::<Result<ChatStreamEvent, ChatModelError>>().await
+                }))
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "memory_lifecycle_test"
+    }
+}
+
+struct EmptyMemoryRetriever;
+
+impl MemoryRetriever for EmptyMemoryRetriever {
+    fn retrieve(
+        &self,
+        _request: &MemoryRetrievalRequest,
+    ) -> Result<MemoryQueryPageReceipt, MemoryError> {
+        Ok(MemoryQueryPageReceipt::new(Vec::new(), None))
+    }
+}
+
+struct TestMemoryDeletionAuthority;
+
+impl MemoryDeletionAuthority for TestMemoryDeletionAuthority {
+    fn record(
+        &self,
+        _request: &MemoryDeletionAuthorityRequest,
+    ) -> Result<MemoryDeletionAuthorityReceipt, MemoryError> {
+        Err(MemoryError::new(
+            MemoryErrorCode::DeletionAuthorityUnavailable,
+        ))
+    }
+
+    fn check(
+        &self,
+        _request: &MemoryDeletionCheckRequest,
+    ) -> Result<MemoryDeletionDecision, MemoryError> {
+        Ok(MemoryDeletionDecision::Allowed)
+    }
+}
+
+struct RecordingMemoryRepository {
+    commit_calls: Arc<AtomicUsize>,
+}
+
+impl MemoryRepository for RecordingMemoryRepository {
+    fn current(
+        &self,
+        _scope: &MemoryPersonaScope,
+        _memory_id: &MemoryId,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        Ok(None)
+    }
+
+    fn apply_committed_batch(
+        &self,
+        envelope: &MemoryCommitEnvelope,
+        _sensitivity: &dyn MemorySensitivityPolicy,
+    ) -> Result<MemoryBatchCommitReceipt, MemoryError> {
+        self.commit_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(MemoryBatchCommitReceipt {
+            idempotency_key: envelope.idempotency_key().to_string(),
+            mutations: envelope
+                .mutations()
+                .iter()
+                .map(|mutation| {
+                    let mut receipt = mutation.staged_receipt();
+                    receipt.state = MemoryMutationReceiptState::Durable;
+                    receipt
+                })
+                .collect(),
+            durable_at: envelope.committed_at().to_string(),
+        })
+    }
+
+    fn apply_management_content_mutation(
+        &self,
+        _mutation: &MemoryManagementContentMutation,
+        _sensitivity: &dyn MemorySensitivityPolicy,
+    ) -> Result<MemoryMutationReceipt, MemoryError> {
+        Err(MemoryError::new(MemoryErrorCode::InvalidRequest))
+    }
+
+    fn adjust_importance(
+        &self,
+        _adjustment: &MemoryImportanceAdjustment,
+    ) -> Result<MemoryImportanceAdjustmentReceipt, MemoryError> {
+        Err(MemoryError::new(MemoryErrorCode::InvalidRequest))
+    }
+
+    fn delete_confirmed(
+        &self,
+        _request: &ConfirmedMemoryDeleteRequest,
+        _authority: &dyn MemoryDeletionAuthority,
+    ) -> Result<MemoryDeleteReceipt, MemoryError> {
+        Err(MemoryError::new(MemoryErrorCode::InvalidRequest))
+    }
+}
 
 #[async_trait::async_trait]
 impl ChatModelProvider for CountingChatProvider {
@@ -172,6 +341,58 @@ fn build_test_state(config_dir: &Path) -> Arc<AppState> {
 
 fn build_empty_test_state(config_dir: &Path) -> Arc<AppState> {
     build_test_state_with_persona(config_dir, None)
+}
+
+fn build_memory_test_state(config_dir: &Path, commit_calls: Arc<AtomicUsize>) -> Arc<AppState> {
+    let mut state = build_test_state(config_dir);
+    Arc::get_mut(&mut state).expect("测试状态尚未共享").memory = Some(MemoryRuntimeServices {
+        retriever: Arc::new(EmptyMemoryRetriever),
+        repository: Arc::new(RecordingMemoryRepository { commit_calls }),
+        sensitivity: Arc::new(DeterministicMemorySensitivityPolicy::new()),
+        deletion_authority: Arc::new(TestMemoryDeletionAuthority),
+        query_call_budget: NonZeroU32::new(2).expect("测试查询预算必须非零"),
+    });
+    state
+}
+
+fn memory_lifecycle_request(client_request_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "message": "用户喜欢夜间散步",
+                "conversation_id": "default",
+                "client_request_id": client_request_id
+            })
+            .to_string(),
+        ))
+        .expect("应能构造记忆生命周期请求")
+}
+
+async fn read_sse_text(response: axum::response::Response) -> String {
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("应能读取记忆生命周期 SSE")
+            .to_vec(),
+    )
+    .expect("记忆生命周期 SSE 应为 UTF-8")
+}
+
+async fn wait_until_runtime_idle(state: &AppState) {
+    for _ in 0..100 {
+        if state
+            .runtime_service
+            .snapshot()
+            .is_ok_and(|snapshot| snapshot.phase == muse_runtime::coordinator::RuntimePhase::Idle)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("运行时未在预期时间内回到 Idle");
 }
 
 fn build_test_state_with_persona(
@@ -2794,6 +3015,140 @@ async fn chat_stream_emits_structured_tool_status_sequence() {
     assert_eq!(projection.emotion, "happy");
     assert_eq!(projection.intensity, 70);
     assert_eq!(projection.reason_code, "positive_interaction");
+}
+
+#[tokio::test]
+async fn memory_mutate_仅在完整提交后落库且错误取消断流与重放均受控() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let _data_dir_guard = MuseDataDirEnvGuard {
+        previous: std::env::var_os("MUSE_DATA_DIR"),
+    };
+
+    let provider_error_dir = unique_temp_dir("memory-provider-error");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &provider_error_dir);
+    }
+    let provider_error_calls = Arc::new(AtomicUsize::new(0));
+    let provider_error_state =
+        build_memory_test_state(&provider_error_dir, Arc::clone(&provider_error_calls));
+    *provider_error_state.provider.lock().await = Some(Arc::new(FailingChatProvider));
+    let provider_error_response = api_routes()
+        .with_state(Arc::clone(&provider_error_state))
+        .oneshot(memory_lifecycle_request("memory-provider-error"))
+        .await
+        .expect("provider 错误仍应返回 SSE");
+    let provider_error_body = read_sse_text(provider_error_response).await;
+    assert!(provider_error_body.contains("error"));
+    assert_eq!(provider_error_calls.load(Ordering::SeqCst), 0);
+    wait_until_runtime_idle(&provider_error_state).await;
+
+    let stream_error_dir = unique_temp_dir("memory-stream-error");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &stream_error_dir);
+    }
+    let stream_error_calls = Arc::new(AtomicUsize::new(0));
+    let stream_error_state =
+        build_memory_test_state(&stream_error_dir, Arc::clone(&stream_error_calls));
+    *stream_error_state.provider.lock().await = Some(Arc::new(MemoryLifecycleProvider {
+        calls: AtomicUsize::new(0),
+        followup: MemoryProviderFollowup::StreamError,
+    }));
+    let stream_error_response = api_routes()
+        .with_state(Arc::clone(&stream_error_state))
+        .oneshot(memory_lifecycle_request("memory-stream-error"))
+        .await
+        .expect("续写断流仍应返回 SSE");
+    let stream_error_body = read_sse_text(stream_error_response).await;
+    assert!(stream_error_body.contains("error"));
+    assert!(!stream_error_body.contains("memory_commit_completed"));
+    assert_eq!(stream_error_calls.load(Ordering::SeqCst), 0);
+    wait_until_runtime_idle(&stream_error_state).await;
+
+    let commit_error_dir = unique_temp_dir("memory-session-commit-error");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &commit_error_dir);
+    }
+    let commit_error_calls = Arc::new(AtomicUsize::new(0));
+    let commit_error_state =
+        build_memory_test_state(&commit_error_dir, Arc::clone(&commit_error_calls));
+    *commit_error_state.provider.lock().await = Some(Arc::new(MemoryLifecycleProvider {
+        calls: AtomicUsize::new(0),
+        followup: MemoryProviderFollowup::Success,
+    }));
+    crate::runtime_support::fail_next_turn_commit_for_test("default");
+    let commit_error_response = api_routes()
+        .with_state(Arc::clone(&commit_error_state))
+        .oneshot(memory_lifecycle_request("memory-session-commit-error"))
+        .await
+        .expect("会话提交失败仍应返回 SSE");
+    let commit_error_body = read_sse_text(commit_error_response).await;
+    assert!(commit_error_body.contains("error"));
+    assert!(!commit_error_body.contains("memory_commit_completed"));
+    assert_eq!(commit_error_calls.load(Ordering::SeqCst), 0);
+    wait_until_runtime_idle(&commit_error_state).await;
+
+    let cancelled_dir = unique_temp_dir("memory-cancelled");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &cancelled_dir);
+    }
+    let cancelled_calls = Arc::new(AtomicUsize::new(0));
+    let cancelled_state = build_memory_test_state(&cancelled_dir, Arc::clone(&cancelled_calls));
+    let pending_entered = Arc::new(Semaphore::new(0));
+    *cancelled_state.provider.lock().await = Some(Arc::new(MemoryLifecycleProvider {
+        calls: AtomicUsize::new(0),
+        followup: MemoryProviderFollowup::Pending(Arc::clone(&pending_entered)),
+    }));
+    let cancelled_response = api_routes()
+        .with_state(Arc::clone(&cancelled_state))
+        .oneshot(memory_lifecycle_request("memory-cancelled"))
+        .await
+        .expect("取消场景应先返回 SSE");
+    tokio::time::timeout(std::time::Duration::from_secs(2), pending_entered.acquire())
+        .await
+        .expect("provider 应在取消前进入续写等待")
+        .expect("测试信号量不应关闭")
+        .forget();
+    drop(cancelled_response);
+    wait_until_runtime_idle(&cancelled_state).await;
+    assert_eq!(cancelled_calls.load(Ordering::SeqCst), 0);
+
+    let success_dir = unique_temp_dir("memory-success-replay");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &success_dir);
+    }
+    let success_calls = Arc::new(AtomicUsize::new(0));
+    let success_state = build_memory_test_state(&success_dir, Arc::clone(&success_calls));
+    *success_state.provider.lock().await = Some(Arc::new(MemoryLifecycleProvider {
+        calls: AtomicUsize::new(0),
+        followup: MemoryProviderFollowup::Success,
+    }));
+    let success_app = api_routes().with_state(Arc::clone(&success_state));
+    let success_response = success_app
+        .clone()
+        .oneshot(memory_lifecycle_request("memory-success-replay"))
+        .await
+        .expect("成功场景应返回 SSE");
+    let success_body = read_sse_text(success_response).await;
+    assert!(success_body.contains("memory_commit_completed"));
+    assert_eq!(success_calls.load(Ordering::SeqCst), 1);
+    wait_until_runtime_idle(&success_state).await;
+
+    let replay = success_app
+        .oneshot(memory_lifecycle_request("memory-success-replay"))
+        .await
+        .expect("重复 client_request_id 应稳定拒绝");
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_eq!(success_calls.load(Ordering::SeqCst), 1);
+
+    for dir in [
+        provider_error_dir,
+        stream_error_dir,
+        commit_error_dir,
+        cancelled_dir,
+        success_dir,
+    ] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[tokio::test]

@@ -302,6 +302,9 @@ impl MemoryManagementContentMutation {
             .assess(request)
             .into_repository_permit(request)?;
         permit.validate(request)?;
+        if permit.policy_version() != self.staging_policy_version {
+            return Err(MemoryError::new(MemoryErrorCode::SensitivityUnavailable));
+        }
 
         match &self.params {
             MemoryManagementContentParams::Create { importance, .. } => {

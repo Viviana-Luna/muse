@@ -28,7 +28,7 @@ pub use ports::{
 pub use runtime_binding::{
     ConfirmedMemoryDeleteRequest, MemoryCommitEnvelope, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryMutationTransition, MemoryPersonaScope,
-    MemoryRetrievalRequest, MemoryRuntimeBinding, MemoryStagedMutation,
+    MemoryRetrievalRequest, MemoryRuntimeBinding, MemorySourceEligibility, MemoryStagedMutation,
 };
 pub use tool_request::{
     MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,

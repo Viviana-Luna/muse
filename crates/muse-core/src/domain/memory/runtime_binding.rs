@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+
 use super::error::{require_non_empty, require_opaque_token, require_rfc3339};
 use super::ports::MemoryPersistencePermit;
 use super::{
@@ -27,7 +30,87 @@ impl MemoryPersonaScope {
     }
 }
 
-/// 来源、时间和幂等操作标识只能由冻结 Turn 运行时绑定。
+/// 由当前直接用户消息确定性签发的来源资格。
+///
+/// 该类型不支持反序列化，也不暴露可自行填写的来源枚举。只有候选事实能在
+/// 当前用户消息的规范化正文中逐字验证时才会构造成功；assistant、Tool、MCP、
+/// 网页、文件、system 与 reasoning 单独提供的内容无法取得该资格。
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemorySourceEligibility {
+    scope: MemoryPersonaScope,
+    source: MemorySourceEvidence,
+    operation_id: String,
+}
+
+impl std::fmt::Debug for MemorySourceEligibility {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemorySourceEligibility")
+            .field("scope", &self.scope)
+            .field("source", &self.source)
+            .field("evidence_binding", &"[确定性摘要]")
+            .finish()
+    }
+}
+
+impl MemorySourceEligibility {
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_direct_user_message(
+        scope: MemoryPersonaScope,
+        conversation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+        direct_user_message: &str,
+        candidate_content: &str,
+    ) -> Result<Self, MemoryError> {
+        let conversation_id = conversation_id.into();
+        let turn_id = turn_id.into();
+        let call_id = call_id.into();
+        require_non_empty(&conversation_id)?;
+        require_non_empty(&turn_id)?;
+        require_opaque_token(&call_id)?;
+
+        let normalized_source = normalize_source_evidence_text(direct_user_message)?;
+        let normalized_candidate = normalize_source_evidence_text(candidate_content)?;
+        let candidate_fact = canonical_direct_user_fact(&normalized_candidate);
+        let whole_source_fact = canonical_direct_user_fact(&normalized_source);
+        if candidate_fact.chars().count() < 2
+            || has_indirect_source_marker(&normalized_source)
+            || (whole_source_fact != candidate_fact
+                && !normalized_source
+                    .split(is_direct_user_clause_separator)
+                    .map(canonical_direct_user_fact)
+                    .any(|source_fact| source_fact == candidate_fact))
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, b"muse-memory-source-evidence/v1");
+        for field in [
+            scope.persona_id(),
+            conversation_id.as_str(),
+            turn_id.as_str(),
+            call_id.as_str(),
+            normalized_source.as_str(),
+            normalized_candidate.as_str(),
+        ] {
+            update_length_prefixed(&mut digest, field.as_bytes());
+        }
+        let operation_id = format!("memory-source-{}", encode_hex(&digest.finalize()));
+        Ok(Self {
+            scope,
+            source: MemorySourceEvidence::ConversationTurn {
+                conversation_id,
+                turn_id,
+                kind: MemorySourceKind::DirectUserMessage,
+            },
+            operation_id,
+        })
+    }
+}
+
+/// 来源、时间和幂等操作标识只能由已验证的运行时证据绑定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRuntimeBinding {
     scope: MemoryPersonaScope,
@@ -39,37 +122,22 @@ pub struct MemoryRuntimeBinding {
 }
 
 impl MemoryRuntimeBinding {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        scope: MemoryPersonaScope,
-        conversation_id: impl Into<String>,
-        turn_id: impl Into<String>,
-        operation_id: impl Into<String>,
-        source_kind: MemorySourceKind,
+        eligibility: MemorySourceEligibility,
         recorded_at: impl Into<String>,
         valid_from: impl Into<String>,
         freshness_at: impl Into<String>,
     ) -> Result<Self, MemoryError> {
-        let conversation_id = conversation_id.into();
-        let turn_id = turn_id.into();
-        let operation_id = operation_id.into();
         let recorded_at = recorded_at.into();
         let valid_from = valid_from.into();
         let freshness_at = freshness_at.into();
-        require_non_empty(&conversation_id)?;
-        require_non_empty(&turn_id)?;
-        require_opaque_token(&operation_id)?;
         for value in [&recorded_at, &valid_from, &freshness_at] {
             require_rfc3339(value)?;
         }
         Ok(Self {
-            scope,
-            source: MemorySourceEvidence::ConversationTurn {
-                conversation_id,
-                turn_id,
-                kind: source_kind,
-            },
-            operation_id,
+            scope: eligibility.scope,
+            source: eligibility.source,
+            operation_id: eligibility.operation_id,
             recorded_at,
             valid_from,
             freshness_at,
@@ -99,6 +167,154 @@ impl MemoryRuntimeBinding {
     pub fn freshness_at(&self) -> &str {
         &self.freshness_at
     }
+}
+
+fn normalize_source_evidence_text(value: &str) -> Result<String, MemoryError> {
+    require_non_empty(value).map_err(|_| MemoryError::new(MemoryErrorCode::SourceIneligible))?;
+    let mut normalized = String::new();
+    for character in value.nfkc().flat_map(char::to_lowercase) {
+        if is_ignored_format_character(character) {
+            continue;
+        }
+        if matches!(character, '\n' | '\r') {
+            normalized.push('。');
+            continue;
+        }
+        if character == '\t' {
+            continue;
+        }
+        if character.is_control() {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        let character = fold_common_homoglyph(character);
+        if !character.is_whitespace() {
+            normalized.push(character);
+        }
+    }
+    if normalized.is_empty() {
+        return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+    }
+    Ok(normalized)
+}
+
+fn strip_direct_user_subject(value: &str) -> &str {
+    const SUBJECTS: [&str; 5] = ["用户", "本人", "我自己", "我", "俺"];
+    SUBJECTS
+        .iter()
+        .find_map(|subject| value.strip_prefix(subject))
+        .unwrap_or(value)
+}
+
+fn canonical_direct_user_fact(value: &str) -> &str {
+    const COMMAND_PREFIXES: [&str; 10] = [
+        "请帮我记住",
+        "请你记住",
+        "请记住",
+        "帮我记住",
+        "记住",
+        "另外",
+        "还有",
+        "并且",
+        "而且",
+        "也",
+    ];
+    let mut fact = value.trim_matches(is_direct_user_clause_separator);
+    loop {
+        let stripped = COMMAND_PREFIXES
+            .iter()
+            .find_map(|prefix| fact.strip_prefix(prefix))
+            .unwrap_or(fact);
+        let stripped = strip_direct_user_subject(stripped);
+        if stripped == fact {
+            break;
+        }
+        fact = stripped;
+    }
+    fact.trim_matches(is_direct_user_clause_separator)
+}
+
+fn is_direct_user_clause_separator(character: char) -> bool {
+    matches!(
+        character,
+        '。' | '，' | ',' | '、' | '；' | ';' | '！' | '!' | '？' | '?'
+    )
+}
+
+fn has_indirect_source_marker(value: &str) -> bool {
+    const MARKERS: [&str; 20] = [
+        "assistant说",
+        "assistant声称",
+        "tool说",
+        "tool返回",
+        "工具说",
+        "工具返回",
+        "工具结果",
+        "mcp说",
+        "mcp返回",
+        "mcp结果",
+        "网页说",
+        "网页写着",
+        "网页内容",
+        "文件说",
+        "文件写着",
+        "文件内容",
+        "资料写着",
+        "文档写着",
+        "system指令",
+        "reasoning推测",
+    ];
+    MARKERS.iter().any(|marker| value.contains(marker))
+}
+
+fn is_ignored_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+fn fold_common_homoglyph(character: char) -> char {
+    match character {
+        'а' | 'α' => 'a',
+        'в' | 'β' => 'b',
+        'с' | 'ϲ' => 'c',
+        'е' | 'ε' => 'e',
+        'һ' | 'η' => 'h',
+        'і' | 'ι' => 'i',
+        'ј' => 'j',
+        'κ' => 'k',
+        'м' | 'μ' => 'm',
+        'ո' => 'n',
+        'о' | 'ο' => 'o',
+        'р' | 'ρ' => 'p',
+        'ѕ' => 's',
+        'т' | 'τ' => 't',
+        'х' | 'χ' => 'x',
+        'у' | 'υ' => 'y',
+        _ => character,
+    }
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    encoded
 }
 
 /// 已绑定 Persona scope 的查询请求。
@@ -223,6 +439,9 @@ impl MemoryStagedMutation {
             .assess(request)
             .into_repository_permit(request)?;
         permit.validate(request)?;
+        if permit.policy_version() != self.staging_policy_version {
+            return Err(MemoryError::new(MemoryErrorCode::SensitivityUnavailable));
+        }
 
         match &self.params {
             MemoryMutateParams::Create { .. } => {
@@ -467,6 +686,8 @@ pub enum MemoryDeleteConfirmationSource {
     ConversationTurn {
         conversation_id: String,
         turn_id: String,
+        approval_id: String,
+        call_id: String,
     },
     PersonaManagement {
         action_id: String,
@@ -479,9 +700,13 @@ impl MemoryDeleteConfirmationSource {
             Self::ConversationTurn {
                 conversation_id,
                 turn_id,
+                approval_id,
+                call_id,
             } => {
                 require_non_empty(conversation_id)?;
-                require_non_empty(turn_id)
+                require_non_empty(turn_id)?;
+                require_opaque_token(approval_id)?;
+                require_opaque_token(call_id)
             }
             Self::PersonaManagement { action_id } => require_opaque_token(action_id),
         }
@@ -492,24 +717,57 @@ impl MemoryDeleteConfirmationSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryDeleteConfirmation {
     confirmation_id: String,
+    persona_id: String,
+    target_digest: String,
     confirmed_at: String,
+    expires_at: String,
     source: MemoryDeleteConfirmationSource,
 }
 
 impl MemoryDeleteConfirmation {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         confirmation_id: impl Into<String>,
+        scope: &MemoryPersonaScope,
+        params: &MemoryDeleteParams,
         confirmed_at: impl Into<String>,
+        expires_at: impl Into<String>,
         source: MemoryDeleteConfirmationSource,
     ) -> Result<Self, MemoryError> {
         let confirmation_id = confirmation_id.into();
         let confirmed_at = confirmed_at.into();
+        let expires_at = expires_at.into();
         require_opaque_token(&confirmation_id)?;
         require_rfc3339(&confirmed_at)?;
+        require_rfc3339(&expires_at)?;
+        params.validate()?;
         source.validate()?;
+        let confirmed = chrono::DateTime::parse_from_rfc3339(&confirmed_at)
+            .map_err(|_| MemoryError::new(MemoryErrorCode::InvalidRequest))?;
+        let expires = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|_| MemoryError::new(MemoryErrorCode::InvalidRequest))?;
+        if expires <= confirmed {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        match &source {
+            MemoryDeleteConfirmationSource::ConversationTurn { approval_id, .. }
+                if approval_id != &confirmation_id =>
+            {
+                return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+            }
+            MemoryDeleteConfirmationSource::PersonaManagement { action_id }
+                if action_id != &confirmation_id =>
+            {
+                return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+            }
+            _ => {}
+        }
         Ok(Self {
             confirmation_id,
+            persona_id: scope.persona_id().to_string(),
+            target_digest: normalized_delete_target_digest(scope, params)?,
             confirmed_at,
+            expires_at,
             source,
         })
     }
@@ -522,8 +780,74 @@ impl MemoryDeleteConfirmation {
         &self.confirmed_at
     }
 
+    pub fn persona_id(&self) -> &str {
+        &self.persona_id
+    }
+
+    pub fn target_digest(&self) -> &str {
+        &self.target_digest
+    }
+
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+
     pub fn source(&self) -> &MemoryDeleteConfirmationSource {
         &self.source
+    }
+
+    pub(crate) fn intent_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, b"muse-memory-delete-confirmation/v1");
+        for field in [
+            self.confirmation_id.as_str(),
+            self.persona_id.as_str(),
+            self.target_digest.as_str(),
+            self.confirmed_at.as_str(),
+            self.expires_at.as_str(),
+        ] {
+            update_length_prefixed(&mut digest, field.as_bytes());
+        }
+        match &self.source {
+            MemoryDeleteConfirmationSource::ConversationTurn {
+                conversation_id,
+                turn_id,
+                approval_id,
+                call_id,
+            } => {
+                update_length_prefixed(&mut digest, b"conversation_turn");
+                for field in [conversation_id, turn_id, approval_id, call_id] {
+                    update_length_prefixed(&mut digest, field.as_bytes());
+                }
+            }
+            MemoryDeleteConfirmationSource::PersonaManagement { action_id } => {
+                update_length_prefixed(&mut digest, b"persona_management");
+                update_length_prefixed(&mut digest, action_id.as_bytes());
+            }
+        }
+        digest.finalize().into()
+    }
+
+    fn validate_bound_request(
+        &self,
+        params: &MemoryDeleteParams,
+        scope: &MemoryPersonaScope,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MemoryError> {
+        if self.persona_id != scope.persona_id()
+            || self.target_digest != normalized_delete_target_digest(scope, params)?
+        {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map_err(|_| MemoryError::new(MemoryErrorCode::InvalidRequest))?
+            .with_timezone(&chrono::Utc);
+        if now >= expires_at {
+            return Err(MemoryError::new(
+                MemoryErrorCode::DeleteConfirmationRequired,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -542,6 +866,7 @@ impl ConfirmedMemoryDeleteRequest {
         confirmation: MemoryDeleteConfirmation,
     ) -> Result<Self, MemoryError> {
         params.validate()?;
+        confirmation.validate_bound_request(&params, &scope, chrono::Utc::now())?;
         Ok(Self {
             params,
             scope,
@@ -560,4 +885,51 @@ impl ConfirmedMemoryDeleteRequest {
     pub fn confirmation(&self) -> &MemoryDeleteConfirmation {
         &self.confirmation
     }
+
+    pub(crate) fn validate_for_repository(&self) -> Result<(), MemoryError> {
+        self.params.validate()?;
+        self.confirmation
+            .validate_bound_request(&self.params, &self.scope, chrono::Utc::now())
+    }
+}
+
+fn normalized_delete_target_digest(
+    scope: &MemoryPersonaScope,
+    params: &MemoryDeleteParams,
+) -> Result<String, MemoryError> {
+    let persona = normalize_delete_target_component(scope.persona_id())?;
+    let (kind, target) = match params {
+        MemoryDeleteParams::Memory { memory_id } => (
+            "memory",
+            normalize_delete_target_component(memory_id.0.as_str())?,
+        ),
+        MemoryDeleteParams::PersonaAll => ("persona_all", "*".to_string()),
+    };
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"muse-memory-delete-target/v1");
+    for field in [persona.as_str(), kind, target.as_str()] {
+        update_length_prefixed(&mut digest, field.as_bytes());
+    }
+    Ok(encode_hex(&digest.finalize()))
+}
+
+fn normalize_delete_target_component(value: &str) -> Result<String, MemoryError> {
+    require_non_empty(value)?;
+    let mut normalized = String::new();
+    for character in value.nfkc().flat_map(char::to_lowercase) {
+        if is_ignored_format_character(character) {
+            continue;
+        }
+        if character.is_control() {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        let character = fold_common_homoglyph(character);
+        if character.is_alphanumeric() {
+            normalized.push(character);
+        }
+    }
+    if normalized.is_empty() {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+    }
+    Ok(normalized)
 }

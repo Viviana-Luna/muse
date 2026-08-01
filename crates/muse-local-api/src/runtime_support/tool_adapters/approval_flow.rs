@@ -16,10 +16,18 @@ pub(in crate::runtime_support) struct ToolApprovalRequest<'a> {
     pub(in crate::runtime_support) policy_revision: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::runtime_support) struct ToolApprovalEvidence {
+    pub(in crate::runtime_support) approval_id: String,
+    pub(in crate::runtime_support) call_id: String,
+    pub(in crate::runtime_support) approved_at: String,
+    pub(in crate::runtime_support) expires_at: String,
+}
+
 pub(in crate::runtime_support) async fn wait_for_tool_approval(
     state: &Arc<AppState>,
     request: ToolApprovalRequest<'_>,
-) -> Result<(bool, String), ()> {
+) -> Result<(bool, String, Option<ToolApprovalEvidence>), ()> {
     let ToolApprovalRequest {
         tx,
         turn,
@@ -33,7 +41,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
         policy_revision,
     } = request;
     let Some(tx) = tx else {
-        return Ok((false, "no_event_channel".to_string()));
+        return Ok((false, "no_event_channel".to_string(), None));
     };
     let approval_id = next_runtime_id("approval");
     state
@@ -178,7 +186,8 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
                 runtime_approval_resolved_event(&approval_id, true, Some("auto_review_allowed")),
             )
             .await?;
-            return Ok((true, "auto_review_allowed".to_string()));
+            let evidence = approval_evidence(&approval_id, &call.call_id);
+            return Ok((true, "auto_review_allowed".to_string(), Some(evidence)));
         }
         if matches!(
             outcome.failure_reason(),
@@ -187,6 +196,7 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
             return Ok((
                 false,
                 outcome.failure_reason().unwrap_or("cancelled").to_string(),
+                None,
             ));
         }
         manual_summary = format!(
@@ -307,5 +317,17 @@ pub(in crate::runtime_support) async fn wait_for_tool_approval(
         )
         .await;
     }
-    Ok((approved, reason))
+    let evidence = approved.then(|| approval_evidence(&approval_id, &call.call_id));
+    Ok((approved, reason, evidence))
+}
+
+fn approval_evidence(approval_id: &str, call_id: &str) -> ToolApprovalEvidence {
+    let approved_at = chrono::Utc::now();
+    let expires_at = approved_at + chrono::Duration::seconds(TOOL_APPROVAL_TIMEOUT_SECS as i64);
+    ToolApprovalEvidence {
+        approval_id: approval_id.to_string(),
+        call_id: call_id.to_string(),
+        approved_at: approved_at.to_rfc3339(),
+        expires_at: expires_at.to_rfc3339(),
+    }
 }

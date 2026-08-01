@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 toml_edit = { version = "0.22.27", features = ["serde"] }
 tracing = "0.1"
+unicode-normalization = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

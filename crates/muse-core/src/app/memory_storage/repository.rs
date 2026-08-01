@@ -20,12 +20,13 @@ use crate::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCategory, MemoryChangeType,
     MemoryCommitEnvelope, MemoryDeleteParams, MemoryDeleteReceipt, MemoryDeletionAuthority,
     MemoryDeletionAuthorityReceipt, MemoryDeletionCheckRequest, MemoryDeletionDecision,
-    MemoryDeletionSubject, MemoryEntry, MemoryEntryState, MemoryError, MemoryErrorCode, MemoryId,
-    MemoryImportance, MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt,
-    MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutationReceipt,
-    MemoryMutationReceiptState, MemoryMutationTransition, MemoryPersonaScope, MemoryRecord,
-    MemoryRepository, MemoryRevision, MemoryRevisionId, MemoryRevisionState,
-    MemorySensitivityPolicy, MemorySourceEvidence, MemorySourceKind,
+    MemoryDeletionSubject, MemoryDerivationKey, MemoryEntry, MemoryEntryState, MemoryError,
+    MemoryErrorCode, MemoryId, MemoryImportance, MemoryImportanceAdjustment,
+    MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation,
+    MemoryManagementContentParams, MemoryMutationReceipt, MemoryMutationReceiptState,
+    MemoryMutationTransition, MemoryPersonaScope, MemoryRecord, MemoryRepository, MemoryRevision,
+    MemoryRevisionId, MemoryRevisionState, MemorySensitivityPolicy, MemorySourceEvidence,
+    MemorySourceKind,
 };
 
 /// 所有记忆写入、FTS 投影和幂等收据的唯一 SQLite 实现。
@@ -395,6 +396,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         request: &ConfirmedMemoryDeleteRequest,
         authority: &dyn MemoryDeletionAuthority,
     ) -> Result<MemoryDeleteReceipt, MemoryError> {
+        request.validate_for_repository()?;
         let scope = request.scope();
         let persona_id = scope.persona_id();
         let deletion_id = request.confirmation().confirmation_id();
@@ -412,10 +414,26 @@ impl MemoryRepository for SqliteMemoryRepository {
             ));
         }
 
+        let confirmation_subject = MemoryDeletionSubject::Derivation {
+            persona_id: persona_id.to_string(),
+            derivation_key: MemoryDerivationKey::from_digest(
+                request.confirmation().intent_digest(),
+            ),
+        };
+
         let mut authority_guard = self.authority.begin_guard()?;
-        let existing = authority_guard.event(persona_id, deletion_id)?;
+        let existing = authority_guard.event_by_deletion_id(deletion_id)?;
         if let Some(event) = &existing {
-            validate_delete_event(event, recorded_at, request_kind, requested_memory_id)?;
+            if event.persona_id != persona_id {
+                return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+            }
+            validate_delete_event(
+                event,
+                recorded_at,
+                request_kind,
+                requested_memory_id,
+                &confirmation_subject,
+            )?;
         }
 
         // authority 首次持锁期间只做主库 autocommit 读取；Repository 的所有记忆
@@ -423,7 +441,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         // 此处绝不能先开启主库 IMMEDIATE，否则 durable authority COMMIT 后重锁
         // 会与另一进程形成 main -> authority / authority -> main 的 ABBA 环。
         let mut connection = self.open_connection()?;
-        let (subjects, target_count) = if let Some(event) = &existing {
+        let (mut subjects, target_count) = if let Some(event) = &existing {
             let count = match event.target_memory_count {
                 Some(count) => count,
                 None => {
@@ -441,6 +459,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                 }
             }
         };
+        subjects.insert(confirmation_subject.clone());
 
         // 删除事件、具体 subjects 与 intent 全部由当前 guard 连接一次 durable 发布；
         // 重取 authority IMMEDIATE 成功之后才允许开启主库 IMMEDIATE。
@@ -470,6 +489,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             recorded_at,
             request_kind,
             requested_memory_id,
+            &confirmation_subject,
         )?;
         if canonical_event.subjects != subjects
             || canonical_event.target_memory_count != Some(target_count)
@@ -555,8 +575,9 @@ fn validate_delete_event(
     recorded_at: &str,
     request_kind: &str,
     requested_memory_id: Option<&str>,
+    confirmation_subject: &MemoryDeletionSubject,
 ) -> Result<(), MemoryError> {
-    if event.recorded_at != recorded_at {
+    if event.recorded_at != recorded_at || !event.subjects.contains(confirmation_subject) {
         return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
     }
     if let Some(stored_kind) = event.request_kind.as_deref()

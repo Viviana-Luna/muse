@@ -10,9 +10,10 @@
 use crate::domain::memory::{
     MemorySafetyAssessment, MemorySafetyFailure, MemorySensitivityPolicy, MemorySensitivityRequest,
 };
+use unicode_normalization::UnicodeNormalization;
 
 /// 当前确定性规则集版本；规则变化必须同步升级，持久化 revision 凭它审计。
-pub const MEMORY_SENSITIVITY_POLICY_VERSION: &str = "deterministic-v1";
+pub const MEMORY_SENSITIVITY_POLICY_VERSION: &str = "deterministic-nfkc-v2";
 
 /// 确定性敏感检测器；无状态，可跨线程共享。
 #[derive(Debug, Default, Clone, Copy)]
@@ -33,10 +34,28 @@ impl MemorySensitivityPolicy for DeterministicMemorySensitivityPolicy {
                 reason: MemorySafetyFailure::DecisionMissing,
             };
         }
-        // content 与 change_reason 分别判定，任一命中即整项拒绝；不拼接扫描，
-        // 避免一字段末尾的关键词把另一字段误读为自己的上下文。
-        let rejected = hits_sensitive_rule(request.content).is_some()
-            || hits_sensitive_rule(request.change_reason).is_some();
+        let content = match NormalizedSensitiveText::new(request.content) {
+            Ok(content) => content,
+            Err(reason) => {
+                return MemorySafetyAssessment::FailClosed {
+                    stage: request.stage,
+                    reason,
+                };
+            }
+        };
+        let change_reason = match NormalizedSensitiveText::new(request.change_reason) {
+            Ok(change_reason) => change_reason,
+            Err(reason) => {
+                return MemorySafetyAssessment::FailClosed {
+                    stage: request.stage,
+                    reason,
+                };
+            }
+        };
+        // 两道门都由本实现先做同一版 NFKC、大小写、零宽字符、同形字符和
+        // 分隔符规范化，再运行完全相同的规则；任一字段命中即整项拒绝。
+        let rejected = hits_sensitive_rule(&content).is_some()
+            || hits_sensitive_rule(&change_reason).is_some();
         if rejected {
             MemorySafetyAssessment::Rejected {
                 stage: request.stage,
@@ -65,48 +84,285 @@ enum SensitiveCategory {
     ThirdPartyPrivacy,
 }
 
-type SensitiveRule = fn(&str, &str) -> bool;
+#[derive(Debug)]
+struct NormalizedSensitiveText {
+    canonical: String,
+    compact: String,
+    json_fields: Vec<(String, String)>,
+}
 
-fn hits_sensitive_rule(text: &str) -> Option<SensitiveCategory> {
-    let lower = text.to_lowercase();
+impl NormalizedSensitiveText {
+    fn new(raw: &str) -> Result<Self, MemorySafetyFailure> {
+        let canonical = normalize_sensitive_scalar(raw)?;
+        if canonical.trim().is_empty() {
+            return Err(MemorySafetyFailure::DecisionMissing);
+        }
+        let compact = canonical
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>();
+        if compact.is_empty() {
+            return Err(MemorySafetyFailure::Indeterminate);
+        }
+
+        let trimmed = raw.trim();
+        let mut json_fields = Vec::new();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let parsed = serde_json::from_str::<serde_json::Value>(trimmed)
+                .map_err(|_| MemorySafetyFailure::Indeterminate)?;
+            collect_json_fields(&parsed, &mut json_fields, 0)?;
+        }
+        Ok(Self {
+            canonical,
+            compact,
+            json_fields,
+        })
+    }
+}
+
+type SensitiveRule = fn(&NormalizedSensitiveText) -> bool;
+
+fn hits_sensitive_rule(text: &NormalizedSensitiveText) -> Option<SensitiveCategory> {
     let rules: [(SensitiveCategory, SensitiveRule); 9] = [
-        (SensitiveCategory::HardSecret, |text, lower| {
-            contains_hard_secret(text, lower)
+        (SensitiveCategory::HardSecret, |text| {
+            contains_hard_secret(text)
         }),
-        (SensitiveCategory::IdentityDocument, |text, _| {
-            contains_identity_document(text)
+        (SensitiveCategory::IdentityDocument, |text| {
+            contains_identity_document(&text.compact)
         }),
-        (SensitiveCategory::FinancialPayment, |text, lower| {
-            contains_financial_payment(text, lower)
+        (SensitiveCategory::FinancialPayment, |text| {
+            contains_financial_payment(&text.compact)
         }),
-        (SensitiveCategory::PreciseLocation, |text, _| {
-            contains_precise_location(text)
+        (SensitiveCategory::PreciseLocation, |text| {
+            contains_precise_location(&text.canonical, &text.compact)
         }),
-        (SensitiveCategory::PrivateContact, |text, _| {
-            contains_private_contact(text)
+        (SensitiveCategory::PrivateContact, |text| {
+            contains_private_contact(&text.canonical, &text.compact)
         }),
-        (SensitiveCategory::HealthMedical, |text, _| {
-            contains_health_medical(text)
+        (SensitiveCategory::HealthMedical, |text| {
+            contains_health_medical(&text.compact)
         }),
-        (SensitiveCategory::SexualIntimacy, |text, _| {
-            contains_sexual_intimacy(text)
+        (SensitiveCategory::SexualIntimacy, |text| {
+            contains_sexual_intimacy(&text.compact)
         }),
-        (SensitiveCategory::Minor, |text, _| {
-            contains_minor_reference(text)
+        (SensitiveCategory::Minor, |text| {
+            contains_minor_reference(&text.canonical, &text.compact)
         }),
-        (SensitiveCategory::ThirdPartyPrivacy, |text, _| {
-            contains_third_party_privacy(text)
+        (SensitiveCategory::ThirdPartyPrivacy, |text| {
+            contains_third_party_privacy(&text.compact)
         }),
     ];
     rules
         .iter()
-        .find(|(_, rule)| rule(text, &lower))
+        .find(|(_, rule)| contains_sensitive_field_assignment(text) || rule(text))
         .map(|(category, _)| *category)
 }
 
+fn normalize_sensitive_scalar(value: &str) -> Result<String, MemorySafetyFailure> {
+    let mut normalized = String::new();
+    let mut previous_space = false;
+    for character in value.nfkc().flat_map(char::to_lowercase) {
+        if is_ignored_format_character(character) {
+            continue;
+        }
+        if character.is_control() {
+            if matches!(character, '\n' | '\r' | '\t') {
+                push_normalized_space(&mut normalized, &mut previous_space);
+                continue;
+            }
+            return Err(MemorySafetyFailure::Indeterminate);
+        }
+        let character = fold_common_homoglyph(character);
+        if character.is_alphanumeric() || matches!(character, '@' | '+' | '.' | '-' | '_') {
+            normalized.push(character);
+            previous_space = false;
+        } else if is_assignment_separator(character) {
+            while normalized.ends_with(' ') {
+                normalized.pop();
+            }
+            if !normalized.ends_with(':') {
+                normalized.push(':');
+            }
+            previous_space = false;
+        } else {
+            push_normalized_space(&mut normalized, &mut previous_space);
+        }
+    }
+    Ok(normalized.trim().to_string())
+}
+
+fn push_normalized_space(normalized: &mut String, previous_space: &mut bool) {
+    if !*previous_space && !normalized.is_empty() && !normalized.ends_with(':') {
+        normalized.push(' ');
+    }
+    *previous_space = true;
+}
+
+fn is_assignment_separator(character: char) -> bool {
+    matches!(
+        character,
+        ':' | '=' | '/' | '\\' | '|' | '→' | '⇒' | '➜' | '⟶' | '⟹' | '﹕' | '︰'
+    )
+}
+
+fn is_ignored_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+fn fold_common_homoglyph(character: char) -> char {
+    match character {
+        'а' | 'α' => 'a',
+        'в' | 'β' => 'b',
+        'с' | 'ϲ' => 'c',
+        'е' | 'ε' => 'e',
+        'һ' | 'η' => 'h',
+        'і' | 'ι' => 'i',
+        'ј' => 'j',
+        'κ' => 'k',
+        'м' | 'μ' => 'm',
+        'ո' => 'n',
+        'о' | 'ο' => 'o',
+        'р' | 'ρ' => 'p',
+        'ѕ' => 's',
+        'т' | 'τ' => 't',
+        'х' | 'χ' => 'x',
+        'у' | 'υ' => 'y',
+        _ => character,
+    }
+}
+
+fn collect_json_fields(
+    value: &serde_json::Value,
+    fields: &mut Vec<(String, String)>,
+    depth: usize,
+) -> Result<(), MemorySafetyFailure> {
+    if depth > 32 || fields.len() > 256 {
+        return Err(MemorySafetyFailure::Indeterminate);
+    }
+    match value {
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                let key = normalize_sensitive_scalar(key)?;
+                match value {
+                    serde_json::Value::String(value) => {
+                        push_json_field(fields, key, normalize_sensitive_scalar(value)?)?;
+                    }
+                    serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                        push_json_field(fields, key, value.to_string())?;
+                    }
+                    serde_json::Value::Null => push_json_field(fields, key, String::new())?,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        collect_json_fields(value, fields, depth + 1)?;
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_fields(value, fields, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn push_json_field(
+    fields: &mut Vec<(String, String)>,
+    key: String,
+    value: String,
+) -> Result<(), MemorySafetyFailure> {
+    if fields.len() >= 256 {
+        return Err(MemorySafetyFailure::Indeterminate);
+    }
+    fields.push((key, value));
+    Ok(())
+}
+
+fn contains_sensitive_field_assignment(text: &NormalizedSensitiveText) -> bool {
+    text.json_fields
+        .iter()
+        .any(|(key, value)| sensitive_field_name(key) && has_field_value(value))
+        || text
+            .canonical
+            .split(':')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| sensitive_field_name(pair[0]) && has_field_value(pair[1]))
+}
+
+fn sensitive_field_name(value: &str) -> bool {
+    let identifier = value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    const FIELD_NAMES: [&str; 42] = [
+        "password",
+        "passwd",
+        "passcode",
+        "apikey",
+        "secretkey",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "privatekey",
+        "authtoken",
+        "sessiontoken",
+        "signingkey",
+        "bearertoken",
+        "otp",
+        "pin",
+        "phone",
+        "phonenumber",
+        "mobile",
+        "mobilephone",
+        "idcard",
+        "identitynumber",
+        "passportnumber",
+        "bankcard",
+        "cardnumber",
+        "homeaddress",
+        "streetaddress",
+        "preciseaddress",
+        "密码",
+        "口令",
+        "密钥",
+        "凭据",
+        "令牌",
+        "验证码",
+        "支付码",
+        "手机号",
+        "电话号码",
+        "身份证",
+        "护照号",
+        "银行卡号",
+        "详细住址",
+        "家庭住址",
+    ];
+    FIELD_NAMES
+        .iter()
+        .any(|field| identifier == *field || identifier.ends_with(field))
+}
+
+fn has_field_value(value: &str) -> bool {
+    value.chars().any(|character| character.is_alphanumeric())
+}
+
 /// 硬秘密与认证凭据：PEM 私钥块、已知令牌前缀、密钥赋值句式。
-fn contains_hard_secret(text: &str, lower: &str) -> bool {
-    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+fn contains_hard_secret(text: &NormalizedSensitiveText) -> bool {
+    let canonical = text.canonical.as_str();
+    if text.compact.contains("begin") && text.compact.contains("privatekey") {
         return true;
     }
     const TOKEN_PREFIXES: [&str; 24] = [
@@ -116,8 +372,8 @@ fn contains_hard_secret(text: &str, lower: &str) -> bool {
         "sk_test_",
         "sk-",
         "rk_live_",
-        "AKIA",
-        "ASIA",
+        "akia",
+        "asia",
         "ghp_",
         "gho_",
         "ghu_",
@@ -131,25 +387,46 @@ fn contains_hard_secret(text: &str, lower: &str) -> bool {
         "xoxr-",
         "xoxs-",
         "ya29.",
-        "AIza",
+        "aiza",
         "dop_v1_",
         "hf_",
     ];
-    for word in ascii_words(text) {
+    const COMPACT_TOKEN_PREFIXES: [&str; 12] = [
+        "skant",
+        "skproj",
+        "sklive",
+        "sktest",
+        "githubpat",
+        "glpat",
+        "xoxb",
+        "xoxp",
+        "ya29",
+        "aiza",
+        "dopv1",
+        "hf",
+    ];
+    if COMPACT_TOKEN_PREFIXES.iter().any(|prefix| {
+        text.compact
+            .find(prefix)
+            .is_some_and(|index| text.compact[index..].len() >= prefix.len() + 16)
+    }) {
+        return true;
+    }
+    for word in ascii_words(canonical) {
         for prefix in TOKEN_PREFIXES {
             if word.starts_with(prefix) && word.len() >= prefix.len() + 16 {
                 return true;
             }
         }
         // JWT 固定以 eyJ 开头且含两段分隔；短词不作为凭据。
-        if word.starts_with("eyJ") && word.len() >= 32 && word.matches('.').count() >= 2 {
+        if word.starts_with("eyj") && word.len() >= 32 && word.matches('.').count() >= 2 {
             return true;
         }
     }
-    if lower.contains("authorization: bearer ")
-        || lower.contains("authorization=basic ")
-        || lower.contains("cookie: session=")
-        || lower.contains("set-cookie: session=")
+    if text.compact.contains("authorizationbearer")
+        || text.compact.contains("authorizationbasic")
+        || text.compact.contains("cookiesession")
+        || text.compact.contains("setcookiesession")
     {
         return true;
     }
@@ -172,12 +449,12 @@ fn contains_hard_secret(text: &str, lower: &str) -> bool {
         "otp",
         "pin",
     ];
-    if contains_assignment_pattern(lower, &ASSIGNMENT_KEYS, &["=", ":"]) {
+    if contains_assignment_pattern(canonical, &ASSIGNMENT_KEYS, &[":", "-"]) {
         return true;
     }
     const CJK_CREDENTIAL_KEYS: [&str; 7] =
         ["密码", "口令", "密钥", "凭据", "令牌", "验证码", "支付码"];
-    contains_assignment_pattern(text, &CJK_CREDENTIAL_KEYS, &[":", "：", "="])
+    contains_assignment_pattern(canonical, &CJK_CREDENTIAL_KEYS, &[":", "-"])
 }
 
 /// 身份证明：带校验位的中国大陆身份证号，或证件关键词伴随数字编号。
@@ -213,7 +490,7 @@ fn contains_identity_document(text: &str) -> bool {
 }
 
 /// 金融支付：Luhn 有效的长卡号，或金融关键词伴随数字。
-fn contains_financial_payment(text: &str, lower: &str) -> bool {
+fn contains_financial_payment(text: &str) -> bool {
     for run in digit_runs(text) {
         if (16..=19).contains(&run.len()) && luhn_valid(&run) {
             return true;
@@ -231,36 +508,53 @@ fn contains_financial_payment(text: &str, lower: &str) -> bool {
     ];
     FINANCIAL_KEYS
         .iter()
-        .any(|key| keyword_followed_by_digit_run(lower, key, 3, 24))
+        .any(|key| keyword_followed_by_digit_run(text, key, 3, 24))
 }
 
 /// 精确住址与实时位置：高精度坐标对，门牌号伴随编号，或住址类关键词伴随具体尾文。
-fn contains_precise_location(text: &str) -> bool {
-    if contains_precise_coordinates(text) {
+fn contains_precise_location(canonical: &str, compact: &str) -> bool {
+    if contains_precise_coordinates(canonical) {
         return true;
     }
-    if keyword_followed_by_digit_run(text, "门牌号", 1, 16) {
+    if keyword_followed_by_digit_run(compact, "门牌号", 1, 16) {
         return true;
     }
-    const LOCATION_KEYS: [&str; 9] = [
+    const LOCATION_KEYS: [&str; 11] = [
         "详细住址",
         "家庭住址",
+        "居住地址",
+        "收货地址",
         "家住",
         "现居",
         "实时位置",
         "定位到",
         "经纬度",
-        "GPS 坐标",
-        "gps 坐标",
+        "gps坐标",
+        "address",
     ];
-    LOCATION_KEYS
+    if LOCATION_KEYS
         .iter()
-        .any(|key| keyword_with_meaningful_tail(text, key, 4))
+        .any(|key| keyword_with_meaningful_tail(compact, key, 4))
+    {
+        return true;
+    }
+    let has_region = ["省", "市", "区", "县"]
+        .iter()
+        .filter(|key| compact.contains(*key))
+        .count()
+        >= 2;
+    let has_street = ["路", "街", "巷", "小区", "大厦", "号楼"]
+        .iter()
+        .any(|key| compact.contains(key));
+    let has_unit = ["号", "栋", "单元", "室"]
+        .iter()
+        .any(|key| keyword_followed_by_digit_run(compact, key, 1, 12));
+    has_region && has_street && has_unit
 }
 
 /// 私人联系方式：手机号、国际号码、邮箱地址，或联系方式关键词伴随号码。
-fn contains_private_contact(text: &str) -> bool {
-    for run in digit_runs(text) {
+fn contains_private_contact(canonical: &str, compact: &str) -> bool {
+    for run in digit_runs(compact) {
         let digits = run.as_str();
         if run.len() == 11
             && digits.starts_with('1')
@@ -272,7 +566,7 @@ fn contains_private_contact(text: &str) -> bool {
             return true;
         }
     }
-    for word in ascii_words(text) {
+    for word in ascii_words(canonical) {
         if let Some(rest) = word.strip_prefix('+')
             && (8..=15).contains(&rest.len())
             && rest.bytes().all(|byte| byte.is_ascii_digit())
@@ -280,13 +574,13 @@ fn contains_private_contact(text: &str) -> bool {
             return true;
         }
     }
-    if contains_email_address(text) {
+    if contains_email_address(canonical) {
         return true;
     }
     const CONTACT_KEYS: [&str; 5] = ["微信号", "QQ号", "qq号", "手机号", "电话号码"];
     CONTACT_KEYS
         .iter()
-        .any(|key| keyword_followed_by_digit_run(text, key, 5, 16))
+        .any(|key| keyword_followed_by_digit_run(compact, key, 5, 16))
 }
 
 /// 健康医疗：确定性医学敏感关键词，命中即拒绝。
@@ -334,7 +628,7 @@ fn contains_sexual_intimacy(text: &str) -> bool {
 }
 
 /// 未成年人：明确未成年表述或 18 岁以下年龄。
-fn contains_minor_reference(text: &str) -> bool {
+fn contains_minor_reference(_canonical: &str, compact: &str) -> bool {
     const MINOR_KEYS: [&str; 7] = [
         "未成年",
         "未满18",
@@ -344,10 +638,10 @@ fn contains_minor_reference(text: &str) -> bool {
         "适龄儿童",
         "幼儿园",
     ];
-    if MINOR_KEYS.iter().any(|key| text.contains(key)) {
+    if MINOR_KEYS.iter().any(|key| compact.contains(key)) {
         return true;
     }
-    age_below_eighteen(text)
+    age_below_eighteen(compact)
 }
 
 /// 第三方隐私：第三人称关系词与敏感关键词近距离共现。
@@ -784,6 +1078,64 @@ mod tests {
         assert_allowed("用户今年 18 岁，刚参加完高考");
         // 关键词后没有实质尾文（纯提问）不命中住址规则。
         assert_allowed("用户随口问了句「什么是经纬度」");
+    }
+
+    #[test]
+    fn normalization_blocks_unicode_homoglyphs_and_nested_fields() {
+        assert_rejected(
+            "ｓｋ－ａｎｔ－ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ１２３４５６",
+        );
+        assert_rejected("pаss\u{200b}ｗord：hunter2hunter2");
+        assert_rejected(r#"{"profile":{"p.a.s.s.w.o.r.d":"hunter2hunter2"}}"#);
+        assert_rejected("p-а-s-s-w-o-r-d ⇒ hunter2hunter2");
+        assert_rejected("password / hunter2hunter2");
+        assert_rejected("id-card | masked-abc-123");
+        assert_rejected(r#"{"outer":{"credential":{"access_token":"abcdef1234567890"}}}"#);
+    }
+
+    #[test]
+    fn normalization_joins_obfuscated_identity_contact_and_address() {
+        assert_rejected("手机号：１３８ １２３４ ５６７８");
+        assert_rejected("身份证：110105 19491231 002X");
+        assert_rejected("家庭\u{200b}住址：北京市朝阳区幸福路 3 号楼 2 单元 501 室");
+    }
+
+    #[test]
+    fn malformed_json_like_payload_fails_closed_at_both_gates() {
+        for stage in [
+            MemorySafetyStage::TurnStaging,
+            MemorySafetyStage::RepositoryCommit,
+        ] {
+            assert!(matches!(
+                assess_content_at(r#"{"password":"unterminated""#, stage),
+                MemorySafetyAssessment::FailClosed {
+                    reason: MemorySafetyFailure::Indeterminate,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn both_gates_use_the_exact_same_policy_version() {
+        let staged = assess_content_at("用户喜欢夜间散步", MemorySafetyStage::TurnStaging);
+        let committed = assess_content_at("用户喜欢夜间散步", MemorySafetyStage::RepositoryCommit);
+        let MemorySafetyAssessment::Allowed {
+            policy_version: staged_version,
+            ..
+        } = staged
+        else {
+            panic!("第一道门应允许普通记忆")
+        };
+        let MemorySafetyAssessment::Allowed {
+            policy_version: committed_version,
+            ..
+        } = committed
+        else {
+            panic!("第二道门应允许普通记忆")
+        };
+        assert_eq!(staged_version, MEMORY_SENSITIVITY_POLICY_VERSION);
+        assert_eq!(committed_version, MEMORY_SENSITIVITY_POLICY_VERSION);
     }
 
     #[test]

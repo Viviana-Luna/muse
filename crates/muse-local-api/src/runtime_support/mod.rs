@@ -796,6 +796,9 @@ impl ConversationRuntime {
                 .memory
                 .as_ref()
                 .map_or(0, |services| services.query_call_budget.get()),
+            conversation_id.clone(),
+            turn_id.clone(),
+            message.clone(),
         );
         let (cancel_token, _active_turn_guard) =
             register_active_turn(&self.state, &turn_id, runtime_lease)?;
@@ -1816,6 +1819,10 @@ async fn append_turn_committed(
     summary: &str,
     emotion_candidate: Option<PersonaEmotionEffect>,
 ) -> Result<muse_runtime::session::SessionEventV3, String> {
+    #[cfg(test)]
+    if consume_turn_commit_failure_for_test(&turn.conversation_id) {
+        return Err("注入会话提交失败".to_string());
+    }
     let persona_effects = persona_effects_for_committed_turn(turn, emotion_candidate);
     let repository = state
         .runtime_service
@@ -1837,6 +1844,29 @@ async fn append_turn_committed(
         )
         .await
         .map_err(|error| format!("写入 v3 会话事件 `turn_committed` 失败：{error}"))
+}
+
+#[cfg(test)]
+fn turn_commit_failures_for_test() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_turn_commit_for_test(conversation_id: impl Into<String>) {
+    turn_commit_failures_for_test()
+        .lock()
+        .expect("会话提交故障注入锁中毒")
+        .insert(conversation_id.into());
+}
+
+#[cfg(test)]
+fn consume_turn_commit_failure_for_test(conversation_id: &str) -> bool {
+    turn_commit_failures_for_test()
+        .lock()
+        .expect("会话提交故障注入锁中毒")
+        .remove(conversation_id)
 }
 
 fn persona_effects_for_committed_turn(
