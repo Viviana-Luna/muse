@@ -5,7 +5,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use futures::StreamExt;
 use muse_core::app::memory_safety::DeterministicMemorySensitivityPolicy;
-use muse_core::domain::conversation::Conversation;
+use muse_core::domain::conversation::{Conversation, Role};
 use muse_core::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCommitEnvelope,
     MemoryDeleteReceipt, MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt,
@@ -26,6 +26,7 @@ use muse_runtime::interactions::{PendingApproval, PendingUserQuestion};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, broadcast, oneshot};
 use tower::util::ServiceExt;
@@ -120,6 +121,180 @@ enum MemoryProviderFollowup {
 struct MemoryLifecycleProvider {
     calls: AtomicUsize,
     followup: MemoryProviderFollowup,
+}
+
+#[derive(Default)]
+struct MemoryContractProviderState {
+    current_memory_id: Option<String>,
+    current_revision_id: Option<String>,
+    query_results_for_model: Vec<String>,
+}
+
+struct MemoryContractProvider {
+    state: StdMutex<MemoryContractProviderState>,
+}
+
+impl MemoryContractProvider {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new(MemoryContractProviderState::default()),
+        }
+    }
+
+    fn set_current(&self, memory_id: &MemoryId, revision_id: &MemoryRevisionId) {
+        let mut state = self.state.lock().expect("记忆合同 Provider 状态锁不应中毒");
+        state.current_memory_id = Some(memory_id.0.clone());
+        state.current_revision_id = Some(revision_id.0.clone());
+    }
+
+    fn current_identifiers(&self) -> (String, String) {
+        let state = self.state.lock().expect("记忆合同 Provider 状态锁不应中毒");
+        (
+            state
+                .current_memory_id
+                .clone()
+                .expect("update/correct 前应注入当前 memory_id"),
+            state
+                .current_revision_id
+                .clone()
+                .expect("update/correct 前应注入当前 revision_id"),
+        )
+    }
+
+    fn query_results_for_model(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("记忆合同 Provider 状态锁不应中毒")
+            .query_results_for_model
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChatModelProvider for MemoryContractProvider {
+    async fn chat(&self, _conversation: &Conversation) -> ChatModelResult {
+        Ok("记忆合同测试回复。".to_string())
+    }
+
+    async fn chat_stream(&self, conversation: &Conversation) -> ChatStreamResult {
+        self.chat_stream_with_tools(conversation, &[]).await
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        conversation: &Conversation,
+        tools: &[ToolDef],
+    ) -> ChatStreamResult {
+        assert!(
+            tools.iter().any(|tool| tool.name == "memory_query")
+                && tools.iter().any(|tool| tool.name == "memory_mutate"),
+            "正常 Persona 回合必须冻结两个自动记忆 Tool"
+        );
+
+        if let Some(last) = conversation.messages.last()
+            && last.role == Role::Tool
+        {
+            if last.tool_name.as_deref() == Some("memory_query") {
+                self.state
+                    .lock()
+                    .expect("记忆合同 Provider 状态锁不应中毒")
+                    .query_results_for_model
+                    .push(last.content.clone());
+            }
+            return Box::pin(futures::stream::iter([
+                Ok(ChatStreamEvent::Text("记忆合同步骤已完成。".to_string())),
+                Ok(ChatStreamEvent::Done),
+            ]));
+        }
+
+        let direct_user_message = conversation
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .map(|message| message.content.as_str())
+            .expect("记忆合同初始模型调用应包含直接用户消息");
+        let (call_id, name, arguments) = match direct_user_message {
+            "我喜欢在晚上喝茉莉花茶" => (
+                "memory-contract-create",
+                "memory_mutate",
+                serde_json::json!({
+                    "operation": "create",
+                    "category": "user_preference",
+                    "content": "用户喜欢在晚上喝茉莉花茶",
+                    "importance": "normal",
+                    "event_time": null,
+                    "change_reason": "用户在当前消息中直接说明饮品偏好"
+                }),
+            ),
+            "请回忆我的茉莉花茶偏好" | "重启后请再次回忆我的茉莉花茶偏好" => {
+                (
+                    if direct_user_message.starts_with("重启后") {
+                        "memory-contract-query-after-restart"
+                    } else {
+                        "memory-contract-query-cross-session"
+                    },
+                    "memory_query",
+                    serde_json::json!({
+                        "query": "茉莉花茶",
+                        "limit": 5,
+                        "cursor": null,
+                        "as_of": null,
+                        "memory_id": null,
+                        "include_history": false
+                    }),
+                )
+            }
+            "我喜欢在晚上喝红茶" => {
+                let (memory_id, revision_id) = self.current_identifiers();
+                (
+                    "memory-contract-update",
+                    "memory_mutate",
+                    serde_json::json!({
+                        "operation": "update",
+                        "memory_id": memory_id,
+                        "expected_revision_id": revision_id,
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝红茶",
+                        "importance": "normal",
+                        "event_time": null,
+                        "change_reason": "用户说明饮品偏好后来发生变化"
+                    }),
+                )
+            }
+            "我喜欢在晚上喝无糖茉莉花茶" => {
+                let (memory_id, revision_id) = self.current_identifiers();
+                (
+                    "memory-contract-correct",
+                    "memory_mutate",
+                    serde_json::json!({
+                        "operation": "correct",
+                        "memory_id": memory_id,
+                        "expected_revision_id": revision_id,
+                        "category": "user_preference",
+                        "content": "用户喜欢在晚上喝无糖茉莉花茶",
+                        "importance": "normal",
+                        "event_time": null,
+                        "change_reason": "用户纠正上一条饮品偏好"
+                    }),
+                )
+            }
+            other => panic!("未定义的记忆合同测试消息：{other}"),
+        };
+        Box::pin(futures::stream::iter([
+            Ok(ChatStreamEvent::ToolCall(ToolCall {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                arguments,
+                source: ToolCallSource::Native,
+            })),
+            Ok(ChatStreamEvent::Done),
+        ]))
+    }
+
+    fn name(&self) -> &'static str {
+        "memory_contract_test"
+    }
 }
 
 #[async_trait::async_trait]
@@ -392,6 +567,26 @@ fn memory_lifecycle_request(client_request_id: &str) -> Request<Body> {
         .expect("应能构造记忆生命周期请求")
 }
 
+fn memory_contract_request(
+    conversation_id: &str,
+    client_request_id: &str,
+    message: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "message": message,
+                "conversation_id": conversation_id,
+                "client_request_id": client_request_id
+            })
+            .to_string(),
+        ))
+        .expect("应能构造自动记忆合同请求")
+}
+
 async fn read_sse_text(response: axum::response::Response) -> String {
     String::from_utf8(
         to_bytes(response.into_body(), usize::MAX)
@@ -400,6 +595,77 @@ async fn read_sse_text(response: axum::response::Response) -> String {
             .to_vec(),
     )
     .expect("记忆生命周期 SSE 应为 UTF-8")
+}
+
+async fn run_memory_contract_turn(
+    state: &Arc<AppState>,
+    conversation_id: &str,
+    client_request_id: &str,
+    message: &str,
+) -> String {
+    let response = api_routes()
+        .with_state(Arc::clone(state))
+        .oneshot(memory_contract_request(
+            conversation_id,
+            client_request_id,
+            message,
+        ))
+        .await
+        .expect("自动记忆合同请求应返回 SSE");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_sse_text(response).await;
+    wait_until_runtime_idle(state).await;
+    assert!(body.contains("\"type\":\"done\""));
+    body
+}
+
+async fn reset_memory_contract_session(state: &Arc<AppState>) -> String {
+    let response = api_routes()
+        .with_state(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/reset")
+                .body(Body::empty())
+                .expect("应能构造记忆合同新会话请求"),
+        )
+        .await
+        .expect("记忆合同新会话请求应成功");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    payload["conversation_id"]
+        .as_str()
+        .expect("新会话响应应包含 conversation_id")
+        .to_string()
+}
+
+async fn memory_tool_session_payloads(
+    state: &Arc<AppState>,
+    conversation_ids: &[String],
+) -> String {
+    let store = state
+        .runtime_service
+        .session_store()
+        .await
+        .expect("应打开自动记忆合同 Session Store");
+    let mut payloads = Vec::new();
+    for conversation_id in conversation_ids {
+        let records = store
+            .events_for_conversation(conversation_id)
+            .await
+            .expect("应读取自动记忆合同 Session 事件");
+        payloads.extend(
+            records
+                .into_iter()
+                .filter(|record| matches!(record.kind.as_str(), "tool_call" | "tool_result"))
+                .map(|record| record.payload),
+        );
+    }
+    assert!(
+        !payloads.is_empty(),
+        "自动记忆合同必须产生 Tool Session 事件"
+    );
+    serde_json::to_string(&payloads).expect("应序列化自动记忆合同 Tool Session 事件")
 }
 
 async fn wait_until_runtime_idle(state: &AppState) {
@@ -3467,6 +3733,289 @@ async fn memory_mutate_仅在完整提交后落库且错误取消断流与重放
     ] {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+#[tokio::test]
+#[ignore = "仅用于隔离桌面来源跳转验收，需显式提供 MUSE_DESKTOP_SOURCE_FIXTURE_DIR"]
+async fn generate_desktop_source_fixture() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let _data_dir_guard = MuseDataDirEnvGuard {
+        previous: std::env::var_os("MUSE_DATA_DIR"),
+    };
+    let data_dir = PathBuf::from(
+        std::env::var_os("MUSE_DESKTOP_SOURCE_FIXTURE_DIR").expect("必须显式提供隔离桌面夹具目录"),
+    );
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &data_dir);
+    }
+
+    let mut state = build_test_state(&data_dir);
+    let persona_id = state
+        .personas
+        .lock()
+        .await
+        .active_persona_id()
+        .map(str::to_string)
+        .expect("隔离桌面夹具必须已有活动 Persona");
+    let (runtime_memory, management_memory) =
+        crate::runtime_support::build_sqlite_memory_services(&data_dir)
+            .expect("应构造生产 SQLite 记忆服务束");
+    Arc::get_mut(&mut state)
+        .expect("桌面夹具状态尚未共享")
+        .memory = Some(runtime_memory);
+    drop(management_memory);
+    *state.provider.lock().await = Some(Arc::new(MemoryLifecycleProvider {
+        calls: AtomicUsize::new(0),
+        followup: MemoryProviderFollowup::Success,
+    }));
+    let conversation_id = state
+        .runtime_service
+        .active_conversation_id()
+        .expect("应读取桌面夹具来源会话 ID");
+
+    let sse = run_memory_contract_turn(
+        &state,
+        &conversation_id,
+        "desktop-source-fixture-request",
+        "我喜欢夜间散步",
+    )
+    .await;
+    assert!(sse.contains("memory_commit_completed"));
+
+    let repository =
+        SqliteMemoryRepository::open(&data_dir).expect("应打开桌面夹具记忆 Repository");
+    let records = repository
+        .search_current_fts(&memory_scope(&persona_id), "夜间散步", 5)
+        .expect("应查询桌面来源记忆");
+    assert_eq!(records.len(), 1, "桌面来源夹具应只生成一条匹配记忆");
+    let source = &records[0].current_revision.source;
+    assert_eq!(source.conversation_id(), Some(conversation_id.as_str()));
+    assert!(source.turn_id().is_some(), "桌面来源夹具必须绑定 Turn");
+    println!(
+        "桌面来源夹具已生成：persona_id={persona_id} conversation_id={conversation_id} turn_id={}",
+        source.turn_id().expect("已核对来源 Turn")
+    );
+}
+
+#[tokio::test]
+async fn automatic_memory_create_query_update_correct_survives_session_and_process_restart() {
+    const CREATE_USER_MESSAGE: &str = "我喜欢在晚上喝茉莉花茶";
+    const CREATE_CONTENT: &str = "用户喜欢在晚上喝茉莉花茶";
+    const UPDATE_USER_MESSAGE: &str = "我喜欢在晚上喝红茶";
+    const UPDATE_CONTENT: &str = "用户喜欢在晚上喝红茶";
+    const CORRECT_USER_MESSAGE: &str = "我喜欢在晚上喝无糖茉莉花茶";
+    const CORRECT_CONTENT: &str = "用户喜欢在晚上喝无糖茉莉花茶";
+    const CREATE_REASON: &str = "用户在当前消息中直接说明饮品偏好";
+    const UPDATE_REASON: &str = "用户说明饮品偏好后来发生变化";
+    const CORRECT_REASON: &str = "用户纠正上一条饮品偏好";
+
+    let _env_guard = ENV_LOCK.lock().await;
+    let _data_dir_guard = MuseDataDirEnvGuard {
+        previous: std::env::var_os("MUSE_DATA_DIR"),
+    };
+    let data_dir = unique_temp_dir("memory-automatic-contract");
+    unsafe {
+        std::env::set_var("MUSE_DATA_DIR", &data_dir);
+    }
+
+    let provider = Arc::new(MemoryContractProvider::new());
+    let mut state = build_test_state(&data_dir);
+    let (runtime_memory, management_memory) =
+        crate::runtime_support::build_sqlite_memory_services(&data_dir)
+            .expect("应构造生产 SQLite 记忆服务束");
+    Arc::get_mut(&mut state).expect("测试状态尚未共享").memory = Some(runtime_memory);
+    drop(management_memory);
+    *state.provider.lock().await = Some(provider.clone());
+    let repository =
+        SqliteMemoryRepository::open(&data_dir).expect("应打开自动记忆合同只读核对 Repository");
+    let scope = memory_scope("router-test-persona");
+    let first_conversation_id = state
+        .runtime_service
+        .active_conversation_id()
+        .expect("应读取首个自动记忆合同会话 ID");
+    assert_eq!(first_conversation_id, "default");
+
+    let create_sse = run_memory_contract_turn(
+        &state,
+        &first_conversation_id,
+        "memory-contract-create-request",
+        CREATE_USER_MESSAGE,
+    )
+    .await;
+    assert!(create_sse.contains("memory_commit_completed"));
+    for forbidden in [CREATE_CONTENT, CREATE_REASON] {
+        assert!(
+            !create_sse.contains(forbidden),
+            "记忆变更 SSE 不得包含正文 `{forbidden}`"
+        );
+    }
+    let mut created_records = repository
+        .search_current_fts(&scope, "茉莉花茶", 5)
+        .expect("自动 create 后应能查询真实 SQLite");
+    assert_eq!(created_records.len(), 1);
+    let created = created_records.remove(0);
+    assert_eq!(created.current_revision.content, CREATE_CONTENT);
+    assert_eq!(
+        created.current_revision.source.conversation_id(),
+        Some(first_conversation_id.as_str())
+    );
+    provider.set_current(&created.entry.memory_id, &created.entry.current_revision_id);
+
+    let second_conversation_id = reset_memory_contract_session(&state).await;
+    assert_ne!(second_conversation_id, first_conversation_id);
+    let first_query_sse = run_memory_contract_turn(
+        &state,
+        &second_conversation_id,
+        "memory-contract-query-cross-session-request",
+        "请回忆我的茉莉花茶偏好",
+    )
+    .await;
+    assert!(!first_query_sse.contains(CREATE_CONTENT));
+    let first_query_results = provider.query_results_for_model();
+    assert_eq!(first_query_results.len(), 1);
+    assert!(first_query_results[0].contains(CREATE_CONTENT));
+
+    let update_sse = run_memory_contract_turn(
+        &state,
+        &second_conversation_id,
+        "memory-contract-update-request",
+        UPDATE_USER_MESSAGE,
+    )
+    .await;
+    assert!(update_sse.contains("memory_commit_completed"));
+    for forbidden in [UPDATE_CONTENT, UPDATE_REASON] {
+        assert!(
+            !update_sse.contains(forbidden),
+            "记忆更新 SSE 不得包含正文 `{forbidden}`"
+        );
+    }
+    let updated = repository
+        .current(&scope, &created.entry.memory_id)
+        .expect("自动 update 后读取不应失败")
+        .expect("自动 update 后记忆应存在");
+    assert_eq!(updated.current_revision.content, UPDATE_CONTENT);
+    assert_eq!(
+        updated.current_revision.change_type,
+        MemoryChangeType::Update
+    );
+    assert_eq!(
+        updated.current_revision.source.conversation_id(),
+        Some(second_conversation_id.as_str())
+    );
+    provider.set_current(&updated.entry.memory_id, &updated.entry.current_revision_id);
+
+    let correct_sse = run_memory_contract_turn(
+        &state,
+        &second_conversation_id,
+        "memory-contract-correct-request",
+        CORRECT_USER_MESSAGE,
+    )
+    .await;
+    assert!(correct_sse.contains("memory_commit_completed"));
+    for forbidden in [CORRECT_CONTENT, CORRECT_REASON] {
+        assert!(
+            !correct_sse.contains(forbidden),
+            "记忆纠正 SSE 不得包含正文 `{forbidden}`"
+        );
+    }
+    let corrected = repository
+        .current(&scope, &created.entry.memory_id)
+        .expect("自动 correct 后读取不应失败")
+        .expect("自动 correct 后记忆应存在");
+    assert_eq!(corrected.current_revision.content, CORRECT_CONTENT);
+    assert_eq!(
+        corrected.current_revision.change_type,
+        MemoryChangeType::Correct
+    );
+    let history = repository
+        .revision_history(&scope, &created.entry.memory_id, None, 10)
+        .expect("自动记忆版本历史应可审计");
+    assert_eq!(history.revisions.len(), 3);
+    assert!(history.revisions.iter().any(|revision| {
+        revision.content == CREATE_CONTENT
+            && revision.change_type == MemoryChangeType::Create
+            && revision.state == MemoryRevisionState::Superseded
+    }));
+    assert!(history.revisions.iter().any(|revision| {
+        revision.content == UPDATE_CONTENT
+            && revision.change_type == MemoryChangeType::Update
+            && revision.state == MemoryRevisionState::Corrected
+    }));
+    assert!(history.revisions.iter().any(|revision| {
+        revision.content == CORRECT_CONTENT
+            && revision.change_type == MemoryChangeType::Correct
+            && revision.state == MemoryRevisionState::Current
+    }));
+
+    let first_process_tool_payloads = memory_tool_session_payloads(
+        &state,
+        &[
+            first_conversation_id.clone(),
+            second_conversation_id.clone(),
+        ],
+    )
+    .await;
+    for forbidden in [
+        CREATE_CONTENT,
+        UPDATE_CONTENT,
+        CORRECT_CONTENT,
+        CREATE_REASON,
+        UPDATE_REASON,
+        CORRECT_REASON,
+        "茉莉花茶",
+    ] {
+        assert!(
+            !first_process_tool_payloads.contains(forbidden),
+            "记忆 Tool Session 收据不得包含 `{forbidden}`"
+        );
+    }
+    assert!(first_process_tool_payloads.contains("memory_mutate_result"));
+    assert!(first_process_tool_payloads.contains("memory_query_result"));
+
+    drop(repository);
+    drop(state);
+
+    let mut restarted_state = build_test_state(&data_dir);
+    let (restarted_runtime_memory, restarted_management_memory) =
+        crate::runtime_support::build_sqlite_memory_services(&data_dir)
+            .expect("进程重启后应重新构造生产 SQLite 记忆服务束");
+    Arc::get_mut(&mut restarted_state)
+        .expect("重启测试状态尚未共享")
+        .memory = Some(restarted_runtime_memory);
+    drop(restarted_management_memory);
+    *restarted_state.provider.lock().await = Some(provider.clone());
+    let third_conversation_id = reset_memory_contract_session(&restarted_state).await;
+    assert_ne!(third_conversation_id, first_conversation_id);
+    assert_ne!(third_conversation_id, second_conversation_id);
+    let restarted_query_sse = run_memory_contract_turn(
+        &restarted_state,
+        &third_conversation_id,
+        "memory-contract-query-after-restart-request",
+        "重启后请再次回忆我的茉莉花茶偏好",
+    )
+    .await;
+    assert!(!restarted_query_sse.contains(CORRECT_CONTENT));
+    let query_results = provider.query_results_for_model();
+    assert_eq!(query_results.len(), 2);
+    assert!(query_results[1].contains(CORRECT_CONTENT));
+    assert!(!query_results[1].contains(UPDATE_CONTENT));
+
+    let restarted_repository =
+        SqliteMemoryRepository::open(&data_dir).expect("重启后应打开记忆 Repository");
+    let after_restart = restarted_repository
+        .current(&scope, &created.entry.memory_id)
+        .expect("重启后读取不应失败")
+        .expect("重启后当前记忆应存在");
+    assert_eq!(after_restart.current_revision.content, CORRECT_CONTENT);
+    let restarted_tool_payloads =
+        memory_tool_session_payloads(&restarted_state, &[third_conversation_id]).await;
+    assert!(!restarted_tool_payloads.contains(CORRECT_CONTENT));
+    assert!(!restarted_tool_payloads.contains("茉莉花茶"));
+    assert!(restarted_tool_payloads.contains("memory_query_result"));
+
+    drop(restarted_repository);
+    drop(restarted_state);
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[tokio::test]
