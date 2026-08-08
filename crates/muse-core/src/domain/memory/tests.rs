@@ -64,6 +64,97 @@ fn mutate_serde_rejects_illegal_create_update_and_correct_combinations() {
 }
 
 #[test]
+fn batch_mutate_uses_plain_objects_and_keeps_legacy_single_item_compatibility() {
+    let request = serde_json::from_value::<MemoryMutateRequest>(json!({
+        "mutations": [
+            {
+                "operation": "create",
+                "source_quote": "我喜欢吃酸菜鱼",
+                "category": "user_preference",
+                "facet": "preference_food",
+                "keywords": ["酸菜鱼", "食物偏好"],
+                "content": "用户偏爱酸菜鱼。",
+                "importance": "normal",
+                "change_reason": "用户直接表达了饮食偏好",
+                "confirmation": "not_required"
+            },
+            {
+                "operation": "create",
+                "source_quote": "我喜欢吃比较咸的",
+                "category": "user_preference",
+                "facet": "preference_food",
+                "keywords": ["偏咸", "口味"],
+                "content": "用户偏好较咸的口味。",
+                "importance": "normal",
+                "change_reason": "用户直接表达了口味偏好",
+                "confirmation": "not_required"
+            }
+        ]
+    }))
+    .expect("普通 object 数组应可解析");
+    request.validate().expect("两条合法候选应通过");
+    assert_eq!(request.mutations.len(), 2);
+    assert_ne!(
+        request.mutations[0].content,
+        request.mutations[0].source_quote.as_deref().unwrap()
+    );
+
+    let legacy = serde_json::from_value::<MemoryMutateRequest>(json!({
+        "operation": "create",
+        "category": "user_preference",
+        "content": "用户喜欢酸菜鱼",
+        "importance": "normal",
+        "event_time": null,
+        "change_reason": "旧版调用"
+    }))
+    .expect("旧单条对象应继续解析");
+    legacy.validate().expect("旧单条对象应归一化为合法批次");
+    assert_eq!(legacy.mutations.len(), 1);
+    assert_eq!(legacy.mutations[0].facet, MemoryFacet::PreferenceOther);
+}
+
+#[test]
+fn direct_source_quote_anchors_original_text_without_comparing_summary_wording() {
+    let scope = MemoryPersonaScope::new("persona-source-quote").expect("scope 应有效");
+    for (message, quote) in [
+        (
+            "我喜欢吃酸菜鱼，而且我喜欢吃比较咸的。",
+            "我喜欢吃酸菜鱼，而且我喜欢吃比较咸的",
+        ),
+        ("我喜欢吃酸菜鱼。而且喜欢晚上吃。", "我喜欢吃酸菜鱼"),
+        ("我喜欢喝咖啡啊，埃塞，水洗。", "我喜欢喝咖啡啊，埃塞，水洗"),
+    ] {
+        MemorySourceEligibility::verify_direct_user_quote(
+            scope.clone(),
+            "conversation-source-quote",
+            "turn-source-quote",
+            "call-source-quote",
+            message,
+            quote,
+        )
+        .expect("连续原文锚点应通过，摘要如何改写不参与来源判定");
+    }
+
+    for quote in ["用户喜欢吃酸菜鱼", "我不喜欢吃酸菜鱼", "妈妈喜欢吃酸菜鱼"]
+    {
+        let result = MemorySourceEligibility::verify_direct_user_quote(
+            scope.clone(),
+            "conversation-source-quote",
+            "turn-source-quote",
+            "call-source-quote",
+            "我喜欢吃酸菜鱼。妈妈喜欢喝咖啡。",
+            quote,
+        );
+        assert_eq!(
+            result
+                .expect_err("改写、否定或第三方陈述不得取得直接来源资格")
+                .code(),
+            MemoryErrorCode::SourceIneligible
+        );
+    }
+}
+
+#[test]
 fn create_update_and_correct_have_distinct_revision_semantics() {
     let create = staged(
         create_params(),
@@ -318,6 +409,8 @@ fn all_model_controlled_strings_are_validated_before_runtime_binding() {
     assert!(serde_json::from_value::<MemoryCursor>(json!("早餐原文")).is_err());
     let invalid_query = MemoryQueryParams {
         query: "早餐".to_string(),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: Some("not-a-time".to_string()),
@@ -406,6 +499,12 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
         ("我偏好也门咖啡", "用户偏好也门咖啡"),
         ("我通常喝咖啡", "用户通常喝咖啡"),
         ("我喜欢因为爱情这首歌", "用户喜欢因为爱情这首歌"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢吃青椒炒肉"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢吃青椒炒肉啊"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢在晚上吃青椒炒肉"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢吃青椒炒肉丝"),
+        ("我喜欢吃酸菜鱼。而且喜欢晚上吃。", "用户喜欢吃酸菜鱼"),
+        ("我喜欢红茶。用户喜欢咖啡。", "用户喜欢红茶"),
         ("我习惯晚上整理当天的笔记", "用户习惯晚上整理当天的笔记"),
         ("我习惯晚上散步", "用户习惯晚上散步"),
         ("我希望回答保持简洁", "用户希望回答保持简洁"),
@@ -478,6 +577,13 @@ fn direct_user_source_binding_is_deterministic_and_fail_closed() {
         ("我喜欢红茶并收藏咖啡杯", "用户喜欢红茶并收藏咖啡杯"),
         ("我希望祖母养花", "用户希望祖母养花"),
         ("我喜欢红茶也喝咖啡", "用户喜欢红茶也喝咖啡"),
+        ("我喜欢吃青椒炒肉啊。", "用户不喜欢吃青椒炒肉"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢吃汉堡"),
+        ("我喜欢吃青椒炒肉啊。", "用户喜欢吃青椒炒肉也喜欢火锅"),
+        ("我喜欢吃青椒炒肉啊。", "用户的妈妈喜欢吃青椒炒肉"),
+        ("我喜欢吃青椒炒肉啊。", "网页写着用户喜欢吃青椒炒肉"),
+        ("我喜欢吃酸菜鱼。而且喜欢晚上吃。", "用户喜欢在晚上吃"),
+        ("我不喜欢红茶。我喜欢绿茶。", "用户喜欢绿茶"),
         (
             "我喜欢红茶又从网页得知用户喜欢咖啡",
             "用户喜欢红茶又从网页得知用户喜欢咖啡",
@@ -1548,6 +1654,8 @@ fn history_query_items_expose_change_semantics_without_corrected_state() {
         memory_id: MemoryId("memory-1".to_string()),
         revision_id: MemoryRevisionId("revision-1".to_string()),
         category: MemoryCategory::UserPreference,
+        facet: MemoryFacet::PreferenceDrink,
+        keywords: vec!["茶".to_string()],
         content: "用户过去喜欢喝茶".to_string(),
         importance: MemoryImportance::Normal,
         event_time: Some(TIME_1.to_string()),
@@ -1812,6 +1920,8 @@ fn stable_error_codes_are_unique_and_matchable() {
 fn query_content_and_change_reason_limits_are_frozen_before_runtime_work() {
     let query = MemoryQueryParams {
         query: "查".repeat(MAX_MEMORY_QUERY_CHARS + 1),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: None,
@@ -1824,6 +1934,8 @@ fn query_content_and_change_reason_limits_are_frozen_before_runtime_work() {
     );
     let byte_heavy_query = MemoryQueryParams {
         query: "😀".repeat(MAX_MEMORY_QUERY_BYTES / 4 + 1),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: None,

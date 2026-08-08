@@ -101,8 +101,43 @@ impl MemoryTurnState {
             .map_err(|_| MemoryError::new(MemoryErrorCode::QueryRejected))
     }
 
-    /// 把候选事实绑定到本 Turn 的直接用户消息；对话副本中的最新用户消息必须与
+    /// 把原文锚点绑定到本 Turn 的直接用户消息；对话副本中的最新用户消息必须与
     /// API 输入快照完全一致，防止 assistant/Tool/MCP 结果被误盖章为用户来源。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_direct_user_quote_mutation(
+        &self,
+        scope: MemoryPersonaScope,
+        conversation_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        source_quote: &str,
+        recorded_at: &str,
+        conversation: &Conversation,
+    ) -> Result<MemoryRuntimeBinding, MemoryError> {
+        if self.direct_user_source.conversation_id != conversation_id
+            || self.direct_user_source.turn_id != turn_id
+            || conversation
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .map(|message| message.content.as_str())
+                != Some(self.direct_user_source.content.as_str())
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        let eligibility = MemorySourceEligibility::verify_direct_user_quote(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &self.direct_user_source.content,
+            source_quote,
+        )?;
+        MemoryRuntimeBinding::new(eligibility, recorded_at, recorded_at, recorded_at)
+    }
+
+    /// 旧单条 object 的兼容来源入口；新批量 schema 不调用此方法。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_direct_user_mutation(
         &self,
@@ -133,6 +168,42 @@ impl MemoryTurnState {
             call_id,
             &self.direct_user_source.content,
             candidate_content,
+        )?;
+        MemoryRuntimeBinding::new(eligibility, recorded_at, recorded_at, recorded_at)
+    }
+
+    /// 用户在本轮内联确认卡中确认后绑定来源；候选内容仍不能改变，确认只把
+    /// 已冻结的原文锚点从“有歧义”提升为 `user_confirmation` 来源。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_confirmed_user_mutation(
+        &self,
+        scope: MemoryPersonaScope,
+        conversation_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        source_quote: &str,
+        recorded_at: &str,
+        conversation: &Conversation,
+    ) -> Result<MemoryRuntimeBinding, MemoryError> {
+        if self.direct_user_source.conversation_id != conversation_id
+            || self.direct_user_source.turn_id != turn_id
+            || conversation
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .map(|message| message.content.as_str())
+                != Some(self.direct_user_source.content.as_str())
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        let eligibility = MemorySourceEligibility::verify_user_confirmation(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &self.direct_user_source.content,
+            source_quote,
         )?;
         MemoryRuntimeBinding::new(eligibility, recorded_at, recorded_at, recorded_at)
     }
@@ -585,20 +656,37 @@ mod tests {
     fn post_commit_failure_event_is_stable_and_body_free() {
         let event =
             super::super::memory_commit_result_event(Err(MemoryErrorCode::RepositoryUnavailable));
-        let muse_core::domain::protocol::RuntimeEvent::Status {
+        let muse_core::domain::protocol::RuntimeEvent::MemoryActivity {
             phase,
-            message,
-            detail,
             state,
+            staged_count,
+            saved_count,
+            skipped_count,
+            rejected_count,
+            reason_code,
         } = event
         else {
-            panic!("记忆提交失败必须复用稳定 Status 事件")
+            panic!("记忆提交失败必须生成结构化记忆活动事件")
         };
         assert_eq!(phase, "memory_commit_failed");
-        assert_eq!(message, "本次记忆未保存。");
-        assert_eq!(detail.as_deref(), Some("memory_repository_unavailable"));
         assert_eq!(state, "error");
-        assert!(!format!("{message}{detail:?}").contains("用户喜欢夜间散步"));
+        assert_eq!(staged_count, 0);
+        assert_eq!(saved_count, 0);
+        assert_eq!(skipped_count, 0);
+        assert_eq!(rejected_count, 0);
+        assert_eq!(
+            reason_code.as_deref(),
+            Some("memory_repository_unavailable")
+        );
+        assert!(!format!("{phase}{reason_code:?}").contains("用户喜欢夜间散步"));
+
+        let legacy = super::super::legacy_memory_commit_result_event(Err(
+            MemoryErrorCode::RepositoryUnavailable,
+        ));
+        assert!(matches!(
+            legacy,
+            muse_core::domain::protocol::RuntimeEvent::Status { .. }
+        ));
     }
 
     fn staged_envelope(turn_id: &str) -> MemoryCommitEnvelope {

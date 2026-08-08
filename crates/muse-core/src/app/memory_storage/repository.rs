@@ -29,7 +29,7 @@ use crate::domain::memory::{
     MemoryCommitEnvelope, MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt,
     MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt, MemoryDeletionCheckRequest,
     MemoryDeletionDecision, MemoryDeletionSubject, MemoryDerivationKey, MemoryEntry,
-    MemoryEntryState, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
+    MemoryEntryState, MemoryError, MemoryErrorCode, MemoryFacet, MemoryId, MemoryImportance,
     MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation,
     MemoryManagementContentParams, MemoryMutationReceipt, MemoryMutationReceiptState,
     MemoryMutationTransition, MemoryPersonaScope, MemoryRecord, MemoryRepository, MemoryRevision,
@@ -38,6 +38,7 @@ use crate::domain::memory::{
 };
 
 pub const MAX_REVISION_HISTORY_PAGE_SIZE: usize = 64;
+pub const MAX_MEMORY_LIST_PAGE_SIZE: usize = 50;
 const REVISION_HISTORY_STORAGE_BATCH_SIZE: usize = MAX_REVISION_HISTORY_PAGE_SIZE;
 const MAX_REVISION_HISTORY_PAGE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_ACTIVE_MEMORY_COUNT_ROWS: usize = 512;
@@ -48,17 +49,20 @@ const MAX_MEMORY_ENTRY_ROW_BYTES: usize =
     MAX_REVISION_METADATA_FIELD_BYTES * MEMORY_ENTRY_TEXT_FIELD_COUNT;
 pub(crate) const MAX_REVISION_SOURCE_FIELD_BYTES: usize = 256;
 const MAX_REVISION_SOURCE_BYTES: usize = MAX_REVISION_SOURCE_FIELD_BYTES * 5;
+const MAX_REVISION_KEYWORD_BYTES: usize = MAX_MEMORY_KEYWORDS * MAX_MEMORY_KEYWORD_BYTES;
 const MAX_REVISION_ROW_BYTES: usize = MAX_MEMORY_CONTENT_BYTES
     + MAX_MEMORY_CHANGE_REASON_BYTES
     + MAX_REVISION_SOURCE_BYTES
-    + MAX_REVISION_METADATA_FIELD_BYTES * 10;
+    + MAX_REVISION_KEYWORD_BYTES
+    + MAX_REVISION_METADATA_FIELD_BYTES * 11;
 const MAX_MEMORY_RECORD_BYTES: usize = MAX_MEMORY_ENTRY_ROW_BYTES + MAX_REVISION_ROW_BYTES;
 const REVISION_SQLITE_PROGRESS_INTERVAL_OPS: i32 = 1_000;
 const MAX_REVISION_SQLITE_PROGRESS_CALLBACKS: usize = 20_000;
 const RFC3339_MICROS_SQL_FUNCTION: &str = "muse_rfc3339_micros";
 use crate::domain::memory::{
-    MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_QUERY_CHARS,
-    validate_memory_change_reason, validate_memory_content, validate_memory_query_text,
+    MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_KEYWORD_BYTES,
+    MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, validate_memory_change_reason,
+    validate_memory_content, validate_memory_keyword, validate_memory_query_text,
 };
 
 #[cfg(test)]
@@ -265,6 +269,123 @@ impl SqliteMemoryRepository {
             transaction.commit().map_err(repository_unavailable)?;
             authority_guard.finish()?;
             Ok(records)
+        })();
+        if exhausted.load(Ordering::Relaxed) {
+            Err(query_budget_exceeded())
+        } else {
+            result
+        }
+    }
+
+    /// 管理审计专用的当前记忆全量分页列表（无关键词浏览模式），仅供管理 API。
+    ///
+    /// 模型读取面不得使用本方法。按 `freshness_at DESC, memory_id ASC` keyset
+    /// 稳定分页，正文加载复用 `load_current` 的有界读取与删除权威过滤。
+    /// 返回 (本页记录, 是否还有下一页)。
+    pub fn list_current_memories(
+        &self,
+        scope: &MemoryPersonaScope,
+        category: Option<MemoryCategory>,
+        importance: Option<MemoryImportance>,
+        after: Option<(&str, &MemoryId)>,
+        limit: usize,
+    ) -> Result<(Vec<MemoryRecord>, bool), MemoryError> {
+        if limit == 0 || limit > MAX_MEMORY_LIST_PAGE_SIZE {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        let mut authority_guard = self.authority.begin_guard()?;
+        let mut connection = self.open_connection()?;
+        let exhausted = install_revision_progress_handler(&connection);
+        let result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(repository_unavailable)?;
+            let fetch_limit = i64::try_from(limit)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| MemoryError::new(MemoryErrorCode::InvalidRequest))?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT CASE
+                                WHEN typeof(e.memory_id) = 'text'
+                                 AND length(CAST(e.memory_id AS BLOB)) <= ?7
+                                THEN e.memory_id
+                            END,
+                            length(CAST(e.memory_id AS BLOB))
+                     FROM memory_entry e
+                     WHERE e.persona_id = ?1
+                       AND e.state = 'active'
+                       AND (?2 IS NULL OR e.category = ?2)
+                       AND (?3 IS NULL OR e.importance = ?3)
+                       AND (
+                            ?4 IS NULL
+                            OR e.freshness_at < ?4
+                            OR (e.freshness_at = ?4 AND e.memory_id > ?5)
+                       )
+                     ORDER BY e.freshness_at DESC, e.memory_id ASC
+                     LIMIT ?6",
+                )
+                .map_err(repository_unavailable)?;
+            let raw_memory_ids = statement
+                .query_map(
+                    params![
+                        scope.persona_id(),
+                        category.map(category_to_str),
+                        importance.map(importance_to_str),
+                        after.map(|(freshness_at, _)| freshness_at),
+                        after.map(|(_, memory_id)| memory_id.0.as_str()),
+                        fetch_limit,
+                        MAX_REVISION_METADATA_FIELD_BYTES as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
+                )
+                .map_err(repository_unavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(repository_unavailable)?;
+            drop(statement);
+
+            let has_more = raw_memory_ids.len() > limit;
+            let mut records = Vec::with_capacity(limit);
+            let mut materialized_bytes = 0_usize;
+            for (memory_id, memory_id_bytes) in raw_memory_ids.into_iter().take(limit) {
+                let memory_id_bytes = bounded_revision_length(
+                    required_revision_length(memory_id_bytes)?,
+                    MAX_REVISION_METADATA_FIELD_BYTES,
+                )?;
+                materialized_bytes = materialized_bytes
+                    .checked_add(memory_id_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                let memory_id = memory_id
+                    .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+                let remaining_bytes = MAX_MEMORY_READ_SCAN_BYTES
+                    .checked_sub(materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                let Some(bounded) =
+                    load_current(&transaction, scope, &MemoryId(memory_id), remaining_bytes)?
+                else {
+                    continue;
+                };
+                materialized_bytes = materialized_bytes
+                    .checked_add(bounded.materialized_bytes)
+                    .ok_or_else(query_budget_exceeded)?;
+                if record_is_blocked(
+                    &mut authority_guard,
+                    &self.authority,
+                    scope,
+                    &bounded.record,
+                )? {
+                    continue;
+                }
+                records.push(bounded.record);
+            }
+            transaction.commit().map_err(repository_unavailable)?;
+            authority_guard.finish()?;
+            Ok((records, has_more))
         })();
         if exhausted.load(Ordering::Relaxed) {
             Err(query_budget_exceeded())
@@ -505,6 +626,16 @@ impl SqliteMemoryRepository {
                         length(CAST(revision.state AS BLOB)),
                         length(CAST(revision.category AS BLOB)),
                         length(CAST(revision.importance AS BLOB)),
+                        length(CAST(revision.facet AS BLOB)),
+                        (SELECT COUNT(*) FROM memory_revision_keyword AS keyword
+                          WHERE keyword.persona_id = revision.persona_id
+                            AND keyword.memory_id = revision.memory_id
+                            AND keyword.revision_id = revision.revision_id),
+                        COALESCE((SELECT SUM(length(CAST(keyword.keyword AS BLOB)))
+                          FROM memory_revision_keyword AS keyword
+                          WHERE keyword.persona_id = revision.persona_id
+                            AND keyword.memory_id = revision.memory_id
+                            AND keyword.revision_id = revision.revision_id), 0),
                         length(CAST(source.source_kind AS BLOB)),
                         length(CAST(source.conversation_id AS BLOB)),
                         length(CAST(source.turn_id AS BLOB)),
@@ -1278,6 +1409,7 @@ struct RawRevisionRow {
     state: String,
     category: String,
     importance: String,
+    facet: String,
     source_kind: Option<String>,
     conversation_id: Option<String>,
     turn_id: Option<String>,
@@ -1315,11 +1447,12 @@ fn raw_revision_from_row(
         state: row.get(11)?,
         category: row.get(12)?,
         importance: row.get(13)?,
-        source_kind: row.get(14)?,
-        conversation_id: row.get(15)?,
-        turn_id: row.get(16)?,
-        action_id: row.get(17)?,
-        authorized_at: row.get(18)?,
+        facet: row.get(14)?,
+        source_kind: row.get(15)?,
+        conversation_id: row.get(16)?,
+        turn_id: row.get(17)?,
+        action_id: row.get(18)?,
+        authorized_at: row.get(19)?,
     })
 }
 
@@ -1350,10 +1483,16 @@ fn revision_snapshot_from_raw(
     )?;
     let category = parse_category(&row.category)?;
     let importance = parse_importance(&row.importance)?;
+    let facet = parse_facet(&row.facet)?;
+    if !facet.is_compatible_with(category) {
+        return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+    }
     Ok(RevisionSnapshotRow {
         revision: MemoryRevision {
             revision_id: MemoryRevisionId(row.revision_id),
             memory_id: memory_id.clone(),
+            facet,
+            keywords: Vec::new(),
             content: row.content,
             event_time: row.event_time,
             recorded_at: row.recorded_at,
@@ -1499,6 +1638,9 @@ struct RawRevisionLengths {
     state: Option<i64>,
     category: Option<i64>,
     importance: Option<i64>,
+    facet: Option<i64>,
+    keyword_count: Option<i64>,
+    keyword_bytes: Option<i64>,
     source_kind: Option<i64>,
     conversation_id: Option<i64>,
     turn_id: Option<i64>,
@@ -1522,11 +1664,14 @@ fn raw_revision_lengths_from_row(row: &Row<'_>) -> rusqlite::Result<RawRevisionL
         state: row.get(11)?,
         category: row.get(12)?,
         importance: row.get(13)?,
-        source_kind: row.get(14)?,
-        conversation_id: row.get(15)?,
-        turn_id: row.get(16)?,
-        action_id: row.get(17)?,
-        authorized_at: row.get(18)?,
+        facet: row.get(14)?,
+        keyword_count: row.get(15)?,
+        keyword_bytes: row.get(16)?,
+        source_kind: row.get(17)?,
+        conversation_id: row.get(18)?,
+        turn_id: row.get(19)?,
+        action_id: row.get(20)?,
+        authorized_at: row.get(21)?,
     })
 }
 
@@ -1569,6 +1714,7 @@ impl RawRevisionLengths {
             required_revision_length(self.state)?,
             required_revision_length(self.category)?,
             required_revision_length(self.importance)?,
+            required_revision_length(self.facet)?,
         ];
         let mut total = 0_usize;
         for length in metadata {
@@ -1590,6 +1736,18 @@ impl RawRevisionLengths {
         total = total
             .checked_add(content)
             .and_then(|total| total.checked_add(change_reason))
+            .ok_or_else(query_budget_exceeded)?;
+
+        let keyword_count = required_revision_length(self.keyword_count)?;
+        if keyword_count > MAX_MEMORY_KEYWORDS {
+            return Err(query_budget_exceeded());
+        }
+        let keyword_bytes = bounded_revision_length(
+            required_revision_length(self.keyword_bytes)?,
+            MAX_REVISION_KEYWORD_BYTES,
+        )?;
+        total = total
+            .checked_add(keyword_bytes)
             .ok_or_else(query_budget_exceeded)?;
 
         let source_lengths = [
@@ -1658,6 +1816,16 @@ fn revision_history_lengths_sql(has_cursor: bool) -> &'static str {
                 length(CAST(revision.state AS BLOB)),
                 length(CAST(revision.category AS BLOB)),
                 length(CAST(revision.importance AS BLOB)),
+                length(CAST(revision.facet AS BLOB)),
+                (SELECT COUNT(*) FROM memory_revision_keyword AS keyword
+                  WHERE keyword.persona_id = revision.persona_id
+                    AND keyword.memory_id = revision.memory_id
+                    AND keyword.revision_id = revision.revision_id),
+                COALESCE((SELECT SUM(length(CAST(keyword.keyword AS BLOB)))
+                  FROM memory_revision_keyword AS keyword
+                  WHERE keyword.persona_id = revision.persona_id
+                    AND keyword.memory_id = revision.memory_id
+                    AND keyword.revision_id = revision.revision_id), 0),
                 length(CAST(source.source_kind AS BLOB)),
                 length(CAST(source.conversation_id AS BLOB)),
                 length(CAST(source.turn_id AS BLOB)),
@@ -1693,6 +1861,16 @@ fn revision_history_lengths_sql(has_cursor: bool) -> &'static str {
                 length(CAST(revision.state AS BLOB)),
                 length(CAST(revision.category AS BLOB)),
                 length(CAST(revision.importance AS BLOB)),
+                length(CAST(revision.facet AS BLOB)),
+                (SELECT COUNT(*) FROM memory_revision_keyword AS keyword
+                  WHERE keyword.persona_id = revision.persona_id
+                    AND keyword.memory_id = revision.memory_id
+                    AND keyword.revision_id = revision.revision_id),
+                COALESCE((SELECT SUM(length(CAST(keyword.keyword AS BLOB)))
+                  FROM memory_revision_keyword AS keyword
+                  WHERE keyword.persona_id = revision.persona_id
+                    AND keyword.memory_id = revision.memory_id
+                    AND keyword.revision_id = revision.revision_id), 0),
                 length(CAST(source.source_kind AS BLOB)),
                 length(CAST(source.conversation_id AS BLOB)),
                 length(CAST(source.turn_id AS BLOB)),
@@ -1737,6 +1915,16 @@ fn revision_lengths_by_id(
                     length(CAST(revision.state AS BLOB)),
                     length(CAST(revision.category AS BLOB)),
                     length(CAST(revision.importance AS BLOB)),
+                    length(CAST(revision.facet AS BLOB)),
+                    (SELECT COUNT(*) FROM memory_revision_keyword AS keyword
+                      WHERE keyword.persona_id = revision.persona_id
+                        AND keyword.memory_id = revision.memory_id
+                        AND keyword.revision_id = revision.revision_id),
+                    COALESCE((SELECT SUM(length(CAST(keyword.keyword AS BLOB)))
+                      FROM memory_revision_keyword AS keyword
+                      WHERE keyword.persona_id = revision.persona_id
+                        AND keyword.memory_id = revision.memory_id
+                        AND keyword.revision_id = revision.revision_id), 0),
                     length(CAST(source.source_kind AS BLOB)),
                     length(CAST(source.conversation_id AS BLOB)),
                     length(CAST(source.turn_id AS BLOB)),
@@ -1825,7 +2013,7 @@ fn load_revision_snapshot_by_identity(
                     revision.recorded_at, revision.valid_from, revision.valid_to,
                     revision.change_type, revision.change_reason,
                     revision.safety_policy_version, revision.state,
-                    revision.category, revision.importance,
+                    revision.category, revision.importance, revision.facet,
                     source.source_kind, source.conversation_id, source.turn_id,
                     source.action_id, source.authorized_at
              FROM memory_revision AS revision
@@ -1850,7 +2038,70 @@ fn load_revision_snapshot_by_identity(
         .optional()
         .map_err(repository_unavailable)?
         .ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
-    revision_snapshot_from_raw(scope, memory_id, revision_id, raw)
+    let mut snapshot = revision_snapshot_from_raw(scope, memory_id, revision_id, raw)?;
+    snapshot.revision.keywords =
+        load_revision_keywords(connection, scope, memory_id, &snapshot.revision.revision_id)?;
+    Ok(snapshot)
+}
+
+fn load_revision_keywords(
+    connection: &Connection,
+    scope: &MemoryPersonaScope,
+    memory_id: &MemoryId,
+    revision_id: &MemoryRevisionId,
+) -> Result<Vec<String>, MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT CASE
+                        WHEN typeof(keyword) = 'text'
+                         AND length(CAST(keyword AS BLOB)) <= ?4
+                        THEN keyword
+                    END,
+                    length(CAST(keyword AS BLOB))
+             FROM memory_revision_keyword
+             WHERE persona_id = ?1 AND memory_id = ?2 AND revision_id = ?3
+             ORDER BY keyword_ordinal
+             LIMIT 9",
+        )
+        .map_err(repository_unavailable)?;
+    let rows = statement
+        .query_map(
+            params![
+                scope.persona_id(),
+                memory_id.0,
+                revision_id.0,
+                MAX_MEMORY_KEYWORD_BYTES as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
+        )
+        .map_err(repository_unavailable)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(repository_unavailable)?;
+    if rows.len() > MAX_MEMORY_KEYWORDS {
+        return Err(query_budget_exceeded());
+    }
+    let mut keywords = Vec::with_capacity(rows.len());
+    let mut unique = BTreeSet::new();
+    for (keyword, bytes) in rows {
+        let bytes =
+            bounded_revision_length(required_revision_length(bytes)?, MAX_MEMORY_KEYWORD_BYTES)?;
+        if bytes == 0 {
+            return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+        }
+        let keyword =
+            keyword.ok_or_else(|| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+        validate_memory_keyword(&keyword)?;
+        if !unique.insert(keyword.clone()) {
+            return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+        }
+        keywords.push(keyword);
+    }
+    Ok(keywords)
 }
 
 fn preflight_existing_runtime_anchor(base_dir: &Path) -> Result<(), MemoryError> {
@@ -2063,6 +2314,17 @@ fn apply_transition(
     // 即使未来新增内部构造路径，Repository 门也必须先于派生键、FTS 与 SQL 拒绝超限正文。
     validate_memory_content(&transition.new_revision.content)?;
     validate_memory_change_reason(&transition.new_revision.change_reason)?;
+    if !transition
+        .new_revision
+        .facet
+        .is_compatible_with(transition.entry.category)
+        || transition.new_revision.keywords.len() > MAX_MEMORY_KEYWORDS
+    {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+    }
+    for keyword in &transition.new_revision.keywords {
+        validate_memory_keyword(keyword)?;
+    }
     if transition.entry.persona_id != scope.persona_id()
         || transition.new_revision.memory_id != transition.entry.memory_id
     {
@@ -2164,10 +2426,10 @@ fn insert_revision(
             "INSERT INTO memory_revision(
                 persona_id, memory_id, revision_id, content, derivation_key,
                 event_time, recorded_at, valid_from, valid_to, change_type,
-                change_reason, safety_policy_version, state, category, importance
+                change_reason, safety_policy_version, state, category, importance, facet
              ) VALUES(
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15
+                ?14, ?15, ?16
              )",
             params![
                 scope.persona_id(),
@@ -2184,13 +2446,49 @@ fn insert_revision(
                 revision.safety_policy_version,
                 revision_state_to_str(revision.state),
                 category_to_str(category),
-                importance_to_str(importance)
+                importance_to_str(importance),
+                facet_to_str(revision.facet)
             ],
         )
         .map_err(repository_unavailable)?;
     let row_id = connection.last_insert_rowid();
     insert_revision_source(connection, scope, revision)?;
+    insert_revision_keywords(connection, scope, revision)?;
     Ok(row_id)
+}
+
+fn insert_revision_keywords(
+    connection: &Connection,
+    scope: &MemoryPersonaScope,
+    revision: &MemoryRevision,
+) -> Result<(), MemoryError> {
+    if revision.keywords.len() > MAX_MEMORY_KEYWORDS {
+        return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+    }
+    let mut normalized_keywords = BTreeSet::new();
+    for (ordinal, keyword) in revision.keywords.iter().enumerate() {
+        validate_memory_keyword(keyword)?;
+        let normalized = normalize_search_text(keyword);
+        validate_memory_keyword(&normalized)?;
+        if !normalized_keywords.insert(normalized.clone()) {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
+        connection
+            .execute(
+                "INSERT INTO memory_revision_keyword(
+                    persona_id, memory_id, revision_id, keyword_ordinal, keyword
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    scope.persona_id(),
+                    revision.memory_id.0,
+                    revision.revision_id.0,
+                    ordinal as i64,
+                    normalized
+                ],
+            )
+            .map_err(repository_unavailable)?;
+    }
+    Ok(())
 }
 
 fn insert_revision_source(
@@ -2719,6 +3017,47 @@ fn parse_category(value: &str) -> Result<MemoryCategory, MemoryError> {
     }
 }
 
+pub(crate) const fn facet_to_str(value: MemoryFacet) -> &'static str {
+    match value {
+        MemoryFacet::Identity => "identity",
+        MemoryFacet::Timezone => "timezone",
+        MemoryFacet::Location => "location",
+        MemoryFacet::Occupation => "occupation",
+        MemoryFacet::PreferenceFood => "preference_food",
+        MemoryFacet::PreferenceDrink => "preference_drink",
+        MemoryFacet::PreferenceCommunication => "preference_communication",
+        MemoryFacet::PreferenceTool => "preference_tool",
+        MemoryFacet::PreferenceOther => "preference_other",
+        MemoryFacet::Habit => "habit",
+        MemoryFacet::Plan => "plan",
+        MemoryFacet::SharedExperience => "shared_experience",
+        MemoryFacet::Commitment => "commitment",
+        MemoryFacet::StoryState => "story_state",
+        MemoryFacet::Other => "other",
+    }
+}
+
+pub(crate) fn parse_facet(value: &str) -> Result<MemoryFacet, MemoryError> {
+    match value {
+        "identity" => Ok(MemoryFacet::Identity),
+        "timezone" => Ok(MemoryFacet::Timezone),
+        "location" => Ok(MemoryFacet::Location),
+        "occupation" => Ok(MemoryFacet::Occupation),
+        "preference_food" => Ok(MemoryFacet::PreferenceFood),
+        "preference_drink" => Ok(MemoryFacet::PreferenceDrink),
+        "preference_communication" => Ok(MemoryFacet::PreferenceCommunication),
+        "preference_tool" => Ok(MemoryFacet::PreferenceTool),
+        "preference_other" => Ok(MemoryFacet::PreferenceOther),
+        "habit" => Ok(MemoryFacet::Habit),
+        "plan" => Ok(MemoryFacet::Plan),
+        "shared_experience" => Ok(MemoryFacet::SharedExperience),
+        "commitment" => Ok(MemoryFacet::Commitment),
+        "story_state" => Ok(MemoryFacet::StoryState),
+        "other" => Ok(MemoryFacet::Other),
+        _ => Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable)),
+    }
+}
+
 fn importance_to_str(value: MemoryImportance) -> &'static str {
     match value {
         MemoryImportance::Low => "low",
@@ -2894,7 +3233,8 @@ mod revision_identity_tests {
                     safety_policy_version TEXT NOT NULL,
                     state TEXT NOT NULL,
                     category TEXT NOT NULL,
-                    importance TEXT NOT NULL
+                    importance TEXT NOT NULL,
+                    facet TEXT NOT NULL
                  );
                  CREATE TABLE memory_revision_source (
                     persona_id TEXT NOT NULL,
@@ -2906,6 +3246,13 @@ mod revision_identity_tests {
                     turn_id TEXT,
                     action_id TEXT,
                     authorized_at TEXT
+                 );
+                 CREATE TABLE memory_revision_keyword (
+                    persona_id TEXT NOT NULL,
+                    memory_id TEXT NOT NULL,
+                    revision_id TEXT NOT NULL,
+                    keyword_ordinal INTEGER NOT NULL,
+                    keyword TEXT NOT NULL
                  );",
             )
             .expect("应建立 revision 身份测试结构");
@@ -2924,10 +3271,10 @@ mod revision_identity_tests {
                 "INSERT INTO memory_revision(
                     row_id, persona_id, memory_id, revision_id, content, event_time,
                     recorded_at, valid_from, valid_to, change_type, change_reason,
-                    safety_policy_version, state, category, importance
+                    safety_policy_version, state, category, importance, facet
                  ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, '2026-08-02T00:00:00Z',
                           '2026-08-02T00:00:00Z', NULL, 'create', '测试创建',
-                          '测试策略-v1', 'current', 'user_fact', 'normal')",
+                          '测试策略-v1', 'current', 'user_fact', 'normal', 'other')",
                 params![row_id, persona_id, memory_id, revision_id, content],
             )
             .expect("应插入 revision 身份夹具");

@@ -54,8 +54,25 @@ impl MemorySensitivityPolicy for DeterministicMemorySensitivityPolicy {
         };
         // 两道门都由本实现先做同一版 NFKC、大小写、零宽字符、同形字符和
         // 分隔符规范化，再运行完全相同的规则；任一字段命中即整项拒绝。
+        let keywords = request
+            .keywords
+            .iter()
+            .map(|keyword| NormalizedSensitiveText::new(keyword))
+            .collect::<Result<Vec<_>, _>>();
+        let keywords = match keywords {
+            Ok(keywords) => keywords,
+            Err(reason) => {
+                return MemorySafetyAssessment::FailClosed {
+                    stage: request.stage,
+                    reason,
+                };
+            }
+        };
         let rejected = hits_sensitive_rule(&content).is_some()
-            || hits_sensitive_rule(&change_reason).is_some();
+            || hits_sensitive_rule(&change_reason).is_some()
+            || keywords
+                .iter()
+                .any(|keyword| hits_sensitive_rule(keyword).is_some());
         if rejected {
             MemorySafetyAssessment::Rejected {
                 stage: request.stage,
@@ -1290,8 +1307,8 @@ fn char_window(text: &str, byte_start: usize, max_chars: usize) -> &str {
 mod tests {
     use super::*;
     use crate::domain::memory::{
-        MemoryCategory, MemoryChangeType, MemoryId, MemoryRevisionId, MemorySafetyStage,
-        MemorySourceEvidence, MemorySourceKind,
+        MemoryCategory, MemoryChangeType, MemoryFacet, MemoryId, MemoryRevisionId,
+        MemorySafetyStage, MemorySourceEvidence, MemorySourceKind,
     };
 
     fn assess_content(content: &str) -> MemorySafetyAssessment {
@@ -1306,6 +1323,7 @@ mod tests {
         };
         let assigned_memory_id = MemoryId("mem-test".to_string());
         let assigned_revision_id = MemoryRevisionId("rev-test".to_string());
+        let keywords = vec!["用户事实".to_string()];
         let request = MemorySensitivityRequest {
             stage,
             operation_id: "op-test",
@@ -1315,6 +1333,8 @@ mod tests {
             assigned_memory_id: &assigned_memory_id,
             assigned_revision_id: &assigned_revision_id,
             category: MemoryCategory::UserFact,
+            facet: MemoryFacet::Identity,
+            keywords: &keywords,
             importance: None,
             content,
             change_reason: "用户在本轮消息中说明",
@@ -1578,6 +1598,7 @@ mod tests {
         };
         let assigned_memory_id = MemoryId("mem-test".to_string());
         let assigned_revision_id = MemoryRevisionId("rev-test".to_string());
+        let keywords = vec!["用户事实".to_string()];
         let assessment =
             DeterministicMemorySensitivityPolicy::new().assess(MemorySensitivityRequest {
                 stage: MemorySafetyStage::TurnStaging,
@@ -1588,6 +1609,8 @@ mod tests {
                 assigned_memory_id: &assigned_memory_id,
                 assigned_revision_id: &assigned_revision_id,
                 category: MemoryCategory::UserFact,
+                facet: MemoryFacet::Identity,
+                keywords: &keywords,
                 importance: None,
                 content: "用户喜欢夜间散步",
                 change_reason: "  ",
@@ -1624,6 +1647,7 @@ mod tests {
         };
         let assigned_memory_id = MemoryId("mem-test".to_string());
         let assigned_revision_id = MemoryRevisionId("rev-test".to_string());
+        let keywords = vec!["用户事实".to_string()];
         let request = MemorySensitivityRequest {
             stage: MemorySafetyStage::TurnStaging,
             operation_id: "op-test",
@@ -1633,6 +1657,8 @@ mod tests {
             assigned_memory_id: &assigned_memory_id,
             assigned_revision_id: &assigned_revision_id,
             category: MemoryCategory::UserFact,
+            facet: MemoryFacet::Identity,
+            keywords: &keywords,
             importance: None,
             content: "用户提到一件私事",
             change_reason: "用户把确诊结果告诉了角色",
@@ -1640,6 +1666,40 @@ mod tests {
             source: &source,
         };
         let assessment = DeterministicMemorySensitivityPolicy::new().assess(request);
+        assert!(matches!(
+            assessment,
+            MemorySafetyAssessment::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn keywords_are_scanned_together_with_content() {
+        let source = MemorySourceEvidence::ConversationTurn {
+            conversation_id: "conv-test".to_string(),
+            turn_id: "turn-test".to_string(),
+            kind: MemorySourceKind::DirectUserMessage,
+        };
+        let assigned_memory_id = MemoryId("mem-test".to_string());
+        let assigned_revision_id = MemoryRevisionId("rev-test".to_string());
+        let keywords = vec!["api_key=abcdefghijklmnop".to_string()];
+        let assessment =
+            DeterministicMemorySensitivityPolicy::new().assess(MemorySensitivityRequest {
+                stage: MemorySafetyStage::TurnStaging,
+                operation_id: "op-test",
+                operation: MemoryChangeType::Create,
+                memory_id: None,
+                expected_revision_id: None,
+                assigned_memory_id: &assigned_memory_id,
+                assigned_revision_id: &assigned_revision_id,
+                category: MemoryCategory::UserFact,
+                facet: MemoryFacet::Identity,
+                keywords: &keywords,
+                importance: None,
+                content: "用户喜欢夜间散步",
+                change_reason: "用户在本轮消息中说明",
+                event_time: None,
+                source: &source,
+            });
         assert!(matches!(
             assessment,
             MemorySafetyAssessment::Rejected { .. }

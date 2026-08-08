@@ -3910,6 +3910,8 @@ async fn memory_tool_events_are_redacted_before_session_and_replay_as_placeholde
                 "memory_id": MEMORY_ID,
                 "revision_id": REVISION_ID,
                 "category": "user_preference",
+                "facet": "preference_drink",
+                "keywords": [CONTENT_SENTINEL, "饮品偏好"],
                 "content": CONTENT_SENTINEL,
                 "importance": "high",
                 "event_time": null,
@@ -4737,6 +4739,8 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
                 "memory_id": MEMORY_ID,
                 "revision_id": REVISION_ID,
                 "category": "user_preference",
+                "facet": "preference_drink",
+                "keywords": ["绿茶", "饮品偏好"],
                 "content": SENTINEL,
                 "importance": "high",
                 "event_time": null,
@@ -4811,6 +4815,20 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
         assert!(receipt.get(dropped).is_none(), "收据不得保留 {dropped}");
     }
 
+    let receipt = super::memory_session_call_receipt(
+        "memory_mutate",
+        &serde_json::json!({
+            "mutations": [
+                { "content": SENTINEL },
+                { "content": "第二条候选" }
+            ]
+        }),
+    )
+    .expect("批量 memory_mutate 应生成去正文调用收据")
+    .to_json();
+    assert_eq!(receipt["mutation_count"], 2);
+    assert!(!receipt.to_string().contains(SENTINEL));
+
     // memory_delete 调用收据：只保留删除范围，目标 ID 也不得进入审批或 Session。
     let receipt = super::memory_session_call_receipt(
         "memory_delete",
@@ -4831,6 +4849,41 @@ fn memory_session_receipts_keep_only_whitelisted_fields() {
     assert_eq!(receipt.structured["has_more"], true);
     let receipt_text = format!("{}{}", receipt.content, receipt.structured);
     assert!(!receipt_text.contains(SENTINEL));
+
+    let batch_result = ToolResult::success(
+        SENTINEL,
+        Some(serde_json::json!({
+            "state": "partial",
+            "staged_count": 1,
+            "confirmation_required_count": 1,
+            "rejected_count": 1,
+            "skipped_count": 0,
+            "items": [
+                {
+                    "index": 0,
+                    "state": "staged",
+                    "operation": "create",
+                    "memory_id": MEMORY_ID,
+                    "revision_id": REVISION_ID
+                },
+                {
+                    "index": 1,
+                    "state": "rejected",
+                    "operation": "create",
+                    "reason_code": "memory_source_ineligible",
+                    "field_path": "mutations[1].source_quote"
+                }
+            ]
+        })),
+    );
+    let batch_receipt = super::memory_session_result_receipt("memory_mutate", &batch_result)
+        .expect("批量结果应生成安全收据");
+    assert!(batch_receipt.success);
+    assert_eq!(batch_receipt.structured["state"], "partial");
+    assert_eq!(batch_receipt.structured["staged_count"], 1);
+    assert_eq!(batch_receipt.structured["rejected_count"], 1);
+    assert_eq!(batch_receipt.structured["memory_ids"][0], MEMORY_ID);
+    assert!(!format!("{}{}", batch_receipt.content, batch_receipt.structured).contains(SENTINEL));
 
     // 每个来自 Tool 的字符串槽位都要经过枚举、时间或稳定 ID 格式校验。
     let invalid_calls = [

@@ -7,6 +7,8 @@
 //! 路由一律返回 503 与对应 `memory_*` 稳定码。
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use muse_core::app::memory_safety::DeterministicMemorySensitivityPolicy;
 use muse_core::app::memory_storage::{
@@ -14,17 +16,18 @@ use muse_core::app::memory_storage::{
     SqliteMemoryRetriever,
 };
 use muse_core::domain::memory::{
-    ConfirmedMemoryDeleteRequest, MemoryCursor, MemoryDeleteConfirmation,
+    ConfirmedMemoryDeleteRequest, MemoryCategory, MemoryCursor, MemoryDeleteConfirmation,
     MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryDeleteReceipt, MemoryError,
-    MemoryErrorCode, MemoryId, MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt,
-    MemoryManagementAuthorization, MemoryManagementBinding, MemoryManagementContentMutation,
-    MemoryManagementContentParams, MemoryMutationReceipt, MemoryPersonaScope,
-    MemoryQueryPageReceipt, MemoryQueryParams, MemoryRepository, MemoryRetrievalFilters,
-    MemoryRetrievalRequest, MemoryRetrievalTurn, MemoryRetriever, MemoryRevision, MemoryRevisionId,
-    MemorySensitivityPolicy,
+    MemoryErrorCode, MemoryId, MemoryImportance, MemoryImportanceAdjustment,
+    MemoryImportanceAdjustmentReceipt, MemoryManagementAuthorization, MemoryManagementBinding,
+    MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutationReceipt,
+    MemoryPersonaScope, MemoryQueryItem, MemoryQueryPageReceipt, MemoryQueryParams, MemoryRecord,
+    MemoryRepository, MemoryRetrievalFilters, MemoryRetrievalRequest, MemoryRetrievalTurn,
+    MemoryRetriever, MemoryRevision, MemoryRevisionId, MemorySensitivityPolicy,
 };
 use std::num::NonZeroU32;
 use std::path::Path as FsPath;
+use std::sync::OnceLock;
 
 use super::*;
 use crate::state::MemoryRuntimeServices;
@@ -97,6 +100,8 @@ pub struct MemoryServices {
 
 const MEMORY_MANAGEMENT_DELETE_CONFIRMATION_TTL_MINUTES: i64 = 5;
 const MAX_MEMORY_MANAGEMENT_HISTORY_PAGES: usize = 8;
+/// 管理页浏览模式单页大小；管理列表不应套用模型检索的 5 条小页。
+const MEMORY_MANAGEMENT_LIST_PAGE_SIZE: usize = 20;
 
 /// 生产管理命令与审计适配器；所有路径共享同一个 SQLite Repository。
 struct SqliteMemoryManagementAdapter {
@@ -438,8 +443,20 @@ pub(crate) async fn handle_persona_memories(
         .map(MemoryCursor::from_runtime)
         .transpose()
         .map_err(memory_error_response)?;
+    let normalized_query = query.query.as_deref().map(str::trim).unwrap_or("");
+    if normalized_query.is_empty() {
+        return handle_persona_memories_browse(
+            &scope,
+            &services,
+            query.category,
+            query.importance,
+            cursor,
+        );
+    }
     let params = MemoryQueryParams {
-        query: query.query,
+        query: normalized_query.to_string(),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor,
         as_of: None,
@@ -461,6 +478,199 @@ pub(crate) async fn handle_persona_memories(
         .retrieve(&request)
         .map_err(memory_error_response)?;
     Ok(Json(receipt))
+}
+
+/// 管理页浏览模式：不携带关键词时按当前记忆全量分页列出。
+///
+/// 直接经 Repository 的 `list_current_memories` 读取，不经过模型检索的 FTS
+/// 排名与预算；分页游标为 HMAC 签名的不透明令牌，绑定 Persona、类别与重要度
+/// 筛选，只能原样回传。
+fn handle_persona_memories_browse(
+    scope: &MemoryPersonaScope,
+    services: &MemoryServices,
+    category: Option<MemoryCategory>,
+    importance: Option<MemoryImportance>,
+    cursor: Option<MemoryCursor>,
+) -> Result<Json<MemoryQueryPageReceipt>, (StatusCode, Json<ErrorResponse>)> {
+    let after = match cursor {
+        Some(cursor) => Some(
+            parse_management_list_cursor(&cursor, scope, category, importance)
+                .map_err(memory_error_response)?,
+        ),
+        None => None,
+    };
+    let (records, has_more) = services
+        .repository
+        .list_current_memories(
+            scope,
+            category,
+            importance,
+            after
+                .as_ref()
+                .map(|(freshness_at, memory_id)| (freshness_at.as_str(), memory_id)),
+            MEMORY_MANAGEMENT_LIST_PAGE_SIZE,
+        )
+        .map_err(memory_error_response)?;
+    let items = records
+        .iter()
+        .map(memory_record_to_query_item)
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        let last = records.last().ok_or_else(|| {
+            memory_error_response(MemoryError::new(MemoryErrorCode::RepositoryUnavailable))
+        })?;
+        Some(
+            build_management_list_cursor(
+                scope,
+                category,
+                importance,
+                &last.entry.freshness_at,
+                &last.entry.memory_id,
+            )
+            .map_err(memory_error_response)?,
+        )
+    } else {
+        None
+    };
+    Ok(Json(MemoryQueryPageReceipt::new(items, next_cursor)))
+}
+
+/// 把 Repository 当前记录转成管理列表条目；字段全部来自 entry 与 current revision。
+fn memory_record_to_query_item(record: &MemoryRecord) -> MemoryQueryItem {
+    MemoryQueryItem {
+        memory_id: record.entry.memory_id.clone(),
+        revision_id: record.current_revision.revision_id.clone(),
+        category: record.entry.category,
+        facet: record.current_revision.facet,
+        keywords: record.current_revision.keywords.clone(),
+        content: record.current_revision.content.clone(),
+        importance: record.entry.importance,
+        event_time: record.current_revision.event_time.clone(),
+        recorded_at: record.current_revision.recorded_at.clone(),
+        valid_from: record.current_revision.valid_from.clone(),
+        valid_to: record.current_revision.valid_to.clone(),
+        change_type: record.current_revision.change_type,
+        change_reason: record.current_revision.change_reason.clone(),
+    }
+}
+
+/// 管理列表分页游标的 HMAC 密钥；进程内随机，重启后旧游标自然失效。
+static MANAGEMENT_LIST_CURSOR_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+fn management_list_cursor_key() -> &'static [u8; 32] {
+    MANAGEMENT_LIST_CURSOR_KEY.get_or_init(|| {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).expect("应能生成管理列表游标密钥");
+        key
+    })
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0_u8; BLOCK_SIZE];
+    let key_len = key.len().min(BLOCK_SIZE);
+    key_block[..key_len].copy_from_slice(&key[..key_len]);
+    let mut inner_key = [0_u8; BLOCK_SIZE];
+    let mut outer_key = [0_u8; BLOCK_SIZE];
+    for (index, byte) in key_block.into_iter().enumerate() {
+        inner_key[index] = byte ^ 0x36;
+        outer_key[index] = byte ^ 0x5c;
+    }
+    let inner_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(inner_key);
+        hasher.update(message);
+        hasher.finalize()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(outer_key);
+    hasher.update(inner_hash);
+    hasher.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (l, r)| acc | (l ^ r))
+        == 0
+}
+
+fn invalid_cursor() -> MemoryError {
+    MemoryError::new(MemoryErrorCode::InvalidCursor)
+}
+
+fn build_management_list_cursor(
+    scope: &MemoryPersonaScope,
+    category: Option<MemoryCategory>,
+    importance: Option<MemoryImportance>,
+    after_freshness_at: &str,
+    after_memory_id: &MemoryId,
+) -> Result<MemoryCursor, MemoryError> {
+    let payload = serde_json::json!({
+        "scope": scope.persona_id(),
+        "category": category,
+        "importance": importance,
+        "after_freshness_at": after_freshness_at,
+        "after_memory_id": after_memory_id,
+    })
+    .to_string();
+    let mac = hmac_sha256(management_list_cursor_key(), payload.as_bytes());
+    MemoryCursor::from_runtime(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(payload.as_bytes()),
+        URL_SAFE_NO_PAD.encode(mac)
+    ))
+}
+
+fn parse_management_list_cursor(
+    cursor: &MemoryCursor,
+    scope: &MemoryPersonaScope,
+    category: Option<MemoryCategory>,
+    importance: Option<MemoryImportance>,
+) -> Result<(String, MemoryId), MemoryError> {
+    let (payload_b64, mac_b64) = cursor
+        .as_str()
+        .rsplit_once('.')
+        .ok_or_else(invalid_cursor)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| invalid_cursor())?;
+    let mac = URL_SAFE_NO_PAD
+        .decode(mac_b64)
+        .map_err(|_| invalid_cursor())?;
+    let expected = hmac_sha256(management_list_cursor_key(), &payload);
+    if !constant_time_eq(&mac, &expected) {
+        return Err(invalid_cursor());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|_| invalid_cursor())?;
+    if value["scope"].as_str() != Some(scope.persona_id()) {
+        return Err(invalid_cursor());
+    }
+    let bound_category: Option<MemoryCategory> =
+        serde_json::from_value(value["category"].clone()).map_err(|_| invalid_cursor())?;
+    let bound_importance: Option<MemoryImportance> =
+        serde_json::from_value(value["importance"].clone()).map_err(|_| invalid_cursor())?;
+    if bound_category != category || bound_importance != importance {
+        return Err(invalid_cursor());
+    }
+    let after_freshness_at = value["after_freshness_at"]
+        .as_str()
+        .ok_or_else(invalid_cursor)?
+        .to_string();
+    chrono::DateTime::parse_from_rfc3339(&after_freshness_at).map_err(|_| invalid_cursor())?;
+    let after_memory_id = value["after_memory_id"]
+        .as_str()
+        .ok_or_else(invalid_cursor)?
+        .to_string();
+    if after_memory_id.is_empty() {
+        return Err(invalid_cursor());
+    }
+    Ok((after_freshness_at, MemoryId(after_memory_id)))
 }
 
 /// 查询单条记忆详情与来源跳转索引。

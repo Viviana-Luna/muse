@@ -1794,9 +1794,36 @@ async fn emit_memory_commit_result(
         tracing::warn!(code = code.as_str(), "Turn 已提交，但记忆批次持久化失败");
     }
     let _ = emitter.emit(memory_commit_result_event(result)).await;
+    // 兼容旧版前端一个版本；新版前端收到结构化事件后会抑制同轮旧提示。
+    let _ = emitter
+        .emit(legacy_memory_commit_result_event(result))
+        .await;
 }
 
 fn memory_commit_result_event(result: Result<usize, MemoryErrorCode>) -> RuntimeEvent {
+    match result {
+        Ok(count) => RuntimeEvent::MemoryActivity {
+            phase: "memory_commit_completed".to_string(),
+            state: "completed".to_string(),
+            staged_count: 0,
+            saved_count: count,
+            skipped_count: 0,
+            rejected_count: 0,
+            reason_code: None,
+        },
+        Err(code) => RuntimeEvent::MemoryActivity {
+            phase: "memory_commit_failed".to_string(),
+            state: "error".to_string(),
+            staged_count: 0,
+            saved_count: 0,
+            skipped_count: 0,
+            rejected_count: 0,
+            reason_code: Some(code.as_str().to_string()),
+        },
+    }
+}
+
+fn legacy_memory_commit_result_event(result: Result<usize, MemoryErrorCode>) -> RuntimeEvent {
     match result {
         Ok(count) => RuntimeEvent::Status {
             phase: "memory_commit_completed".to_string(),

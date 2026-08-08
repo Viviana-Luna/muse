@@ -38,6 +38,8 @@ const page: MemoryQueryPageReceipt = {
       memory_id: 'memory-1',
       revision_id: 'revision-1',
       category: 'user_preference',
+      facet: 'preference_drink',
+      keywords: ['绿茶', '饮品偏好'],
       content: '用户喜欢在晚上喝绿茶',
       importance: 'normal',
       event_time: null,
@@ -65,6 +67,8 @@ const detail: MemoryDetailResponse = {
   current_revision: {
     revision_id: 'revision-1',
     memory_id: 'memory-1',
+    facet: 'preference_drink',
+    keywords: ['绿茶', '饮品偏好'],
     content: '用户喜欢在晚上喝绿茶',
     event_time: null,
     recorded_at: '2026-08-01T12:00:00Z',
@@ -129,6 +133,21 @@ describe('PersonaMemoryPanel', () => {
 
   afterEach(() => cleanup());
 
+  it('进入页面默认加载记忆列表（浏览模式）', async () => {
+    renderPanel();
+
+    await waitFor(() =>
+      expect(api.searchPersonaMemories).toHaveBeenCalledWith(
+        'alice',
+        expect.objectContaining({ query: '', cursor: undefined }),
+        expect.anything()
+      )
+    );
+    expect(
+      await screen.findByRole('button', { name: /用户喜欢在晚上喝绿茶/ })
+    ).toBeVisible();
+  });
+
   it('搜索、读取详情、调整重要程度并打开来源会话', async () => {
     const { onOpenSource } = renderPanel();
     fireEvent.change(screen.getByPlaceholderText('搜索至少 3 个字符'), {
@@ -149,15 +168,16 @@ describe('PersonaMemoryPanel', () => {
     expect(onOpenSource).toHaveBeenCalledWith('conversation-1', 'turn-1');
   });
 
-  it('少于 3 个有效字符时本地拒绝搜索', () => {
+  it('少于 3 个有效字符时本地拒绝搜索（仅保留初始浏览加载）', async () => {
     renderPanel();
+    await waitFor(() => expect(api.searchPersonaMemories).toHaveBeenCalledOnce());
     fireEvent.change(screen.getByPlaceholderText('搜索至少 3 个字符'), {
       target: { value: '茶！' }
     });
     fireEvent.click(screen.getByRole('button', { name: '搜索' }));
 
     expect(screen.getByRole('alert')).toHaveTextContent('请输入至少 3 个有效字符再搜索。');
-    expect(api.searchPersonaMemories).not.toHaveBeenCalled();
+    expect(api.searchPersonaMemories).toHaveBeenCalledTimes(1);
   });
 
   it('可以手工新增，并为重试生成稳定 operation_id', async () => {

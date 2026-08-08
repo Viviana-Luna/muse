@@ -8,6 +8,22 @@ export type MemoryCategory =
   | 'story_state';
 
 export type MemoryImportance = 'low' | 'normal' | 'high';
+export type MemoryFacet =
+  | 'identity'
+  | 'timezone'
+  | 'location'
+  | 'occupation'
+  | 'preference_food'
+  | 'preference_drink'
+  | 'preference_communication'
+  | 'preference_tool'
+  | 'preference_other'
+  | 'habit'
+  | 'plan'
+  | 'shared_experience'
+  | 'commitment'
+  | 'story_state'
+  | 'other';
 export type MemoryChangeType = 'create' | 'update' | 'correct';
 export type MemoryRevisionState = 'current' | 'superseded' | 'corrected';
 
@@ -15,6 +31,8 @@ export interface MemoryQueryItem {
   memory_id: string;
   revision_id: string;
   category: MemoryCategory;
+  facet: MemoryFacet;
+  keywords: string[];
   content: string;
   importance: MemoryImportance;
   event_time: string | null;
@@ -45,6 +63,8 @@ export interface MemoryEntry {
 export interface MemoryRevision {
   revision_id: string;
   memory_id: string;
+  facet: MemoryFacet;
+  keywords: string[];
   content: string;
   event_time: string | null;
   recorded_at: string;

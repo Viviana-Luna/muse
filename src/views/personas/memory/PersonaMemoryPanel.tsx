@@ -28,6 +28,7 @@ import type { AppToastInput } from '@/hooks/useAppToast';
 import type {
   MemoryCategory,
   MemoryDetailResponse,
+  MemoryFacet,
   MemoryHistoryResponse,
   MemoryImportance,
   MemoryQueryItem,
@@ -47,6 +48,24 @@ const IMPORTANCE_LABELS: Record<MemoryImportance, string> = {
   low: '低',
   normal: '普通',
   high: '高'
+};
+
+const FACET_LABELS: Record<MemoryFacet, string> = {
+  identity: '身份',
+  timezone: '时区',
+  location: '地点',
+  occupation: '职业',
+  preference_food: '食物偏好',
+  preference_drink: '饮品偏好',
+  preference_communication: '沟通偏好',
+  preference_tool: '工具偏好',
+  preference_other: '其他偏好',
+  habit: '习惯',
+  plan: '计划',
+  shared_experience: '共同经历',
+  commitment: '约定',
+  story_state: '故事状态',
+  other: '其他'
 };
 
 const CHANGE_LABELS = {
@@ -224,8 +243,22 @@ export function PersonaMemoryPanel({
     () => results?.items.find((item) => item.memory_id === selectedMemoryId) ?? null,
     [results, selectedMemoryId]
   );
+  // 查询框为空表示当前处于默认浏览模式（展示全部记忆），非空才是关键词检索。
+  const browsing = queryDraft.trim() === '';
 
   useEffect(() => () => searchAbort.current?.abort(), []);
+  useEffect(() => {
+    // 进入管理页默认展示当前记忆列表；只有输入关键词时才切到检索。
+    searchAbort.current?.abort();
+    setQueryDraft('');
+    setResults(null);
+    setSelectedMemoryId(null);
+    setDetail(null);
+    setHistory(null);
+    setDetailState('idle');
+    setEditorMode(null);
+    void performSearch({ query: '' });
+  }, [persona.id]);
 
   function operationId(signature: string, prefix: string) {
     const existing = operationIds.current.get(signature);
@@ -237,7 +270,8 @@ export function PersonaMemoryPanel({
 
   async function performSearch(options: { cursor?: string; append?: boolean; query?: string } = {}) {
     const query = (options.query ?? queryDraft).trim();
-    if (Array.from(query.replace(/[^\p{L}\p{N}]/gu, '')).length < 3) {
+    const effectiveChars = Array.from(query.replace(/[^\p{L}\p{N}]/gu, '')).length;
+    if (query !== '' && effectiveChars < 3) {
       setSearchState('failed');
       setSearchError('请输入至少 3 个有效字符再搜索。');
       return;
@@ -334,7 +368,7 @@ export function PersonaMemoryPanel({
         operationIds.current.delete(payloadSignature);
         notify({ title: '记忆已保存', description: '这条事实现在可以在后续对话中被主动查询。', tone: 'success' });
         setEditorMode(null);
-        await performSearch({ query: draft.content.trim() });
+        await performSearch({ query: queryDraft });
         await loadDetail(receipt.memory_id);
       } else if (editorMode === 'correct' && detail) {
         const operation = operationId(payloadSignature, 'memory-correct');
@@ -350,14 +384,7 @@ export function PersonaMemoryPanel({
         notify({ title: '记忆已纠正', description: '旧事实只保留在管理历史中，不再参与普通查询。', tone: 'success' });
         setEditorMode(null);
         await loadDetail(detail.entry.memory_id);
-        setResults((current) => current && ({
-          ...current,
-          items: current.items.map((item) =>
-            item.memory_id === detail.entry.memory_id
-              ? { ...item, content: draft.content.trim(), category: draft.category, change_type: 'correct' }
-              : item
-          )
-        }));
+        await performSearch({ query: queryDraft });
       }
     } catch (error) {
       notify({ title: editorMode === 'create' ? '记忆未保存' : '记忆未纠正', description: formatApiErrorMessage(error), tone: 'error' });
@@ -421,7 +448,7 @@ export function PersonaMemoryPanel({
       setSelectedMemoryId(null);
       setDetail(null);
       setHistory(null);
-      setSearchState('idle');
+      await performSearch({ query: '' });
       notify({ title: '角色记忆已清空', description: `已永久删除 ${receipt.deleted_memory_count} 条记忆；聊天记录未受影响。`, tone: 'success' });
     } catch (error) {
       notify({ title: '角色记忆未清空', description: formatApiErrorMessage(error), tone: 'error' });
@@ -461,7 +488,7 @@ export function PersonaMemoryPanel({
       </header>
 
       <div className="persona-memory-layout">
-        <aside className="persona-memory-list" aria-label="记忆搜索结果">
+        <aside className="persona-memory-list" aria-label="记忆列表与搜索">
           <form
             className="persona-memory-search"
             onSubmit={(event) => {
@@ -490,17 +517,24 @@ export function PersonaMemoryPanel({
           </form>
 
           <div className="persona-memory-results" aria-live="polite">
-            {searchState === 'idle' && (
+            {(searchState === 'idle' || (searchState === 'loading' && !results)) && (
               <section className="persona-memory-list-empty">
-                <BookHeart aria-hidden="true" />
-                <strong>从一个线索开始</strong>
-                <p>输入人、事或偏好，Muse 只返回相关的少量记忆。</p>
+                <LoaderCircle className="memory-spin" aria-hidden="true" />
+                <strong>正在加载记忆</strong>
               </section>
             )}
             {searchState === 'failed' && <p className="persona-memory-error" role="alert">{searchError}</p>}
             {searchState === 'ready' && results?.items.length === 0 && (
               <section className="persona-memory-list-empty compact">
-                <Search aria-hidden="true" /><strong>没有相关记忆</strong><p>换一个更具体的线索试试。</p>
+                {browsing ? (
+                  <>
+                    <BookHeart aria-hidden="true" /><strong>还没有长期记忆</strong><p>记录过的事实会显示在这里，也可以搜索具体线索。</p>
+                  </>
+                ) : (
+                  <>
+                    <Search aria-hidden="true" /><strong>没有相关记忆</strong><p>换一个更具体的线索试试。</p>
+                  </>
+                )}
               </section>
             )}
             {results?.items.map((item: MemoryQueryItem) => (
@@ -513,6 +547,10 @@ export function PersonaMemoryPanel({
               >
                 <span><em>{CATEGORY_LABELS[item.category]}</em><em>{IMPORTANCE_LABELS[item.importance]}</em></span>
                 <strong>{item.content}</strong>
+                <span className="memory-taxonomy">
+                  <em>{FACET_LABELS[item.facet]}</em>
+                  {item.keywords.map((keyword) => <em key={keyword}>{keyword}</em>)}
+                </span>
                 <small>{formatMemoryTime(item.recorded_at)} · {CHANGE_LABELS[item.change_type]}</small>
                 <ChevronRight aria-hidden="true" />
               </button>
@@ -524,7 +562,7 @@ export function PersonaMemoryPanel({
                 disabled={searchState === 'loading'}
                 onClick={() => void performSearch({ cursor: results.next_cursor, append: true })}
               >
-                继续查找
+                {browsing ? '加载更多' : '继续查找'}
               </button>
             )}
           </div>
@@ -577,6 +615,8 @@ export function PersonaMemoryPanel({
                 <div><dt>重要程度</dt><dd><select aria-label="调整记忆重要程度" value={detail.entry.importance} disabled={mutationBusy} onChange={(event) => void changeImportance(event.target.value as MemoryImportance)}>{Object.entries(IMPORTANCE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></dd></div>
                 <div><dt>记录时间</dt><dd>{formatMemoryTime(detail.current_revision.recorded_at)}</dd></div>
                 <div><dt>发生时间</dt><dd>{formatMemoryTime(detail.current_revision.event_time)}</dd></div>
+                <div><dt>记忆分面</dt><dd>{FACET_LABELS[detail.current_revision.facet]}</dd></div>
+                <div><dt>关键词</dt><dd>{detail.current_revision.keywords.join('、') || '未标注'}</dd></div>
                 <div><dt>当前版本</dt><dd title={detail.entry.current_revision_id}>{detail.entry.current_revision_id.slice(0, 18)}…</dd></div>
               </dl>
 

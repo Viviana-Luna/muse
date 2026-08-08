@@ -39,6 +39,15 @@ describe('长期记忆 API', () => {
     );
   });
 
+  it('空关键词走浏览模式，不携带 query 参数', async () => {
+    await searchPersonaMemories('alice', { query: '  ' });
+
+    expect(client.apiFetch).toHaveBeenCalledWith(
+      '/api/personas/alice/memories',
+      { signal: undefined }
+    );
+  });
+
   it('详情与历史接口编码 memory_id', async () => {
     await fetchPersonaMemory('alice', 'memory/1');
     await fetchPersonaMemoryHistory('alice', 'memory/1');

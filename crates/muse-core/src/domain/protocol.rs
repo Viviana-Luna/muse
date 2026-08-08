@@ -62,6 +62,22 @@ pub enum RuntimeEvent {
         detail: Option<String>,
         state: String,
     },
+    /// 长期记忆批次的结构化活动状态；不包含记忆正文。
+    MemoryActivity {
+        phase: String,
+        state: String,
+        staged_count: usize,
+        saved_count: usize,
+        skipped_count: usize,
+        rejected_count: usize,
+        reason_code: Option<String>,
+    },
+    /// 长期记忆候选需要用户逐项确认；候选正文由通用问题事件承载。
+    MemoryConfirmationRequired {
+        turn_id: String,
+        call_id: String,
+        candidate_count: usize,
+    },
     ReasoningDelta {
         content: String,
     },

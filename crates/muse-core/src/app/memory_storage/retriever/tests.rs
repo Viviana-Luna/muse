@@ -126,6 +126,58 @@ fn stage_create(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn stage_structured_create(
+    scope: &MemoryPersonaScope,
+    conversation_id: &str,
+    turn_id: &str,
+    operation_id: &str,
+    memory_id: &str,
+    revision_id: &str,
+    facet: crate::domain::memory::MemoryFacet,
+    keywords: &[&str],
+    content: &str,
+    time: &str,
+) -> MemoryStagedMutation {
+    let source_quote = "我喜欢这条结构化检索测试记忆";
+    let eligibility = MemorySourceEligibility::verify_direct_user_quote(
+        scope.clone(),
+        conversation_id,
+        turn_id,
+        operation_id,
+        source_quote,
+        source_quote,
+    )
+    .expect("结构化测试来源应可验证");
+    let binding =
+        MemoryRuntimeBinding::new(eligibility, time, time, time).expect("runtime binding 应有效");
+    let proposal = crate::domain::memory::MemoryMutationProposal {
+        operation: MemoryChangeType::Create,
+        source_quote: Some(source_quote.to_string()),
+        category: MemoryCategory::UserPreference,
+        facet,
+        keywords: keywords
+            .iter()
+            .map(|keyword| (*keyword).to_string())
+            .collect(),
+        content: content.to_string(),
+        importance: MemoryImportance::Normal,
+        event_time: None,
+        change_reason: "测试结构化召回".to_string(),
+        confirmation: crate::domain::memory::MemoryConfirmationMode::NotRequired,
+        memory_id: None,
+        expected_revision_id: None,
+    };
+    MemoryStagedMutation::stage_proposal(
+        &proposal,
+        binding,
+        MemoryId(memory_id.to_string()),
+        MemoryRevisionId(revision_id.to_string()),
+        &AllowPolicy,
+    )
+    .expect("结构化候选应允许暂存")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stage_change(
     scope: &MemoryPersonaScope,
     conversation_id: &str,
@@ -401,6 +453,8 @@ fn request_for_turn_and_filters(
 ) -> MemoryRetrievalRequest {
     let params = MemoryQueryParams {
         query: query.to_string(),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit,
         cursor,
         as_of: as_of.map(str::to_string),
@@ -808,10 +862,10 @@ fn chinese_recall_baseline() {
     seed_eval_corpus(&repository, &scope);
     let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
 
-    // 多候选查询：权重排序高重要度在前，同重要度新鲜的在前。
+    // 多候选查询：词法相关度优先，其后才是重要程度与新鲜度。
     assert_eq!(
         retrieve_ids(&retriever, &scope, "用户早餐"),
-        vec!["m-eval-01", "m-eval-02", "m-eval-03"]
+        vec!["m-eval-03", "m-eval-01", "m-eval-02"]
     );
     // 精确语义查询只命中连续覆盖的记忆。
     assert_eq!(
@@ -841,6 +895,123 @@ fn chinese_recall_baseline() {
 }
 
 #[test]
+fn structured_facet_and_keyword_hits_bypass_lexical_coverage_and_bind_cursor() {
+    let directory = TestDirectory::new("structured-hybrid");
+    let repository = open_repository(&directory);
+    let scope = scope("structured-persona");
+    let conversation_id = "structured-conversation";
+    let turn_id = "structured-write-turn";
+    let mutations = vec![
+        stage_structured_create(
+            &scope,
+            conversation_id,
+            turn_id,
+            "structured-food-1",
+            "structured-food-1",
+            "structured-food-1-rev",
+            crate::domain::memory::MemoryFacet::PreferenceFood,
+            &["酸菜鱼", "食物偏好"],
+            "用户偏爱一道传统鱼菜。",
+            FRESH,
+        ),
+        stage_structured_create(
+            &scope,
+            conversation_id,
+            turn_id,
+            "structured-food-2",
+            "structured-food-2",
+            "structured-food-2-rev",
+            crate::domain::memory::MemoryFacet::PreferenceFood,
+            &["偏咸", "口味"],
+            "用户偏好味道更重的菜肴。",
+            AGE_3D,
+        ),
+        stage_structured_create(
+            &scope,
+            conversation_id,
+            turn_id,
+            "structured-drink",
+            "structured-drink",
+            "structured-drink-rev",
+            crate::domain::memory::MemoryFacet::PreferenceDrink,
+            &["咖啡", "埃塞", "水洗"],
+            "用户偏爱明亮花香的饮品。",
+            AGE_7D,
+        ),
+    ];
+    commit_batch(&repository, &scope, conversation_id, turn_id, mutations);
+    let retriever = SqliteMemoryRetriever::new(Arc::new(repository));
+    let turn = MemoryRetrievalTurn::from_runtime("structured-read-turn", "structured-read-nonce")
+        .expect("Turn 应有效");
+
+    let retrieve = |facets: Vec<crate::domain::memory::MemoryFacet>,
+                    keywords: Vec<String>,
+                    limit: Option<u32>,
+                    cursor: Option<MemoryCursor>| {
+        retriever.retrieve(
+            &MemoryRetrievalRequest::bind(
+                MemoryQueryParams {
+                    query: String::new(),
+                    facets,
+                    keywords,
+                    limit,
+                    cursor,
+                    as_of: None,
+                    memory_id: None,
+                    include_history: false,
+                },
+                scope.clone(),
+                turn.clone(),
+                MemoryRetrievalFilters::none(),
+            )
+            .expect("结构化检索请求应有效"),
+        )
+    };
+
+    let drink =
+        retrieve(Vec::new(), vec!["埃塞".to_string()], None, None).expect("关键词精确命中应召回");
+    assert_eq!(drink.items.len(), 1);
+    assert_eq!(drink.items[0].memory_id.0, "structured-drink");
+    assert_eq!(
+        drink.items[0].facet,
+        crate::domain::memory::MemoryFacet::PreferenceDrink
+    );
+
+    let first_food = retrieve(
+        vec![crate::domain::memory::MemoryFacet::PreferenceFood],
+        Vec::new(),
+        Some(1),
+        None,
+    )
+    .expect("facet 命中不应受正文连续覆盖率限制");
+    assert_eq!(first_food.items.len(), 1);
+    let cursor = first_food.next_cursor.expect("两个食物偏好应产生下一页");
+    let second_food = retrieve(
+        vec![crate::domain::memory::MemoryFacet::PreferenceFood],
+        Vec::new(),
+        Some(1),
+        Some(cursor.clone()),
+    )
+    .expect("原结构化条件应可续页");
+    assert_eq!(second_food.items.len(), 1);
+    assert_ne!(
+        second_food.items[0].memory_id,
+        first_food.items[0].memory_id
+    );
+
+    assert_eq!(
+        error_code(retrieve(
+            vec![crate::domain::memory::MemoryFacet::PreferenceDrink],
+            Vec::new(),
+            Some(1),
+            Some(cursor),
+        )),
+        MemoryErrorCode::InvalidCursor,
+        "游标必须绑定 facet 与关键词选择器"
+    );
+}
+
+#[test]
 fn english_and_unicode_recall_baseline() {
     let directory = TestDirectory::new("english-unicode");
     let repository = open_repository(&directory);
@@ -850,7 +1021,7 @@ fn english_and_unicode_recall_baseline() {
 
     assert_eq!(
         retrieve_ids(&retriever, &scope, "THE USER PREFERS"),
-        vec!["m-en-01", "m-en-02", "m-en-03"]
+        vec!["m-en-01", "m-en-03", "m-en-02"]
     );
     assert_eq!(retrieve_ids(&retriever, &scope, "CAFÉ"), vec!["m-en-02"]);
     assert_eq!(
@@ -910,6 +1081,8 @@ fn short_or_symbol_only_query_rejected() {
     let long_query = "早".repeat(crate::domain::memory::MAX_MEMORY_QUERY_CHARS + 1);
     let params = MemoryQueryParams {
         query: long_query,
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: None,
@@ -929,6 +1102,8 @@ fn short_or_symbol_only_query_rejected() {
     );
     let params = MemoryQueryParams {
         query: "😀".repeat(100),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: None,
@@ -3438,6 +3613,8 @@ fn scoring_and_paging_primitives() {
     // 页大小解析：默认值与上限均由集中常量控制。
     let params = |limit| MemoryQueryParams {
         query: "用户早餐".to_string(),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit,
         cursor: None,
         as_of: None,
@@ -3448,7 +3625,7 @@ fn scoring_and_paging_primitives() {
     assert_eq!(page_size(&params(Some(3))), 3);
     assert_eq!(page_size(&params(Some(1000))), MAX_MEMORY_QUERY_PAGE_SIZE);
 
-    // 同权重排序：相关度（bm25 低者优）优先，其次更新时间，最后稳定 ID。
+    // 排序：相关度（bm25 低者优）优先，其后才是权重、更新时间和稳定 ID。
     let entry = MemoryEntry {
         memory_id: MemoryId("m-x".to_string()),
         persona_id: "p".to_string(),
@@ -3462,6 +3639,8 @@ fn scoring_and_paging_primitives() {
     let revision = |id: &str| MemoryRevision {
         revision_id: MemoryRevisionId(id.to_string()),
         memory_id: MemoryId("m-x".to_string()),
+        facet: crate::domain::memory::MemoryFacet::Other,
+        keywords: vec!["内容".to_string()],
         content: "内容".to_string(),
         event_time: None,
         recorded_at: FRESH.to_string(),
@@ -3492,7 +3671,7 @@ fn scoring_and_paging_primitives() {
     ];
     items.sort_by(compare_frozen_items);
     let ordered: Vec<&str> = items.iter().map(|item| item.memory_id.0.as_str()).collect();
-    assert_eq!(ordered, vec!["m-d", "m-c", "m-a", "m-b"]);
+    assert_eq!(ordered, vec!["m-c", "m-a", "m-b", "m-d"]);
 
     // 游标解析：合法形态往返成功，畸形一律 memory_cursor_invalid。
     let legal = format!("mqc1.0123456789abcdef.89abcdef01234567.{}", "0".repeat(64));
@@ -3808,6 +3987,8 @@ fn fixed_bilingual_corpus_evaluation() {
     let normalized = normalize_memory_fts_query("用户早餐").expect("查询应可规范化");
     let params = MemoryQueryParams {
         query: "用户早餐".to_string(),
+        facets: Vec::new(),
+        keywords: Vec::new(),
         limit: None,
         cursor: None,
         as_of: None,
@@ -3829,11 +4010,11 @@ fn fixed_bilingual_corpus_evaluation() {
         .build_frozen_items(&evaluation_request, &normalized, evaluation_now)
         .expect("冻结构建应成功");
     assert_eq!(items.len(), 3);
-    assert_eq!(items[0].memory_id.0, "m-eval-01");
-    assert_eq!(items[1].memory_id.0, "m-eval-02");
-    assert_eq!(items[2].memory_id.0, "m-eval-03");
-    assert!(items[0].effective_weight > items[1].effective_weight);
+    assert_eq!(items[0].memory_id.0, "m-eval-03");
+    assert_eq!(items[1].memory_id.0, "m-eval-01");
+    assert_eq!(items[2].memory_id.0, "m-eval-02");
     assert!(items[1].effective_weight > items[2].effective_weight);
+    assert!(items[2].effective_weight > items[0].effective_weight);
     for item in &items {
         println!(
             "EVAL|rank id={} importance={:?} weight={:.4} tokens={}",

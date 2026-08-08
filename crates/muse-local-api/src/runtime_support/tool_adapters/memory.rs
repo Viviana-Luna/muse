@@ -7,16 +7,24 @@
 use super::*;
 
 use muse_core::domain::memory::{
-    ConfirmedMemoryDeleteRequest, MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME,
-    MEMORY_QUERY_TOOL_NAME, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
-    MemoryDeleteParams, MemoryError, MemoryErrorCode, MemoryId, MemoryMutateParams,
-    MemoryPersonaScope, MemoryQueryParams, MemoryRetrievalFilters, MemoryRetrievalRequest,
-    MemoryRevisionId, MemoryStagedMutation,
+    ConfirmedMemoryDeleteRequest, MAX_MEMORY_MUTATIONS, MEMORY_DELETE_TOOL_NAME,
+    MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME, MemoryConfirmationMode,
+    MemoryDeleteConfirmation, MemoryDeleteConfirmationSource, MemoryDeleteParams, MemoryError,
+    MemoryErrorCode, MemoryId, MemoryMutateRequest, MemoryMutationBatchReceipt,
+    MemoryMutationBatchState, MemoryMutationItemReceipt, MemoryMutationItemState,
+    MemoryMutationProposal, MemoryPersonaScope, MemoryQueryParams, MemoryRetrievalFilters,
+    MemoryRetrievalRequest, MemoryRevisionId, MemoryStagedMutation,
 };
 
 pub(in crate::runtime_support) struct MemoryQueryHandler;
 pub(in crate::runtime_support) struct MemoryMutateHandler;
 pub(in crate::runtime_support) struct MemoryDeleteHandler;
+
+type IndexedMemoryMutationProposal = (usize, MemoryMutationProposal);
+type ParsedMemoryMutationBatch = (
+    Vec<IndexedMemoryMutationProposal>,
+    Vec<MemoryMutationItemReceipt>,
+);
 
 pub(in crate::runtime_support) static MEMORY_QUERY_HANDLER: MemoryQueryHandler = MemoryQueryHandler;
 pub(in crate::runtime_support) static MEMORY_MUTATE_HANDLER: MemoryMutateHandler =
@@ -26,6 +34,21 @@ pub(in crate::runtime_support) static MEMORY_DELETE_HANDLER: MemoryDeleteHandler
 
 fn memory_tool_failed(error: MemoryError) -> ToolResult {
     memory_tool_failure(error.code())
+}
+
+/// memory_mutate 专用失败形态：除稳定错误码外，显式要求模型不得声称已保存。
+///
+/// 模型收到失败收据后仍可能按角色习惯回复“记下了”；把“未保存”写进失败正文，
+/// 让如实转述成为默认行为，而不是依赖模型自行推理。
+pub(in crate::runtime_support) fn memory_mutate_failure(code: MemoryErrorCode) -> ToolResult {
+    ToolResult {
+        status: ToolResultStatus::Failed,
+        content: format!(
+            "{} 本次没有保存任何记忆，回复中不得声称已记住、已记录或已保存。",
+            MemoryError::new(code)
+        ),
+        structured: Some(serde_json::json!({ "error_code": code })),
+    }
 }
 
 /// 记忆工具专用失败包装：模型、SSE 与 Session 消费端只依赖同一个稳定字段。
@@ -164,9 +187,18 @@ impl RuntimeToolHandler for MemoryMutateHandler {
     }
 
     fn validate_input(&self, call: &ToolCall) -> Result<(), ToolResult> {
-        let params: MemoryMutateParams = serde_json::from_value(call.arguments.clone())
-            .map_err(|_| memory_tool_failure(MemoryErrorCode::InvalidRequest))?;
-        params.validate().map_err(memory_tool_failed)
+        if let Some(mutations) = call.arguments.get("mutations") {
+            let Some(mutations) = mutations.as_array() else {
+                return Err(memory_mutate_failure(MemoryErrorCode::InvalidRequest));
+            };
+            if mutations.is_empty() || mutations.len() > MAX_MEMORY_MUTATIONS {
+                return Err(memory_mutate_failure(MemoryErrorCode::InvalidRequest));
+            }
+            return Ok(());
+        }
+        serde_json::from_value::<MemoryMutateRequest>(call.arguments.clone())
+            .map(|_| ())
+            .map_err(|_| memory_mutate_failure(MemoryErrorCode::InvalidRequest))
     }
 
     fn check_permissions(
@@ -192,8 +224,10 @@ impl RuntimeToolHandler for MemoryMutateHandler {
         Box::pin(async move {
             let RuntimeToolInvocation {
                 state,
+                tx,
                 turn,
                 call,
+                cancel_token,
                 memory_turn,
                 conversation,
                 ..
@@ -203,53 +237,411 @@ impl RuntimeToolHandler for MemoryMutateHandler {
                     MemoryErrorCode::RepositoryUnavailable,
                 ));
             };
-            let Ok(params) = serde_json::from_value::<MemoryMutateParams>(call.arguments.clone())
-            else {
-                return memory_tool_failure(MemoryErrorCode::InvalidRequest);
+            let (proposals, mut receipts) = match parse_memory_mutation_proposals(&call.arguments) {
+                Ok(parsed) => parsed,
+                Err(result) => return result,
             };
-            // 来源资格由 Turn 开始时冻结的 API 用户输入签发，候选事实还必须能在
-            // 当前最新用户消息的统一规范化正文中确定性验证；模型不能自报来源。
             let scope = match memory_scope_for_turn(turn, MemoryErrorCode::SourceIneligible) {
                 Ok(scope) => scope,
                 Err(result) => return result,
             };
+            let confirmation_questions = proposals
+                .iter()
+                .filter(|(_, proposal)| proposal.confirmation == MemoryConfirmationMode::AskUser)
+                .map(|(index, proposal)| {
+                    let question = format!(
+                        "是否保存这条记忆？\n原文：{}\n摘要：{}",
+                        proposal
+                            .source_quote
+                            .as_deref()
+                            .unwrap_or("[旧格式未提供原文锚点]"),
+                        proposal.content
+                    );
+                    (
+                        *index,
+                        question.clone(),
+                        AskUserQuestionItem {
+                            question,
+                            header: format!("确认记忆 {}", index + 1),
+                            options: vec![
+                                AskUserQuestionOption {
+                                    label: "确认保存".to_string(),
+                                    description: "确认该摘要准确表达了你的原意。".to_string(),
+                                },
+                                AskUserQuestionOption {
+                                    label: "跳过".to_string(),
+                                    description: "本轮不保存这条候选记忆。".to_string(),
+                                },
+                            ],
+                            multi_select: false,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut confirmed = std::collections::BTreeSet::new();
+            if !confirmation_questions.is_empty() {
+                if let Some(tx) = tx {
+                    let _ = emit_json_event(
+                        tx,
+                        runtime_event_payload(RuntimeEvent::MemoryConfirmationRequired {
+                            turn_id: turn.turn_id.clone(),
+                            call_id: call.call_id.clone(),
+                            candidate_count: confirmation_questions.len(),
+                        }),
+                    )
+                    .await;
+                }
+                let request = AskUserQuestionRequest {
+                    questions: confirmation_questions
+                        .iter()
+                        .map(|(_, _, question)| question.clone())
+                        .collect(),
+                };
+                let decision = match wait_for_user_question_answer(
+                    state,
+                    tx,
+                    turn,
+                    call,
+                    &request,
+                    cancel_token,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(_) => muse_runtime::interactions::UserQuestionDecision {
+                        answered: false,
+                        answers: None,
+                        annotations: None,
+                        reason: Some("memory_confirmation_interrupted".to_string()),
+                    },
+                };
+                if decision.answered
+                    && let Some(answers) = decision
+                        .answers
+                        .as_ref()
+                        .and_then(|value| value.as_object())
+                {
+                    for (index, question, _) in &confirmation_questions {
+                        let accepted = answers.get(question).is_some_and(|answer| match answer {
+                            serde_json::Value::String(value) => value == "确认保存",
+                            serde_json::Value::Array(values) => values
+                                .iter()
+                                .any(|value| value.as_str() == Some("确认保存")),
+                            _ => false,
+                        });
+                        if accepted {
+                            confirmed.insert(*index);
+                        }
+                    }
+                }
+            }
             let now = chrono::Utc::now().to_rfc3339();
-            let binding = match memory_turn.bind_direct_user_mutation(
-                scope,
-                &turn.conversation_id,
-                &turn.turn_id,
-                &call.call_id,
-                params.content(),
-                &now,
-                conversation,
-            ) {
-                Ok(binding) => binding,
-                Err(error) => return memory_tool_failed(error),
+            for (index, proposal) in proposals {
+                if proposal.confirmation == MemoryConfirmationMode::AskUser
+                    && !confirmed.contains(&index)
+                {
+                    receipts.push(memory_item_receipt(
+                        index,
+                        MemoryMutationItemState::Skipped,
+                        Some(&proposal),
+                        None,
+                        None,
+                        Some("memory_confirmation_skipped"),
+                        Some("confirmation"),
+                    ));
+                    continue;
+                }
+                let operation_call_id = format!("{}-{index}", call.call_id);
+                let binding = match proposal.source_quote.as_deref() {
+                    Some(source_quote)
+                        if proposal.confirmation == MemoryConfirmationMode::AskUser =>
+                    {
+                        memory_turn.bind_confirmed_user_mutation(
+                            scope.clone(),
+                            &turn.conversation_id,
+                            &turn.turn_id,
+                            &operation_call_id,
+                            source_quote,
+                            &now,
+                            conversation,
+                        )
+                    }
+                    Some(source_quote) => memory_turn.bind_direct_user_quote_mutation(
+                        scope.clone(),
+                        &turn.conversation_id,
+                        &turn.turn_id,
+                        &operation_call_id,
+                        source_quote,
+                        &now,
+                        conversation,
+                    ),
+                    None => memory_turn.bind_direct_user_mutation(
+                        scope.clone(),
+                        &turn.conversation_id,
+                        &turn.turn_id,
+                        &operation_call_id,
+                        &proposal.content,
+                        &now,
+                        conversation,
+                    ),
+                };
+                let binding = match binding {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        receipts.push(memory_item_receipt(
+                            index,
+                            MemoryMutationItemState::Rejected,
+                            Some(&proposal),
+                            None,
+                            None,
+                            Some(memory_error_code_value(error.code())),
+                            Some("source_quote"),
+                        ));
+                        continue;
+                    }
+                };
+                let params = match proposal.to_params() {
+                    Ok(params) => params,
+                    Err(error) => {
+                        receipts.push(memory_item_receipt(
+                            index,
+                            MemoryMutationItemState::Rejected,
+                            Some(&proposal),
+                            None,
+                            None,
+                            Some(memory_error_code_value(error.code())),
+                            Some("mutations"),
+                        ));
+                        continue;
+                    }
+                };
+                let assigned_memory_id = params
+                    .memory_id()
+                    .cloned()
+                    .unwrap_or_else(|| MemoryId(next_runtime_id("memory")));
+                let assigned_revision_id = MemoryRevisionId(next_runtime_id("memory-rev"));
+                let staged = match MemoryStagedMutation::stage_proposal(
+                    &proposal,
+                    binding,
+                    assigned_memory_id.clone(),
+                    assigned_revision_id.clone(),
+                    services.sensitivity.as_ref(),
+                ) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        receipts.push(memory_item_receipt(
+                            index,
+                            MemoryMutationItemState::Rejected,
+                            Some(&proposal),
+                            None,
+                            None,
+                            Some(memory_error_code_value(error.code())),
+                            Some("content"),
+                        ));
+                        continue;
+                    }
+                };
+                memory_turn.stage(staged);
+                receipts.push(memory_item_receipt(
+                    index,
+                    MemoryMutationItemState::Staged,
+                    Some(&proposal),
+                    Some(assigned_memory_id),
+                    Some(assigned_revision_id),
+                    None,
+                    None,
+                ));
+            }
+            receipts.sort_by_key(|receipt| receipt.index);
+            let staged_count = receipts
+                .iter()
+                .filter(|receipt| receipt.state == MemoryMutationItemState::Staged)
+                .count();
+            let skipped_count = receipts
+                .iter()
+                .filter(|receipt| receipt.state == MemoryMutationItemState::Skipped)
+                .count();
+            let rejected_count = receipts
+                .iter()
+                .filter(|receipt| receipt.state == MemoryMutationItemState::Rejected)
+                .count();
+            let confirmation_required_count = confirmation_questions.len();
+            let state_value = if staged_count == 0 {
+                MemoryMutationBatchState::Rejected
+            } else if skipped_count > 0 || rejected_count > 0 {
+                MemoryMutationBatchState::Partial
+            } else {
+                MemoryMutationBatchState::Staged
             };
-            let assigned_memory_id = params
-                .memory_id()
-                .cloned()
-                .unwrap_or_else(|| MemoryId(next_runtime_id("memory")));
-            let assigned_revision_id = MemoryRevisionId(next_runtime_id("memory-rev"));
-            let staged = match MemoryStagedMutation::stage(
-                params,
-                binding,
-                assigned_memory_id,
-                assigned_revision_id,
-                services.sensitivity.as_ref(),
-            ) {
-                Ok(staged) => staged,
-                Err(error) => return memory_tool_failed(error),
+            let receipt = MemoryMutationBatchReceipt {
+                state: state_value,
+                staged_count,
+                confirmation_required_count,
+                rejected_count,
+                skipped_count,
+                items: receipts,
             };
-            let receipt = staged.staged_receipt();
-            memory_turn.stage(staged);
             ToolResult {
-                status: ToolResultStatus::Success,
-                // staged 只表示已接受、等待本轮提交，绝不能向模型承诺已 durable。
-                content: "已暂存，等待本轮对话可靠提交后生效。".to_string(),
+                status: if staged_count > 0 {
+                    ToolResultStatus::Success
+                } else {
+                    ToolResultStatus::Failed
+                },
+                content: if staged_count > 0 {
+                    format!(
+                        "已暂存 {staged_count} 条记忆候选，等待本轮可靠提交；跳过 {skipped_count} 条，拒绝 {rejected_count} 条。不得声称已经保存。"
+                    )
+                } else {
+                    format!(
+                        "本轮没有可暂存的记忆；跳过 {skipped_count} 条，拒绝 {rejected_count} 条。不得声称已经保存。"
+                    )
+                },
                 structured: serde_json::to_value(&receipt).ok(),
             }
         })
+    }
+}
+
+fn parse_memory_mutation_proposals(
+    arguments: &serde_json::Value,
+) -> Result<ParsedMemoryMutationBatch, ToolResult> {
+    if let Some(values) = arguments.get("mutations") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| memory_mutate_failure(MemoryErrorCode::InvalidRequest))?;
+        if values.is_empty() || values.len() > MAX_MEMORY_MUTATIONS {
+            return Err(memory_mutate_failure(MemoryErrorCode::InvalidRequest));
+        }
+        let mut proposals = Vec::new();
+        let mut receipts = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            match serde_json::from_value::<MemoryMutationProposal>(value.clone()) {
+                Ok(proposal) => match proposal.validate() {
+                    Ok(()) => proposals.push((index, proposal)),
+                    Err(error) => receipts.push(memory_item_receipt(
+                        index,
+                        MemoryMutationItemState::Rejected,
+                        Some(&proposal),
+                        None,
+                        None,
+                        Some(memory_error_code_value(error.code())),
+                        Some(memory_proposal_field_path(&proposal)),
+                    )),
+                },
+                Err(_) => receipts.push(memory_item_receipt(
+                    index,
+                    MemoryMutationItemState::Rejected,
+                    None,
+                    None,
+                    None,
+                    Some("memory_invalid_request"),
+                    Some("mutations"),
+                )),
+            }
+        }
+        return Ok((proposals, receipts));
+    }
+    let request = serde_json::from_value::<MemoryMutateRequest>(arguments.clone())
+        .map_err(|_| memory_mutate_failure(MemoryErrorCode::InvalidRequest))?;
+    Ok((
+        request.mutations.into_iter().enumerate().collect(),
+        Vec::new(),
+    ))
+}
+
+fn memory_proposal_field_path(proposal: &MemoryMutationProposal) -> &'static str {
+    if proposal.content.trim().is_empty() {
+        return "content";
+    }
+    if proposal.change_reason.trim().is_empty() {
+        return "change_reason";
+    }
+    if proposal
+        .source_quote
+        .as_deref()
+        .is_some_and(|source_quote| source_quote.trim().is_empty())
+    {
+        return "source_quote";
+    }
+    if proposal.keywords.is_empty()
+        || proposal
+            .keywords
+            .iter()
+            .any(|keyword| keyword.trim().is_empty())
+    {
+        return "keywords";
+    }
+    if !proposal.facet.is_compatible_with(proposal.category) {
+        return "facet";
+    }
+    if proposal
+        .event_time
+        .as_deref()
+        .is_some_and(|event_time| chrono::DateTime::parse_from_rfc3339(event_time).is_err())
+    {
+        return "event_time";
+    }
+    match proposal.operation {
+        muse_core::domain::memory::MemoryChangeType::Create
+            if proposal.memory_id.is_some() || proposal.expected_revision_id.is_some() =>
+        {
+            "operation"
+        }
+        muse_core::domain::memory::MemoryChangeType::Update
+        | muse_core::domain::memory::MemoryChangeType::Correct
+            if proposal.memory_id.is_none() =>
+        {
+            "memory_id"
+        }
+        muse_core::domain::memory::MemoryChangeType::Update
+        | muse_core::domain::memory::MemoryChangeType::Correct
+            if proposal.expected_revision_id.is_none() =>
+        {
+            "expected_revision_id"
+        }
+        _ => "mutations",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn memory_item_receipt(
+    index: usize,
+    state: MemoryMutationItemState,
+    proposal: Option<&MemoryMutationProposal>,
+    memory_id: Option<MemoryId>,
+    revision_id: Option<MemoryRevisionId>,
+    reason_code: Option<&str>,
+    field_path: Option<&str>,
+) -> MemoryMutationItemReceipt {
+    MemoryMutationItemReceipt {
+        index,
+        state,
+        operation: proposal.map(|proposal| proposal.operation),
+        memory_id,
+        revision_id,
+        reason_code: reason_code.map(str::to_string),
+        field_path: field_path.map(|field| format!("mutations[{index}].{field}")),
+    }
+}
+
+fn memory_error_code_value(code: MemoryErrorCode) -> &'static str {
+    match code {
+        MemoryErrorCode::InvalidRequest => "memory_invalid_request",
+        MemoryErrorCode::InvalidStateTransition => "memory_invalid_state_transition",
+        MemoryErrorCode::MemoryNotFound => "memory_not_found",
+        MemoryErrorCode::RevisionConflict => "memory_revision_conflict",
+        MemoryErrorCode::PersonaScopeMismatch => "memory_persona_scope_mismatch",
+        MemoryErrorCode::SourceIneligible => "memory_source_ineligible",
+        MemoryErrorCode::SensitiveContentRejected => "memory_sensitive_content_rejected",
+        MemoryErrorCode::SensitivityUnavailable => "memory_sensitivity_unavailable",
+        MemoryErrorCode::InvalidCursor => "memory_cursor_invalid",
+        MemoryErrorCode::CursorExpired => "memory_cursor_expired",
+        MemoryErrorCode::QueryRejected => "memory_query_rejected",
+        MemoryErrorCode::QueryBudgetExceeded => "memory_query_budget_exceeded",
+        MemoryErrorCode::DeleteConfirmationRequired => "memory_delete_confirmation_required",
+        MemoryErrorCode::DeletionAuthorityUnavailable => "memory_deletion_authority_unavailable",
+        MemoryErrorCode::DeletionIncomplete => "memory_deletion_incomplete",
+        MemoryErrorCode::RepositoryUnavailable => "memory_repository_unavailable",
     }
 }
 
@@ -410,6 +802,51 @@ mod tests {
                 serde_json::json!(code)
             );
         }
+    }
+
+    #[test]
+    fn batch_parser_keeps_valid_items_when_another_item_is_invalid() {
+        let (proposals, receipts) = parse_memory_mutation_proposals(&serde_json::json!({
+            "mutations": [
+                {
+                    "operation": "create",
+                    "source_quote": "我喜欢吃酸菜鱼",
+                    "category": "user_preference",
+                    "facet": "preference_food",
+                    "keywords": ["酸菜鱼", "食物偏好"],
+                    "content": "用户喜欢吃酸菜鱼。",
+                    "importance": "normal",
+                    "change_reason": "用户直接表达饮食偏好",
+                    "confirmation": "not_required"
+                },
+                {
+                    "operation": "create",
+                    "source_quote": "我喜欢喝咖啡",
+                    "category": "user_preference",
+                    "facet": "preference_drink",
+                    "keywords": [],
+                    "content": "用户喜欢喝咖啡。",
+                    "importance": "normal",
+                    "change_reason": "用户直接表达饮品偏好",
+                    "confirmation": "not_required"
+                }
+            ]
+        }))
+        .expect("批量 envelope 应可解析");
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].0, 0);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].index, 1);
+        assert_eq!(receipts[0].state, MemoryMutationItemState::Rejected);
+        assert_eq!(
+            receipts[0].reason_code.as_deref(),
+            Some("memory_invalid_request")
+        );
+        assert_eq!(
+            receipts[0].field_path.as_deref(),
+            Some("mutations[1].keywords")
+        );
     }
 
     #[test]

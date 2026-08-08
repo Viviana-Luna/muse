@@ -13,7 +13,7 @@ const RUNTIME_DATABASE_FILE: &str = "muse.sqlite";
 const LEGACY_RUNTIME_DATABASE_FILE: &str = "agent-vp.sqlite";
 const RUNTIME_DATABASE_DIR: &str = "runtime";
 const RUNTIME_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 9;
+const LATEST_RUNTIME_SCHEMA_MIGRATION: i64 = 10;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// 统一运行时数据库初始化、连接或迁移错误。
@@ -452,6 +452,49 @@ const RUNTIME_MIGRATIONS: &[RuntimeMigration] = &[
                 ADD COLUMN importance TEXT NOT NULL CHECK (
                     importance IN ('low', 'normal', 'high')
                 );
+        "#,
+    },
+    RuntimeMigration {
+        version: 10,
+        name: "memory_facets_and_keywords",
+        // facet 是每个 revision 的检索快照；关键词使用规范化子表，避免把数组
+        // 序列化格式变成查询事实源。旧记录只按 category 回填保守 facet，关键词
+        // 保持为空，不调用模型重写历史数据。
+        sql: r#"
+            ALTER TABLE memory_revision
+                ADD COLUMN facet TEXT NOT NULL DEFAULT 'other' CHECK (
+                    facet IN (
+                        'identity', 'timezone', 'location', 'occupation',
+                        'preference_food', 'preference_drink',
+                        'preference_communication', 'preference_tool',
+                        'preference_other', 'habit', 'plan', 'shared_experience',
+                        'commitment', 'story_state', 'other'
+                    )
+                );
+            UPDATE memory_revision
+               SET facet = CASE category
+                   WHEN 'user_preference' THEN 'preference_other'
+                   WHEN 'shared_experience' THEN 'shared_experience'
+                   WHEN 'commitment' THEN 'commitment'
+                   WHEN 'story_state' THEN 'story_state'
+                   ELSE 'other'
+               END;
+            CREATE TABLE memory_revision_keyword (
+                persona_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                keyword_ordinal INTEGER NOT NULL CHECK (keyword_ordinal BETWEEN 0 AND 7),
+                keyword TEXT NOT NULL CHECK (
+                    length(keyword) > 0 AND length(CAST(keyword AS BLOB)) <= 128
+                ),
+                PRIMARY KEY(persona_id, memory_id, revision_id, keyword_ordinal),
+                UNIQUE(persona_id, memory_id, revision_id, keyword),
+                FOREIGN KEY(persona_id, memory_id, revision_id)
+                    REFERENCES memory_revision(persona_id, memory_id, revision_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX memory_revision_keyword_persona_keyword
+                ON memory_revision_keyword(persona_id, keyword, memory_id, revision_id);
         "#,
     },
 ];
@@ -1121,10 +1164,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("应记录最新 migration");
-        assert_eq!(
-            migration,
-            (9, "memory_revision_attribute_snapshots".to_string())
-        );
+        assert_eq!(migration, (10, "memory_facets_and_keywords".to_string()));
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1162,7 +1202,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取 migration 数量");
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
         let recoverable_column: i64 = reopened
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('session_index') WHERE name = 'recoverable'",
@@ -1248,7 +1288,7 @@ mod tests {
                 row.get(0)
             })
             .expect("应读取最新 migration");
-        assert_eq!(latest, 9);
+        assert_eq!(latest, 10);
         drop(migrated);
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }

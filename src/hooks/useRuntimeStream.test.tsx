@@ -138,6 +138,25 @@ describe('useRuntimeStream 交互恢复', () => {
         }
       });
       emit({
+        type: 'memory_activity',
+        phase: 'memory_mutation_staged',
+        state: 'active',
+        staged_count: 1,
+        saved_count: 0,
+        skipped_count: 1,
+        rejected_count: 0
+      });
+      emit({
+        type: 'memory_activity',
+        phase: 'memory_commit_completed',
+        state: 'completed',
+        staged_count: 0,
+        saved_count: 1,
+        skipped_count: 0,
+        rejected_count: 0
+      });
+      // 旧事件仍由后端兼容发送，新前端在同轮结构化事件后必须抑制它。
+      emit({
         type: 'status',
         phase: 'memory_commit_completed',
         message: '本次记忆已保存。',
@@ -159,7 +178,7 @@ describe('useRuntimeStream 交互恢复', () => {
           revisionId: 'revision-2'
         })]
       }),
-      expect.objectContaining({ kind: 'commit', count: 1 })
+      expect.objectContaining({ kind: 'commit', count: 1, skippedCount: 1 })
     ]);
     expect(JSON.stringify(activities)).not.toContain('正文只交给当前模型');
   });

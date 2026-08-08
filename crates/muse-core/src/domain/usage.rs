@@ -422,6 +422,7 @@ fn inspect_history_database(
                         | "memory_authority_anchor"
                         | "memory_entry"
                         | "memory_revision"
+                        | "memory_revision_keyword"
                         | "memory_revision_source"
                         | "memory_committed_batch"
                         | "memory_committed_operation"

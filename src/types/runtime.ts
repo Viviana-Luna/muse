@@ -256,6 +256,24 @@ export interface RuntimeStatusEvent extends RuntimeEventBase {
   type: 'status';
 }
 
+// 长期记忆批次的结构化状态，不携带记忆正文。
+export interface RuntimeMemoryActivityEvent extends RuntimeEventBase {
+  type: 'memory_activity';
+  staged_count?: number;
+  saved_count?: number;
+  skipped_count?: number;
+  rejected_count?: number;
+  reason_code?: string | null;
+}
+
+// 长期记忆候选需要用户确认；具体候选由随后的通用问题事件承载。
+export interface RuntimeMemoryConfirmationRequiredEvent extends RuntimeEventBase {
+  type: 'memory_confirmation_required';
+  turn_id?: string;
+  call_id?: string;
+  candidate_count?: number;
+}
+
 // 工具审批等待事件。
 export interface RuntimeApprovalEvent extends RuntimeEventBase {
   type: 'approval_pending';
@@ -546,6 +564,8 @@ export type RuntimeEvent =
   | RuntimeTokenUsageEvent
   | RuntimeContextSnapshotEvent
   | RuntimeStatusEvent
+  | RuntimeMemoryActivityEvent
+  | RuntimeMemoryConfirmationRequiredEvent
   | RuntimeApprovalEvent
   | RuntimeApprovalResolvedEvent
   | RuntimeApprovalReviewEvent

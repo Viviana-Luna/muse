@@ -87,7 +87,7 @@ impl OpenAiProvider {
         body["tools"] = serde_json::Value::Array(native_tools);
         body["tool_choice"] = serde_json::json!("auto");
         // 两个正式供应商都未声明 `parallel_tool_calls` 扩展参数，不能发送该字段。
-        // 响应侧仍会拒绝单响应内的多个工具调用，保持串行工具续轮边界。
+        // 响应侧仍按协议接受多个调用，但运行时会按 index 顺序串行执行。
     }
 
     fn chat_completions_messages(conversation: &Conversation) -> Vec<serde_json::Value> {
@@ -126,17 +126,31 @@ impl OpenAiProvider {
                 }
             };
 
-            // Chat Completions 的同一助手响应可以同时包含可见文本、推理和一个
+            // Chat Completions 的同一助手响应可以同时包含可见文本、推理和多个
             // 工具调用。运行时按事件保存成相邻消息；续轮时合并回原生形态，
-            // 避免把同一响应伪造成两个助手回合。
+            // 避免把同一响应伪造成多个助手回合。
             if message.role == Role::Assistant
                 && message.tool_call_id.is_some()
-                && let Some(previous) = messages.last_mut()
-                && previous.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                && previous.get("tool_calls").is_none()
+                && let Some(assistant_index) = messages.iter().rposition(|previous| {
+                    previous.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                })
+                && messages[assistant_index + 1..].iter().all(|following| {
+                    following.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                })
             {
-                previous["tool_calls"] = value["tool_calls"].clone();
-                if let Some(reasoning) = value.get("reasoning_content") {
+                let previous = &mut messages[assistant_index];
+                let mut next_calls = value["tool_calls"].as_array().cloned().unwrap_or_default();
+                if let Some(existing) = previous
+                    .get_mut("tool_calls")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    existing.append(&mut next_calls);
+                } else {
+                    previous["tool_calls"] = serde_json::Value::Array(next_calls);
+                }
+                if previous.get("reasoning_content").is_none()
+                    && let Some(reasoning) = value.get("reasoning_content")
+                {
                     previous["reasoning_content"] = reasoning.clone();
                 }
                 continue;
@@ -352,37 +366,40 @@ impl OpenAiProvider {
         Ok(())
     }
 
-    fn finalize_chat_completions_tool_call(
+    fn finalize_chat_completions_tool_calls(
         states: &mut BTreeMap<u64, StreamingToolCallState>,
-    ) -> Result<Option<ToolCall>, ChatModelError> {
-        let mut active = std::mem::take(states)
+    ) -> Result<Vec<ToolCall>, ChatModelError> {
+        let mut calls = Vec::new();
+        let mut call_ids = std::collections::BTreeSet::new();
+        for state in std::mem::take(states)
             .into_values()
             .filter(|state| state.active)
-            .collect::<Vec<_>>();
-        if active.len() > 1 {
-            return Err(ChatModelError::protocol_error(
-                "模型 API 返回了多个并行工具调用，当前运行时拒绝执行。",
-            ));
+        {
+            let call_id = state
+                .call_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ChatModelError::protocol_error("模型 API 工具调用缺少 call_id。"))?;
+            if !call_ids.insert(call_id.clone()) {
+                return Err(ChatModelError::protocol_error(
+                    "模型 API 返回了重复的工具调用 call_id。",
+                ));
+            }
+            let name = state
+                .name
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ChatModelError::protocol_error("模型 API 工具调用缺少 name。"))?;
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(&state.arguments).map_err(|_| {
+                    ChatModelError::protocol_error("模型 API 工具调用参数不是合法 JSON。")
+                })?;
+            calls.push(ToolCall {
+                call_id,
+                name,
+                arguments,
+                source: ToolCallSource::Native,
+            });
         }
-        let Some(state) = active.pop() else {
-            return Ok(None);
-        };
-        let call_id = state
-            .call_id
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| ChatModelError::protocol_error("模型 API 工具调用缺少 call_id。"))?;
-        let name = state
-            .name
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| ChatModelError::protocol_error("模型 API 工具调用缺少 name。"))?;
-        let arguments = serde_json::from_str::<serde_json::Value>(&state.arguments)
-            .map_err(|_| ChatModelError::protocol_error("模型 API 工具调用参数不是合法 JSON。"))?;
-        Ok(Some(ToolCall {
-            call_id,
-            name,
-            arguments,
-            source: ToolCallSource::Native,
-        }))
+        Ok(calls)
     }
 }
 
@@ -518,19 +535,20 @@ impl ChatModelProvider for OpenAiProvider {
                             if let Some(data) = line.strip_prefix("data: ") {
                                 let data = data.trim().to_string();
                                 if data == "[DONE]" {
-                                    match Self::finalize_chat_completions_tool_call(
+                                    match Self::finalize_chat_completions_tool_calls(
                                         &mut tool_call_states,
                                     ) {
-                                        Ok(Some(call)) => {
-                                            if tx
-                                                .send(Ok(ChatStreamEvent::ToolCall(call)))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
+                                        Ok(calls) => {
+                                            for call in calls {
+                                                if tx
+                                                    .send(Ok(ChatStreamEvent::ToolCall(call)))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
                                             }
                                         }
-                                        Ok(None) => {}
                                         Err(error) => {
                                             let _ = tx.send(Err(error)).await;
                                             return;
@@ -592,19 +610,23 @@ impl ChatModelProvider for OpenAiProvider {
                                             return;
                                         }
                                         if choice["finish_reason"].as_str() == Some("tool_calls") {
-                                            match Self::finalize_chat_completions_tool_call(
+                                            match Self::finalize_chat_completions_tool_calls(
                                                 &mut tool_call_states,
                                             ) {
-                                                Ok(Some(call)) => {
-                                                    if tx
-                                                        .send(Ok(ChatStreamEvent::ToolCall(call)))
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        return;
+                                                Ok(calls) if !calls.is_empty() => {
+                                                    for call in calls {
+                                                        if tx
+                                                            .send(Ok(ChatStreamEvent::ToolCall(
+                                                                call,
+                                                            )))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
                                                     }
                                                 }
-                                                Ok(None) => {
+                                                Ok(_) => {
                                                     let _ = tx
                                                     .send(Err(ChatModelError::protocol_error(
                                                         "模型 API 以工具调用结束，但未返回工具调用。",
@@ -635,13 +657,14 @@ impl ChatModelProvider for OpenAiProvider {
                     }
                 }
             }
-            match Self::finalize_chat_completions_tool_call(&mut tool_call_states) {
-                Ok(Some(call)) => {
-                    if tx.send(Ok(ChatStreamEvent::ToolCall(call))).await.is_err() {
-                        return;
+            match Self::finalize_chat_completions_tool_calls(&mut tool_call_states) {
+                Ok(calls) => {
+                    for call in calls {
+                        if tx.send(Ok(ChatStreamEvent::ToolCall(call))).await.is_err() {
+                            return;
+                        }
                     }
                 }
-                Ok(None) => {}
                 Err(error) => {
                     let _ = tx.send(Err(error)).await;
                     return;
@@ -833,6 +856,49 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_parallel_tool_continuation_merges_calls_and_keeps_all_results() {
+        let mut conversation = Conversation::new("系统提示".to_string(), 20);
+        conversation.add_user_message("同时查询上海天气和时间。".to_string());
+        conversation.add_assistant_message("我同时查询。".to_string());
+        conversation.add_assistant_tool_call_with_reasoning(
+            "call-weather".to_string(),
+            "weather".to_string(),
+            serde_json::json!({ "city": "上海" }),
+            Some("需要查询两个实时信息。".to_string()),
+        );
+        conversation.add_tool_result(
+            "call-weather".to_string(),
+            "weather".to_string(),
+            "晴，25℃".to_string(),
+        );
+        conversation.add_assistant_tool_call_with_reasoning(
+            "call-clock".to_string(),
+            "clock".to_string(),
+            serde_json::json!({ "timezone": "Asia/Shanghai" }),
+            Some("需要查询两个实时信息。".to_string()),
+        );
+        conversation.add_tool_result(
+            "call-clock".to_string(),
+            "clock".to_string(),
+            "14:00".to_string(),
+        );
+
+        let messages = OpenAiProvider::chat_completions_messages(&conversation);
+
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "我同时查询。");
+        assert_eq!(messages[2]["reasoning_content"], "需要查询两个实时信息。");
+        let calls = messages[2]["tool_calls"]
+            .as_array()
+            .expect("应合并工具调用");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call-weather");
+        assert_eq!(calls[1]["id"], "call-clock");
+        assert_eq!(messages[3]["tool_call_id"], "call-weather");
+        assert_eq!(messages[4]["tool_call_id"], "call-clock");
+    }
+
+    #[test]
     fn ordinary_deepseek_history_omits_previous_reasoning_content() {
         let mut conversation = Conversation::new("系统提示".to_string(), 20);
         conversation.add_user_message("第一轮问题".to_string());
@@ -870,9 +936,9 @@ mod tests {
             OpenAiProvider::collect_chat_completions_tool_deltas(event, &mut states)
                 .expect("单工具分片应能合并");
         }
-        let call = OpenAiProvider::finalize_chat_completions_tool_call(&mut states)
-            .expect("单工具调用应通过")
-            .expect("应生成工具调用");
+        let calls = OpenAiProvider::finalize_chat_completions_tool_calls(&mut states)
+            .expect("单工具调用应通过");
+        let call = calls.first().expect("应生成工具调用");
 
         assert_eq!(call.call_id, "call-weather");
         assert_eq!(call.name, "weather");
@@ -880,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_chat_tool_fixture_fails_closed_before_emitting_a_call() {
+    fn parallel_chat_tool_fixture_is_reassembled_in_index_order() {
         let events: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("fixtures/openai_chat_parallel_tools.json"))
                 .expect("fixture 应为合法 JSON");
@@ -890,10 +956,100 @@ mod tests {
                 .expect("并行分片本身应可收集");
         }
 
-        let error = OpenAiProvider::finalize_chat_completions_tool_call(&mut states)
-            .expect_err("多个调用必须拒绝");
+        let calls = OpenAiProvider::finalize_chat_completions_tool_calls(&mut states)
+            .expect("多个调用应按 index 还原");
 
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call-weather");
+        assert_eq!(calls[0].name, "weather");
+        assert_eq!(calls[0].arguments, serde_json::json!({ "city": "上海" }));
+        assert_eq!(calls[1].call_id, "call-clock");
+        assert_eq!(calls[1].name, "clock");
+        assert_eq!(
+            calls[1].arguments,
+            serde_json::json!({ "timezone": "Asia/Shanghai" })
+        );
+    }
+
+    #[test]
+    fn out_of_order_tool_deltas_are_sorted_by_index_after_reassembly() {
+        let events = [
+            serde_json::json!({
+                "choices": [{ "delta": { "tool_calls": [{
+                    "index": 1,
+                    "id": "call-second",
+                    "function": { "name": "second", "arguments": "{\"value\":" }
+                }] } }]
+            }),
+            serde_json::json!({
+                "choices": [{ "delta": { "tool_calls": [{
+                    "index": 0,
+                    "id": "call-first",
+                    "function": { "name": "first", "arguments": "{\"value\":1}" }
+                }] } }]
+            }),
+            serde_json::json!({
+                "choices": [{ "delta": { "tool_calls": [{
+                    "index": 1,
+                    "function": { "arguments": "2}" }
+                }] } }]
+            }),
+        ];
+        let mut states = BTreeMap::<u64, StreamingToolCallState>::new();
+        for event in events {
+            OpenAiProvider::collect_chat_completions_tool_deltas(&event, &mut states)
+                .expect("乱序增量应可收集");
+        }
+
+        let calls = OpenAiProvider::finalize_chat_completions_tool_calls(&mut states)
+            .expect("乱序增量应按 index 还原");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call-first", "call-second",]
+        );
+        assert_eq!(calls[1].arguments, serde_json::json!({ "value": 2 }));
+    }
+
+    #[test]
+    fn duplicate_or_incomplete_tool_calls_fail_closed() {
+        let mut duplicate = BTreeMap::from([
+            (
+                0,
+                StreamingToolCallState {
+                    call_id: Some("call-duplicate".to_string()),
+                    name: Some("first".to_string()),
+                    arguments: "{}".to_string(),
+                    active: true,
+                },
+            ),
+            (
+                1,
+                StreamingToolCallState {
+                    call_id: Some("call-duplicate".to_string()),
+                    name: Some("second".to_string()),
+                    arguments: "{}".to_string(),
+                    active: true,
+                },
+            ),
+        ]);
+        let error = OpenAiProvider::finalize_chat_completions_tool_calls(&mut duplicate)
+            .expect_err("重复 call_id 必须拒绝");
         assert_eq!(error.code(), "provider_protocol_error");
-        assert!(error.to_string().contains("拒绝执行"));
+
+        let mut incomplete = BTreeMap::from([(
+            0,
+            StreamingToolCallState {
+                call_id: Some("call-incomplete".to_string()),
+                name: None,
+                arguments: "{}".to_string(),
+                active: true,
+            },
+        )]);
+        let error = OpenAiProvider::finalize_chat_completions_tool_calls(&mut incomplete)
+            .expect_err("残缺调用必须拒绝");
+        assert_eq!(error.code(), "provider_protocol_error");
     }
 }

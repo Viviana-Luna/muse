@@ -21,7 +21,7 @@ use crate::domain::memory::{
     MemoryCategory, MemoryCommitEnvelope, MemoryDeleteConfirmation, MemoryDeleteConfirmationSource,
     MemoryDeleteParams, MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt,
     MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest, MemoryDeletionDecision,
-    MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryId, MemoryImportance,
+    MemoryDeletionSubject, MemoryError, MemoryErrorCode, MemoryFacet, MemoryId, MemoryImportance,
     MemoryImportanceAdjustment, MemoryManagementAuthorization, MemoryManagementBinding,
     MemoryManagementContentMutation, MemoryManagementContentParams, MemoryMutateParams,
     MemoryRepository, MemoryRevisionId, MemorySafetyAssessment, MemorySafetyFailure,
@@ -958,11 +958,12 @@ fn downgrade_runtime_to_v7(root: &Path) {
              DROP TABLE IF EXISTS memory_management_operation;
              DROP TABLE IF EXISTS memory_committed_operation;
              DROP TABLE IF EXISTS memory_committed_batch;
+             DROP TABLE IF EXISTS memory_revision_keyword;
              DROP TABLE IF EXISTS memory_revision_source;
              DROP TABLE IF EXISTS memory_revision;
              DROP TABLE IF EXISTS memory_entry;
              DROP TABLE IF EXISTS memory_authority_anchor;
-             DELETE FROM schema_migrations WHERE version IN (8, 9);
+             DELETE FROM schema_migrations WHERE version >= 8;
              COMMIT;
              PRAGMA foreign_keys = ON;",
         )
@@ -981,13 +982,30 @@ fn downgrade_runtime_to_v8_without_attribute_snapshots(root: &Path) {
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS memory_revision_keyword;
+             ALTER TABLE memory_revision DROP COLUMN facet;
              ALTER TABLE memory_revision DROP COLUMN importance;
              ALTER TABLE memory_revision DROP COLUMN category;
-             DELETE FROM schema_migrations WHERE version = 9;
+             DELETE FROM schema_migrations WHERE version >= 9;
              COMMIT;
              PRAGMA foreign_keys = ON;",
         )
         .expect("应还原缺少 revision 属性快照的 v8 结构");
+}
+
+fn downgrade_runtime_to_v9_without_facets_and_keywords(root: &Path) {
+    let connection = Connection::open(root.join("runtime/muse.sqlite")).expect("应打开 runtime 库");
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN IMMEDIATE;
+             DROP TABLE IF EXISTS memory_revision_keyword;
+             ALTER TABLE memory_revision DROP COLUMN facet;
+             DELETE FROM schema_migrations WHERE version >= 10;
+             COMMIT;
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("应还原缺少 facet 与关键词子表的 v9 结构");
 }
 
 fn seed_completed_deletion(
@@ -1221,14 +1239,12 @@ fn migration_八覆盖空库_v7升级与完整性约束() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("应读取 migration");
-    assert_eq!(
-        latest,
-        (9, "memory_revision_attribute_snapshots".to_string())
-    );
+    assert_eq!(latest, (10, "memory_facets_and_keywords".to_string()));
     for table in [
         "memory_authority_anchor",
         "memory_entry",
         "memory_revision",
+        "memory_revision_keyword",
         "memory_revision_source",
         "memory_committed_batch",
         "memory_committed_operation",
@@ -1286,7 +1302,7 @@ fn migration_八覆盖空库_v7升级与完整性约束() {
             row.get(0)
         })
         .expect("应读取升级版本");
-    assert_eq!(latest, 9);
+    assert_eq!(latest, 10);
     let verifier_lengths: (i64, i64) = Connection::open(
         upgraded
             .path()
@@ -1394,6 +1410,51 @@ fn migration_九只升级空_revision库并对旧历史_fail_closed() {
             "第 {attempt} 次失败后不得改写原 revision"
         );
     }
+}
+
+#[test]
+fn migration_十按_category_回填_facet_且不伪造历史关键词() {
+    let directory = TestDirectory::new("migration-v10-populated");
+    let repository = SqliteMemoryRepository::open(directory.path()).expect("应建立最新记忆库");
+    let scope = scope("migration-v10-persona");
+    commit_create(
+        &repository,
+        &scope,
+        "migration-v10-batch",
+        "migration-v10-conversation",
+        "migration-v10-turn",
+        "migration-v10-operation",
+        "migration-v10-memory",
+        "migration-v10-revision",
+        "用户喜欢酸菜鱼",
+    );
+    drop(repository);
+    downgrade_runtime_to_v9_without_facets_and_keywords(directory.path());
+
+    let (_, connection) = open_runtime_database(directory.path()).expect("v9 历史库应升级到 v10");
+    let (version, facet, keyword_count): (i64, String, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT MAX(version) FROM schema_migrations),
+                (SELECT facet FROM memory_revision WHERE revision_id = 'migration-v10-revision'),
+                (SELECT COUNT(*) FROM memory_revision_keyword)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("应读取 v10 回填结果");
+    assert_eq!(version, 10);
+    assert_eq!(facet, "preference_other");
+    assert_eq!(keyword_count, 0, "迁移不得调用模型或伪造历史关键词");
+    drop(connection);
+
+    let reopened =
+        SqliteMemoryRepository::open(directory.path()).expect("升级后的 Repository 应可重开");
+    let record = reopened
+        .current(&scope, &MemoryId("migration-v10-memory".to_string()))
+        .expect("升级后读取不应失败")
+        .expect("旧记忆应保留");
+    assert_eq!(record.current_revision.facet, MemoryFacet::PreferenceOther);
+    assert!(record.current_revision.keywords.is_empty());
 }
 
 #[test]

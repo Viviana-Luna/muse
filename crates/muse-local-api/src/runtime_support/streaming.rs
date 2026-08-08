@@ -4,6 +4,7 @@ use super::*;
 use muse_core::domain::memory::{
     MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME, MemoryChangeType,
     MemoryDeleteParams, MemoryDeleteReceipt, MemoryErrorCode, MemoryMutateParams,
+    MemoryMutationBatchReceipt, MemoryMutationBatchState, MemoryMutationItemState,
     MemoryMutationReceipt, MemoryMutationReceiptState, MemoryQueryPageReceipt, MemoryQueryParams,
 };
 
@@ -2831,6 +2832,8 @@ pub(super) enum MemorySessionCallReceipt {
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_revision_id: Option<String>,
     },
+    #[serde(rename = "memory_mutate")]
+    MutateBatch { mutation_count: usize },
     #[serde(rename = "memory_delete")]
     Delete { scope: MemorySessionDeleteScope },
     #[serde(rename = "memory_query")]
@@ -2846,7 +2849,9 @@ impl MemorySessionCallReceipt {
         serde_json::to_value(self).unwrap_or_else(|_| {
             let tool_name = match self {
                 Self::Query { .. } | Self::InvalidQuery { .. } => MEMORY_QUERY_TOOL_NAME,
-                Self::Mutate { .. } | Self::InvalidMutate { .. } => MEMORY_MUTATE_TOOL_NAME,
+                Self::Mutate { .. } | Self::MutateBatch { .. } | Self::InvalidMutate { .. } => {
+                    MEMORY_MUTATE_TOOL_NAME
+                }
                 Self::Delete { .. } | Self::InvalidDelete { .. } => MEMORY_DELETE_TOOL_NAME,
             };
             serde_json::json!({
@@ -2876,6 +2881,10 @@ impl MemorySessionCallReceipt {
                 "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
                 "operation": memory_change_type_name(*operation),
             }),
+            Self::MutateBatch { mutation_count } => serde_json::json!({
+                "memory_receipt": MEMORY_MUTATE_TOOL_NAME,
+                "mutation_count": mutation_count,
+            }),
             Self::Delete { scope } => serde_json::json!({
                 "memory_receipt": MEMORY_DELETE_TOOL_NAME,
                 "scope": scope,
@@ -2899,7 +2908,9 @@ impl MemorySessionCallReceipt {
     pub(super) const fn approval_summary(&self) -> &'static str {
         match self {
             Self::Query { .. } => "确认查询当前 Persona 的长期记忆。",
-            Self::Mutate { .. } => "确认暂存当前 Persona 的长期记忆变更。",
+            Self::Mutate { .. } | Self::MutateBatch { .. } => {
+                "确认暂存当前 Persona 的长期记忆变更。"
+            }
             Self::Delete {
                 scope: MemorySessionDeleteScope::Memory,
             } => "确认彻底删除当前 Persona 的一条长期记忆。",
@@ -2932,6 +2943,13 @@ impl MemorySessionCallReceipt {
             memory_id: Option<String>,
             #[serde(default)]
             expected_revision_id: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MutateBatchReceipt {
+            memory_receipt: String,
+            mutation_count: usize,
         }
 
         #[derive(Deserialize)]
@@ -2987,6 +3005,19 @@ impl MemorySessionCallReceipt {
                 })
             }
             MEMORY_MUTATE_TOOL_NAME => {
+                if value.get("mutation_count").is_some() {
+                    let receipt =
+                        serde_json::from_value::<MutateBatchReceipt>(value.clone()).ok()?;
+                    if receipt.memory_receipt != tool_name
+                        || !(1..=muse_core::domain::memory::MAX_MEMORY_MUTATIONS)
+                            .contains(&receipt.mutation_count)
+                    {
+                        return None;
+                    }
+                    return Some(Self::MutateBatch {
+                        mutation_count: receipt.mutation_count,
+                    });
+                }
                 let receipt = serde_json::from_value::<MutateReceipt>(value.clone()).ok()?;
                 let identifiers_match_operation = match receipt.operation {
                     MemoryChangeType::Create => {
@@ -3078,6 +3109,18 @@ pub(super) fn memory_session_call_receipt(
             })
         }
         MEMORY_MUTATE_TOOL_NAME => {
+            if let Some(mutations) = arguments
+                .get("mutations")
+                .and_then(serde_json::Value::as_array)
+            {
+                if !(1..=muse_core::domain::memory::MAX_MEMORY_MUTATIONS).contains(&mutations.len())
+                {
+                    return Some(memory_session_invalid_call_receipt(MEMORY_MUTATE_TOOL_NAME));
+                }
+                return Some(MemorySessionCallReceipt::MutateBatch {
+                    mutation_count: mutations.len(),
+                });
+            }
             let Ok(params) = serde_json::from_value::<MemoryMutateParams>(arguments.clone()) else {
                 return Some(memory_session_invalid_call_receipt(MEMORY_MUTATE_TOOL_NAME));
             };
@@ -3130,6 +3173,65 @@ pub(super) struct MemorySessionResultReceipt {
     pub(super) success: bool,
     pub(super) content: String,
     pub(super) structured: serde_json::Value,
+}
+
+fn memory_activity_event_for_receipt(
+    tool_name: &str,
+    receipt: &MemorySessionResultReceipt,
+) -> Option<RuntimeEvent> {
+    if tool_name != MEMORY_MUTATE_TOOL_NAME {
+        return None;
+    }
+    let state_value = receipt
+        .structured
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("error");
+    let count = |field: &str| {
+        receipt
+            .structured
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let legacy_staged_count =
+        usize::from(state_value == "staged").saturating_sub(count("staged_count").min(1));
+    let staged_count = count("staged_count") + legacy_staged_count;
+    let failed = !receipt.success || matches!(state_value, "rejected" | "error");
+    Some(RuntimeEvent::MemoryActivity {
+        phase: if failed {
+            "memory_mutation_rejected".to_string()
+        } else {
+            "memory_mutation_staged".to_string()
+        },
+        state: if failed {
+            "error".to_string()
+        } else {
+            "active".to_string()
+        },
+        staged_count,
+        saved_count: 0,
+        skipped_count: count("skipped_count"),
+        rejected_count: count("rejected_count"),
+        reason_code: receipt
+            .structured
+            .get("error_code")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                receipt
+                    .structured
+                    .get("items")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|items| {
+                        items.iter().find_map(|item| {
+                            item.get("reason_code").and_then(serde_json::Value::as_str)
+                        })
+                    })
+            })
+            .filter(|value| is_safe_memory_reason_code(value))
+            .map(str::to_string),
+    })
 }
 
 /// 记忆结果只信任 ToolResult.structured 对象；content 永远只是模型正文，
@@ -3212,6 +3314,13 @@ pub(super) fn memory_session_result_receipt(
         return None;
     }
     let source = memory_session_structured_result(result);
+    if tool_name == MEMORY_MUTATE_TOOL_NAME
+        && let Some(receipt) = source.as_ref().and_then(|source| {
+            serde_json::from_value::<MemoryMutationBatchReceipt>(source.clone()).ok()
+        })
+    {
+        return Some(memory_mutation_batch_session_receipt(receipt));
+    }
     if !result.is_success() {
         // 失败只保留稳定安全错误码；错误正文可能携带敏感检测输入，不落盘。
         let error_code = memory_error_code_from_source(source.as_ref());
@@ -3333,6 +3442,118 @@ pub(super) fn memory_session_result_receipt(
         }
         _ => None,
     }
+}
+
+fn memory_mutation_batch_session_receipt(
+    receipt: MemoryMutationBatchReceipt,
+) -> MemorySessionResultReceipt {
+    let counts_match = receipt.items.len()
+        == receipt.staged_count + receipt.rejected_count + receipt.skipped_count;
+    let items_valid = receipt.items.iter().all(|item| match item.state {
+        MemoryMutationItemState::Staged => {
+            item.operation.is_some()
+                && item
+                    .memory_id
+                    .as_ref()
+                    .is_some_and(|memory_id| is_valid_memory_id(&memory_id.0))
+                && item
+                    .revision_id
+                    .as_ref()
+                    .is_some_and(|revision_id| is_valid_memory_revision_id(&revision_id.0))
+                && item.reason_code.is_none()
+                && item.field_path.is_none()
+        }
+        MemoryMutationItemState::ConfirmationRequired
+        | MemoryMutationItemState::Rejected
+        | MemoryMutationItemState::Skipped => {
+            item.memory_id.is_none()
+                && item.revision_id.is_none()
+                && item
+                    .reason_code
+                    .as_deref()
+                    .is_none_or(is_safe_memory_reason_code)
+                && item
+                    .field_path
+                    .as_deref()
+                    .is_none_or(is_safe_memory_field_path)
+        }
+    });
+    let state_valid = match receipt.state {
+        MemoryMutationBatchState::Staged => {
+            receipt.staged_count > 0 && receipt.rejected_count == 0 && receipt.skipped_count == 0
+        }
+        MemoryMutationBatchState::Partial => {
+            receipt.staged_count > 0 && (receipt.rejected_count > 0 || receipt.skipped_count > 0)
+        }
+        MemoryMutationBatchState::Rejected => receipt.staged_count == 0,
+    };
+    if !counts_match || !items_valid || !state_valid {
+        return memory_session_failure_receipt(
+            MEMORY_MUTATE_TOOL_NAME,
+            Some(MemoryErrorCode::RepositoryUnavailable),
+        );
+    }
+    let memory_ids = receipt
+        .items
+        .iter()
+        .filter_map(|item| item.memory_id.as_ref().map(|memory_id| memory_id.0.clone()))
+        .collect::<Vec<_>>();
+    let revision_ids = receipt
+        .items
+        .iter()
+        .filter_map(|item| {
+            item.revision_id
+                .as_ref()
+                .map(|revision_id| revision_id.0.clone())
+        })
+        .collect::<Vec<_>>();
+    let state = match receipt.state {
+        MemoryMutationBatchState::Staged => "staged",
+        MemoryMutationBatchState::Partial => "partial",
+        MemoryMutationBatchState::Rejected => "rejected",
+    };
+    let structured = serde_json::json!({
+        "memory_receipt": "memory_mutate_result",
+        "state": state,
+        "staged_count": receipt.staged_count,
+        "confirmation_required_count": receipt.confirmation_required_count,
+        "rejected_count": receipt.rejected_count,
+        "skipped_count": receipt.skipped_count,
+        "memory_ids": memory_ids,
+        "revision_ids": revision_ids,
+        "items": receipt.items.iter().map(|item| serde_json::json!({
+            "index": item.index,
+            "state": item.state,
+            "reason_code": item.reason_code,
+            "field_path": item.field_path,
+        })).collect::<Vec<_>>(),
+    });
+    MemorySessionResultReceipt {
+        success: receipt.staged_count > 0,
+        content: format!(
+            "记忆批次收据：暂存 {} 条，跳过 {} 条，拒绝 {} 条；尚未持久化。",
+            receipt.staged_count, receipt.skipped_count, receipt.rejected_count
+        ),
+        structured,
+    }
+}
+
+fn is_safe_memory_reason_code(value: &str) -> bool {
+    value.len() <= 64
+        && value.starts_with("memory_")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn is_safe_memory_field_path(value: &str) -> bool {
+    value.len() <= 96
+        && value.starts_with("mutations[")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'[' | b']' | b'.')
+        })
 }
 
 pub(super) fn sanitize_private_session_value(value: &serde_json::Value) -> serde_json::Value {
@@ -3631,6 +3852,13 @@ pub(super) async fn emit_and_record_tool_result(
         )
         .await
         .map_err(|_| "客户端连接已断开。".to_string())?;
+        if let Some(receipt) = memory_result_receipt.as_ref()
+            && let Some(event) = memory_activity_event_for_receipt(&call.name, receipt)
+        {
+            emit_json_event(tx, runtime_event_payload(event))
+                .await
+                .map_err(|_| "客户端连接已断开。".to_string())?;
+        }
     }
     let context_effect = runtime_tool_handler(&call.name)
         .and_then(|handler| handler.context_effect(result))

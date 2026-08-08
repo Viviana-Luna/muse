@@ -270,7 +270,20 @@
 
 .persona-memory-results > button > span {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+.persona-memory-results > button > .memory-taxonomy {
+  grid-column: 1 / -1;
+  gap: 5px;
+}
+
+.persona-memory-results .memory-taxonomy em {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--theme-color), transparent 74%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--theme-color), transparent 92%);
 }
 
 .persona-memory-results em {
@@ -687,7 +700,7 @@
   padding: 8px 11px;
 }
 
-.story-memory-activity > p.failed {
+.story-memory-activity details.failed {
   border-color: rgba(232, 98, 111, 0.34);
   background: rgba(176, 44, 58, 0.08);
   color: #ffb6bd;

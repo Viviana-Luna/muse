@@ -1,19 +1,21 @@
 //! Persona 长期记忆管理接口的请求与响应 DTO。
 
 use muse_core::domain::memory::{
-    MemoryCategory, MemoryChangeType, MemoryEntry, MemoryId, MemoryImportance, MemoryRevision,
-    MemoryRevisionId, MemoryRevisionState,
+    MemoryCategory, MemoryChangeType, MemoryEntry, MemoryFacet, MemoryId, MemoryImportance,
+    MemoryRevision, MemoryRevisionId, MemoryRevisionState,
 };
 use serde::{Deserialize, Serialize};
 
 /// 记忆列表查询参数。
 ///
-/// 管理读取与模型读取共用检索语义：`query` 必填非空，`category`/`importance`
+/// 管理读取与模型读取共用检索语义：`query` 可选——提供时按关键词检索（仍要求
+/// 足够有效字符），缺省或为空时按当前记忆全量分页浏览；`category`/`importance`
 /// 为页内过滤条件，`cursor` 只能原样回传上一页收据中的不透明游标。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryListQuery {
-    pub query: String,
+    #[serde(default)]
+    pub query: Option<String>,
     #[serde(default)]
     pub category: Option<MemoryCategory>,
     #[serde(default)]
@@ -91,6 +93,8 @@ pub struct MemoryDetailResponse {
 pub struct MemoryRevisionResponse {
     pub revision_id: MemoryRevisionId,
     pub memory_id: MemoryId,
+    pub facet: MemoryFacet,
+    pub keywords: Vec<String>,
     pub content: String,
     pub event_time: Option<String>,
     pub recorded_at: String,
@@ -109,6 +113,8 @@ impl From<MemoryRevision> for MemoryRevisionResponse {
         Self {
             revision_id: revision.revision_id,
             memory_id: revision.memory_id,
+            facet: revision.facet,
+            keywords: revision.keywords,
             content: revision.content,
             event_time: revision.event_time,
             recorded_at: revision.recorded_at,

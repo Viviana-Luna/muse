@@ -15,9 +15,9 @@ pub use management::{
     MemoryManagementBinding, MemoryManagementContentMutation, MemoryManagementContentParams,
 };
 pub use model::{
-    MemoryCategory, MemoryChangeType, MemoryEntry, MemoryEntryState, MemoryId, MemoryImportance,
-    MemoryRecord, MemoryRevision, MemoryRevisionId, MemoryRevisionState, MemorySourceEvidence,
-    MemorySourceKind,
+    MemoryCategory, MemoryChangeType, MemoryEntry, MemoryEntryState, MemoryFacet, MemoryId,
+    MemoryImportance, MemoryRecord, MemoryRevision, MemoryRevisionId, MemoryRevisionState,
+    MemorySourceEvidence, MemorySourceKind,
 };
 pub use ports::{
     MAX_MEMORY_DELETION_FIELD_BYTES, MAX_MEMORY_DELETION_SUBJECTS, MemoryDeletionAuthority,
@@ -34,14 +34,19 @@ pub use runtime_binding::{
 };
 pub use tool_request::{
     MAX_MEMORY_CHANGE_REASON_BYTES, MAX_MEMORY_CHANGE_REASON_CHARS, MAX_MEMORY_CONTENT_BYTES,
-    MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_BYTES, MAX_MEMORY_QUERY_CHARS,
-    MEMORY_DELETE_TOOL_NAME, MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME,
-    MemoryBatchCommitReceipt, MemoryCursor, MemoryDeleteParams, MemoryDeleteReceipt,
-    MemoryMutateParams, MemoryMutationReceipt, MemoryMutationReceiptState, MemoryQueryItem,
-    MemoryQueryPageReceipt, MemoryQueryParams,
+    MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_KEYWORD_BYTES, MAX_MEMORY_KEYWORD_CHARS,
+    MAX_MEMORY_KEYWORDS, MAX_MEMORY_MUTATIONS, MAX_MEMORY_QUERY_BYTES, MAX_MEMORY_QUERY_CHARS,
+    MAX_MEMORY_SOURCE_QUOTE_BYTES, MAX_MEMORY_SOURCE_QUOTE_CHARS, MEMORY_DELETE_TOOL_NAME,
+    MEMORY_MUTATE_TOOL_NAME, MEMORY_QUERY_TOOL_NAME, MemoryBatchCommitReceipt,
+    MemoryConfirmationMode, MemoryCursor, MemoryDeleteParams, MemoryDeleteReceipt,
+    MemoryMutateParams, MemoryMutateRequest, MemoryMutationBatchReceipt, MemoryMutationBatchState,
+    MemoryMutationItemReceipt, MemoryMutationItemState, MemoryMutationProposal,
+    MemoryMutationReceipt, MemoryMutationReceiptState, MemoryQueryItem, MemoryQueryPageReceipt,
+    MemoryQueryParams,
 };
 pub(crate) use tool_request::{
-    validate_memory_change_reason, validate_memory_content, validate_memory_query_text,
+    validate_memory_change_reason, validate_memory_content, validate_memory_keyword,
+    validate_memory_query_text, validate_memory_source_quote,
 };
 
 #[cfg(test)]

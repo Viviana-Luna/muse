@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::error::{require_non_empty, require_opaque_token, require_rfc3339};
 use super::{
     ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCategory, MemoryChangeType,
-    MemoryCommitEnvelope, MemoryDeleteReceipt, MemoryError, MemoryErrorCode, MemoryId,
+    MemoryCommitEnvelope, MemoryDeleteReceipt, MemoryError, MemoryErrorCode, MemoryFacet, MemoryId,
     MemoryImportance, MemoryImportanceAdjustment, MemoryImportanceAdjustmentReceipt,
     MemoryManagementContentMutation, MemoryMutationReceipt, MemoryQueryPageReceipt, MemoryRecord,
     MemoryRetrievalRequest, MemoryRevisionId, MemorySourceEvidence,
@@ -189,6 +189,8 @@ pub struct MemorySensitivityRequest<'a> {
     pub assigned_memory_id: &'a MemoryId,
     pub assigned_revision_id: &'a MemoryRevisionId,
     pub category: MemoryCategory,
+    pub facet: MemoryFacet,
+    pub keywords: &'a [String],
     pub importance: Option<MemoryImportance>,
     pub content: &'a str,
     pub change_reason: &'a str,
@@ -203,6 +205,8 @@ impl fmt::Debug for MemorySensitivityRequest<'_> {
             .field("stage", &self.stage)
             .field("operation", &self.operation)
             .field("category", &self.category)
+            .field("facet", &self.facet)
+            .field("keyword_count", &self.keywords.len())
             .field("importance", &self.importance)
             .field("has_event_time", &self.event_time.is_some())
             .field("bound_identity", &"[已去敏]")
@@ -224,6 +228,8 @@ struct MemorySensitivityIdentity {
     assigned_memory_id: MemoryId,
     assigned_revision_id: MemoryRevisionId,
     category: MemoryCategory,
+    facet: MemoryFacet,
+    keywords: Vec<String>,
     importance: Option<MemoryImportance>,
     content: String,
     change_reason: String,
@@ -242,6 +248,8 @@ impl From<MemorySensitivityRequest<'_>> for MemorySensitivityIdentity {
             assigned_memory_id: request.assigned_memory_id.clone(),
             assigned_revision_id: request.assigned_revision_id.clone(),
             category: request.category,
+            facet: request.facet,
+            keywords: request.keywords.to_vec(),
             importance: request.importance,
             content: request.content.to_string(),
             change_reason: request.change_reason.to_string(),

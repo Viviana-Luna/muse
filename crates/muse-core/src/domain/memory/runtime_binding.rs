@@ -6,10 +6,11 @@ use unicode_normalization::UnicodeNormalization;
 use super::error::{require_non_empty, require_opaque_token, require_rfc3339};
 use super::ports::MemoryPersistencePermit;
 use super::{
-    MemoryDeleteParams, MemoryEntry, MemoryEntryState, MemoryError, MemoryErrorCode, MemoryId,
-    MemoryMutateParams, MemoryMutationReceipt, MemoryMutationReceiptState, MemoryQueryParams,
-    MemoryRecord, MemoryRevision, MemoryRevisionId, MemoryRevisionState, MemorySafetyStage,
-    MemorySensitivityPolicy, MemorySensitivityRequest, MemorySourceEvidence, MemorySourceKind,
+    MemoryDeleteParams, MemoryEntry, MemoryEntryState, MemoryError, MemoryErrorCode, MemoryFacet,
+    MemoryId, MemoryMutateParams, MemoryMutationProposal, MemoryMutationReceipt,
+    MemoryMutationReceiptState, MemoryQueryParams, MemoryRecord, MemoryRevision, MemoryRevisionId,
+    MemoryRevisionState, MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest,
+    MemorySourceEvidence, MemorySourceKind,
 };
 
 /// 运行时绑定的 Persona scope；该类型不支持反序列化。
@@ -54,6 +55,10 @@ impl std::fmt::Debug for MemorySourceEligibility {
 }
 
 impl MemorySourceEligibility {
+    /// 旧单条工具调用的兼容入口。
+    ///
+    /// 新批量主链必须调用 `verify_direct_user_quote`；这里保留旧候选骨架验证，
+    /// 仅用于已存在的调用方和历史重试，不再作为摘要写入的新契约。
     #[allow(clippy::too_many_arguments)]
     pub fn verify_direct_user_message(
         scope: MemoryPersonaScope,
@@ -76,10 +81,105 @@ impl MemorySourceEligibility {
             .ok_or_else(|| MemoryError::new(MemoryErrorCode::SourceIneligible))?;
         let candidate_fact = canonical_memory_candidate(&normalized_candidate)
             .ok_or_else(|| MemoryError::new(MemoryErrorCode::SourceIneligible))?;
-        if candidate_fact.chars().count() < 3 || source_fact != candidate_fact {
+        if candidate_fact.chars().count() < 3 || !is_char_subsequence(&source_fact, &candidate_fact)
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        Self::from_verified_source(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &normalized_source,
+            &normalized_candidate,
+            MemorySourceKind::DirectUserMessage,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_direct_user_quote(
+        scope: MemoryPersonaScope,
+        conversation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+        direct_user_message: &str,
+        source_quote: &str,
+    ) -> Result<Self, MemoryError> {
+        let conversation_id = conversation_id.into();
+        let turn_id = turn_id.into();
+        let call_id = call_id.into();
+        require_non_empty(&conversation_id)?;
+        require_non_empty(&turn_id)?;
+        require_opaque_token(&call_id)?;
+        super::validate_memory_source_quote(source_quote)?;
+
+        let normalized_source = normalize_source_evidence_text(direct_user_message)?;
+        let normalized_quote = normalize_source_evidence_text(source_quote)?;
+        // 摘要正文可以改写；来源门只验证模型提供的原文锚点确实连续出现在当前
+        // 直接用户消息中。安全语法仍独立拒绝否定、第三方和外部来源片段。
+        if normalized_quote.chars().count() < 3
+            || !normalized_source.contains(&normalized_quote)
+            || !direct_source_quote_is_safe(&normalized_quote)
+        {
             return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
         }
 
+        Self::from_verified_source(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &normalized_source,
+            &normalized_quote,
+            MemorySourceKind::DirectUserMessage,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_user_confirmation(
+        scope: MemoryPersonaScope,
+        conversation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+        direct_user_message: &str,
+        source_quote: &str,
+    ) -> Result<Self, MemoryError> {
+        let conversation_id = conversation_id.into();
+        let turn_id = turn_id.into();
+        let call_id = call_id.into();
+        require_non_empty(&conversation_id)?;
+        require_non_empty(&turn_id)?;
+        require_opaque_token(&call_id)?;
+        super::validate_memory_source_quote(source_quote)?;
+        let normalized_source = normalize_source_evidence_text(direct_user_message)?;
+        let normalized_quote = normalize_source_evidence_text(source_quote)?;
+        if normalized_quote.chars().count() < 3
+            || !normalized_source.contains(&normalized_quote)
+            || has_structured_external_source(&normalized_quote)
+            || has_explicit_direct_user_negation(&normalized_quote)
+        {
+            return Err(MemoryError::new(MemoryErrorCode::SourceIneligible));
+        }
+        Self::from_verified_source(
+            scope,
+            conversation_id,
+            turn_id,
+            call_id,
+            &normalized_source,
+            &normalized_quote,
+            MemorySourceKind::UserConfirmation,
+        )
+    }
+
+    fn from_verified_source(
+        scope: MemoryPersonaScope,
+        conversation_id: String,
+        turn_id: String,
+        call_id: String,
+        normalized_source: &str,
+        normalized_evidence: &str,
+        kind: MemorySourceKind,
+    ) -> Result<Self, MemoryError> {
         let mut digest = Sha256::new();
         update_length_prefixed(&mut digest, b"muse-memory-source-evidence/v1");
         for field in [
@@ -87,8 +187,8 @@ impl MemorySourceEligibility {
             conversation_id.as_str(),
             turn_id.as_str(),
             call_id.as_str(),
-            normalized_source.as_str(),
-            normalized_candidate.as_str(),
+            normalized_source,
+            normalized_evidence,
         ] {
             update_length_prefixed(&mut digest, field.as_bytes());
         }
@@ -98,11 +198,60 @@ impl MemorySourceEligibility {
             source: MemorySourceEvidence::ConversationTurn {
                 conversation_id,
                 turn_id,
-                kind: MemorySourceKind::DirectUserMessage,
+                kind,
             },
             operation_id,
         })
     }
+}
+
+fn direct_source_quote_is_safe(value: &str) -> bool {
+    let mut saw_direct_fact = false;
+    for raw_segment in value.split([
+        '。', '！', '!', '？', '?', '，', ',', '、', '；', ';', '：', ':', '\n', '\r',
+    ]) {
+        let mut segment = raw_segment.trim();
+        if let Some(stripped) = ["而且", "并且", "另外", "同时", "还", "也"]
+            .iter()
+            .find_map(|prefix| segment.strip_prefix(prefix))
+        {
+            segment = stripped;
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if has_structured_external_source(segment) || has_explicit_direct_user_negation(segment) {
+            return false;
+        }
+        if segment.starts_with('我') {
+            if canonical_direct_user_fact(segment).is_none() {
+                return false;
+            }
+            saw_direct_fact = true;
+            continue;
+        }
+        // 直接事实后的短名词片段可作为同一偏好的限定信息，例如“埃塞，水洗”；
+        // 带动作谓词的省略主语从句具有歧义，必须交给确认来源而不是静默接受。
+        if !saw_direct_fact || has_direct_user_clause_predicate(segment) {
+            return false;
+        }
+    }
+    saw_direct_fact
+}
+
+fn has_explicit_direct_user_negation(value: &str) -> bool {
+    [
+        "我不",
+        "我没",
+        "我从不",
+        "我并不",
+        "我并没有",
+        "我不再",
+        "我不要",
+        "我未",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 /// 来源、时间和幂等操作标识只能由已验证的运行时证据绑定。
@@ -194,7 +343,19 @@ fn normalize_source_evidence_text(value: &str) -> Result<String, MemoryError> {
 
 fn canonical_direct_user_fact(value: &str) -> Option<String> {
     const COMMAND_PREFIXES: [&str; 5] = ["请帮我记住", "请你记住", "请记住", "帮我记住", "记住"];
-    let mut fact = value.trim_matches(is_direct_user_terminal_separator);
+    // 只取第一个句末标点之前的句子：多句消息（如“我喜欢吃酸菜鱼。而且喜欢
+    // 晚上吃。”）的第二句通常是承接省略句，无法确定性验证；要求整条消息都是
+    // 单一事实会让常见多句表达整体无法保存。第二句内容仍由候选侧语法拒绝，
+    // 不能混入记忆正文。
+    let first_sentence = value
+        .char_indices()
+        .find_map(|(index, character)| {
+            is_direct_user_terminal_separator(character).then_some(index)
+        })
+        .map_or(value, |index| &value[..index]);
+    let mut fact = first_sentence
+        .trim_matches(is_direct_user_terminal_separator)
+        .trim_end_matches(is_direct_user_particle);
     if let Some(stripped) = COMMAND_PREFIXES
         .iter()
         .find_map(|prefix| fact.strip_prefix(prefix))
@@ -219,16 +380,55 @@ fn canonical_direct_user_fact(value: &str) -> Option<String> {
     canonical_memory_candidate(&canonical)
 }
 
+/// 候选摘要必须锚定用户主语，并复用源侧同一套正向谓词语法；返回候选事实骨架。
 fn canonical_memory_candidate(value: &str) -> Option<String> {
-    let fact = value.trim_matches(is_direct_user_terminal_separator);
+    // 句尾语气助词不承载事实信息；模型摘要省略或保留都不应与用户原话失配。
+    let fact = value
+        .trim_matches(is_direct_user_terminal_separator)
+        .trim_end_matches(is_direct_user_particle);
     if fact.is_empty() || has_direct_user_clause_boundary(fact) {
         return None;
     }
-    Some(fact.to_string())
+    let rest = fact.strip_prefix("用户")?;
+    if let Some(attribute) = rest.strip_prefix('的') {
+        if !is_safe_direct_user_attribute(attribute) {
+            return None;
+        }
+        return Some(format!("用户的{attribute}"));
+    }
+    validate_simple_direct_user_predicate(rest)?;
+    Some(format!("用户{rest}"))
+}
+
+/// 旧兼容入口使用的源骨架匹配；新批量主链不调用此逻辑。
+fn is_char_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut remaining = haystack.chars();
+    needle
+        .chars()
+        .all(|character| remaining.any(|candidate| candidate == character))
 }
 
 fn is_direct_user_terminal_separator(character: char) -> bool {
     matches!(character, '。' | '！' | '!' | '？' | '?')
+}
+
+fn is_direct_user_particle(character: char) -> bool {
+    matches!(
+        character,
+        '啊' | '呀'
+            | '哦'
+            | '喔'
+            | '呢'
+            | '吧'
+            | '嘛'
+            | '啦'
+            | '哈'
+            | '哟'
+            | '呗'
+            | '咧'
+            | '欸'
+            | '诶'
+    )
 }
 
 fn is_explicit_memory_prefix_separator(character: char) -> bool {
@@ -849,6 +1049,8 @@ impl MemoryRetrievalFilters {
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryStagedMutation {
     params: MemoryMutateParams,
+    facet: MemoryFacet,
+    keywords: Vec<String>,
     binding: MemoryRuntimeBinding,
     assigned_memory_id: MemoryId,
     assigned_revision_id: MemoryRevisionId,
@@ -875,7 +1077,61 @@ impl MemoryStagedMutation {
         assigned_revision_id: MemoryRevisionId,
         sensitivity: &dyn MemorySensitivityPolicy,
     ) -> Result<Self, MemoryError> {
+        let facet = MemoryFacet::default_for_category(params.category());
+        let keywords = vec![
+            match params.category() {
+                super::MemoryCategory::UserFact => "用户事实",
+                super::MemoryCategory::UserPreference => "用户偏好",
+                super::MemoryCategory::SharedExperience => "共同经历",
+                super::MemoryCategory::Commitment => "约定",
+                super::MemoryCategory::StoryState => "剧情状态",
+            }
+            .to_string(),
+        ];
+        Self::stage_with_metadata(
+            params,
+            facet,
+            keywords,
+            binding,
+            assigned_memory_id,
+            assigned_revision_id,
+            sensitivity,
+        )
+    }
+
+    pub fn stage_proposal(
+        proposal: &MemoryMutationProposal,
+        binding: MemoryRuntimeBinding,
+        assigned_memory_id: MemoryId,
+        assigned_revision_id: MemoryRevisionId,
+        sensitivity: &dyn MemorySensitivityPolicy,
+    ) -> Result<Self, MemoryError> {
+        proposal.validate()?;
+        Self::stage_with_metadata(
+            proposal.to_params()?,
+            proposal.facet,
+            proposal.keywords.clone(),
+            binding,
+            assigned_memory_id,
+            assigned_revision_id,
+            sensitivity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_with_metadata(
+        params: MemoryMutateParams,
+        facet: MemoryFacet,
+        keywords: Vec<String>,
+        binding: MemoryRuntimeBinding,
+        assigned_memory_id: MemoryId,
+        assigned_revision_id: MemoryRevisionId,
+        sensitivity: &dyn MemorySensitivityPolicy,
+    ) -> Result<Self, MemoryError> {
         params.validate()?;
+        if !facet.is_compatible_with(params.category()) || keywords.is_empty() {
+            return Err(MemoryError::new(MemoryErrorCode::InvalidRequest));
+        }
         require_non_empty(&assigned_memory_id.0)?;
         require_non_empty(&assigned_revision_id.0)?;
         if let Some(memory_id) = params.memory_id()
@@ -887,6 +1143,8 @@ impl MemoryStagedMutation {
         let request = sensitivity_request_for_mutation(
             MemorySafetyStage::TurnStaging,
             &params,
+            facet,
+            &keywords,
             &binding,
             &assigned_memory_id,
             &assigned_revision_id,
@@ -896,6 +1154,8 @@ impl MemoryStagedMutation {
 
         Ok(Self {
             params,
+            facet,
+            keywords,
             binding,
             assigned_memory_id,
             assigned_revision_id,
@@ -905,6 +1165,14 @@ impl MemoryStagedMutation {
 
     pub fn params(&self) -> &MemoryMutateParams {
         &self.params
+    }
+
+    pub const fn facet(&self) -> MemoryFacet {
+        self.facet
+    }
+
+    pub fn keywords(&self) -> &[String] {
+        &self.keywords
     }
 
     #[cfg(test)]
@@ -932,6 +1200,8 @@ impl MemoryStagedMutation {
         sensitivity_request_for_mutation(
             stage,
             &self.params,
+            self.facet,
+            &self.keywords,
             &self.binding,
             &self.assigned_memory_id,
             &self.assigned_revision_id,
@@ -1054,6 +1324,8 @@ impl MemoryStagedMutation {
         MemoryRevision {
             revision_id: self.assigned_revision_id.clone(),
             memory_id: self.assigned_memory_id.clone(),
+            facet: self.facet,
+            keywords: self.keywords.clone(),
             content: self.params.content().trim().to_string(),
             event_time: self.params.event_time().map(str::to_string),
             recorded_at: self.binding.recorded_at.clone(),
@@ -1180,6 +1452,8 @@ impl MemoryCommitEnvelope {
 fn sensitivity_request_for_mutation<'a>(
     stage: MemorySafetyStage,
     params: &'a MemoryMutateParams,
+    facet: MemoryFacet,
+    keywords: &'a [String],
     binding: &'a MemoryRuntimeBinding,
     assigned_memory_id: &'a MemoryId,
     assigned_revision_id: &'a MemoryRevisionId,
@@ -1193,6 +1467,8 @@ fn sensitivity_request_for_mutation<'a>(
         assigned_memory_id,
         assigned_revision_id,
         category: params.category(),
+        facet,
+        keywords,
         importance: Some(params.importance()),
         content: params.content(),
         change_reason: params.change_reason(),

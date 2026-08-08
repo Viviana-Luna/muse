@@ -10,7 +10,7 @@ use muse_core::domain::memory::{
     ConfirmedMemoryDeleteRequest, MemoryBatchCommitReceipt, MemoryCommitEnvelope,
     MemoryDeleteReceipt, MemoryDeletionAuthority, MemoryDeletionAuthorityReceipt,
     MemoryDeletionAuthorityRequest, MemoryDeletionCheckRequest, MemoryDeletionDecision,
-    MemoryError, MemoryErrorCode, MemoryId, MemoryImportanceAdjustment,
+    MemoryError, MemoryErrorCode, MemoryFacet, MemoryId, MemoryImportanceAdjustment,
     MemoryImportanceAdjustmentReceipt, MemoryManagementContentMutation, MemoryMutationReceipt,
     MemoryMutationReceiptState, MemoryPersonaScope, MemoryQueryPageReceipt, MemoryRecord,
     MemoryRepository, MemoryRetrievalRequest, MemoryRetriever, MemorySensitivityPolicy,
@@ -219,12 +219,18 @@ impl ChatModelProvider for MemoryContractProvider {
                 "memory-contract-create",
                 "memory_mutate",
                 serde_json::json!({
-                    "operation": "create",
-                    "category": "user_preference",
-                    "content": "用户喜欢在晚上喝茉莉花茶",
-                    "importance": "normal",
-                    "event_time": null,
-                    "change_reason": "用户在当前消息中直接说明饮品偏好"
+                    "mutations": [{
+                        "operation": "create",
+                        "source_quote": "我喜欢在晚上喝茉莉花茶",
+                        "category": "user_preference",
+                        "facet": "preference_drink",
+                        "keywords": ["茉莉花茶", "晚上", "饮品偏好"],
+                        "content": "用户偏好在夜间饮用茉莉花茶。",
+                        "importance": "normal",
+                        "event_time": null,
+                        "change_reason": "用户在当前消息中直接说明饮品偏好",
+                        "confirmation": "not_required"
+                    }]
                 }),
             ),
             "请回忆我的茉莉花茶偏好" | "重启后请再次回忆我的茉莉花茶偏好" => {
@@ -251,14 +257,20 @@ impl ChatModelProvider for MemoryContractProvider {
                     "memory-contract-update",
                     "memory_mutate",
                     serde_json::json!({
-                        "operation": "update",
-                        "memory_id": memory_id,
-                        "expected_revision_id": revision_id,
-                        "category": "user_preference",
-                        "content": "用户喜欢在晚上喝红茶",
-                        "importance": "normal",
-                        "event_time": null,
-                        "change_reason": "用户说明饮品偏好后来发生变化"
+                        "mutations": [{
+                            "operation": "update",
+                            "source_quote": "我喜欢在晚上喝红茶",
+                            "memory_id": memory_id,
+                            "expected_revision_id": revision_id,
+                            "category": "user_preference",
+                            "facet": "preference_drink",
+                            "keywords": ["红茶", "晚上", "饮品偏好"],
+                            "content": "用户现在偏好在夜间饮用红茶。",
+                            "importance": "normal",
+                            "event_time": null,
+                            "change_reason": "用户说明饮品偏好后来发生变化",
+                            "confirmation": "not_required"
+                        }]
                     }),
                 )
             }
@@ -268,14 +280,20 @@ impl ChatModelProvider for MemoryContractProvider {
                     "memory-contract-correct",
                     "memory_mutate",
                     serde_json::json!({
-                        "operation": "correct",
-                        "memory_id": memory_id,
-                        "expected_revision_id": revision_id,
-                        "category": "user_preference",
-                        "content": "用户喜欢在晚上喝无糖茉莉花茶",
-                        "importance": "normal",
-                        "event_time": null,
-                        "change_reason": "用户纠正上一条饮品偏好"
+                        "mutations": [{
+                            "operation": "correct",
+                            "source_quote": "我喜欢在晚上喝无糖茉莉花茶",
+                            "memory_id": memory_id,
+                            "expected_revision_id": revision_id,
+                            "category": "user_preference",
+                            "facet": "preference_drink",
+                            "keywords": ["无糖茉莉花茶", "晚上", "饮品偏好"],
+                            "content": "用户准确的偏好是在夜间饮用无糖茉莉花茶。",
+                            "importance": "normal",
+                            "event_time": null,
+                            "change_reason": "用户纠正上一条饮品偏好",
+                            "confirmation": "not_required"
+                        }]
                     }),
                 )
             }
@@ -3800,11 +3818,11 @@ async fn generate_desktop_source_fixture() {
 #[tokio::test]
 async fn automatic_memory_create_query_update_correct_survives_session_and_process_restart() {
     const CREATE_USER_MESSAGE: &str = "我喜欢在晚上喝茉莉花茶";
-    const CREATE_CONTENT: &str = "用户喜欢在晚上喝茉莉花茶";
+    const CREATE_CONTENT: &str = "用户偏好在夜间饮用茉莉花茶。";
     const UPDATE_USER_MESSAGE: &str = "我喜欢在晚上喝红茶";
-    const UPDATE_CONTENT: &str = "用户喜欢在晚上喝红茶";
+    const UPDATE_CONTENT: &str = "用户现在偏好在夜间饮用红茶。";
     const CORRECT_USER_MESSAGE: &str = "我喜欢在晚上喝无糖茉莉花茶";
-    const CORRECT_CONTENT: &str = "用户喜欢在晚上喝无糖茉莉花茶";
+    const CORRECT_CONTENT: &str = "用户准确的偏好是在夜间饮用无糖茉莉花茶。";
     const CREATE_REASON: &str = "用户在当前消息中直接说明饮品偏好";
     const UPDATE_REASON: &str = "用户说明饮品偏好后来发生变化";
     const CORRECT_REASON: &str = "用户纠正上一条饮品偏好";
@@ -5139,6 +5157,8 @@ fn stub_query_item(
         memory_id: MemoryId(memory_id.to_string()),
         revision_id: MemoryRevisionId(format!("{memory_id}-rev")),
         category,
+        facet: MemoryFacet::default_for_category(category),
+        keywords: vec!["测试".to_string()],
         content: format!("{memory_id} 的测试内容"),
         importance,
         event_time: None,
@@ -5154,6 +5174,8 @@ fn stub_audit_revision(memory_id: &MemoryId, state: MemoryRevisionState) -> Memo
     MemoryRevision {
         revision_id: MemoryRevisionId(format!("{}-{state:?}-rev", memory_id.0)),
         memory_id: memory_id.clone(),
+        facet: MemoryFacet::Other,
+        keywords: vec!["测试".to_string()],
         content: "历史测试内容".to_string(),
         event_time: None,
         recorded_at: "2026-07-30T00:00:00+00:00".to_string(),
@@ -5710,7 +5732,7 @@ async fn persona_memory_management_roundtrip_and_cross_persona_denial() {
 }
 
 #[tokio::test]
-async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
+async fn persona_memory_list_filters_page_and_browse_mode() {
     let _guard = memory_services_test_guard().await;
     let config_dir = unique_temp_dir("memory-list");
     let memory_dir = unique_temp_dir("memory-list-store");
@@ -5731,7 +5753,7 @@ async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
     );
     let app = api_routes().with_state(build_test_state(&config_dir));
 
-    // 空白 query 违反检索契约，返回稳定 400。
+    // 空白 query 进入管理页浏览模式：无关键词时按当前记忆全量分页。
     let blank = app
         .clone()
         .oneshot(
@@ -5742,10 +5764,17 @@ async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
         )
         .await
         .expect("空白检索应返回响应");
-    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(blank.status(), StatusCode::OK);
     let blank_payload = response_json(blank).await;
-    assert_flat_api_error(&blank_payload);
-    assert_eq!(blank_payload["code"], "memory_query_rejected");
+    assert_eq!(
+        blank_payload["items"]
+            .as_array()
+            .expect("浏览响应应带 items")
+            .len(),
+        0,
+        "未种子记忆时浏览模式应返回空列表"
+    );
+    assert_eq!(blank_payload["has_more"], false);
 
     // category 与 importance 必须绑定到 Retriever，在分页前完成过滤。
     let filtered = app
@@ -5800,6 +5829,164 @@ async fn persona_memory_list_filters_page_and_requires_non_blank_query() {
     let cursor_payload = response_json(bad_cursor).await;
     assert_flat_api_error(&cursor_payload);
     assert_eq!(cursor_payload["code"], "memory_cursor_invalid");
+
+    clear_memory_services_for_test();
+    let _ = std::fs::remove_dir_all(config_dir);
+    let _ = std::fs::remove_dir_all(memory_dir);
+}
+
+#[tokio::test]
+async fn persona_memory_browse_lists_paginates_and_rejects_tampered_cursor() {
+    let _guard = memory_services_test_guard().await;
+    let config_dir = unique_temp_dir("memory-browse");
+    let memory_dir = unique_temp_dir("memory-browse-store");
+    let repository = open_test_memory_repository(&memory_dir);
+    // 浏览器模式首屏：无关键词返回第一页当前记忆，并给出可续页的签名游标。
+    for index in 0..25 {
+        seed_test_memory(
+            &repository,
+            "router-test-persona",
+            &format!("浏览测试记忆 {index}"),
+        );
+    }
+    install_test_memory_services(
+        repository,
+        Vec::new(),
+        StubMemoryAudit {
+            count: 0,
+            revisions: Vec::new(),
+        },
+    );
+    let app = api_routes().with_state(build_test_state(&config_dir));
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories")
+                .body(Body::empty())
+                .expect("应能构造浏览首屏请求"),
+        )
+        .await
+        .expect("浏览首屏应返回响应");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_payload = response_json(first).await;
+    let first_items = first_payload["items"]
+        .as_array()
+        .expect("浏览响应应带 items");
+    assert_eq!(first_items.len(), 20, "管理页单页大小应为 20");
+    assert_eq!(first_payload["has_more"], true);
+    let next_cursor = first_payload["next_cursor"]
+        .as_str()
+        .expect("有下一页时应返回不透明游标")
+        .to_string();
+
+    // 原样回传游标可继续取第二页，末尾页不再返回游标。
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/personas/router-test-persona/memories?cursor={}",
+                    next_cursor
+                ))
+                .body(Body::empty())
+                .expect("应能构造续页请求"),
+        )
+        .await
+        .expect("续页应返回响应");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_payload = response_json(second).await;
+    assert_eq!(
+        second_payload["items"]
+            .as_array()
+            .expect("续页应带 items")
+            .len(),
+        5,
+        "25 条种子记忆第二页应剩 5 条"
+    );
+    assert_eq!(second_payload["has_more"], false);
+    assert!(second_payload["next_cursor"].is_null());
+
+    // 篡改游标与跨 Persona 复用游标都必须稳定拒绝。
+    let tampered = format!("{}x", &next_cursor[..next_cursor.len() - 1]);
+    let tampered_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/personas/router-test-persona/memories?cursor={}",
+                    tampered
+                ))
+                .body(Body::empty())
+                .expect("应能构造篡改游标请求"),
+        )
+        .await
+        .expect("篡改游标应返回响应");
+    assert_eq!(tampered_response.status(), StatusCode::BAD_REQUEST);
+    let tampered_payload = response_json(tampered_response).await;
+    assert_flat_api_error(&tampered_payload);
+    assert_eq!(tampered_payload["code"], "memory_cursor_invalid");
+
+    // 先创建第二个角色（不切换活动角色），复用首屏游标必须被角色绑定拒绝。
+    let create_other = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/personas")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "persona": test_persona("another-persona"),
+                        "visual_pack_patch": null,
+                        "activate_after_create": false
+                    })
+                    .to_string(),
+                ))
+                .expect("应能构造创建第二角色请求"),
+        )
+        .await
+        .expect("创建第二角色应返回响应");
+    assert_eq!(create_other.status(), StatusCode::CREATED);
+    let cross_persona = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/personas/another-persona/memories?cursor={}",
+                    next_cursor
+                ))
+                .body(Body::empty())
+                .expect("应能构造跨 Persona 游标请求"),
+        )
+        .await
+        .expect("跨 Persona 游标应返回响应");
+    assert_eq!(cross_persona.status(), StatusCode::BAD_REQUEST);
+    let cross_payload = response_json(cross_persona).await;
+    assert_flat_api_error(&cross_payload);
+    assert_eq!(cross_payload["code"], "memory_cursor_invalid");
+
+    // 浏览模式仍按类别过滤当前记忆。
+    let preference_filter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/personas/router-test-persona/memories?category=user_preference")
+                .body(Body::empty())
+                .expect("应能构造浏览类别过滤请求"),
+        )
+        .await
+        .expect("浏览类别过滤应返回响应");
+    assert_eq!(preference_filter.status(), StatusCode::OK);
+    let preference_payload = response_json(preference_filter).await;
+    assert_eq!(
+        preference_payload["items"]
+            .as_array()
+            .expect("浏览过滤应带 items")
+            .len(),
+        0,
+        "没有 user_preference 种子时浏览过滤应为空"
+    );
 
     clear_memory_services_for_test();
     let _ = std::fs::remove_dir_all(config_dir);

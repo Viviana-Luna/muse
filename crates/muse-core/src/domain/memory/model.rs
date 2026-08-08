@@ -11,6 +11,68 @@ pub enum MemoryCategory {
     StoryState,
 }
 
+/// 记忆检索使用的封闭主题维度。
+///
+/// category 表达业务来源，facet 表达用户提问时最常用的检索入口；两者分开保存，
+/// 避免把不断扩张的自然语言主题塞进 category。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFacet {
+    Identity,
+    Timezone,
+    Location,
+    Occupation,
+    PreferenceFood,
+    PreferenceDrink,
+    PreferenceCommunication,
+    PreferenceTool,
+    PreferenceOther,
+    Habit,
+    Plan,
+    SharedExperience,
+    Commitment,
+    StoryState,
+    Other,
+}
+
+impl MemoryFacet {
+    pub const fn default_for_category(category: MemoryCategory) -> Self {
+        match category {
+            MemoryCategory::UserFact => Self::Other,
+            MemoryCategory::UserPreference => Self::PreferenceOther,
+            MemoryCategory::SharedExperience => Self::SharedExperience,
+            MemoryCategory::Commitment => Self::Commitment,
+            MemoryCategory::StoryState => Self::StoryState,
+        }
+    }
+
+    pub const fn is_compatible_with(self, category: MemoryCategory) -> bool {
+        match category {
+            MemoryCategory::UserFact => matches!(
+                self,
+                Self::Identity
+                    | Self::Timezone
+                    | Self::Location
+                    | Self::Occupation
+                    | Self::Habit
+                    | Self::Plan
+                    | Self::Other
+            ),
+            MemoryCategory::UserPreference => matches!(
+                self,
+                Self::PreferenceFood
+                    | Self::PreferenceDrink
+                    | Self::PreferenceCommunication
+                    | Self::PreferenceTool
+                    | Self::PreferenceOther
+            ),
+            MemoryCategory::SharedExperience => matches!(self, Self::SharedExperience),
+            MemoryCategory::Commitment => matches!(self, Self::Commitment),
+            MemoryCategory::StoryState => matches!(self, Self::StoryState),
+        }
+    }
+}
+
 /// 记忆的重要程度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +196,8 @@ impl MemorySourceEvidence {
 pub struct MemoryRevision {
     pub revision_id: MemoryRevisionId,
     pub memory_id: MemoryId,
+    pub facet: MemoryFacet,
+    pub keywords: Vec<String>,
     pub content: String,
     pub event_time: Option<String>,
     pub recorded_at: String,

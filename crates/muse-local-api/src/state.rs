@@ -560,6 +560,13 @@ pub fn build_runtime_system_prompt_with_mode_state(
     system_prompt.push_str(&build_runtime_mode_context(mode_state));
     system_prompt.push_str("\n\n");
     system_prompt.push_str(&build_runtime_environment_context());
+    system_prompt.push_str(
+        "\n\n【工具结果规则】\n工具返回失败时必须如实告知用户操作未完成或失败，\
+         不得以角色口吻声称已经成功、已保存、已记录或已记住；\
+         工具成功只代表该工具阶段完成。尤其 memory_mutate 成功仅表示候选已暂存，\
+         在应用发出持久化状态前不得声称已经记住、记录或保存；\
+         长期记忆是否保存只能以应用的最终状态卡为准。",
+    );
 
     let tools_prompt = ToolRegistry::tools_prompt_from_definitions(tool_defs);
     if !tools_prompt.is_empty() {

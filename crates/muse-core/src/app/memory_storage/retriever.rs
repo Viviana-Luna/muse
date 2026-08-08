@@ -19,7 +19,7 @@ use rusqlite::{TransactionBehavior, params};
 use super::authority::{CanonicalAuthorityGuard, SqliteMemoryDeletionAuthority};
 use super::repository::{
     MAX_REVISION_METADATA_FIELD_BYTES, SqliteMemoryRepository, canonicalize_derivation_content,
-    normalize_memory_fts_query, normalize_search_text, rfc3339_micros,
+    facet_to_str, normalize_memory_fts_query, normalize_search_text, rfc3339_micros,
 };
 use crate::domain::memory::{
     MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_QUERY_CHARS, MemoryCategory, MemoryChangeType,
@@ -73,7 +73,7 @@ const CURSOR_HMAC_DOMAIN: &[u8] = b"muse-memory-query-cursor/v1";
 const CURSOR_BINDING_DOMAIN: &[u8] = b"muse-memory-query-binding/v1";
 const SNAPSHOT_ID_DOMAIN: &[u8] = b"muse-memory-query-snapshot/v1";
 const CURSOR_HANDLE_DOMAIN: &[u8] = b"muse-memory-query-page-handle/v1";
-const RETRIEVAL_SORT_VERSION: &[u8] = b"effective-weight-v1";
+const RETRIEVAL_SORT_VERSION: &[u8] = b"structured-hybrid-v2";
 const CURSOR_PREFIX: &str = "mqc1";
 
 const FTS_CANDIDATE_SQL: &str = "SELECT CASE
@@ -199,7 +199,11 @@ impl SqliteMemoryRetriever {
         params.validate()?;
         // 查询先经 FTS 专用规范化；有效字符不足 trigram 基线时要求模型改写。
         // 该规范化与派生键 canonicalize_derivation_content 严格分离，禁止混用。
-        let normalized = normalize_memory_fts_query(&params.query)?;
+        let normalized = if params.query.is_empty() {
+            String::new()
+        } else {
+            normalize_memory_fts_query(&params.query)?
+        };
         // 显式历史查询只能针对单条记忆；与 as_of 叠加的时间-历史混合语义不开放。
         if params.include_history && params.memory_id.is_none() {
             return Err(MemoryError::new(MemoryErrorCode::QueryRejected));
@@ -413,6 +417,7 @@ impl SqliteMemoryRetriever {
                     authority,
                     scope,
                     normalized,
+                    params,
                     params.as_of.as_deref(),
                     filters,
                     now,
@@ -439,6 +444,7 @@ impl SqliteMemoryRetriever {
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         normalized: &str,
+        params: &MemoryQueryParams,
         as_of: Option<&str>,
         filters: &MemoryRetrievalFilters,
         now: DateTime<Utc>,
@@ -451,8 +457,23 @@ impl SqliteMemoryRetriever {
                 authority,
                 scope,
                 normalized,
+                params,
                 filters,
                 as_of,
+                budget,
+            );
+        }
+
+        if !params.facets.is_empty() || !params.keywords.is_empty() {
+            return self.structured_current_items(
+                transaction,
+                authority_guard,
+                authority,
+                scope,
+                normalized,
+                params,
+                filters,
+                now,
                 budget,
             );
         }
@@ -557,6 +578,131 @@ impl SqliteMemoryRetriever {
         Ok(items)
     }
 
+    /// 含 facet 或关键词的查询在有界 Persona 当前集上做结构化匹配，并与文本
+    /// 硬相关候选取并集。结构化命中不再受连续字符覆盖率限制。
+    #[allow(clippy::too_many_arguments)]
+    fn structured_current_items(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        authority_guard: &mut CanonicalAuthorityGuard<'_>,
+        authority: &SqliteMemoryDeletionAuthority,
+        scope: &MemoryPersonaScope,
+        normalized: &str,
+        params: &MemoryQueryParams,
+        filters: &MemoryRetrievalFilters,
+        now: DateTime<Utc>,
+        budget: &mut RetrievalResourceBudget,
+    ) -> Result<Vec<FrozenItem>, MemoryError> {
+        let query_chars: Vec<char> = normalized.chars().collect();
+        let requested_keywords = normalized_query_keywords(params);
+        let reference_micros = now.timestamp_micros();
+        let mut statement = transaction
+            .prepare(AS_OF_CANDIDATE_SQL)
+            .map_err(repository_unavailable)?;
+        let mut items = Vec::new();
+        let mut scanned = 0_usize;
+        while scanned < MAX_CANDIDATES_SCANNED {
+            let batch_size = usize::min(
+                FTS_SCAN_BATCH_SIZE,
+                MAX_CANDIDATES_SCANNED.saturating_sub(scanned),
+            );
+            budget.authorize_revision_batch(batch_size)?;
+            let mut memory_ids = statement
+                .query_map(
+                    params![
+                        scope.persona_id(),
+                        batch_size.saturating_add(1) as i64,
+                        scanned as i64,
+                        MAX_REVISION_METADATA_FIELD_BYTES as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
+                )
+                .map_err(repository_unavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(repository_unavailable)?;
+            let has_more = memory_ids.len() > batch_size;
+            memory_ids.truncate(batch_size);
+            let fetched = memory_ids.len();
+            if has_more && scanned.saturating_add(fetched) >= MAX_CANDIDATES_SCANNED {
+                return Err(query_budget_exceeded());
+            }
+            for (memory_id, memory_id_bytes) in memory_ids {
+                let memory_id = bounded_candidate_memory_id(
+                    memory_id,
+                    memory_id_bytes,
+                    budget.remaining_revision_bytes(),
+                )?;
+                budget.consume_materialized_metadata(memory_id.0.len())?;
+                let Some(bounded) = self.repository.load_current_on(
+                    transaction,
+                    scope,
+                    &memory_id,
+                    budget.remaining_revision_bytes(),
+                )?
+                else {
+                    continue;
+                };
+                budget.consume_materialized_revisions(1, bounded.materialized_bytes)?;
+                let record = bounded.record;
+                validate_revision_fields(&record.current_revision)?;
+                if !record_matches_filters(&record, filters)
+                    || candidate_blocked(
+                        authority_guard,
+                        authority,
+                        scope,
+                        &memory_id,
+                        &record.current_revision.content,
+                    )?
+                {
+                    continue;
+                }
+                let facet_match = params.facets.contains(&record.current_revision.facet);
+                let keyword_match_count =
+                    keyword_match_count(&record.current_revision.keywords, &requested_keywords);
+                let content_chars: Vec<char> =
+                    normalize_search_text(&record.current_revision.content)
+                        .chars()
+                        .collect();
+                let relevance_ratio = if query_chars.is_empty() {
+                    0.0
+                } else {
+                    budget.consume_relevance(query_chars.len(), content_chars.len())?;
+                    hard_relevance_ratio(&query_chars, &content_chars)
+                };
+                let lexical_match =
+                    !query_chars.is_empty() && relevance_ratio >= RELEVANCE_MIN_CONTIGUOUS_RATIO;
+                if !facet_match && keyword_match_count == 0 && !lexical_match {
+                    continue;
+                }
+                let freshness_micros = rfc3339_micros(&record.entry.freshness_at)?;
+                let effective_weight = importance_weight(record.entry.importance)
+                    * freshness_decay(reference_micros - freshness_micros);
+                items.push(
+                    FrozenItem::new(
+                        &record.entry,
+                        record.current_revision.clone(),
+                        effective_weight,
+                        -relevance_ratio,
+                        freshness_micros,
+                    )?
+                    .with_structured_matches(facet_match, keyword_match_count),
+                );
+            }
+            scanned += fetched;
+            if !has_more {
+                break;
+            }
+        }
+        drop(statement);
+        items.sort_by(compare_frozen_items);
+        Ok(items)
+    }
+
     /// 时间点相关性不能复用 current FTS；先选中 as_of 可读 revision，再对该正文硬匹配。
     #[allow(clippy::too_many_arguments)]
     fn as_of_relevance_items(
@@ -566,12 +712,14 @@ impl SqliteMemoryRetriever {
         authority: &SqliteMemoryDeletionAuthority,
         scope: &MemoryPersonaScope,
         normalized: &str,
+        params: &MemoryQueryParams,
         filters: &MemoryRetrievalFilters,
         as_of: &str,
         budget: &mut RetrievalResourceBudget,
     ) -> Result<Vec<FrozenItem>, MemoryError> {
         let at_micros = rfc3339_micros(as_of)?;
         let query_chars: Vec<char> = normalized.chars().collect();
+        let requested_keywords = normalized_query_keywords(params);
         let mut statement = transaction
             .prepare(AS_OF_CANDIDATE_SQL)
             .map_err(repository_unavailable)?;
@@ -661,9 +809,18 @@ impl SqliteMemoryRetriever {
                 }
                 let content_chars: Vec<char> =
                     normalize_search_text(&revision.content).chars().collect();
-                budget.consume_relevance(query_chars.len(), content_chars.len())?;
-                let relevance_ratio = hard_relevance_ratio(&query_chars, &content_chars);
-                if relevance_ratio < RELEVANCE_MIN_CONTIGUOUS_RATIO {
+                let facet_match = params.facets.contains(&revision.facet);
+                let keyword_match_count =
+                    keyword_match_count(&revision.keywords, &requested_keywords);
+                let relevance_ratio = if query_chars.is_empty() {
+                    0.0
+                } else {
+                    budget.consume_relevance(query_chars.len(), content_chars.len())?;
+                    hard_relevance_ratio(&query_chars, &content_chars)
+                };
+                let lexical_match =
+                    !query_chars.is_empty() && relevance_ratio >= RELEVANCE_MIN_CONTIGUOUS_RATIO;
+                if !facet_match && keyword_match_count == 0 && !lexical_match {
                     continue;
                 }
                 // 历史查询的 freshness 只能来自该 revision 的可靠记录时间；current
@@ -671,13 +828,16 @@ impl SqliteMemoryRetriever {
                 let freshness_micros = rfc3339_micros(&revision.recorded_at)?;
                 let effective_weight = importance_weight(historical_entry.importance)
                     * freshness_decay(at_micros - freshness_micros);
-                items.push(FrozenItem::new(
-                    &historical_entry,
-                    revision,
-                    effective_weight,
-                    -relevance_ratio,
-                    freshness_micros,
-                )?);
+                items.push(
+                    FrozenItem::new(
+                        &historical_entry,
+                        revision,
+                        effective_weight,
+                        -relevance_ratio,
+                        freshness_micros,
+                    )?
+                    .with_structured_matches(facet_match, keyword_match_count),
+                );
             }
             scanned += fetched;
             if !has_more {
@@ -970,6 +1130,16 @@ impl SqliteMemoryRetriever {
             .importance()
             .map(importance_binding_value)
             .unwrap_or("");
+        let facets = params
+            .facets
+            .iter()
+            .map(|facet| facet_to_str(*facet))
+            .collect::<Vec<_>>()
+            .join(",");
+        let keywords = normalized_query_keywords(params)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\0");
         Ok(self.repository.deletion_authority().keyed_digest(
             CURSOR_BINDING_DOMAIN,
             &[
@@ -978,6 +1148,8 @@ impl SqliteMemoryRetriever {
                 &normalized_limit.to_be_bytes(),
                 category.as_bytes(),
                 importance.as_bytes(),
+                facets.as_bytes(),
+                keywords.as_bytes(),
                 &include_history,
                 as_of.as_bytes(),
                 memory_id.as_bytes(),
@@ -1136,6 +1308,8 @@ struct FrozenItem {
     memory_id: MemoryId,
     revision_id: MemoryRevisionId,
     category: MemoryCategory,
+    facet: crate::domain::memory::MemoryFacet,
+    keywords: Vec<String>,
     content: String,
     importance: MemoryImportance,
     event_time: Option<String>,
@@ -1144,6 +1318,8 @@ struct FrozenItem {
     valid_to: Option<String>,
     change_type: MemoryChangeType,
     change_reason: String,
+    facet_match: bool,
+    keyword_match_count: usize,
     effective_weight: f64,
     relevance: f64,
     freshness_micros: i64,
@@ -1166,6 +1342,8 @@ impl FrozenItem {
             memory_id: entry.memory_id.clone(),
             revision_id: revision.revision_id,
             category: entry.category,
+            facet: revision.facet,
+            keywords: revision.keywords,
             content: revision.content,
             importance: entry.importance,
             event_time: revision.event_time,
@@ -1174,6 +1352,8 @@ impl FrozenItem {
             valid_to: revision.valid_to,
             change_type: revision.change_type,
             change_reason: revision.change_reason,
+            facet_match: false,
+            keyword_match_count: 0,
             effective_weight,
             relevance,
             freshness_micros,
@@ -1182,11 +1362,19 @@ impl FrozenItem {
         })
     }
 
+    fn with_structured_matches(mut self, facet_match: bool, keyword_match_count: usize) -> Self {
+        self.facet_match = facet_match;
+        self.keyword_match_count = keyword_match_count;
+        self
+    }
+
     fn to_query_item(&self) -> MemoryQueryItem {
         MemoryQueryItem {
             memory_id: self.memory_id.clone(),
             revision_id: self.revision_id.clone(),
             category: self.category,
+            facet: self.facet,
+            keywords: self.keywords.clone(),
             content: self.content.clone(),
             importance: self.importance,
             event_time: self.event_time.clone(),
@@ -1381,11 +1569,31 @@ fn frozen_snapshot_bytes(items: &[FrozenItem]) -> Result<usize, MemoryError> {
 
 fn compare_frozen_items(left: &FrozenItem, right: &FrozenItem) -> std::cmp::Ordering {
     right
-        .effective_weight
-        .total_cmp(&left.effective_weight)
+        .keyword_match_count
+        .cmp(&left.keyword_match_count)
+        .then_with(|| right.facet_match.cmp(&left.facet_match))
         .then_with(|| left.relevance.total_cmp(&right.relevance))
+        .then_with(|| right.effective_weight.total_cmp(&left.effective_weight))
         .then_with(|| right.freshness_micros.cmp(&left.freshness_micros))
         .then_with(|| left.memory_id.0.cmp(&right.memory_id.0))
+}
+
+fn normalized_query_keywords(params: &MemoryQueryParams) -> BTreeSet<String> {
+    params
+        .keywords
+        .iter()
+        .map(|keyword| normalize_search_text(keyword))
+        .filter(|keyword| !keyword.is_empty())
+        .collect()
+}
+
+fn keyword_match_count(keywords: &[String], requested: &BTreeSet<String>) -> usize {
+    keywords
+        .iter()
+        .map(|keyword| normalize_search_text(keyword))
+        .filter(|keyword| requested.contains(keyword))
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn record_matches_filters(
@@ -1443,7 +1651,15 @@ fn bounded_candidate_memory_id(
 
 fn validate_revision_fields(revision: &MemoryRevision) -> Result<(), MemoryError> {
     validate_memory_content(&revision.content)?;
-    validate_memory_change_reason(&revision.change_reason)
+    validate_memory_change_reason(&revision.change_reason)?;
+    if revision.keywords.len() > crate::domain::memory::MAX_MEMORY_KEYWORDS {
+        return Err(MemoryError::new(MemoryErrorCode::RepositoryUnavailable));
+    }
+    for keyword in &revision.keywords {
+        crate::domain::memory::validate_memory_keyword(keyword)
+            .map_err(|_| MemoryError::new(MemoryErrorCode::RepositoryUnavailable))?;
+    }
+    Ok(())
 }
 
 fn canonical_rfc3339(value: &str) -> Result<String, MemoryError> {

@@ -85,6 +85,11 @@ export interface ChatMemoryActivity {
   hasMore?: boolean;
   references?: ChatMemoryReference[];
   errorCode?: string;
+  fieldPath?: string;
+  stagedCount?: number;
+  savedCount?: number;
+  skippedCount?: number;
+  rejectedCount?: number;
 }
 
 export interface ChatMessage extends Message {
@@ -270,7 +275,27 @@ function memoryActivityForToolResult(
     };
   }
   if (toolName === 'memory_mutate') {
-    return { kind: 'staged', label: '记忆变更已暂存，等待本轮可靠提交' };
+    const stagedCount = countFromRuntimeEvent(structured.staged_count)
+      || (structured.state === 'staged' ? 1 : 0);
+    const skippedCount = countFromRuntimeEvent(structured.skipped_count);
+    const rejectedCount = countFromRuntimeEvent(structured.rejected_count);
+    const itemDiagnostic = Array.isArray(structured.items)
+      ? structured.items
+          .map(runtimeRecord)
+          .find((item) => typeof item.reason_code === 'string')
+      : undefined;
+    return {
+      kind: success ? 'staged' : 'failed',
+      label: success
+        ? `已暂存 ${stagedCount} 条记忆候选，等待本轮可靠提交`
+        : '本轮没有可暂存的记忆',
+      count: stagedCount,
+      stagedCount,
+      skippedCount,
+      rejectedCount,
+      errorCode: runtimeArgText(itemDiagnostic, 'reason_code') || undefined,
+      fieldPath: runtimeArgText(itemDiagnostic, 'field_path') || undefined
+    };
   }
   if (toolName === 'memory_delete') {
     const count = typeof structured.deleted_memory_count === 'number'
@@ -299,6 +324,42 @@ function memoryCommitActivity(payload: RuntimeEvent): ChatMemoryActivity | undef
     };
   }
   return undefined;
+}
+
+function countFromRuntimeEvent(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function structuredMemoryActivity(
+  payload: Extract<RuntimeEvent, { type: 'memory_activity' }>,
+  previous?: ChatMemoryActivity
+): ChatMemoryActivity {
+  const stagedCount = countFromRuntimeEvent(payload.staged_count);
+  const savedCount = countFromRuntimeEvent(payload.saved_count);
+  const skippedCount = countFromRuntimeEvent(payload.skipped_count)
+    || previous?.skippedCount
+    || 0;
+  const rejectedCount = countFromRuntimeEvent(payload.rejected_count)
+    || previous?.rejectedCount
+    || 0;
+  const failed = payload.state === 'error' || payload.phase === 'memory_commit_failed';
+  const final = savedCount > 0 || payload.phase === 'memory_commit_completed';
+  const label = failed
+    ? '本次记忆未保存'
+    : final
+      ? `已保存 ${savedCount} 条记忆${skippedCount ? `，跳过 ${skippedCount} 条` : ''}${rejectedCount ? `，拒绝 ${rejectedCount} 条` : ''}`
+      : `已暂存 ${stagedCount} 条记忆候选${skippedCount ? `，跳过 ${skippedCount} 条` : ''}${rejectedCount ? `，拒绝 ${rejectedCount} 条` : ''}，等待本轮可靠提交`;
+  return {
+    kind: failed ? 'failed' : final ? 'commit' : 'staged',
+    label,
+    count: final ? savedCount : stagedCount,
+    errorCode: payload.reason_code || previous?.errorCode,
+    fieldPath: previous?.fieldPath,
+    stagedCount: final ? previous?.stagedCount ?? stagedCount : stagedCount,
+    savedCount,
+    skippedCount,
+    rejectedCount
+  };
 }
 
 function normalizeRuntimeTodoItems(value: unknown): RuntimeTodoItem[] | null {
@@ -455,6 +516,7 @@ export function useRuntimeStream({
   const activeTurnIdRef = useRef<string | null>(null);
   const activeTurnVoiceIdRef = useRef<string | undefined>(undefined);
   const cancelRequestedRef = useRef(false);
+  const structuredMemoryEventRef = useRef(false);
   const currentChatAbortRef = useRef<AbortController | null>(null);
   const deltaFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDeltaFlushRef = useRef<{
@@ -500,6 +562,63 @@ export function useRuntimeStream({
     [updateChatMessage]
   );
 
+  const upsertStructuredMemoryActivity = useCallback(
+    (
+      assistantId: string,
+      payload: Extract<RuntimeEvent, { type: 'memory_activity' }>
+    ) => {
+      let statusLabel = '';
+      updateChatMessage(assistantId, (item) => {
+        const legacyMutationActivity = item.process.find(
+          (step) => step.toolName === 'memory_mutate' && step.memoryActivity
+        )?.memoryActivity;
+        const withoutLegacyMutation = item.process.filter(
+          (step) => !(step.toolName === 'memory_mutate' && step.memoryActivity)
+        );
+        const existingIndex = withoutLegacyMutation.findIndex(
+          (step) => step.toolName === 'memory_activity'
+        );
+        const previous = existingIndex >= 0
+          ? withoutLegacyMutation[existingIndex].memoryActivity
+          : legacyMutationActivity;
+        const activity = structuredMemoryActivity(payload, previous);
+        statusLabel = activity.label;
+        const phase: ChatMessageStatus = activity.kind === 'failed'
+          ? 'failed'
+          : activity.kind === 'commit'
+            ? 'tool_completed'
+            : 'tool_running';
+        const step: ChatProcessStep = {
+          id: existingIndex >= 0
+            ? withoutLegacyMutation[existingIndex].id
+            : createMessageId('process'),
+          phase,
+          message: activity.label,
+          state: activity.kind === 'failed'
+            ? 'error'
+            : activity.kind === 'commit'
+              ? 'completed'
+              : 'active',
+          time: existingIndex >= 0
+            ? withoutLegacyMutation[existingIndex].time
+            : formatStepTime(),
+          toolName: 'memory_activity',
+          memoryActivity: activity
+        };
+        const process = [...withoutLegacyMutation];
+        if (existingIndex >= 0) process[existingIndex] = step;
+        else process.push(step);
+        return {
+          ...item,
+          status: activity.kind === 'failed' ? 'failed' : item.status,
+          process
+        };
+      });
+      if (statusLabel) setRuntimeStatus(statusLabel);
+    },
+    [updateChatMessage]
+  );
+
   const closeCurrentChatSource = useCallback(() => {
     currentChatAbortRef.current?.abort();
     currentChatAbortRef.current = null;
@@ -510,6 +629,7 @@ export function useRuntimeStream({
     activeTurnIdRef.current = null;
     activeTurnVoiceIdRef.current = undefined;
     cancelRequestedRef.current = false;
+    structuredMemoryEventRef.current = false;
     setCanceling(false);
   }, []);
 
@@ -688,6 +808,7 @@ export function useRuntimeStream({
       if (!text || busy) return false;
       setBusy(true);
       cancelRequestedRef.current = false;
+      structuredMemoryEventRef.current = false;
       currentReplyRef.current = '';
       const userMessage: ChatMessage = {
         id: createMessageId('user'),
@@ -754,9 +875,18 @@ export function useRuntimeStream({
           });
         }
         if (payload.type === 'status') {
+          if (
+            structuredMemoryEventRef.current
+            && (payload.phase === 'memory_commit_completed'
+              || payload.phase === 'memory_commit_failed')
+          ) return;
           appendChatProcess(currentAssistantId, payload, {
             memoryActivity: memoryCommitActivity(payload)
           });
+        }
+        if (payload.type === 'memory_activity') {
+          structuredMemoryEventRef.current = true;
+          upsertStructuredMemoryActivity(currentAssistantId, payload);
         }
         if (payload.type === 'reasoning_delta') {
           const chunk = payload.content ?? '';
@@ -1082,6 +1212,7 @@ export function useRuntimeStream({
       onRuntimeTokenUsage,
       onSpeech,
       queueRuntimeDelta,
+      upsertStructuredMemoryActivity,
       updateChatMessage,
       voiceEnabled
     ]

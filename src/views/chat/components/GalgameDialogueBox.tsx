@@ -104,12 +104,27 @@ function MemoryActivityFeed({ message }: { message: ChatMessage }) {
             </details>
           );
         }
+        if (activity.kind === 'failed' || activity.errorCode) {
+          return (
+            <details key={key} className={activity.kind === 'failed' ? 'failed' : undefined}>
+              <summary>
+                <BookHeart aria-hidden="true" />
+                <span><strong>{activity.label}</strong></span>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <p>
+                诊断信息
+                {activity.errorCode && <code>{activity.errorCode}</code>}
+                {activity.fieldPath && <code>{activity.fieldPath}</code>}
+              </p>
+            </details>
+          );
+        }
         return (
-          <p key={key} className={activity.kind === 'failed' ? 'failed' : ''}>
+          <p key={key}>
             <BookHeart aria-hidden="true" />
             <span>{activity.label}</span>
             {typeof activity.count === 'number' && <small>{activity.count} 项</small>}
-            {activity.errorCode && <code>{activity.errorCode}</code>}
           </p>
         );
       })}

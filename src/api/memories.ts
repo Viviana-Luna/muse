@@ -28,12 +28,18 @@ export async function searchPersonaMemories(
   },
   signal?: AbortSignal
 ): Promise<MemoryQueryPageReceipt> {
-  const query = new URLSearchParams({ query: input.query });
-  if (input.category) query.set('category', input.category);
-  if (input.importance) query.set('importance', input.importance);
-  if (input.cursor) query.set('cursor', input.cursor);
+  const params = new URLSearchParams();
+  const query = input.query.trim();
+  if (query) params.set('query', query);
+  if (input.category) params.set('category', input.category);
+  if (input.importance) params.set('importance', input.importance);
+  if (input.cursor) params.set('cursor', input.cursor);
+  const suffix = params.toString();
   return readJson<MemoryQueryPageReceipt>(
-    await apiFetch(`${personaMemoryPath(personaId)}?${query.toString()}`, { signal })
+    await apiFetch(
+      suffix ? `${personaMemoryPath(personaId)}?${suffix}` : personaMemoryPath(personaId),
+      { signal }
+    )
   );
 }
 

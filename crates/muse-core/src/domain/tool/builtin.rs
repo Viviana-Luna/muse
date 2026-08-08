@@ -225,77 +225,30 @@ fn register_memory_tools(registry: &mut ToolRegistry) {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "检索问题或关键词；过短或过抽象的查询会被稳定拒绝，需改写后重试" },
+                "facets": {
+                    "type": "array",
+                    "description": "结构化主题筛选；可与 query、keywords 组合，命中任一结构化条件即可进入候选",
+                    "items": { "type": "string", "enum": ["identity", "timezone", "location", "occupation", "preference_food", "preference_drink", "preference_communication", "preference_tool", "preference_other", "habit", "plan", "shared_experience", "commitment", "story_state", "other"] },
+                    "maxItems": 8
+                },
+                "keywords": {
+                    "type": "array",
+                    "description": "1 到 8 个明确检索词；适合食物、饮品、工具或事件名称",
+                    "items": { "type": "string" },
+                    "maxItems": 8
+                },
                 "limit": { "type": "integer", "description": "本页最多返回条数；省略时由运行时按冻结页大小决定，不能要求返回全部" },
                 "cursor": { "type": ["string", "null"], "description": "上一页返回的 next_cursor，只能原样回传；新查询必须为 null" },
                 "as_of": { "type": ["string", "null"], "description": "RFC3339 时间点；仅在用户明确询问过去状态时使用，默认 null" },
                 "memory_id": { "type": ["string", "null"], "description": "按稳定 ID 精确查询单条记忆，默认 null" },
                 "include_history": { "type": "boolean", "description": "是否包含 update/correct 历史，默认 false；仅在用户明确询问过去状态时使用" }
             },
-            "required": ["query"],
             "additionalProperties": false
         }),
     );
-    let mutate_content_properties = {
-        let category = serde_json::json!({
-            "type": "string",
-            "enum": ["user_fact", "user_preference", "shared_experience", "commitment", "story_state"],
-            "description": "封闭记忆类别，不得使用其他取值"
-        });
-        let content = serde_json::json!({
-            "type": "string",
-            "description": "整理后的单一、原子、可独立理解的事实，不复制整段原文；不得包含敏感信息、外部内容、无用户依据的断言或权限指令"
-        });
-        let importance = serde_json::json!({
-            "type": "string",
-            "enum": ["low", "normal", "high"],
-            "description": "重要程度受限枚举"
-        });
-        let event_time = serde_json::json!({
-            "type": ["string", "null"],
-            "description": "事实或事件发生的 RFC3339 时间；不知道时传 null，不得编造"
-        });
-        let change_reason = serde_json::json!({
-            "type": "string",
-            "description": "本次创建、更新或纠正的原因，必须能回溯到当前用户消息或用户确认"
-        });
-        move |extra: serde_json::Map<String, serde_json::Value>| {
-            let mut properties = serde_json::Map::new();
-            properties.insert("category".to_string(), category.clone());
-            properties.insert("content".to_string(), content.clone());
-            properties.insert("importance".to_string(), importance.clone());
-            properties.insert("event_time".to_string(), event_time.clone());
-            properties.insert("change_reason".to_string(), change_reason.clone());
-            properties.extend(extra);
-            properties
-        }
-    };
-    let mut create_properties = mutate_content_properties(serde_json::Map::new());
-    create_properties.insert(
-        "operation".to_string(),
-        serde_json::json!({ "const": "create" }),
-    );
-    let identity_properties = || {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "memory_id".to_string(),
-            serde_json::json!({ "type": "string", "description": "要更新或纠正的记忆稳定 ID" }),
-        );
-        extra.insert(
-            "expected_revision_id".to_string(),
-            serde_json::json!({ "type": "string", "description": "当前 revision ID，用于并发校验，禁止最后写入覆盖" }),
-        );
-        extra
-    };
-    let mut update_properties = mutate_content_properties(identity_properties());
-    update_properties.insert(
-        "operation".to_string(),
-        serde_json::json!({ "const": "update" }),
-    );
-    let mut correct_properties = mutate_content_properties(identity_properties());
-    correct_properties.insert(
-        "operation".to_string(),
-        serde_json::json!({ "const": "correct" }),
-    );
+    // OpenAI 兼容上游（DeepSeek 等）只接受顶层 `type: "object"` 的工具参数 schema，
+    // 顶层 `oneOf` 会被 400 拒绝；operation 互斥分支的强制校验由运行时
+    // `tool_adapters/memory.rs` 按 operation 兜底执行，schema 只描述可写字段。
     register_web_runtime_tool(
         registry,
         MEMORY_MUTATE_TOOL_NAME,
@@ -307,26 +260,36 @@ fn register_memory_tools(registry: &mut ToolRegistry) {
         ToolRisk::ReadOnly,
         false,
         serde_json::json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": create_properties,
-                    "required": ["operation", "category", "content", "importance", "change_reason"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": update_properties,
-                    "required": ["operation", "memory_id", "expected_revision_id", "category", "content", "importance", "change_reason"],
-                    "additionalProperties": false
-                },
-                {
-                    "type": "object",
-                    "properties": correct_properties,
-                    "required": ["operation", "memory_id", "expected_revision_id", "category", "content", "importance", "change_reason"],
-                    "additionalProperties": false
+            "type": "object",
+            "properties": {
+                "mutations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "description": "本轮用户消息中的原子记忆候选；逐项校验，某项失败不会抹掉其他合法候选",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "operation": { "type": "string", "enum": ["create", "update", "correct"], "description": "create 表示新事实；update 表示事实后来变化；correct 表示旧事实原本错误" },
+                            "source_quote": { "type": "string", "description": "当前直接用户消息中的连续原文片段；摘要可以改写，但该字段不得改写或拼接" },
+                            "category": { "type": "string", "enum": ["user_fact", "user_preference", "shared_experience", "commitment", "story_state"], "description": "封闭记忆类别" },
+                            "facet": { "type": "string", "enum": ["identity", "timezone", "location", "occupation", "preference_food", "preference_drink", "preference_communication", "preference_tool", "preference_other", "habit", "plan", "shared_experience", "commitment", "story_state", "other"], "description": "用于自然提问召回的固定主题" },
+                            "keywords": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string" }, "description": "1 到 8 个简短、明确、无敏感信息的检索词" },
+                            "content": { "type": "string", "description": "对原文的单一事实摘要；允许改写和人称转换，不要求与 source_quote 相同" },
+                            "importance": { "type": "string", "enum": ["low", "normal", "high"], "description": "重要程度受限枚举" },
+                            "event_time": { "type": ["string", "null"], "description": "事实或事件发生的 RFC3339 时间；不知道时传 null" },
+                            "change_reason": { "type": "string", "description": "本次创建、更新或纠正的原因" },
+                            "confirmation": { "type": "string", "enum": ["not_required", "ask_user"], "description": "普通直接事实使用 not_required；存在主语、指代或含义歧义时由模型选择 ask_user" },
+                            "memory_id": { "type": "string", "description": "update/correct 时必须提供的记忆 ID" },
+                            "expected_revision_id": { "type": "string", "description": "update/correct 时必须提供的当前 revision ID" }
+                        },
+                        "required": ["operation", "source_quote", "category", "facet", "keywords", "content", "importance", "change_reason", "confirmation"],
+                        "additionalProperties": false
+                    }
                 }
-            ]
+            },
+            "required": ["mutations"],
+            "additionalProperties": false
         }),
     );
     register_web_runtime_tool(
@@ -337,25 +300,20 @@ fn register_memory_tools(registry: &mut ToolRegistry) {
         ToolRisk::ExternalSideEffect,
         true,
         serde_json::json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "scope": { "const": "memory" },
-                        "memory_id": { "type": "string", "description": "要删除的记忆稳定 ID" }
-                    },
-                    "required": ["scope", "memory_id"],
-                    "additionalProperties": false
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["memory", "persona_all"],
+                    "description": "memory 表示删除单条记忆，必须同时提供 memory_id；persona_all 表示清空当前角色全部记忆"
                 },
-                {
-                    "type": "object",
-                    "properties": {
-                        "scope": { "const": "persona_all" }
-                    },
-                    "required": ["scope"],
-                    "additionalProperties": false
+                "memory_id": {
+                    "type": "string",
+                    "description": "要删除的记忆稳定 ID；scope 为 memory 时必须提供"
                 }
-            ]
+            },
+            "required": ["scope"],
+            "additionalProperties": false
         }),
     );
 }

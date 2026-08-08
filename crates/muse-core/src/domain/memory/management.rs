@@ -5,9 +5,9 @@ use super::ports::MemoryPersistencePermit;
 use super::tool_request::{validate_memory_change_reason, validate_memory_content};
 use super::{
     MemoryCategory, MemoryChangeType, MemoryEntry, MemoryEntryState, MemoryError, MemoryErrorCode,
-    MemoryId, MemoryImportance, MemoryPersonaScope, MemoryRecord, MemoryRevision, MemoryRevisionId,
-    MemoryRevisionState, MemorySafetyStage, MemorySensitivityPolicy, MemorySensitivityRequest,
-    MemorySourceEvidence,
+    MemoryFacet, MemoryId, MemoryImportance, MemoryPersonaScope, MemoryRecord, MemoryRevision,
+    MemoryRevisionId, MemoryRevisionState, MemorySafetyStage, MemorySensitivityPolicy,
+    MemorySensitivityRequest, MemorySourceEvidence,
 };
 
 /// Persona 管理操作完成鉴权后由 runtime 创建的能力对象。
@@ -220,6 +220,8 @@ impl MemoryManagementContentParams {
 #[derive(Debug, PartialEq, Eq)]
 pub struct MemoryManagementContentMutation {
     params: MemoryManagementContentParams,
+    facet: MemoryFacet,
+    keywords: Vec<String>,
     binding: MemoryManagementBinding,
     assigned_memory_id: MemoryId,
     assigned_revision_id: MemoryRevisionId,
@@ -242,10 +244,14 @@ impl MemoryManagementContentMutation {
         {
             return Err(MemoryError::new(MemoryErrorCode::InvalidStateTransition));
         }
+        let facet = MemoryFacet::default_for_category(params.category());
+        let keywords = vec![management_default_keyword(params.category()).to_string()];
 
         let request = sensitivity_request_for_management_mutation(
             MemorySafetyStage::TurnStaging,
             &params,
+            facet,
+            &keywords,
             &binding,
             &assigned_memory_id,
             &assigned_revision_id,
@@ -255,6 +261,8 @@ impl MemoryManagementContentMutation {
 
         Ok(Self {
             params,
+            facet,
+            keywords,
             binding,
             assigned_memory_id,
             assigned_revision_id,
@@ -294,6 +302,8 @@ impl MemoryManagementContentMutation {
         sensitivity_request_for_management_mutation(
             stage,
             &self.params,
+            self.facet,
+            &self.keywords,
             &self.binding,
             &self.assigned_memory_id,
             &self.assigned_revision_id,
@@ -308,7 +318,21 @@ impl MemoryManagementContentMutation {
     ) -> Result<super::MemoryMutationTransition, MemoryError> {
         // Repository 最终门在散列、敏感评分和 SQL 之前重验有界字段。
         self.params.validate()?;
-        let request = self.sensitivity_request(MemorySafetyStage::RepositoryCommit);
+        let (facet, keywords) = current.map_or((self.facet, self.keywords.as_slice()), |record| {
+            (
+                record.current_revision.facet,
+                record.current_revision.keywords.as_slice(),
+            )
+        });
+        let request = sensitivity_request_for_management_mutation(
+            MemorySafetyStage::RepositoryCommit,
+            &self.params,
+            facet,
+            keywords,
+            &self.binding,
+            &self.assigned_memory_id,
+            &self.assigned_revision_id,
+        );
         let permit = sensitivity
             .assess(request)
             .into_repository_permit(request)?;
@@ -325,7 +349,7 @@ impl MemoryManagementContentMutation {
                 Ok(super::MemoryMutationTransition {
                     entry: self.new_entry(self.binding.recorded_at.clone(), *importance),
                     previous_revision: None,
-                    new_revision: self.new_revision(&permit),
+                    new_revision: self.new_revision(&permit, None),
                 })
             }
             MemoryManagementContentParams::Correct {
@@ -367,7 +391,7 @@ impl MemoryManagementContentMutation {
         Ok(super::MemoryMutationTransition {
             entry: self.new_entry(current.entry.created_at.clone(), current.entry.importance),
             previous_revision: Some(previous_revision),
-            new_revision: self.new_revision(permit),
+            new_revision: self.new_revision(permit, Some(current)),
         })
     }
 
@@ -384,10 +408,24 @@ impl MemoryManagementContentMutation {
         }
     }
 
-    fn new_revision(&self, permit: &MemoryPersistencePermit) -> MemoryRevision {
+    fn new_revision(
+        &self,
+        permit: &MemoryPersistencePermit,
+        current: Option<&MemoryRecord>,
+    ) -> MemoryRevision {
+        let facet = current.map_or_else(
+            || MemoryFacet::default_for_category(self.params.category()),
+            |record| record.current_revision.facet,
+        );
+        let keywords = current.map_or_else(
+            || vec![management_default_keyword(self.params.category()).to_string()],
+            |record| record.current_revision.keywords.clone(),
+        );
         MemoryRevision {
             revision_id: self.assigned_revision_id.clone(),
             memory_id: self.assigned_memory_id.clone(),
+            facet,
+            keywords,
             content: self.params.content().trim().to_string(),
             event_time: self.params.event_time().map(str::to_string),
             recorded_at: self.binding.recorded_at.clone(),
@@ -402,9 +440,21 @@ impl MemoryManagementContentMutation {
     }
 }
 
+fn management_default_keyword(category: MemoryCategory) -> &'static str {
+    match category {
+        MemoryCategory::UserFact => "用户事实",
+        MemoryCategory::UserPreference => "用户偏好",
+        MemoryCategory::SharedExperience => "共同经历",
+        MemoryCategory::Commitment => "约定",
+        MemoryCategory::StoryState => "剧情状态",
+    }
+}
+
 fn sensitivity_request_for_management_mutation<'a>(
     stage: MemorySafetyStage,
     params: &'a MemoryManagementContentParams,
+    facet: MemoryFacet,
+    keywords: &'a [String],
     binding: &'a MemoryManagementBinding,
     assigned_memory_id: &'a MemoryId,
     assigned_revision_id: &'a MemoryRevisionId,
@@ -418,6 +468,8 @@ fn sensitivity_request_for_management_mutation<'a>(
         assigned_memory_id,
         assigned_revision_id,
         category: params.category(),
+        facet,
+        keywords,
         importance: params.importance(),
         content: params.content(),
         change_reason: params.change_reason(),
