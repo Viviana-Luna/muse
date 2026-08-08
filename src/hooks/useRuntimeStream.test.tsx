@@ -125,15 +125,13 @@ describe('useRuntimeStream 交互恢复', () => {
         call_id: 'call-memory',
         name: 'memory_query',
         success: true,
-        content: '查到 1 条相关长期记忆。',
+        content: '记忆查询收据：返回 1 条记忆。',
         structured: {
-          items: [{
-            memory_id: 'memory-1',
-            revision_id: 'revision-2',
-            category: 'user_preference',
-            importance: 'high',
-            content: '正文只交给当前模型，不进入活动索引。'
-          }],
+          memory_receipt: 'memory_query_result',
+          state: 'completed',
+          returned_count: 1,
+          memory_ids: ['memory-1'],
+          revision_ids: ['revision-2'],
           has_more: false
         }
       });
@@ -180,7 +178,7 @@ describe('useRuntimeStream 交互恢复', () => {
       }),
       expect.objectContaining({ kind: 'commit', count: 1, skippedCount: 1 })
     ]);
-    expect(JSON.stringify(activities)).not.toContain('正文只交给当前模型');
+    expect(JSON.stringify(activities)).not.toContain('content');
   });
 
   it('成功提交取消后等待后端终态，再将本地流标记为已停止', async () => {

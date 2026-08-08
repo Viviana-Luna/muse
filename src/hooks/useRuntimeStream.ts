@@ -254,7 +254,7 @@ function memoryActivityForToolResult(
   }
   if (toolName === 'memory_query') {
     const items = Array.isArray(structured.items) ? structured.items : [];
-    const references = items.flatMap((value) => {
+    const legacyReferences = items.flatMap((value) => {
       const item = runtimeRecord(value);
       const memoryId = runtimeArgText(item, 'memory_id');
       const revisionId = runtimeArgText(item, 'revision_id');
@@ -266,10 +266,24 @@ function memoryActivityForToolResult(
         importance: runtimeArgText(item, 'importance') || undefined
       }];
     });
+    const memoryIds = Array.isArray(structured.memory_ids) ? structured.memory_ids : [];
+    const revisionIds = Array.isArray(structured.revision_ids) ? structured.revision_ids : [];
+    const receiptReferences = memoryIds.flatMap((value, index) => {
+      const memoryId = typeof value === 'string' ? value.trim() : '';
+      const revisionIdValue = revisionIds[index];
+      const revisionId = typeof revisionIdValue === 'string' ? revisionIdValue.trim() : '';
+      return memoryId && revisionId ? [{ memoryId, revisionId }] : [];
+    });
+    const references = legacyReferences.length > 0 ? legacyReferences : receiptReferences;
+    const returnedCount = typeof structured.returned_count === 'number'
+      && Number.isSafeInteger(structured.returned_count)
+      && structured.returned_count >= 0
+      ? structured.returned_count
+      : references.length;
     return {
       kind: 'query',
-      label: `本轮读取了 ${references.length} 条相关记忆`,
-      count: references.length,
+      label: `本轮读取了 ${returnedCount} 条相关记忆`,
+      count: returnedCount,
       hasMore: structured.has_more === true,
       references
     };
