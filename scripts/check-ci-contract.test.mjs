@@ -183,6 +183,13 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   ]) {
     assert.ok(appShellStyles.includes(marker), `Windows 双浮岛标题栏缺少 ${marker}。`);
   }
+  for (const marker of [
+    '.app-titlebar-macos',
+    'grid-template-columns: 68px minmax(0, 1fr);',
+    '.app-titlebar-left.native-macos-controls::before',
+  ]) {
+    assert.ok(appShellStyles.includes(marker), `macOS 标题栏浮岛缺少 ${marker}。`);
+  }
   const appearancePanel = read('src/views/settings/panels/AppearancePanel.tsx');
   for (const marker of ['实色背景', '半透明背景', '0.72']) {
     assert.ok(appearancePanel.includes(marker), `Windows 背景材质选项缺少 ${marker}。`);

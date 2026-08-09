@@ -184,13 +184,24 @@ describe('AppTitleBar', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent('Token1,200');
   });
 
-  it('macOS 使用原生窗口按钮并为其保留固定区域', () => {
+  it('macOS 用左侧独立胶囊承载原生窗口按钮并让上下文占满剩余区域', () => {
     platform.mockReturnValue('MacIntel');
     const { container } = render(<AppTitleBar {...titleBarProps()} />);
 
+    const titlebar = screen.getByLabelText('Muse 窗口工具栏');
+    const nativeControls = container.querySelector('.app-titlebar-left');
+    const contextBar = container.querySelector('.titlebar-context-bar');
+
     expect(screen.queryByRole('button', { name: '关闭窗口' })).not.toBeInTheDocument();
-    expect(screen.getByLabelText('Muse 窗口工具栏')).toHaveClass('app-titlebar-macos');
-    expect(container.querySelector('.app-titlebar-left')).toHaveClass('native-macos-controls');
+    expect(screen.queryByLabelText('窗口控制')).not.toBeInTheDocument();
+    expect(titlebar).toHaveClass('app-titlebar-macos');
+    expect(Array.from(titlebar.children).map((child) => child.className)).toEqual([
+      'app-titlebar-left native-macos-controls',
+      'titlebar-context-bar'
+    ]);
+    expect(nativeControls).toHaveClass('native-macos-controls');
+    expect(nativeControls).toHaveAttribute('data-tauri-drag-region', 'deep');
+    expect(contextBar).toHaveAttribute('data-tauri-drag-region', 'false');
     expect(windowApi.isMaximized).not.toHaveBeenCalled();
     expect(windowApi.onResized).not.toHaveBeenCalled();
   });

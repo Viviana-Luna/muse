@@ -50,7 +50,17 @@
   box-shadow: none;
 }
 
-.app-titlebar-windows .titlebar-context-bar {
+.app-titlebar-macos {
+  grid-template-columns: 68px minmax(0, 1fr);
+  column-gap: 8px;
+  padding: 0 8px 0 4px;
+  border-bottom-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-titlebar-windows .titlebar-context-bar,
+.app-titlebar-macos .titlebar-context-bar {
   width: 100%;
   border-color: var(--glass-edge, rgba(255, 255, 255, 0.13));
   background: var(--glass-surface-strong, rgba(12, 15, 24, 0.78));
@@ -66,7 +76,14 @@
   align-items: center;
 }
 
-.app-titlebar-left.native-macos-controls { padding-left: 76px; }
+.app-titlebar-left.native-macos-controls {
+  position: relative;
+  isolation: isolate;
+  align-self: stretch;
+  width: 68px;
+  height: 58px;
+}
+
 .window-controls {
   position: relative;
   isolation: isolate;
@@ -76,7 +93,8 @@
   margin: 0;
 }
 
-.window-controls::before {
+.window-controls::before,
+.app-titlebar-left.native-macos-controls::before {
   position: absolute;
   z-index: 0;
   inset: 8px 0;
@@ -89,6 +107,8 @@
   content: '';
   pointer-events: none;
 }
+
+.app-titlebar-left.native-macos-controls::before { border-radius: 999px; }
 
 .app-titlebar button {
   min-height: 0;
@@ -1221,6 +1241,12 @@
   border-bottom-color: rgba(41, 31, 38, 0.11);
   background: rgba(249, 247, 247, 0.96);
   box-shadow: 0 8px 28px rgba(64, 47, 57, 0.05);
+}
+.theme-light .app-titlebar-windows,
+.theme-light .app-titlebar-macos {
+  border-bottom-color: transparent;
+  background: transparent;
+  box-shadow: none;
 }
 .theme-light .titlebar-context-bar {
   border-color: rgba(41, 31, 38, 0.12);
