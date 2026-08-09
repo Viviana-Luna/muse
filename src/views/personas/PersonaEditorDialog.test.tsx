@@ -224,6 +224,19 @@ describe('PersonaEditorDialog', () => {
     expect(api.uploadPersonaImage).not.toHaveBeenCalled();
   });
 
+  it('Windows 未提供 MIME 时仍允许 JPG 原图进入裁剪流程', () => {
+    renderEditor();
+
+    const input = screen.getByLabelText<HTMLInputElement>('选择角色原图');
+    expect(input.accept).toContain('.jpg');
+    expect(input.accept).toContain('.jpeg');
+    fireEvent.change(input, {
+      target: { files: [new File(['jpeg-source'], '角色原图.JPG')] }
+    });
+
+    expect(screen.getByRole('dialog', { name: '裁剪角色图片' })).toBeInTheDocument();
+  });
+
   it('同一原图裁剪后同时更新立绘与头像并清空旧背景', async () => {
     api.uploadPersonaImage
       .mockResolvedValueOnce({ url: '/api/assets/uploaded/portrait-new.webp' })

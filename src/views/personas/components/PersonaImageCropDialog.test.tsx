@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -28,6 +29,36 @@ function loadSourceImage() {
 }
 
 describe('PersonaImageCropDialog', () => {
+  it('React StrictMode 下为 JPG 重新创建未撤销的预览地址', () => {
+    const createObjectUrl = vi.mocked(URL.createObjectURL);
+    createObjectUrl
+      .mockReset()
+      .mockReturnValueOnce('blob:jpg-first')
+      .mockReturnValueOnce('blob:jpg-second');
+    const revokeObjectUrl = vi.mocked(URL.revokeObjectURL);
+    const view = render(
+      <StrictMode>
+        <PersonaImageCropDialog
+          file={new File(['jpeg-source'], 'source.jpg', { type: 'image/jpeg' })}
+          busy={false}
+          onCancel={vi.fn()}
+          onConfirm={vi.fn().mockResolvedValue(true)}
+        />
+      </StrictMode>
+    );
+
+    const image = document.querySelector<HTMLImageElement>('.persona-crop-frame img');
+    expect(createObjectUrl).toHaveBeenCalledTimes(2);
+    expect(image).toHaveAttribute('src', 'blob:jpg-second');
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:jpg-first');
+    expect(revokeObjectUrl).not.toHaveBeenCalledWith('blob:jpg-second');
+    loadSourceImage();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    view.unmount();
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:jpg-second');
+  });
+
   it('提供固定立绘与头像目标，并为两个目标保留独立缩放值', () => {
     render(
       <PersonaImageCropDialog

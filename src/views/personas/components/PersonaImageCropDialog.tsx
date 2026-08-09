@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, PointerEvent, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
 
@@ -46,17 +46,21 @@ export function PersonaImageCropDialog({
   });
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState('');
+  const [sourceUrl, setSourceUrl] = useState('');
   const frameRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const dialogRef = useModalAccessibility<HTMLElement>(true, () => {
     if (!busy && !processing) onCancel();
   });
-  const sourceUrl = useMemo(() => URL.createObjectURL(file), [file]);
   const target = PERSONA_CROP_TARGETS[activeTarget];
   const selection = selections[activeTarget];
   const locked = busy || processing;
 
-  useEffect(() => () => URL.revokeObjectURL(sourceUrl), [sourceUrl]);
+  useEffect(() => {
+    const nextSourceUrl = URL.createObjectURL(file);
+    setSourceUrl(nextSourceUrl);
+    return () => URL.revokeObjectURL(nextSourceUrl);
+  }, [file]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -243,16 +247,22 @@ export function PersonaImageCropDialog({
               onWheel={handleWheel}
               onKeyDown={handleCropKeyDown}
             >
-              <img
-                src={sourceUrl}
-                alt=""
-                draggable={false}
-                style={imageStyle}
-                onLoad={(event) =>
-                  initializeImage(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)
-                }
-                onError={() => setError('图片无法读取，请重新选择 PNG、JPEG 或 WebP 原图。')}
-              />
+              {sourceUrl && (
+                <img
+                  key={sourceUrl}
+                  src={sourceUrl}
+                  alt=""
+                  draggable={false}
+                  style={imageStyle}
+                  onLoad={(event) =>
+                    initializeImage(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)
+                  }
+                  onError={() => {
+                    setImageSize(null);
+                    setError('图片无法读取，请重新选择 PNG、JPG/JPEG 或 WebP 原图。');
+                  }}
+                />
+              )}
               <span className="persona-crop-guide" aria-hidden="true" />
             </div>
             <p>拖动图片调整位置，滚轮或下方滑杆缩放；方向键可精细移动。</p>

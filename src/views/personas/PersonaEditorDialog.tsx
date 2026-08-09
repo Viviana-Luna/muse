@@ -20,10 +20,13 @@ import type {
   PersonaEditorState
 } from '@/views/personas/hooks/usePersonaState';
 import { PersonaImageCropDialog } from '@/views/personas/components/PersonaImageCropDialog';
-import type { PersonaCropTargetKey } from '@/views/personas/utils/personaImageCrop';
+import {
+  isSupportedPersonaImageFile,
+  PERSONA_IMAGE_ACCEPT,
+  type PersonaCropTargetKey
+} from '@/views/personas/utils/personaImageCrop';
 
 const MAX_PERSONA_IMAGE_BYTES = 5 * 1024 * 1024;
-const PERSONA_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 const DEFAULT_PERSONA_THEME_COLOR = '#d8596f';
 const DEFAULT_PORTRAIT_FRAME = 'portrait';
 const DEFAULT_PORTRAIT_FIT = 'cover';
@@ -267,10 +270,10 @@ export function PersonaEditorDialog({
 
   function selectCropSource(file?: File | null) {
     if (!file || busy) return;
-    if (!PERSONA_IMAGE_MIME_TYPES.includes(file.type)) {
+    if (!isSupportedPersonaImageFile(file)) {
       notify({
         title: '图片格式不支持',
-        description: '请选择 PNG、JPEG 或 WebP 图片。',
+        description: '请选择 PNG、JPG/JPEG 或 WebP 图片。',
         tone: 'error'
       });
       return;
@@ -422,7 +425,7 @@ export function PersonaEditorDialog({
                   type="file"
                   aria-label="选择角色原图"
                   disabled={busy || imageUploading}
-                  accept={PERSONA_IMAGE_MIME_TYPES.join(',')}
+                  accept={PERSONA_IMAGE_ACCEPT}
                   onChange={(event) => {
                     selectCropSource(event.target.files?.[0]);
                     event.target.value = '';
@@ -455,7 +458,7 @@ export function PersonaEditorDialog({
             </div>
             {!hasPortrait && !avatarPath && (
               <p className="persona-image-hint">
-                支持 PNG、JPEG、WebP，原图不超过 5MB。裁剪结果固定为 900×1200 与 768×768。
+                支持 PNG、JPG/JPEG、WebP，原图不超过 5MB。裁剪结果固定为 900×1200 与 768×768。
               </p>
             )}
             <label>

@@ -4,7 +4,9 @@ import {
   clampPersonaCropSelection,
   createInitialPersonaCropSelection,
   createPersonaImageCrops,
+  isSupportedPersonaImageFile,
   panPersonaCropSelection,
+  PERSONA_IMAGE_ACCEPT,
   PERSONA_CROP_TARGETS,
   resolvePersonaCropRect
 } from './personaImageCrop';
@@ -15,6 +17,25 @@ afterEach(() => {
 });
 
 describe('角色图片裁剪数学', () => {
+  it('接受标准 JPEG、非标准 image/jpg 与缺失 MIME 的 JPG 文件', () => {
+    expect(PERSONA_IMAGE_ACCEPT).toContain('.jpg');
+    expect(PERSONA_IMAGE_ACCEPT).toContain('.jpeg');
+    expect(isSupportedPersonaImageFile(new File(['jpg'], 'role.jpg', { type: 'image/jpeg' })))
+      .toBe(true);
+    expect(isSupportedPersonaImageFile(new File(['jpg'], 'role.jpeg', { type: 'image/jpg' })))
+      .toBe(true);
+    expect(isSupportedPersonaImageFile(new File(['jpg'], 'ROLE.JPG'))).toBe(true);
+    expect(
+      isSupportedPersonaImageFile(
+        new File(['jpg'], 'role.jpeg', { type: 'application/octet-stream' })
+      )
+    ).toBe(true);
+    expect(isSupportedPersonaImageFile(new File(['gif'], 'fake.jpg', { type: 'image/gif' })))
+      .toBe(false);
+    expect(isSupportedPersonaImageFile(new File(['gif'], 'role.gif', { type: 'image/gif' })))
+      .toBe(false);
+  });
+
   it('竖向原图会为立绘和头像生成固定比例的居中裁剪区', () => {
     const initial = createInitialPersonaCropSelection(810, 1440);
 
@@ -101,11 +122,17 @@ describe('角色图片裁剪数学', () => {
       new File(['source'], 'source.png', { type: 'image/png' }),
       { portrait: initial, avatar: initial }
     );
+    const jpgFiles = await createPersonaImageCrops(
+      new File(['source'], 'SOURCE.JPG'),
+      { portrait: initial, avatar: initial }
+    );
 
-    expect(canvasSizes).toEqual([[900, 1200], [768, 768]]);
+    expect(canvasSizes).toEqual([[900, 1200], [768, 768], [900, 1200], [768, 768]]);
     expect(files.portrait).toMatchObject({ name: 'source-portrait.png', type: 'image/png' });
     expect(files.avatar).toMatchObject({ name: 'source-avatar.png', type: 'image/png' });
-    expect(drawImage).toHaveBeenCalledTimes(2);
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(jpgFiles.portrait).toMatchObject({ name: 'SOURCE-portrait.jpg', type: 'image/jpeg' });
+    expect(jpgFiles.avatar).toMatchObject({ name: 'SOURCE-avatar.jpg', type: 'image/jpeg' });
+    expect(drawImage).toHaveBeenCalledTimes(4);
+    expect(close).toHaveBeenCalledTimes(2);
   });
 });

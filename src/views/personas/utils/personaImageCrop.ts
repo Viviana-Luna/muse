@@ -20,6 +20,24 @@ export interface PersonaCropRect {
   height: number;
 }
 
+const PERSONA_IMAGE_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp'
+]);
+
+export const PERSONA_IMAGE_ACCEPT = [
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp'
+].join(',');
+
 export const PERSONA_CROP_TARGETS: Record<PersonaCropTargetKey, PersonaCropTarget> = {
   portrait: { key: 'portrait', label: '立绘', width: 900, height: 1200 },
   avatar: { key: 'avatar', label: '头像', width: 768, height: 768 }
@@ -27,6 +45,34 @@ export const PERSONA_CROP_TARGETS: Record<PersonaCropTargetKey, PersonaCropTarge
 
 export const PERSONA_CROP_ZOOM_MIN = 1;
 export const PERSONA_CROP_ZOOM_MAX = 3;
+
+function normalizedPersonaImageMimeType(file: File): string {
+  return file.type.split(';', 1)[0].trim().toLowerCase();
+}
+
+function personaImageExtension(file: File): string {
+  return file.name.match(/\.([^.]+)$/u)?.[1]?.toLowerCase() ?? '';
+}
+
+export function isSupportedPersonaImageFile(file: File): boolean {
+  const mimeType = normalizedPersonaImageMimeType(file);
+  if (mimeType && mimeType !== 'application/octet-stream') {
+    return PERSONA_IMAGE_MIME_TYPES.has(mimeType);
+  }
+  return ['png', 'jpg', 'jpeg', 'webp'].includes(personaImageExtension(file));
+}
+
+function personaImageOutputType(file: File): string {
+  const mimeType = normalizedPersonaImageMimeType(file);
+  if (mimeType === 'image/png') return 'image/png';
+  if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') return 'image/jpeg';
+  if (mimeType === 'image/webp') return 'image/webp';
+
+  const extension = personaImageExtension(file);
+  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg';
+  if (extension === 'webp') return 'image/webp';
+  return 'image/png';
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -170,9 +216,7 @@ export async function createPersonaImageCrops(
   selections: Record<PersonaCropTargetKey, PersonaCropSelection>
 ): Promise<Record<PersonaCropTargetKey, File>> {
   const decoded = await decodeImage(file);
-  const outputType = ['image/png', 'image/jpeg', 'image/webp'].includes(file.type)
-    ? file.type
-    : 'image/png';
+  const outputType = personaImageOutputType(file);
   const baseName = file.name.replace(/\.[^.]+$/u, '') || 'persona-image';
 
   try {
