@@ -35,10 +35,8 @@
   box-shadow: none;
 }
 
-/* === 应用外壳 · 亮色主题变量覆盖（.theme-light） === */
+/* === 应用外壳 · 亮色界面变量覆盖（.theme-light） === */
 .runtime-shell.story-shell.app-shell.theme-light {
-  --app-canvas: #e9ebf1;
-  --app-window-background: rgb(233 235 241 / var(--app-background-opacity, 1));
   --glass-surface: rgba(249, 249, 252, 0.72);
   --glass-surface-strong: rgba(252, 252, 254, 0.88);
   --glass-surface-soft: rgba(255, 255, 255, 0.58);
@@ -55,7 +53,28 @@
   --accent-soft: color-mix(in srgb, var(--theme-color), white 84%);
   --accent-edge: color-mix(in srgb, var(--theme-color), #4a4c58 45%);
   color-scheme: light;
-  background: var(--app-window-background);
+}
+
+/* 背景明暗与浮岛界面主题独立；根节点是整扇窗口唯一的连续背景。 */
+.runtime-shell.story-shell.app-shell.background-theme-dark {
+  --app-canvas: #070a12;
+  --app-window-background: rgb(7 10 18 / var(--app-background-opacity, 1));
+}
+
+.runtime-shell.story-shell.app-shell.background-theme-light {
+  --app-canvas: #e9ebf1;
+  --app-window-background: rgb(233 235 241 / var(--app-background-opacity, 1));
+}
+
+/* 半透明只属于最底层画布；浮岛改用实体表面，避免桌面继续穿透内容层。 */
+.runtime-shell.story-shell.app-shell.background-translucent {
+  --glass-surface: rgb(16 20 31);
+  --glass-surface-strong: rgb(12 15 24);
+}
+
+.runtime-shell.story-shell.app-shell.theme-light.background-translucent {
+  --glass-surface: rgb(249 249 252);
+  --glass-surface-strong: rgb(252 252 254);
 }
 
 /* ===========================================================================
@@ -79,6 +98,49 @@
   border-radius: inherit;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-color), transparent 91%);
   pointer-events: none;
+}
+
+/* 聊天页的阅读区与舞台已经是独立浮岛，两个外层只能承担布局。 */
+.runtime-shell.story-shell.app-shell.view-chat > .app-main-surface {
+  margin: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  filter: none !important;
+  isolation: auto;
+}
+
+.runtime-shell.story-shell.app-shell.view-chat > .app-main-surface::after { display: none; }
+
+.runtime-shell.story-shell.app-shell.view-chat > .app-main-surface > .story-workspace {
+  background: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  filter: none !important;
+  isolation: auto;
+}
+
+.runtime-shell.story-shell.app-shell.background-translucent .app-main-surface {
+  background: var(--glass-surface);
+}
+
+/* 半透明模式：导航、管理页与标题栏浮岛保持实体表面，浅色主题硬编码的半透明背景不得透出桌面。 */
+.runtime-shell.story-shell.app-shell.background-translucent .app-rail,
+.runtime-shell.story-shell.app-shell.background-translucent .object-list-pane,
+.runtime-shell.story-shell.app-shell.background-translucent .detail-actions,
+.runtime-shell.story-shell.app-shell.background-translucent .management-page,
+.runtime-shell.story-shell.app-shell.background-translucent .object-detail-pane {
+  background: var(--glass-surface);
+}
+
+.runtime-shell.story-shell.app-shell.background-translucent .titlebar-context-bar,
+.runtime-shell.story-shell.app-shell.background-translucent .window-controls::before {
+  background: var(--glass-surface-strong);
 }
 
 .app-main-surface > [data-modal-accessibility-surface="true"] {
@@ -1010,6 +1072,10 @@
   border-radius: 26px !important;
   background: color-mix(in srgb, var(--glass-surface), transparent 52%) !important;
   box-shadow: var(--shadow-float), var(--shadow-inset) !important;
+}
+
+.runtime-shell.story-shell.app-shell.background-translucent .story-stage-panel {
+  background: var(--glass-fallback) !important;
 }
 
 .story-stage-panel.is-empty {

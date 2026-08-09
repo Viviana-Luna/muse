@@ -14,9 +14,7 @@
   min-height: 100dvh;
   overflow: hidden;
   color: rgba(255, 255, 255, 0.9);
-  background:
-    radial-gradient(circle at 90% 4%, color-mix(in srgb, var(--theme-color), transparent 88%), transparent 34%),
-    rgb(8 11 19 / var(--app-background-opacity, 1));
+  background: var(--app-window-background, rgb(8 11 19 / var(--app-background-opacity, 1)));
 }
 
 .app-titlebar {
@@ -51,9 +49,9 @@
 }
 
 .app-titlebar-macos {
-  grid-template-columns: 68px minmax(0, 1fr);
+  grid-template-columns: 84px minmax(0, 1fr);
   column-gap: 8px;
-  padding: 0 8px 0 4px;
+  padding: 0 8px;
   border-bottom-color: transparent;
   background: transparent;
   box-shadow: none;
@@ -80,7 +78,7 @@
   position: relative;
   isolation: isolate;
   align-self: stretch;
-  width: 68px;
+  width: 84px;
   height: 58px;
 }
 
@@ -163,6 +161,12 @@
   border-radius: 7px;
   content: '';
   pointer-events: none;
+}
+
+.app-titlebar button.window-control:hover:not(:disabled),
+.app-titlebar button.window-control:active:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
 }
 
 .window-control:hover:not(:disabled)::before { background: rgba(255, 255, 255, 0.06); }
@@ -1336,6 +1340,10 @@
 .theme-light .detail-toolbar,
 .theme-light .detail-actions { border-color: rgba(41, 31, 38, 0.1); }
 .theme-light .window-control { color: rgba(22, 18, 21, 0.88); }
+.theme-light .app-titlebar .window-control {
+  border-color: transparent;
+  background: transparent;
+}
 .theme-light .window-control:hover:not(:disabled)::before { background: rgba(0, 0, 0, 0.06); }
 .theme-light .window-control:active:not(:disabled)::before { background: rgba(0, 0, 0, 0.11); }
 .theme-light .window-control-close:hover:not(:disabled) { color: #fff; }

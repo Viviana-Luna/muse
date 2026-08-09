@@ -509,8 +509,8 @@ pub fn run() {
                 .decorations(true)
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true)
-                // 红绿灯默认按系统 28px 标题栏定位，这里下移到与前端 58px 标题栏垂直居中。
-                .traffic_light_position(tauri::LogicalPosition::new(7.0, 30.5));
+                // 关闭按钮从 x=23px 开始，使约 54px 的原生按钮组在 8px 外边距、84px 胶囊内居中；y 继续与前端 58px 标题栏垂直居中。
+                .traffic_light_position(tauri::LogicalPosition::new(23.0, 30.5));
             #[cfg(target_os = "windows")]
             // Windows 的可选半透明背景需要窗口层和 WebView 同时支持 alpha；默认 1.0 仍保持实色。
             let window_builder = window_builder.decorations(false).transparent(true);

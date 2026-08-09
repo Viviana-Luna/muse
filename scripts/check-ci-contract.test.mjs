@@ -179,21 +179,88 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
     '.app-titlebar-windows',
     'grid-template-columns:\n    0',
     '.window-controls::before',
+    '.app-titlebar button.window-control:hover:not(:disabled)',
     '--app-background-opacity',
   ]) {
     assert.ok(appShellStyles.includes(marker), `Windows 双浮岛标题栏缺少 ${marker}。`);
   }
+  assert.match(
+    appShellStyles,
+    /\.theme-light \.app-titlebar \.window-control\s*\{\s*border-color: transparent;\s*background: transparent;\s*\}/,
+    '浅色主题下窗口控件按钮必须保持透明，不得被通用浅色按钮规则覆盖成白色直角块。',
+  );
   for (const marker of [
     '.app-titlebar-macos',
-    'grid-template-columns: 68px minmax(0, 1fr);',
+    'grid-template-columns: 84px minmax(0, 1fr);',
+    'padding: 0 8px;',
     '.app-titlebar-left.native-macos-controls::before',
   ]) {
     assert.ok(appShellStyles.includes(marker), `macOS 标题栏浮岛缺少 ${marker}。`);
   }
-  const appearancePanel = read('src/views/settings/panels/AppearancePanel.tsx');
-  for (const marker of ['实色背景', '半透明背景', '0.72']) {
-    assert.ok(appearancePanel.includes(marker), `Windows 背景材质选项缺少 ${marker}。`);
+  assert.match(
+    desktopHost,
+    /traffic_light_position\(tauri::LogicalPosition::new\(23\.0, 30\.5\)\)/,
+    'macOS 原生红绿灯必须在 84px 胶囊与 8px 窗口边距内居中。',
+  );
+  const liquidGlassStyles = read('src/assets/styles/liquid-glass.css');
+  const storyWorkspace = read('src/views/story/components/StoryWorkspace.tsx');
+  assert.ok(
+    !storyWorkspace.includes('<StageView'),
+    '聊天工作区不得重新渲染覆盖整个主网格的旧 StageView 蒙层。',
+  );
+  assert.match(
+    liquidGlassStyles,
+    /\.view-chat > \.app-main-surface::after\s*\{\s*display: none;\s*\}/,
+    '聊天工作区外层不得保留玻璃描边叠层。',
+  );
+  assert.match(
+    liquidGlassStyles,
+    /\.app-shell\.background-translucent\s*\{[^}]*--glass-surface: rgb\(16 20 31\);[^}]*--glass-surface-strong: rgb\(12 15 24\);/s,
+    '半透明背景模式必须让内容浮岛使用不透出桌面的实体表面。',
+  );
+  assert.match(
+    liquidGlassStyles,
+    /\.app-shell\.background-translucent \.app-rail[\s\S]*?background: var\(--glass-surface\);/,
+    '半透明背景模式下左侧导航浮岛必须使用实体表面，不得被浅色主题硬编码背景覆盖。',
+  );
+  for (const selector of [
+    '.view-chat > .app-main-surface',
+    '.view-chat > .app-main-surface > .story-workspace',
+  ]) {
+    const escapedSelector = selector.replaceAll('.', '\\.');
+    assert.match(
+      liquidGlassStyles,
+      new RegExp(
+        `${escapedSelector}\\s*\\{[^}]*background: none !important;[^}]*backdrop-filter: none !important;[^}]*isolation: auto;`,
+        's',
+      ),
+      `聊天页布局层 ${selector} 不得绘制方角背景或建立玻璃合成层。`,
+    );
   }
+  assert.match(
+    liquidGlassStyles,
+    /\.background-translucent \.story-stage-panel\s*\{\s*background: var\(--glass-fallback\) !important;\s*\}/,
+    '半透明背景模式下的角色舞台浮岛必须使用不透出桌面的实体背景。',
+  );
+  const museApp = read('src/views/MuseApp.tsx');
+  for (const marker of ['background-translucent', 'background-solid', 'background-theme-']) {
+    assert.ok(museApp.includes(marker), `应用根节点缺少背景材质状态 ${marker}。`);
+  }
+  const appearancePanel = read('src/views/settings/panels/AppearancePanel.tsx');
+  for (const marker of ['跟随系统', '深色主题', '浅色主题', '深色背景', '浅色背景', '实色背景', '半透明背景', '0.72']) {
+    assert.ok(appearancePanel.includes(marker), `外观选项缺少 ${marker}。`);
+  }
+  const appearanceApi = read('src/api/preferences.ts');
+  assert.match(
+    appearanceApi,
+    /interface AppearancePreferencesUpdate\s*\{[^}]*theme: AppearanceTheme;/s,
+    '外观保存请求必须复用既有 appearance.theme 字段。',
+  );
+  assert.match(
+    appearanceApi,
+    /interface AppearancePreferencesUpdate\s*\{[^}]*background_theme: AppearanceBackgroundTheme;/s,
+    '外观保存请求必须独立保存 appearance.background_theme 字段。',
+  );
 
   const windowsAclCheck = read('scripts/check-windows-private-acl.ps1');
   for (const marker of [
