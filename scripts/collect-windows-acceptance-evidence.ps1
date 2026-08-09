@@ -90,13 +90,14 @@ if ([int]$operatingSystem.ProductType -ne 1) {
   throw '当前系统不是 Windows 客户端工作站。'
 }
 $windowsBuild = [int]$operatingSystem.BuildNumber
-$windowsTarget = if ($windowsBuild -eq 19045) {
-  'windows_10_22h2'
-} elseif ($windowsBuild -ge 22000) {
-  'windows_11'
-} else {
-  throw "当前 Windows build $windowsBuild 不在支持的实机矩阵内。"
+$osArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($windowsBuild -ne 26200) {
+  throw "当前 Windows build $windowsBuild 不是支持基线 Windows 11 25H2 build 26200。"
 }
+if ($osArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
+  throw "当前 Windows 架构 $osArchitecture 不是支持基线 x64。"
+}
+$windowsTarget = 'windows_11_25h2_x64'
 
 # Microsoft WebView2 官方分发文档指定该 Client ID 用于查询 Evergreen Runtime。
 $webView2ClientId = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
@@ -179,7 +180,7 @@ $installer = Get-Item -LiteralPath $InstallerPath
 $installerHash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
 
 [ordered]@{
-  schema_version = 'muse-windows-acceptance-evidence/v1'
+  schema_version = 'muse-windows-acceptance-evidence/v2'
   collected_at_utc = [DateTime]::UtcNow.ToString('o')
   commit_sha = $CommitSha.ToLowerInvariant()
   installer = [ordered]@{
@@ -191,7 +192,7 @@ $installerHash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
     caption = [string]$operatingSystem.Caption
     version = [string]$operatingSystem.Version
     build_number = [string]$operatingSystem.BuildNumber
-    architecture = [string]$operatingSystem.OSArchitecture
+    architecture = 'x64'
   }
   webview2_runtime_version = $webView2Version
   display = [ordered]@{

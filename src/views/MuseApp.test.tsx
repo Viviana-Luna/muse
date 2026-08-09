@@ -126,6 +126,31 @@ describe('MuseApp 角色导入意图', () => {
     expect(screen.queryByRole('heading', { name: '暂无角色' })).not.toBeInTheDocument();
   });
 
+  it('把已保存的背景可见度应用到应用画布', async () => {
+    api.fetchAppearancePreferences.mockResolvedValue({
+      schema_version: 1,
+      appearance: {
+        theme: 'system',
+        language: 'zh-CN',
+        background_blur: 18,
+        background_opacity: 0.72,
+        motion_level: 'full'
+      },
+      diagnostics: []
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: '暂无角色' });
+
+    await waitFor(() =>
+      expect(
+        container
+          .querySelector<HTMLElement>('main.runtime-shell')
+          ?.style.getPropertyValue('--app-background-opacity')
+      ).toBe('0.72')
+    );
+  });
+
   it('从空态进入角色库后打开可审阅的导入流程，不直接弹出系统文件框', async () => {
     const inputClick = vi
       .spyOn(HTMLInputElement.prototype, 'click')

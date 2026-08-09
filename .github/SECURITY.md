@@ -4,6 +4,8 @@
 
 安全修复优先覆盖最新发布版本和 `master` 分支。尚未发布的历史版本不承诺单独维护。
 
+Windows 平台报告范围从 `v1.0.0-beta.2` 源码标签起限定为 Windows 11 25H2 x64（build 26200）与 Evergreen WebView2 111+；当前无公开 Windows 安装包。Windows 10、Windows 11 24H2/26H1、ARM64 和 Windows Server 不在支持范围。固定实机为 Windows 11 Pro 25H2 x64，但安全问题仍应按实际受影响版本如实报告。
+
 ## 报告安全问题
 
 请不要通过公开 Issue、Discussion、Pull Request 或 Actions 日志披露尚未修复的漏洞、密钥、利用代码或用户数据。

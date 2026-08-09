@@ -21,7 +21,7 @@
 - **Rust stable** 工具链，并安装 `rustfmt` 与 `clippy`（用于后端服务与本地工具运行时编译）。
 - **Node.js 22** 与 **npm**（用于前端 UI 开发与构建）。
 - 对应平台的 **Tauri 2 前置依赖**（用于原生桌面构建与调试）。
-- 当前主要开发和真实桌面验证环境为 **macOS**；代码仍保留 **macOS 13.1 / Safari 16.2** 技术基线。**Windows 10 22H2 / Windows 11、WebView2 111+** 是未来适配目标，当前不属于已支持平台。修改前端能力、构建目标或安装配置时必须同步维护 [`docs/webview-compatibility.md`](../docs/webview-compatibility.md) 与 CI 契约。
+- 当前主要开发环境仍为 **macOS**，并保留 **macOS 13.1 / Safari 16.2** 技术基线。从 `v1.0.0-beta.2` 源码标签起支持 **Windows 11 25H2 x64（build 26200）与 Evergreen WebView2 111+**，固定实机为 Windows 11 Pro；当前不提供公开 Windows 安装包。Windows 10、Windows 11 24H2/26H1 和 ARM64 不在支持范围。修改前端能力、构建目标或安装配置时必须同步维护 [`docs/webview-compatibility.md`](../docs/webview-compatibility.md) 与 CI 契约。
 
 ### 仓库克隆与依赖安装
 
@@ -93,7 +93,7 @@ bash scripts/clean-build-artifacts.sh
 
 ## 🔁 CI 与发布流程
 
-Muse 当前处于 `v1.0.0-beta.1` 内部 Beta 打磨阶段。带 `-beta.N` 后缀的标签只标记 `dev` 上经过确认的可用基线并运行 quality，不创建安装包或 GitHub Release；稳定版标签、公开安装包和正式 Release 仍需以后从 `master` 单独启动发布评估。任何版本阶段都不得以“准备发布”为理由降低质量门禁。
+Muse 当前工程版本为 `v1.0.0-beta.2`。带 `-beta.N` 后缀的标签只标记 `dev` 上经过确认的源码基线并运行 quality，不创建安装包或 GitHub Release；Windows 11 支持同样只绑定通过实机验收的源码标签。稳定版标签、公开安装包和正式 Release 仍需以后从 `master` 单独启动发布评估。任何版本阶段都不得以“准备发布”为理由降低质量门禁。
 
 `.github/workflows/ci.yml` 是自动化实际执行契约。当前日常协作只把 quality 作为有效门禁：
 
@@ -123,7 +123,7 @@ npm run build
 cargo test --workspace --all-targets --locked --features live-tests
 ```
 
-当前平台策略：macOS 是主要开发、长期自用和真实桌面验证环境，但并未达到发布质量；Windows 条件编译和适配基础保留，等待以后有固定 Windows 主机时重新立项。自动化 Windows 结果不能代替 Windows 实机，也不阻塞当前 macOS 开发。
+当前平台策略：macOS 是主要开发和长期自用环境，但尚未达到公开分发质量；Windows 11 25H2 x64 从 `v1.0.0-beta.2` 源码标签起进入支持范围，仍不提供公开安装包。自动化 Windows 结果不能替代固定 Windows 11 Pro 25H2 实机证据，Windows 10、24H2/26H1 与 ARM64 结果也不能由该证据推断。
 
 未来若维护者明确启动版本阶段评估，必须新建独立计划，重新确认目标平台、版本一致性、最低系统、签名、公证、安装升级、资产数量和 `SHA256SUMS`，不能沿用当前遗留双平台发布假设。
 

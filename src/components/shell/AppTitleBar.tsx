@@ -2,15 +2,18 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Bot,
   ChevronDown,
-  Maximize2,
+  Copy,
   MessageSquareText,
   Minus,
+  Square,
   UserRound,
   X
 } from 'lucide-react';
 
 import {
   closeDesktopWindow,
+  isDesktopWindowMaximized,
+  listenDesktopWindowResized,
   minimizeDesktopWindow,
   toggleDesktopWindowMaximize
 } from '@/components/shell/desktopWindow';
@@ -127,8 +130,39 @@ export function AppTitleBar({
   const modelDisplayName = modelNameParts.join(' / ');
   const personaLabel = activePersonaName || '未选择角色';
   const nativeMacWindowControls = usesNativeMacWindowControls();
+  const [windowMaximized, setWindowMaximized] = useState(false);
   const contextProgress = Math.max(0, Math.min(100, conversationContext.contextProgress ?? 0));
   const currentDateTime = useCurrentDateTime();
+
+  useEffect(() => {
+    if (nativeMacWindowControls) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    function refreshMaximizedState() {
+      void isDesktopWindowMaximized()
+        .then((maximized) => {
+          if (!disposed) setWindowMaximized(maximized);
+        })
+        .catch(reportWindowCommandFailure('无法读取窗口最大化状态。'));
+    }
+
+    refreshMaximizedState();
+    void listenDesktopWindowResized(refreshMaximizedState)
+      .then((stopListening) => {
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisten = stopListening;
+        }
+      })
+      .catch(reportWindowCommandFailure('无法监听窗口尺寸变化。'));
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [nativeMacWindowControls]);
 
   useEffect(() => {
     if (!sessionSelectorOpen && !personaSelectorOpen && !modelSelectorOpen) return;
@@ -178,48 +212,15 @@ export function AppTitleBar({
   ]);
 
   return (
-    <header className="app-titlebar" aria-label="Muse 窗口工具栏" data-tauri-drag-region="deep">
+    <header
+      className={`app-titlebar ${nativeMacWindowControls ? 'app-titlebar-macos' : 'app-titlebar-windows'}`}
+      aria-label="Muse 窗口工具栏"
+      data-tauri-drag-region="deep"
+    >
       <div
         className={`app-titlebar-left${nativeMacWindowControls ? ' native-macos-controls' : ''}`}
-      >
-        {!nativeMacWindowControls && (
-          <div className="window-controls" aria-label="窗口控制" data-tauri-drag-region="false">
-            <button
-              type="button"
-              className="window-control window-control-close"
-              aria-label="关闭窗口"
-              title="关闭窗口"
-              onClick={() => void closeDesktopWindow().catch(reportWindowCommandFailure('无法关闭窗口。'))}
-            >
-              <X aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="window-control window-control-minimize"
-              aria-label="最小化窗口"
-              title="最小化窗口"
-              onClick={() =>
-                void minimizeDesktopWindow().catch(reportWindowCommandFailure('无法最小化窗口。'))
-              }
-            >
-              <Minus aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="window-control window-control-maximize"
-              aria-label="最大化或还原窗口"
-              title="最大化或还原窗口"
-              onClick={() =>
-                void toggleDesktopWindowMaximize().catch(
-                  reportWindowCommandFailure('无法切换窗口大小。')
-                )
-              }
-            >
-              <Maximize2 aria-hidden="true" />
-            </button>
-          </div>
-        )}
-      </div>
+        data-tauri-drag-region="deep"
+      />
 
       <div className="titlebar-context-bar" data-tauri-drag-region="false">
         <div
@@ -270,7 +271,11 @@ export function AppTitleBar({
           </button>
           {personaSelectorOpen && personaPickerContent}
         </div>
-        <div className="titlebar-segment" ref={modelPickerAnchorRef}>
+        <div
+          className="titlebar-segment"
+          ref={modelPickerAnchorRef}
+          data-tauri-drag-region="false"
+        >
           <button
             type="button"
             className="titlebar-segment-button titlebar-model-selector"
@@ -344,6 +349,48 @@ export function AppTitleBar({
           <strong>{currentDateTime.timeLabel}</strong>
         </span>
       </div>
+
+      {!nativeMacWindowControls && (
+        <div className="window-controls" aria-label="窗口控制" data-tauri-drag-region="false">
+          <button
+            type="button"
+            className="window-control window-control-minimize"
+            aria-label="最小化窗口"
+            title="最小化窗口"
+            data-tauri-drag-region="false"
+            onClick={() =>
+              void minimizeDesktopWindow().catch(reportWindowCommandFailure('无法最小化窗口。'))
+            }
+          >
+            <Minus aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="window-control window-control-maximize"
+            aria-label={windowMaximized ? '还原窗口' : '最大化窗口'}
+            title={windowMaximized ? '还原窗口' : '最大化窗口'}
+            data-tauri-drag-region="false"
+            onClick={() =>
+              void toggleDesktopWindowMaximize()
+                .then(isDesktopWindowMaximized)
+                .then(setWindowMaximized)
+                .catch(reportWindowCommandFailure('无法切换窗口大小。'))
+            }
+          >
+            {windowMaximized ? <Copy aria-hidden="true" /> : <Square aria-hidden="true" />}
+          </button>
+          <button
+            type="button"
+            className="window-control window-control-close"
+            aria-label="关闭窗口"
+            title="关闭窗口"
+            data-tauri-drag-region="false"
+            onClick={() => void closeDesktopWindow().catch(reportWindowCommandFailure('无法关闭窗口。'))}
+          >
+            <X aria-hidden="true" />
+          </button>
+        </div>
+      )}
     </header>
   );
 }

@@ -1,6 +1,6 @@
 // 主应用视图，整合聊天舞台、角色管理、模型设置和运行时工具事件。
 
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { Check } from 'lucide-react';
 import { fetchModelCatalog, fetchModelsConfig } from '@/api';
 import { reportDesktopReady } from '@/api/client';
@@ -288,6 +288,10 @@ export function App() {
 
   const personaTheme = usePersonaTheme(activeVisualPack, voice.status);
   const { themeMode, rootStyle } = personaTheme;
+  const appRootStyle = {
+    ...rootStyle,
+    '--app-background-opacity': String(appearanceSettings.backgroundOpacity)
+  } as CSSProperties;
   const selectableSessions = chatRuntime.runtimeSessions.filter(
     (session) => session.can_resume && session.records > 0
   );
@@ -325,7 +329,7 @@ export function App() {
       <AppToastViewport toasts={toasts} themeMode={themeMode} onDismiss={dismissToast} />
       <main
         className={`runtime-shell story-shell app-shell view-${route.section} theme-${themeMode} motion-${appearanceSettings.motionLevel}`}
-        style={rootStyle}
+        style={appRootStyle}
       >
       <RuntimeLiveRegion status={runtimeStatus} />
       <AppTitleBar

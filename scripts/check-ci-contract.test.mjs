@@ -168,6 +168,26 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   }
   assert.ok(!windowsJob.includes('taskkill'), 'Windows 进程回收不得退回 taskkill。');
 
+  const desktopHost = read('src-tauri/src/lib.rs');
+  assert.match(
+    desktopHost,
+    /#\[cfg\(target_os = "windows"\)\][\s\S]*?decorations\(false\)\.transparent\(true\)/,
+    'Windows 半透明背景必须同时启用透明宿主与透明 WebView。',
+  );
+  const appShellStyles = read('src/assets/styles/app-shell.css');
+  for (const marker of [
+    '.app-titlebar-windows',
+    'grid-template-columns:\n    0',
+    '.window-controls::before',
+    '--app-background-opacity',
+  ]) {
+    assert.ok(appShellStyles.includes(marker), `Windows 双浮岛标题栏缺少 ${marker}。`);
+  }
+  const appearancePanel = read('src/views/settings/panels/AppearancePanel.tsx');
+  for (const marker of ['实色背景', '半透明背景', '0.72']) {
+    assert.ok(appearancePanel.includes(marker), `Windows 背景材质选项缺少 ${marker}。`);
+  }
+
   const windowsAclCheck = read('scripts/check-windows-private-acl.ps1');
   for (const marker of [
     'muse-windows-acl-evidence/v1',
@@ -191,11 +211,13 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
 
   const windowsAcceptanceEvidence = read('scripts/collect-windows-acceptance-evidence.ps1');
   for (const marker of [
-    'muse-windows-acceptance-evidence/v1',
+    'muse-windows-acceptance-evidence/v2',
     'Win32_OperatingSystem',
     'ProductType',
-    'windows_10_22h2',
-    'windows_11',
+    'windows_11_25h2_x64',
+    '$windowsBuild -ne 26200',
+    'RuntimeInformation]::OSArchitecture',
+    'Architecture]::X64',
     'F3017226-FE2A-4295-8BDF-00C3A9A7E4C5',
     'WebView2 Runtime',
     "[version]'111.0.0.0'",
@@ -212,6 +234,11 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
       `Windows 实机证据采集缺少 ${marker}。`,
     );
   }
+  assert.doesNotMatch(
+    windowsAcceptanceEvidence,
+    /windows_10_22h2|windowsBuild\s+-ge\s+22000/,
+    'Windows 实机证据不得把 Windows 10 或所有 Windows 11 build 纳入支持范围。',
+  );
   assert.doesNotMatch(
     windowsAcceptanceEvidence,
     /UserName|ComputerName|CommandLine|Get-Content|config\.toml/iu,
@@ -304,16 +331,37 @@ test('WebView 构建目标、安装下限和公开支持口径保持一致', () 
     'Safari 16.2 产物必须包含立绘 mask-image 前缀。',
   );
 
-  const publicSupportFiles = [
+  const currentSupportFiles = [
     'README.md',
     '.github/CONTRIBUTING.md',
     '.github/ISSUE_TEMPLATE/bug_report.md',
-    'docs/releases/v0.1.0.md',
+    '.github/SECURITY.md',
+    'AGENTS.md',
+    'CLAUDE.md',
     'docs/webview-compatibility.md',
+    'docs/releases/v1.0.0-beta.2.md',
   ];
-  const publicSupport = publicSupportFiles.map(read).join('\n');
+  for (const relative of currentSupportFiles) {
+    assert.ok(
+      read(relative).includes('Windows 11 25H2 x64'),
+      `${relative} 缺少 Windows 11 25H2 x64 支持范围。`,
+    );
+  }
+  const publicSupport = currentSupportFiles.map(read).join('\n');
   assert.doesNotMatch(publicSupport, /macOS 10\.15/i);
-  for (const required of ['macOS 13.1', 'Windows 10 22H2', 'WebView2 111']) {
+  assert.doesNotMatch(
+    publicSupport,
+    /未来适配目标|当前不宣称 Windows 已受支持|Windows 适配整体延后|当前不属于已支持平台/,
+    '当前公开文档不得继续使用 Windows 尚未支持的历史口径。',
+  );
+  for (const required of [
+    'macOS 13.1',
+    'v1.0.0-beta.2',
+    'Windows 11 25H2 x64',
+    'build 26200',
+    'WebView2 111+',
+    '不提供公开 Windows 安装包',
+  ]) {
     assert.ok(publicSupport.includes(required), `公开支持口径缺少 ${required}。`);
   }
   const compatibilityGuide = read('docs/webview-compatibility.md');
@@ -321,6 +369,11 @@ test('WebView 构建目标、安装下限和公开支持口径保持一致', () 
     'scripts/collect-windows-acceptance-evidence.ps1',
     '-MainProcessId',
     '-ExpectNoMuseProcess',
+    'muse-windows-acceptance-evidence/v2',
+    'Windows 10',
+    'Windows 11 24H2/26H1',
+    'ARM64',
+    'Windows Server',
   ]) {
     assert.ok(compatibilityGuide.includes(marker), `Windows 实机指南缺少 ${marker}。`);
   }

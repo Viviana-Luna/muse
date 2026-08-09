@@ -22,3 +22,13 @@ export function minimizeDesktopWindow(): Promise<void> {
 export function toggleDesktopWindowMaximize(): Promise<void> {
   return runWindowCommand((window) => window.toggleMaximize());
 }
+
+export async function isDesktopWindowMaximized(): Promise<boolean> {
+  if (!isTauriDesktopRuntime()) return false;
+  return getCurrentWindow().isMaximized();
+}
+
+export async function listenDesktopWindowResized(listener: () => void): Promise<() => void> {
+  if (!isTauriDesktopRuntime()) return () => undefined;
+  return getCurrentWindow().onResized(listener);
+}

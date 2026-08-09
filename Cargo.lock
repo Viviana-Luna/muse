@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "muse"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "axum",
  "muse-api",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "muse-api"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "muse-core"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "muse-runtime"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "chrono",
  "futures",

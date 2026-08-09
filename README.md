@@ -8,9 +8,9 @@ Muse 面向希望在本机创建、演绎和陪伴角色的用户。角色设定
 
 ## 当前开发状态
 
-Muse 已进入 `v1.0.0-beta.1` 内部 Beta 打磨阶段。该标签表示当前主链已经形成可持续使用的基线，后续重点转向项目认知、真实缺陷审计、架构收口和体验修正；它不表示已经完成公开发布准备，也不承诺发布日期。
+Muse 当前工程版本为 `v1.0.0-beta.2`。该源码标签用于冻结 Windows 11 支持基线；只有标签指向的同一提交和同一 NSIS 测试包完成自动化、安装、权限、产品主链与真实桌面验收后，支持声明才生效。`v1.0.0-beta.1` 仍是此前的内部 Beta 历史基线。
 
-macOS 是当前主要开发、长期自用和真实桌面验证环境，但这不表示 macOS 已达到公开分发质量。当前 Beta 只提供源码与标签基线，不创建 GitHub Release 或公开安装包。Windows 相关条件编译和适配基础仍保留，计划在 macOS 主链稳定、具备固定 Windows 测试主机并重新立项后独立适配；当前不宣称 Windows 已受支持。
+从 `v1.0.0-beta.2` 源码标签起，Muse 支持 Windows 11 25H2 x64（build 26200）与 Evergreen WebView2 111+；固定实机验收环境为 Windows 11 Pro 25H2 x64。当前不提供公开 Windows 安装包，使用者需要从源码构建。Windows 10、Windows 11 24H2/26H1 和 ARM64 不在支持范围。macOS 仍是主要开发与长期自用环境，但尚未达到公开分发质量；Beta 标签不创建 GitHub Release 或公开安装包。
 
 ## 主要能力
 
@@ -31,7 +31,7 @@ macOS 是当前主要开发、长期自用和真实桌面验证环境，但这�
 - 运行时：`crates/muse-runtime` 负责状态协调、回合快照和 v3 会话存储。
 - 本地 API：`crates/muse-api` 负责 Axum 路由、安全边界和运行时装配。
 - 前端：React 19、Vite 7、TypeScript、Zustand、Radix UI、react-markdown。
-- 桌面：Tauri 2；当前以 macOS WKWebView 桌面开发为主，保留未来 Windows WebView2/NSIS 适配基础。
+- 桌面：Tauri 2；macOS 继续作为主要开发环境，Windows 11 25H2 x64 使用 WebView2 与 NSIS 完成源码支持验收。
 - 存储：平台应用数据目录中的用户级 `config.toml`、版本化 SQLite、Session JSONL 和文件资源；旧 JSON 只作为一次性迁移来源原样保留。
 
 ## 快速开始
@@ -43,7 +43,7 @@ macOS 是当前主要开发、长期自用和真实桌面验证环境，但这�
 - 对应平台的 [Tauri 2 前置依赖](https://v2.tauri.app/start/prerequisites/)。
 - 打包安装包时使用 `tauri-cli 2.10.1`。
 
-当前开发技术基线仍保留 macOS 13.1 / Safari 16.2，以及未来 Windows 10 22H2、Windows 11 / WebView2 111 的兼容目标，但这些目标不等于已完成公开支持验收。日常真实桌面工作只以 macOS 为主；Windows 适配整体延后。完整边界见 [WebView 兼容基线](docs/webview-compatibility.md)。
+前端构建继续保留 macOS 13.1 / Safari 16.2 技术目标；Windows 源码支持基线固定为 Windows 11 25H2 x64 与 Evergreen WebView2 111+。平台支持、实机证据和未覆盖范围见 [WebView 兼容基线](docs/webview-compatibility.md)。
 
 ### 安装依赖
 
@@ -73,14 +73,14 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm run tauri build -- --bundles dmg --target universal-apple-darwin
 ```
 
-Windows（未来适配或 CI 诊断使用，当前不属于支持范围）：
+Windows 11 25H2 x64（源码支持；本地或内部验收包）：
 
 ```bash
 npm run tauri build -- --bundles nsis
 ```
 
 Windows 测试包输出到 `target/release/bundle/`；macOS Universal 测试包输出到
-`target/universal-apple-darwin/release/bundle/`。当前 macOS 构建不使用 Apple Developer ID 签名或公证，只能作为本地或受控测试产物，不能据此创建公开 Release。未来进入版本阶段时必须重新制定签名、公证、最低系统和分发策略。
+`target/universal-apple-darwin/release/bundle/`。Windows 11 支持当前只绑定源码标签，不提供公开或签名 NSIS；macOS 构建同样不使用 Apple Developer ID 签名或公证。两类产物都只能用于本地或受控测试，不能据此创建公开 Release。
 
 ## 数据目录
 

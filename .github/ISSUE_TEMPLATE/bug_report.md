@@ -28,9 +28,9 @@ assignees: []
 
 ## 💻 运行环境
 
-当前主要开发与验证环境为 macOS；Windows 10 22H2、Windows 11 和 WebView2 111 属于未来适配目标。欢迎记录 Windows 源码调试问题，但这不表示当前已有 Windows 安装包或支持承诺。
+当前主要开发环境为 macOS；从 `v1.0.0-beta.2` 源码标签起支持 Windows 11 25H2 x64（build 26200）与 Evergreen WebView2 111+，但不提供公开 Windows 安装包。Windows 10、Windows 11 24H2/26H1 和 ARM64 不在支持范围。
 
-- **操作系统及完整版本**：[例如：macOS 13.1 / Windows 10 22H2 / Windows 11 24H2]
+- **操作系统及完整版本**：[例如：macOS 13.1 / Windows 11 25H2 build 26200 x64]
 - **WebView 版本**：[macOS 填 Safari 版本；Windows 填 WebView2 版本]
 - **显示缩放**：[例如：100% / 125% / 150% / 200%]
 - **主题与窗口尺寸**：[例如：深色主题 / 1280 × 800]

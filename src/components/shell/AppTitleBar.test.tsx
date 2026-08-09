@@ -1,10 +1,13 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const windowApi = vi.hoisted(() => ({
   close: vi.fn(),
+  isMaximized: vi.fn(),
   minimize: vi.fn(),
-  toggleMaximize: vi.fn()
+  onResized: vi.fn(),
+  toggleMaximize: vi.fn(),
+  unlistenResized: vi.fn()
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -44,11 +47,21 @@ function titleBarProps(overrides: Record<string, unknown> = {}) {
 }
 
 describe('AppTitleBar', () => {
+  let platform: ReturnType<typeof vi.spyOn>;
+  let resizeListener: (() => void) | undefined;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    resizeListener = undefined;
     windowApi.close.mockResolvedValue(undefined);
+    windowApi.isMaximized.mockResolvedValue(false);
     windowApi.minimize.mockResolvedValue(undefined);
+    windowApi.onResized.mockImplementation(async (listener: () => void) => {
+      resizeListener = listener;
+      return windowApi.unlistenResized;
+    });
     windowApi.toggleMaximize.mockResolvedValue(undefined);
+    platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('Win32');
     Object.defineProperty(window, '__TAURI_INTERNALS__', {
       configurable: true,
       value: {}
@@ -58,21 +71,62 @@ describe('AppTitleBar', () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    platform.mockRestore();
     Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
   });
 
-  it('使用自绘按钮调用桌面窗口控制命令', async () => {
-    render(<AppTitleBar {...titleBarProps()} />);
+  it('Windows 在右侧按最小化、最大化和关闭顺序渲染可点击控件', async () => {
+    const { container } = render(<AppTitleBar {...titleBarProps()} />);
 
-    fireEvent.click(screen.getByRole('button', { name: '关闭窗口' }));
+    const titlebar = screen.getByLabelText('Muse 窗口工具栏');
+    const controls = screen.getByLabelText('窗口控制');
+    const buttons = within(controls).getAllByRole('button');
+
+    expect(titlebar).toHaveClass('app-titlebar-windows');
+    expect(titlebar).toHaveAttribute('data-tauri-drag-region', 'deep');
+    expect(Array.from(titlebar.children).map((child) => child.className)).toEqual([
+      'app-titlebar-left',
+      'titlebar-context-bar',
+      'window-controls'
+    ]);
+    expect(container.querySelector('.app-titlebar-left')).toHaveAttribute(
+      'data-tauri-drag-region',
+      'deep'
+    );
+    expect(controls).toHaveAttribute('data-tauri-drag-region', 'false');
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
+      '最小化窗口',
+      '最大化窗口',
+      '关闭窗口'
+    ]);
+    for (const button of buttons) {
+      expect(button).toHaveAttribute('data-tauri-drag-region', 'false');
+    }
+
     fireEvent.click(screen.getByRole('button', { name: '最小化窗口' }));
-    fireEvent.click(screen.getByRole('button', { name: '最大化或还原窗口' }));
+    fireEvent.click(screen.getByRole('button', { name: '最大化窗口' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭窗口' }));
 
     await waitFor(() => {
       expect(windowApi.close).toHaveBeenCalledOnce();
       expect(windowApi.minimize).toHaveBeenCalledOnce();
       expect(windowApi.toggleMaximize).toHaveBeenCalledOnce();
     });
+  });
+
+  it('窗口最大化状态变化时切换最大化和还原控件', async () => {
+    windowApi.isMaximized.mockResolvedValue(true);
+    render(<AppTitleBar {...titleBarProps()} />);
+
+    const restore = await screen.findByRole('button', { name: '还原窗口' });
+    expect(restore.querySelector('.lucide-copy')).toBeInTheDocument();
+    await waitFor(() => expect(windowApi.onResized).toHaveBeenCalledOnce());
+
+    windowApi.isMaximized.mockResolvedValue(false);
+    resizeListener?.();
+
+    const maximize = await screen.findByRole('button', { name: '最大化窗口' });
+    expect(maximize.querySelector('.lucide-square')).toBeInTheDocument();
   });
 
   it('把当前会话、角色、模型、环形上下文状态和时间集中到标题栏', () => {
@@ -131,12 +185,14 @@ describe('AppTitleBar', () => {
   });
 
   it('macOS 使用原生窗口按钮并为其保留固定区域', () => {
-    const platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('MacIntel');
+    platform.mockReturnValue('MacIntel');
     const { container } = render(<AppTitleBar {...titleBarProps()} />);
 
     expect(screen.queryByRole('button', { name: '关闭窗口' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Muse 窗口工具栏')).toHaveClass('app-titlebar-macos');
     expect(container.querySelector('.app-titlebar-left')).toHaveClass('native-macos-controls');
-    platform.mockRestore();
+    expect(windowApi.isMaximized).not.toHaveBeenCalled();
+    expect(windowApi.onResized).not.toHaveBeenCalled();
   });
 
   it('模型弹出菜单支持选中项聚焦、Escape 和点击外部关闭', async () => {

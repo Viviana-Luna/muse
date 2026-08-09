@@ -511,7 +511,10 @@ pub fn run() {
                 .hidden_title(true)
                 // 红绿灯默认按系统 28px 标题栏定位，这里下移到与前端 58px 标题栏垂直居中。
                 .traffic_light_position(tauri::LogicalPosition::new(7.0, 30.5));
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            // Windows 的可选半透明背景需要窗口层和 WebView 同时支持 alpha；默认 1.0 仍保持实色。
+            let window_builder = window_builder.decorations(false).transparent(true);
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             let window_builder = window_builder.decorations(false);
 
             window_builder
