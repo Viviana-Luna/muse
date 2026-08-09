@@ -16,7 +16,6 @@ import {
 import { ComposerBar } from '@/views/chat/components/ComposerBar';
 import { GalgameDialogueBox } from '@/views/chat/components/GalgameDialogueBox';
 import { ClassicInteractionPanel } from '@/views/chat/components/PendingInteractionPanel';
-import { StageView } from '@/views/chat/components/StageView';
 import type { useChatRuntime } from '@/views/chat/hooks/useChatRuntime';
 import type { usePersonaTheme } from '@/hooks/usePersonaTheme';
 import {
@@ -174,10 +173,7 @@ function ActiveWorkspace({
     handleForkSession,
     retryBootstrap
   } = runtime;
-  const {
-    portraitPath,
-    stageStateClass
-  } = theme;
+  const { portraitPath } = theme;
   const [portraitFailed, setPortraitFailed] = useState(false);
 
   useEffect(() => setPortraitFailed(false), [portraitPath]);
@@ -188,12 +184,6 @@ function ActiveWorkspace({
   return (
     <>
       <audio ref={audioRef} className="voice-player" preload="auto" />
-      <StageView
-        stageStateClass={stageStateClass}
-        portraitPath={portraitPath}
-        personaName={persona.name}
-        showPortrait={false}
-      />
       <section
         className="story-workspace"
         aria-label="角色剧情"

@@ -307,6 +307,7 @@ describe('StoryWorkspace', () => {
     );
     expect(screen.queryByText('暂无角色')).not.toBeInTheDocument();
     expect(document.querySelector('.story-scene-head')).not.toBeInTheDocument();
+    expect(document.querySelector('.app-main-surface > .stage, .stage-vignette')).toBeNull();
   });
 
   it('聊天记录区域不再渲染会话仪表头，全部高度留给消息', () => {
