@@ -87,7 +87,7 @@ test('CI 全面使用根前端、src-tauri 和 crates 工作区', () => {
   assert.match(workflow, /cargo test -p muse --all-targets --locked/);
   assert.doesNotMatch(
     workflow,
-    /cargo test -p muse-local-api security:: --all-targets --locked/,
+    /cargo test -p muse-api security:: --all-targets --locked/,
     '本地 API 安全测试已包含在 workspace 全量测试中，不得重复执行。',
   );
   assert.match(workflow, /live_tests:[\s\S]*--features live-tests/);
@@ -114,7 +114,7 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   for (const member of [
     'crates/muse-core',
     'crates/muse-runtime',
-    'crates/muse-local-api',
+    'crates/muse-api',
     'src-tauri',
   ]) {
     assert.ok(workspace.includes(`"${member}"`), `workspace 缺少成员 ${member}。`);
@@ -140,22 +140,22 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
   assert.match(desktop, /window_builder\.decorations\(false\)/);
 
   for (const relative of [
-    'crates/muse-local-api/src/lib.rs',
-    'crates/muse-local-api/src/api/mod.rs',
-    'crates/muse-local-api/src/dto/mod.rs',
-    'crates/muse-local-api/src/middleware/mod.rs',
-    'crates/muse-local-api/src/runtime_support/tool_adapters/mod.rs',
+    'crates/muse-api/src/lib.rs',
+    'crates/muse-api/src/api/mod.rs',
+    'crates/muse-api/src/dto/mod.rs',
+    'crates/muse-api/src/middleware/mod.rs',
+    'crates/muse-api/src/runtime_support/tool_adapters/mod.rs',
   ]) {
     assert.ok(read(relative).split('\n').length <= 120, `${relative} 只能承担装配与兼容导出。`);
   }
-  for (const relative of rustFiles('crates/muse-local-api/src/api')) {
+  for (const relative of rustFiles('crates/muse-api/src/api')) {
     assert.ok(read(relative).split('\n').length <= 1200, `${relative} 超过 1200 行。`);
   }
-  for (const relative of rustFiles('crates/muse-local-api/src/runtime_support')) {
+  for (const relative of rustFiles('crates/muse-api/src/runtime_support')) {
     if (relative.endsWith('/tests.rs')) continue;
     assert.ok(read(relative).split('\n').length <= 4000, `${relative} 超过 4000 行。`);
   }
-  const router = read('crates/muse-local-api/src/router.rs');
+  const router = read('crates/muse-api/src/router.rs');
   assert.doesNotMatch(router.split('#[cfg(test)]')[0], /\/model-assets/);
   const windowsJob = read('crates/muse-core/src/process_supervision.rs');
   for (const marker of [
@@ -268,7 +268,7 @@ test('标准 Tauri 壳、内嵌页面、图标和版本保持一致', () => {
     manifestVersion('src-tauri/Cargo.toml'),
     manifestVersion('crates/muse-core/Cargo.toml'),
     manifestVersion('crates/muse-runtime/Cargo.toml'),
-    manifestVersion('crates/muse-local-api/Cargo.toml'),
+    manifestVersion('crates/muse-api/Cargo.toml'),
   ];
   assert.equal(new Set(versions).size, 1, `工程版本不一致：${versions.join(', ')}`);
 });

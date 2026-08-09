@@ -318,7 +318,7 @@ mod tests {
         assert!(
             unix_containment_escape_reason("launchctl bootstrap gui/501 service.plist").is_some()
         );
-        assert!(unix_containment_escape_reason("rg setsid crates/muse-local-api/src").is_none());
+        assert!(unix_containment_escape_reason("rg setsid crates/muse-api/src").is_none());
         assert!(unix_containment_escape_reason("printf 'setsid is documented'").is_none());
 
         assert!(windows_containment_escape_reason("schtasks.exe /Create /TN Muse").is_some());

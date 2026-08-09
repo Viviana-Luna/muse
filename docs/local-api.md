@@ -1,6 +1,6 @@
 # Muse 本地 API 协议
 
-Muse 本地 API 的协议版本为 `muse-local-api/v1`。生产桌面端由 Tauri 宿主启动 API，并将运行信息只交付给受信任的主窗口；项目不提供独立服务端或外部 Bootstrap 通道。
+Muse 本地 API 的协议版本为 `muse-api/v1`。生产桌面端由 Tauri 宿主启动 API，并将运行信息只交付给受信任的主窗口；项目不提供独立服务端或外部 Bootstrap 通道。
 
 ## 运行时 Bootstrap
 
@@ -11,7 +11,7 @@ Bootstrap 响应结构固定为：
   "api_origin": "http://127.0.0.1:<随机端口>",
   "access_token": "<仅存在于本次进程内存中的 Bearer>",
   "token_type": "Bearer",
-  "protocol_version": "muse-local-api/v1",
+  "protocol_version": "muse-api/v1",
   "instance_id": "<本次进程实例 ID>"
 }
 ```

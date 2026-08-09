@@ -64,7 +64,7 @@ export function formatApiErrorMessage(error: unknown, fallback = '请求失败�
 }
 
 let bootstrapPromise: Promise<RuntimeBootstrap | null> | null = null;
-const SUPPORTED_PROTOCOL_VERSION = 'muse-local-api/v1';
+const SUPPORTED_PROTOCOL_VERSION = 'muse-api/v1';
 
 function normalizeApiOrigin(value: string) {
   return value.trim().replace(/\/+$/u, '');

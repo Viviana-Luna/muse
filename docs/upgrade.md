@@ -63,7 +63,7 @@ Skill 名称必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`、长度为 1–64，且目�
 
 ## 本地 API 不兼容变更
 
-升级后的本地协议为 `muse-local-api/v1`：
+升级后的本地协议为 `muse-api/v1`：
 
 - 桌面 UI 改为 Tauri 内嵌资源，不再访问外部 localhost 首页。
 - 桌面 API 每次启动绑定新的回环随机端口。
@@ -80,7 +80,7 @@ Skill 名称必须匹配 `^[a-z0-9]+(-[a-z0-9]+)*$`、长度为 1–64，且目�
 升级后建议确认：
 
 - 桌面应用能从任意当前工作目录打开，不依赖源码或根目录 `dist`。
-- `runtime_bootstrap.protocol_version` 为 `muse-local-api/v1`，health 的 `instance_id` 与本次 Bootstrap 一致。
+- `runtime_bootstrap.protocol_version` 为 `muse-api/v1`，health 的 `instance_id` 与本次 Bootstrap 一致。
 - 角色、会话和当前 `config.toml` 中的模型、MCP、Skill、Exa 与语音设置可读取。
 - legacy 原目录仍存在且内容未被迁移过程改写。
 - `~/.muse` 中没有因本次升级新建 `model-files` 或模型资产清单；旧模型仍留在 legacy 原目录。

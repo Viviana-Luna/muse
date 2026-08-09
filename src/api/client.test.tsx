@@ -15,7 +15,7 @@ describe('apiFetch', () => {
       api_origin: 'http://127.0.0.1:43127/',
       access_token: 'runtime-secret',
       token_type: 'Bearer',
-      protocol_version: 'muse-local-api/v1',
+      protocol_version: 'muse-api/v1',
       instance_id: 'instance-1'
     });
   });

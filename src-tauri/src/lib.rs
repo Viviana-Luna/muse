@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use muse_api::{LocalApiBootstrap, LocalApiSecurity, LocalApiSecurityOptions};
 use muse_core::config::{Config, DataDirLock, LegacyWorkspaceMigrationReport};
-use muse_local_api::{LocalApiBootstrap, LocalApiSecurity, LocalApiSecurityOptions};
 use tauri::http::HeaderValue;
 use tauri::utils::config::{Csp, CspDirectiveSources};
 use tauri::{Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -240,21 +240,21 @@ async fn start_local_server(dev_url: Option<tauri::Url>) -> Result<StartedLocalS
         );
     }
     let mut config = Config::default();
-    match muse_local_api::migrate_pristine_legacy_default_persona(
+    match muse_api::migrate_pristine_legacy_default_persona(
         &data_dir,
         &session_store,
         migration.quarantined_records,
     )
     .await
     {
-        Ok(muse_local_api::LegacyDefaultPersonaMigrationOutcome::Removed { backup_path }) => {
+        Ok(muse_api::LegacyDefaultPersonaMigrationOutcome::Removed { backup_path }) => {
             tracing::info!(
                 target: "muse::desktop",
                 backup_path = %backup_path.display(),
                 "已备份并移除未使用的历史自动默认角色"
             );
         }
-        Ok(muse_local_api::LegacyDefaultPersonaMigrationOutcome::PreservedUncertain { reason }) => {
+        Ok(muse_api::LegacyDefaultPersonaMigrationOutcome::PreservedUncertain { reason }) => {
             tracing::warn!(
                 target: "muse::desktop",
                 %reason,
@@ -297,7 +297,7 @@ async fn start_local_server(dev_url: Option<tauri::Url>) -> Result<StartedLocalS
 
     config.server.host = "127.0.0.1".to_string();
     config.server.port = address.port();
-    let router = muse_local_api::build_router_with_security(config, security)
+    let router = muse_api::build_router_with_security(config, security)
         .await
         .map_err(|err| format!("无法初始化 Muse 运行时：{err}"))?;
     let (shutdown, shutdown_rx) = oneshot::channel();
@@ -673,26 +673,21 @@ mod tests {
         let path = root.join("ready.json");
         let data_dir = root.join("app-data");
 
-        super::write_desktop_ready_file(&path, "muse-local-api/v1", "instance-test", &data_dir)
+        super::write_desktop_ready_file(&path, "muse-api/v1", "instance-test", &data_dir)
             .expect("首次就绪证明应写入");
-        super::write_desktop_ready_file(&path, "muse-local-api/v1", "instance-test", &data_dir)
+        super::write_desktop_ready_file(&path, "muse-api/v1", "instance-test", &data_dir)
             .expect("相同实例重复报告应幂等");
 
         let content = std::fs::read_to_string(&path).expect("应读取就绪证明");
         let value: serde_json::Value = serde_json::from_str(&content).expect("就绪证明应为 JSON");
-        assert_eq!(value["protocol_version"], "muse-local-api/v1");
+        assert_eq!(value["protocol_version"], "muse-api/v1");
         assert_eq!(value["instance_id"], "instance-test");
         assert!(value.get("access_token").is_none());
         assert!(value.get("token").is_none());
 
         assert!(
-            super::write_desktop_ready_file(
-                &path,
-                "muse-local-api/v1",
-                "other-instance",
-                &data_dir,
-            )
-            .is_err(),
+            super::write_desktop_ready_file(&path, "muse-api/v1", "other-instance", &data_dir,)
+                .is_err(),
             "其他实例不能覆盖已有就绪证明"
         );
         std::fs::remove_dir_all(root).expect("应清理就绪测试目录");

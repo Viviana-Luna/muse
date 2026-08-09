@@ -371,11 +371,10 @@ fn canonical_direct_user_fact(value: &str) -> Option<String> {
             return None;
         }
         format!("用户的{rest}")
-    } else if let Some(rest) = fact.strip_prefix('我') {
+    } else {
+        let rest = fact.strip_prefix('我')?;
         validate_simple_direct_user_predicate(rest)?;
         format!("用户{rest}")
-    } else {
-        return None;
     };
     canonical_memory_candidate(&canonical)
 }

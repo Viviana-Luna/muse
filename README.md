@@ -29,7 +29,7 @@ macOS 是当前主要开发、长期自用和真实桌面验证环境，但这�
 
 - 核心领域：`crates/muse-core` 负责配置、角色、模型、工具、语音和存储能力。
 - 运行时：`crates/muse-runtime` 负责状态协调、回合快照和 v3 会话存储。
-- 本地 API：`crates/muse-local-api` 负责 Axum 路由、安全边界和运行时装配。
+- 本地 API：`crates/muse-api` 负责 Axum 路由、安全边界和运行时装配。
 - 前端：React 19、Vite 7、TypeScript、Zustand、Radix UI、react-markdown。
 - 桌面：Tauri 2；当前以 macOS WKWebView 桌面开发为主，保留未来 Windows WebView2/NSIS 适配基础。
 - 存储：平台应用数据目录中的用户级 `config.toml`、版本化 SQLite、Session JSONL 和文件资源；旧 JSON 只作为一次性迁移来源原样保留。
@@ -110,14 +110,14 @@ export MUSE_DATA_DIR=/your/local/muse-data
 ├── crates/
 │   ├── muse-core/      # 与 Tauri 无关的核心领域层
 │   ├── muse-runtime/   # 会话与回合协调层
-│   └── muse-local-api/ # Axum 本地 API 适配层
+│   └── muse-api/       # Axum 本地 API 适配层
 ├── docs/              # 公开协议与升级文档
 ├── package.json       # 前端与 Tauri CLI 命令
 ├── Cargo.toml         # Rust workspace
 └── README.md          # 项目介绍
 ```
 
-Rust 依赖从应用壳向内单向指向 `src-tauri → muse-local-api → muse-runtime → muse-core`；`muse-local-api` 可以直接复用 `muse-core`，领域 crate 不得反向依赖 Tauri。
+Rust 依赖从应用壳向内单向指向 `src-tauri → muse-api → muse-runtime → muse-core`；`muse-api` 可以直接复用 `muse-core`，领域 crate 不得反向依赖 Tauri。
 
 ## 质量检查
 
@@ -126,7 +126,7 @@ Rust 依赖从应用壳向内单向指向 `src-tauri → muse-local-api → muse
 ```bash
 # Rust focused 示例
 cargo test -p muse-core model::config --lib --locked
-cargo test -p muse-local-api router::tests --lib --locked
+cargo test -p muse-api router::tests --lib --locked
 
 # 前端 focused 示例
 npx vitest run src/views/settings/SettingsDialog.test.tsx

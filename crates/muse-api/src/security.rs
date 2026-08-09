@@ -121,7 +121,7 @@ impl LocalApiSecurity {
             api_origin: self.api_origin.clone(),
             access_token: self.access_token.clone(),
             token_type: "Bearer",
-            protocol_version: "muse-local-api/v1",
+            protocol_version: "muse-api/v1",
             instance_id: self.instance_id.clone(),
         }
     }
@@ -162,7 +162,7 @@ impl LocalApiSecurity {
     pub fn health(&self) -> RuntimeHealthResponse {
         RuntimeHealthResponse {
             status: "ok",
-            protocol_version: "muse-local-api/v1",
+            protocol_version: "muse-api/v1",
             instance_id: self.instance_id.clone(),
         }
     }
@@ -394,7 +394,7 @@ fn security_error(
     if authenticate {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"muse-local-api\""),
+            HeaderValue::from_static("Bearer realm=\"muse-api\""),
         );
     }
     response
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             missing.headers().get(header::WWW_AUTHENTICATE),
-            Some(&HeaderValue::from_static("Bearer realm=\"muse-local-api\""))
+            Some(&HeaderValue::from_static("Bearer realm=\"muse-api\""))
         );
 
         let accepted = app

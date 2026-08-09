@@ -80,7 +80,7 @@ bash scripts/clean-build-artifacts.sh
 提交代码前，请确保遵循以下项目的开发约束（完整规范请见项目根目录下的 [`AGENTS.md`](../AGENTS.md)）：
 
 ### 1. 代码质量与重用
-- **优先复用**：新增功能优先复用 `crates/muse-core`、`crates/muse-runtime`、`crates/muse-local-api` 和现有 helper，避免重复造轮子。`src-tauri` 只承载桌面外壳；新增抽象必须能切实降低耦合或真实复杂度。
+- **优先复用**：新增功能优先复用 `crates/muse-core`、`crates/muse-runtime`、`crates/muse-api` 和现有 helper，避免重复造轮子。`src-tauri` 只承载桌面外壳；新增抽象必须能切实降低耦合或真实复杂度。
 - **注释精简**：代码注释仅用于解释复杂的边界条件、特殊架构设计原因或风险点，不写空泛、显而易见的废话注释。
 - **公开术语约定**：代码标识符、接口路径、依赖包名、配置键、协议字段和第三方专有名称按既有英文命名规范保留。
 

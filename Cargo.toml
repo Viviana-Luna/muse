@@ -2,7 +2,7 @@
 members = [
     "crates/muse-core",
     "crates/muse-runtime",
-    "crates/muse-local-api",
+    "crates/muse-api",
     "src-tauri",
 ]
 default-members = ["src-tauri"]

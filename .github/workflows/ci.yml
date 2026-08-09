@@ -357,7 +357,7 @@ jobs:
           const path = require('node:path');
           const ready = JSON.parse(fs.readFileSync(process.env.READY_FILE, 'utf8'));
           const expected = path.join(path.resolve(process.env.ISOLATED_HOME), '.muse');
-          if (ready.protocol_version !== 'muse-local-api/v1') {
+          if (ready.protocol_version !== 'muse-api/v1') {
             throw new Error('桌面就绪证明的协议版本不匹配。');
           }
           if (typeof ready.instance_id !== 'string' || ready.instance_id.length < 16) {
@@ -518,7 +518,7 @@ jobs:
               throw '桌面内嵌页未在时限内完成 Bootstrap 与鉴权 health。'
             }
             $ready = Get-Content -LiteralPath $readyFile -Raw | ConvertFrom-Json
-            if ($ready.protocol_version -ne 'muse-local-api/v1' -or
+            if ($ready.protocol_version -ne 'muse-api/v1' -or
                 [string]::IsNullOrWhiteSpace($ready.instance_id) -or
                 [IO.Path]::GetFullPath([string]$ready.data_dir) -ne $expectedDataDir -or
                 -not (Test-Path -LiteralPath $expectedDataDir -PathType Container)) {
@@ -640,7 +640,7 @@ jobs:
 
           for manifest in \
             crates/muse-core/Cargo.toml \
-            crates/muse-local-api/Cargo.toml \
+            crates/muse-api/Cargo.toml \
             crates/muse-runtime/Cargo.toml \
             src-tauri/Cargo.toml; do
             manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${manifest}" | head -n 1)"

@@ -2253,8 +2253,8 @@ name = "muse"
 version = "1.0.0-beta.1"
 dependencies = [
  "axum",
+ "muse-api",
  "muse-core",
- "muse-local-api",
  "muse-runtime",
  "serde_json",
  "tauri",
@@ -2263,6 +2263,30 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "muse-api"
+version = "1.0.0-beta.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "getrandom 0.3.4",
+ "libc",
+ "muse-core",
+ "muse-runtime",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2286,30 +2310,6 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "unicode-normalization",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "muse-local-api"
-version = "1.0.0-beta.1"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures",
- "getrandom 0.3.4",
- "libc",
- "muse-core",
- "muse-runtime",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-stream",
- "tower",
- "tracing",
  "windows-sys 0.61.2",
 ]
 

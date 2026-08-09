@@ -1594,8 +1594,8 @@ fn runtime_tool_handlers_own_approval_summaries() {
         ),
         (
             "file_list",
-            serde_json::json!({ "path": "crates/muse-local-api/src" }),
-            "列出目录：crates/muse-local-api/src",
+            serde_json::json!({ "path": "crates/muse-api/src" }),
+            "列出目录：crates/muse-api/src",
         ),
         (
             "file_write",
@@ -5694,13 +5694,13 @@ fn runtime_tool_handlers_render_model_results() {
         content: "在 `.` 下找到 1 个 `runtime_support` 的候选路径。".to_string(),
         structured: Some(serde_json::json!({
             "results": [
-                { "path": "crates/muse-local-api/src/runtime_support/mod.rs", "kind": "file" }
+                { "path": "crates/muse-api/src/runtime_support/mod.rs", "kind": "file" }
             ]
         })),
     };
     let rendered = search_handler.render_result_for_model(&search_result);
     assert!(rendered.contains("搜索候选路径（供模型继续决策）："));
-    assert!(rendered.contains("crates/muse-local-api/src/runtime_support/mod.rs"));
+    assert!(rendered.contains("crates/muse-api/src/runtime_support/mod.rs"));
 
     let compact_handler = super::runtime_tool_handler("session_compact")
         .expect("runtime handler registry 应包含 session_compact");
