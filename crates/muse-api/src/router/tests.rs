@@ -1070,6 +1070,7 @@ check_on_startup = true
     let payload = response_json(response).await;
     assert_eq!(payload["schema_version"], 1);
     assert_eq!(payload["appearance"]["background_blur"], 12);
+    assert_eq!(payload["appearance"]["background_theme"], "dark");
     assert_eq!(payload["diagnostics"][0]["field_path"], "extension_flag");
 
     let manually_edited = std::fs::read_to_string(config_dir.join("config.toml"))
@@ -1086,6 +1087,8 @@ check_on_startup = true
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
+                        "theme": "light",
+                        "background_theme": "light",
                         "background_blur": 26,
                         "background_opacity": 0.65,
                         "motion_level": "reduced"
@@ -1109,6 +1112,8 @@ check_on_startup = true
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
+                        "theme": "light",
+                        "background_theme": "light",
                         "background_blur": 26,
                         "background_opacity": 0.65,
                         "motion_level": "reduced"
@@ -1121,13 +1126,16 @@ check_on_startup = true
         .expect("冲突恢复后的外观更新应返回响应");
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
+    assert_eq!(payload["appearance"]["theme"], "light");
+    assert_eq!(payload["appearance"]["background_theme"], "light");
     assert_eq!(payload["appearance"]["background_blur"], 26);
     assert_eq!(payload["appearance"]["motion_level"], "reduced");
     let content =
         std::fs::read_to_string(config_dir.join("config.toml")).expect("应读取更新后的用户配置");
     assert!(content.starts_with("# 保留注释"));
     assert!(content.contains("extension_flag = \"keep\""));
-    assert!(content.contains("theme = \"dark\""));
+    assert!(content.contains("theme = \"light\""));
+    assert!(content.contains("background_theme = \"light\""));
     let _ = std::fs::remove_dir_all(config_dir);
 }
 

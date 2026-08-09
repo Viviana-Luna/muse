@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 /// 外观偏好更新请求。
 #[derive(Deserialize)]
 pub(crate) struct AppearancePreferencesUpdateRequest {
+    #[serde(default)]
+    pub(crate) theme: Option<String>,
+    #[serde(default)]
+    pub(crate) background_theme: Option<String>,
     pub(crate) background_blur: u8,
     pub(crate) background_opacity: f64,
     pub(crate) motion_level: muse_core::app::preferences::MotionLevel,
@@ -35,6 +39,33 @@ impl From<muse_core::app::preferences::MuseConfigSnapshot> for AppearancePrefere
             appearance: snapshot.config.appearance,
             diagnostics: snapshot.diagnostics,
         }
+    }
+}
+
+#[cfg(test)]
+mod appearance_preferences_tests {
+    use super::AppearancePreferencesUpdateRequest;
+
+    #[test]
+    fn appearance_update_accepts_existing_theme_field() {
+        let request: AppearancePreferencesUpdateRequest = serde_json::from_str(
+            r#"{"theme":"light","background_theme":"light","background_blur":18,"background_opacity":1.0,"motion_level":"full"}"#,
+        )
+        .expect("外观更新应接受既有主题字段");
+
+        assert_eq!(request.theme.as_deref(), Some("light"));
+        assert_eq!(request.background_theme.as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn appearance_update_keeps_legacy_clients_compatible() {
+        let request: AppearancePreferencesUpdateRequest = serde_json::from_str(
+            r#"{"background_blur":18,"background_opacity":1.0,"motion_level":"full"}"#,
+        )
+        .expect("旧外观更新请求应继续可解析");
+
+        assert!(request.theme.is_none());
+        assert!(request.background_theme.is_none());
     }
 }
 

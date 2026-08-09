@@ -18,6 +18,7 @@ import { RuntimeLiveRegion } from '@/components/feedback/RuntimeLiveRegion';
 import { LazySurfaceBoundary } from '@/components/feedback/LazySurfaceBoundary';
 import { AppLoadingScreen, SectionLoading } from '@/components/feedback/LoadingState';
 import { useAppToast } from '@/hooks/useAppToast';
+import { useAppearanceThemeMode } from '@/hooks/useAppearanceThemeMode';
 import { useModalAccessibility } from '@/hooks/useModalAccessibility';
 import { usePersonaTheme } from '@/hooks/usePersonaTheme';
 import { usePersonaState } from '@/views/personas/hooks/usePersonaState';
@@ -285,9 +286,12 @@ export function App() {
     openImportDialog();
   }, [route.section, openImportDialog, pendingImportIntent]);
 
-
+  const themeMode = useAppearanceThemeMode(appearanceSettings.theme);
   const personaTheme = usePersonaTheme(activeVisualPack, voice.status);
-  const { themeMode, rootStyle } = personaTheme;
+  const { rootStyle } = personaTheme;
+  const backgroundMaterialClass =
+    appearanceSettings.backgroundOpacity < 1 ? 'background-translucent' : 'background-solid';
+  const backgroundThemeClass = `background-theme-${appearanceSettings.backgroundTheme}`;
   const appRootStyle = {
     ...rootStyle,
     '--app-background-opacity': String(appearanceSettings.backgroundOpacity)
@@ -328,7 +332,7 @@ export function App() {
     <>
       <AppToastViewport toasts={toasts} themeMode={themeMode} onDismiss={dismissToast} />
       <main
-        className={`runtime-shell story-shell app-shell view-${route.section} theme-${themeMode} motion-${appearanceSettings.motionLevel}`}
+        className={`runtime-shell story-shell app-shell view-${route.section} theme-${themeMode} ${backgroundThemeClass} motion-${appearanceSettings.motionLevel} ${backgroundMaterialClass}`}
         style={appRootStyle}
       >
       <RuntimeLiveRegion status={runtimeStatus} />

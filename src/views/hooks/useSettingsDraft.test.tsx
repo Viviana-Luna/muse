@@ -144,6 +144,8 @@ describe('useSettingsDraft', () => {
     );
     const { result } = renderHook(() => useSettingsDraft());
 
+    expect(result.current.appearanceSettings.theme).toBe('system');
+    expect(result.current.appearanceSettings.backgroundTheme).toBe('dark');
     expect(result.current.appearanceSettings.backgroundBlur).toBe(9);
     expect(result.current.legacyAppearanceSettings?.backgroundBlur).toBe(9);
     act(() => result.current.markAppearanceSaved());

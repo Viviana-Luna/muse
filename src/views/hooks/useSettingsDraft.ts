@@ -112,6 +112,14 @@ function readAppearanceSettings(): InitialAppearanceState {
   try {
     const parsed = JSON.parse(stored) as Partial<AppearanceSettings>;
     const settings = {
+      theme:
+        parsed.theme === 'dark' || parsed.theme === 'light'
+          ? parsed.theme
+          : DEFAULT_APPEARANCE_SETTINGS.theme,
+      backgroundTheme:
+        parsed.backgroundTheme === 'light'
+          ? 'light'
+          : DEFAULT_APPEARANCE_SETTINGS.backgroundTheme,
       backgroundBlur:
         typeof parsed.backgroundBlur === 'number'
           ? Math.min(30, Math.max(0, parsed.backgroundBlur))

@@ -56,12 +56,16 @@ export function useSettingsController(options: UseSettingsControllerOptions) {
 
   function appearanceFromResponse(response: {
     appearance: {
+      theme: AppearanceSettings['theme'];
+      background_theme: AppearanceSettings['backgroundTheme'];
       background_blur: number;
       background_opacity: number;
       motion_level: AppearanceSettings['motionLevel'];
     };
   }): AppearanceSettings {
     return {
+      theme: response.appearance.theme,
+      backgroundTheme: response.appearance.background_theme,
       backgroundBlur: response.appearance.background_blur,
       backgroundOpacity: response.appearance.background_opacity,
       motionLevel: response.appearance.motion_level
@@ -70,6 +74,8 @@ export function useSettingsController(options: UseSettingsControllerOptions) {
 
   function appearanceUpdate(settings: AppearanceSettings) {
     return {
+      theme: settings.theme,
+      background_theme: settings.backgroundTheme,
       background_blur: settings.backgroundBlur,
       background_opacity: settings.backgroundOpacity,
       motion_level: settings.motionLevel

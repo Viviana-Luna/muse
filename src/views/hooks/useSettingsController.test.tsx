@@ -122,6 +122,7 @@ describe('useSettingsController 诊断反馈', () => {
       schema_version: 1,
       appearance: {
         theme: 'system',
+        background_theme: 'dark',
         language: 'zh-CN',
         background_blur: 18,
         background_opacity: 1,
@@ -133,6 +134,7 @@ describe('useSettingsController 诊断反馈', () => {
       schema_version: 1,
       appearance: {
         theme: 'system',
+        background_theme: 'dark',
         language: 'zh-CN',
         background_blur: 9,
         background_opacity: 0.7,
@@ -145,11 +147,15 @@ describe('useSettingsController 诊断反馈', () => {
     await act(async () => result.current.controller.initializeAppearancePreferences());
 
     expect(saveAppearancePreferences).toHaveBeenCalledWith({
+      theme: 'system',
+      background_theme: 'dark',
       background_blur: 9,
       background_opacity: 0.7,
       motion_level: 'reduced'
     });
     expect(result.current.draft.appearanceSettings).toEqual({
+      theme: 'system',
+      backgroundTheme: 'dark',
       backgroundBlur: 9,
       backgroundOpacity: 0.7,
       motionLevel: 'reduced'
@@ -166,6 +172,7 @@ describe('useSettingsController 诊断反馈', () => {
       schema_version: 1,
       appearance: {
         theme: 'dark',
+        background_theme: 'light',
         language: 'zh-CN',
         background_blur: 24,
         background_opacity: 0.8,
@@ -184,6 +191,8 @@ describe('useSettingsController 诊断反馈', () => {
     await act(async () => result.current.controller.initializeAppearancePreferences());
 
     expect(saveAppearancePreferences).not.toHaveBeenCalled();
+    expect(result.current.draft.appearanceSettings.theme).toBe('dark');
+    expect(result.current.draft.appearanceSettings.backgroundTheme).toBe('light');
     expect(result.current.draft.appearanceSettings.backgroundBlur).toBe(24);
     expect(window.localStorage.getItem('muse:appearance-settings')).toBeNull();
     expect(notify).toHaveBeenCalledWith(

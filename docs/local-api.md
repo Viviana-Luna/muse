@@ -109,7 +109,7 @@ Skill `revision` 同时覆盖 `SKILL.md` 字节与当前启停状态。手工编
 
 ## 用户级外观偏好
 
-`GET /api/preferences/appearance` 读取用户数据目录中的 `config.toml`，返回 `schema_version`、外观偏好和字段诊断。`PUT /api/preferences/appearance` 只接受当前界面可编辑的 `background_blur`、`background_opacity` 与 `motion_level`；其中 Windows 实色/半透明背景复用 `background_opacity`，默认 `1.0`，半透明预设为 `0.72`。主题、语言、其他配置段、注释、顺序和未知字段由服务端原样保留。
+`GET /api/preferences/appearance` 读取用户数据目录中的 `config.toml`，返回 `schema_version`、外观偏好和字段诊断。`PUT /api/preferences/appearance` 接受当前界面可编辑的 `theme`、`background_theme`、`background_blur`、`background_opacity` 与 `motion_level`；其中 `theme` 控制浮岛界面，`background_theme` 只控制整窗连续底层，Windows 实色/半透明背景复用 `background_opacity`，默认 `1.0`，半透明预设为 `0.72`。旧客户端缺省 `theme` 或 `background_theme` 时保留磁盘现值；语言、其他配置段、注释、顺序和未知字段由服务端原样保留。
 
 若 `config.toml` 在页面加载后被手工修改，陈旧页面保存返回 HTTP 409，并提供 `code = "config_revision_conflict"`、`field_path = "config.toml"` 和不包含秘密的中文 `message`；服务端不会覆盖外部修改。重新读取后，页面与手工配置看到同一个 revision。语法、版本和文件读写错误也使用稳定的 `code`、`field_path`、`message` 结构。
 

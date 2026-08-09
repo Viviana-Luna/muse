@@ -13,7 +13,7 @@ Muse 当前工程版本为 `v1.0.0-beta.2`。Windows 支持声明只有在该源
 
 Windows 支持仅覆盖 25H2 x64，固定实机为 Windows 11 Pro、build 26200；安装器继续使用 Evergreen Runtime 与 `downloadBootstrapper`，最低 WebView2 为 111。Windows 10、Windows 11 24H2/26H1、ARM64、Windows Server、Windows 7/8/8.1 和 Linux 不在支持范围。源码支持不等于提供公开、签名或自动更新的 NSIS。
 
-Windows 宿主同时开启窗口与 WebView 透明能力，但默认 `background_opacity = 1.0`，视觉仍为实色。用户显式选择半透明背景后，只有应用画布透出桌面，导航、内容和标题栏控件浮岛继续使用独立玻璃表面；该模式必须与实色模式一并完成 DPI、亮暗主题、最大化和可读性验收。
+Windows 宿主同时开启窗口与 WebView 透明能力，但默认 `background_opacity = 1.0`，视觉仍为实色。用户显式选择半透明背景后，只有整扇窗口唯一的连续底层画布透出桌面，导航、内容和标题栏控件浮岛继续使用独立玻璃表面；`appearance.theme` 的界面明暗与 `appearance.background_theme` 的背景明暗分别生效。该模式必须与实色模式及四种界面/背景明暗组合一并完成 DPI、最大化和可读性验收。
 
 ## 前端能力契约
 

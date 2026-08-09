@@ -50,6 +50,7 @@ impl MotionLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppearancePreferences {
     pub theme: String,
+    pub background_theme: String,
     pub language: String,
     pub background_blur: u8,
     pub background_opacity: f64,
@@ -60,6 +61,7 @@ impl Default for AppearancePreferences {
     fn default() -> Self {
         Self {
             theme: "system".to_string(),
+            background_theme: "dark".to_string(),
             language: "zh-CN".to_string(),
             background_blur: 18,
             background_opacity: 1.0,
@@ -678,6 +680,13 @@ fn validate_appearance(appearance: &AppearancePreferences) -> Result<(), MuseCon
             "外观主题必须是 system、light 或 dark。",
         ));
     }
+    if !matches!(appearance.background_theme.as_str(), "light" | "dark") {
+        return Err(validation(
+            "config_value_invalid",
+            "appearance.background_theme",
+            "背景主题必须是 light 或 dark。",
+        ));
+    }
     if appearance.language.trim().is_empty() || appearance.language.len() > 32 {
         return Err(validation(
             "config_value_invalid",
@@ -717,6 +726,7 @@ fn default_document() -> DocumentMut {
 
 [appearance]
 theme = "system"
+background_theme = "dark"
 language = "zh-CN"
 background_blur = 18
 background_opacity = 1.0
@@ -773,6 +783,14 @@ fn decode_document(
             "appearance.theme",
             &config.appearance.theme,
             &["system", "light", "dark"],
+            &mut diagnostics,
+        );
+        config.appearance.background_theme = read_optional_enum_string(
+            table,
+            "background_theme",
+            "appearance.background_theme",
+            &config.appearance.background_theme,
+            &["light", "dark"],
             &mut diagnostics,
         );
         config.appearance.language = read_non_empty_string(
@@ -940,6 +958,7 @@ fn collect_unknown_fields(document: &DocumentMut, diagnostics: &mut Vec<ConfigDi
             "appearance",
             &[
                 "theme",
+                "background_theme",
                 "language",
                 "background_blur",
                 "background_opacity",
@@ -1308,6 +1327,39 @@ fn read_enum_string(
     }
 }
 
+/// 读取后续版本新增的枚举字段；字段缺失表示沿用兼容默认值，不产生诊断。
+fn read_optional_enum_string(
+    table: &Table,
+    key: &str,
+    path: &str,
+    default: &str,
+    allowed: &[&str],
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> String {
+    let Some(item) = table.get(key) else {
+        return default.to_string();
+    };
+    match item.as_str() {
+        Some(value) if allowed.contains(&value) => value.to_string(),
+        Some(_) => {
+            diagnostics.push(diagnostic(
+                "config_value_invalid",
+                path,
+                &format!("配置字段 `{path}` 的值不受支持，当前使用默认值。"),
+            ));
+            default.to_string()
+        }
+        None => {
+            diagnostics.push(diagnostic(
+                "config_type_invalid",
+                path,
+                &format!("配置字段 `{path}` 必须是字符串，当前使用默认值。"),
+            ));
+            default.to_string()
+        }
+    }
+}
+
 fn read_non_empty_string(
     table: &Table,
     key: &str,
@@ -1452,6 +1504,11 @@ fn write_appearance(
         .as_table_mut()
         .expect("appearance 已转换为表");
     set_value_preserving_decor(table, "theme", Value::from(appearance.theme.as_str()));
+    set_value_preserving_decor(
+        table,
+        "background_theme",
+        Value::from(appearance.background_theme.as_str()),
+    );
     set_value_preserving_decor(table, "language", Value::from(appearance.language.as_str()));
     set_value_preserving_decor(
         table,
@@ -1565,10 +1622,49 @@ mod tests {
         let content = std::fs::read_to_string(root.join("config.toml")).expect("应读取默认配置");
         assert!(content.contains("schema_version = 1"));
         assert_eq!(store.snapshot().config.appearance.background_blur, 18);
+        assert_eq!(store.snapshot().config.appearance.background_theme, "dark");
         assert_eq!(
             store.web_search_preferences().provider,
             WebSearchProvider::ExaFreeMcp
         );
+        assert!(store.snapshot().diagnostics.is_empty());
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn loads_legacy_appearance_without_background_theme_diagnostic() {
+        let root = unique_root("legacy-background-theme");
+        std::fs::create_dir_all(&root).expect("应创建测试目录");
+        std::fs::write(
+            root.join("config.toml"),
+            r#"schema_version = 1
+
+[appearance]
+theme = "system"
+language = "zh-CN"
+background_blur = 18
+background_opacity = 1.0
+motion_level = "full"
+
+[conversation]
+send_key = "enter"
+restore_last_session = true
+
+[voice]
+auto_play = false
+input_language = "zh"
+
+[updates]
+check_on_startup = true
+
+[web_search]
+provider = "exa_free_mcp"
+"#,
+        )
+        .expect("应写入旧版外观配置");
+
+        let store = MuseConfigStore::load_from_dir(&root).expect("旧配置应继续加载");
+        assert_eq!(store.snapshot().config.appearance.background_theme, "dark");
         assert!(store.snapshot().diagnostics.is_empty());
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
@@ -1941,6 +2037,7 @@ check_on_startup = true
         store
             .update_appearance(AppearancePreferences {
                 theme: "system".to_string(),
+                background_theme: "light".to_string(),
                 language: "zh-CN".to_string(),
                 background_blur: 22,
                 background_opacity: 0.6,
@@ -1953,6 +2050,7 @@ check_on_startup = true
         assert!(content.contains("custom_flag = \"keep\""));
         assert!(content.contains("future_field = 42"));
         assert!(content.contains("background_blur = 22"));
+        assert!(content.contains("background_theme = \"light\""));
         assert!(content.contains("motion_level = \"none\""));
         std::fs::remove_dir_all(root).expect("应清理测试目录");
     }
@@ -1998,6 +2096,24 @@ motion_level = "fast"
             .update_appearance(invalid)
             .expect_err("越界值必须拒绝");
         assert!(error.to_string().contains("背景可见度"));
+        assert_eq!(
+            std::fs::read(root.join("config.toml")).expect("应读取失败后的配置"),
+            before
+        );
+        std::fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[test]
+    fn rejects_invalid_background_theme_without_mutating_file() {
+        let root = unique_root("invalid-background-theme");
+        let mut store = MuseConfigStore::load_from_dir(&root).expect("应创建默认配置");
+        let before = std::fs::read(root.join("config.toml")).expect("应读取原配置");
+        let mut invalid = store.snapshot().config.appearance;
+        invalid.background_theme = "system".to_string();
+        let error = store
+            .update_appearance(invalid)
+            .expect_err("背景主题不得复用界面的跟随系统值");
+        assert!(error.to_string().contains("背景主题"));
         assert_eq!(
             std::fs::read(root.join("config.toml")).expect("应读取失败后的配置"),
             before

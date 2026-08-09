@@ -1,3 +1,4 @@
+import type { AppearanceBackgroundTheme, AppearanceTheme } from '@/types';
 import type { MotionLevel, SettingsDialogProps } from '../types';
 
 type AppearancePanelProps = Pick<
@@ -6,6 +7,20 @@ type AppearancePanelProps = Pick<
 >;
 
 const TRANSLUCENT_BACKGROUND_OPACITY = 0.72;
+
+const THEME_OPTIONS: Array<{
+  value: AppearanceTheme;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'system',
+    label: '跟随系统',
+    description: '自动匹配 Windows 当前的亮色或深色模式。'
+  },
+  { value: 'dark', label: '深色主题', description: '始终使用深色浮岛与浅色文字。' },
+  { value: 'light', label: '浅色主题', description: '始终使用浅色浮岛与深色文字。' }
+];
 
 const BACKGROUND_OPTIONS = [
   {
@@ -19,6 +34,23 @@ const BACKGROUND_OPTIONS = [
     description: '在 Windows 11 中透出桌面背景，浮岛继续保持独立材质。'
   }
 ] as const;
+
+const BACKGROUND_THEME_OPTIONS: Array<{
+  value: AppearanceBackgroundTheme;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: 'dark',
+    label: '深色背景',
+    description: '整扇窗口使用深色连续底层，浮岛主题保持独立。'
+  },
+  {
+    value: 'light',
+    label: '浅色背景',
+    description: '整扇窗口使用浅色连续底层，不改变浮岛与文字配色。'
+  }
+];
 
 const MOTION_OPTIONS: Array<{
   value: MotionLevel;
@@ -35,6 +67,59 @@ export function AppearancePanel({ appearanceSettings, setAppearanceSettings }: A
 
   return (
     <div className="settings-panel-body">
+      <section className="settings-module">
+        <header className="settings-module-head">
+          <div>
+            <h2>界面主题</h2>
+            <p>选择浮岛、文字与控件的明暗；角色强调色不会覆盖这里的选择。</p>
+          </div>
+        </header>
+        <div className="segmented-control" role="group" aria-label="界面主题">
+          {THEME_OPTIONS.map((option) => (
+            <button
+              type="button"
+              key={option.value}
+              className={appearanceSettings.theme === option.value ? 'active' : ''}
+              aria-pressed={appearanceSettings.theme === option.value}
+              onClick={() =>
+                setAppearanceSettings((state) => ({ ...state, theme: option.value }))
+              }
+            >
+              <strong>{option.label}</strong>
+              <small>{option.description}</small>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="settings-module">
+        <header className="settings-module-head">
+          <div>
+            <h2>背景明暗</h2>
+            <p>只控制浮岛下方的一整块窗口背景，与界面主题分别保存。</p>
+          </div>
+        </header>
+        <div className="segmented-control" role="group" aria-label="背景明暗">
+          {BACKGROUND_THEME_OPTIONS.map((option) => (
+            <button
+              type="button"
+              key={option.value}
+              className={appearanceSettings.backgroundTheme === option.value ? 'active' : ''}
+              aria-pressed={appearanceSettings.backgroundTheme === option.value}
+              onClick={() =>
+                setAppearanceSettings((state) => ({
+                  ...state,
+                  backgroundTheme: option.value
+                }))
+              }
+            >
+              <strong>{option.label}</strong>
+              <small>{option.description}</small>
+            </button>
+          ))}
+        </div>
+      </section>
+
       <section className="settings-module">
         <header className="settings-module-head">
           <div>

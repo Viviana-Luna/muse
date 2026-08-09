@@ -1,3 +1,4 @@
+import type { AppearanceBackgroundTheme, AppearanceTheme } from '@/types';
 import { apiFetch, readJson } from './client';
 
 export type AppearanceMotionLevel = 'full' | 'reduced' | 'none';
@@ -11,7 +12,8 @@ export interface ConfigDiagnostic {
 export interface AppearancePreferencesResponse {
   schema_version: number;
   appearance: {
-    theme: string;
+    theme: AppearanceTheme;
+    background_theme: AppearanceBackgroundTheme;
     language: string;
     background_blur: number;
     background_opacity: number;
@@ -21,6 +23,8 @@ export interface AppearancePreferencesResponse {
 }
 
 export interface AppearancePreferencesUpdate {
+  theme: AppearanceTheme;
+  background_theme: AppearanceBackgroundTheme;
   background_blur: number;
   background_opacity: number;
   motion_level: AppearanceMotionLevel;

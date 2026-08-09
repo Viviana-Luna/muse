@@ -36,6 +36,7 @@ describe('MuseApp 角色导入意图', () => {
       schema_version: 1,
       appearance: {
         theme: 'system',
+        background_theme: 'dark',
         language: 'zh-CN',
         background_blur: 18,
         background_opacity: 1,
@@ -126,11 +127,12 @@ describe('MuseApp 角色导入意图', () => {
     expect(screen.queryByRole('heading', { name: '暂无角色' })).not.toBeInTheDocument();
   });
 
-  it('把已保存的背景可见度应用到应用画布', async () => {
+  it('只把已保存的半透明背景可见度应用到画布并标记材质状态', async () => {
     api.fetchAppearancePreferences.mockResolvedValue({
       schema_version: 1,
       appearance: {
         theme: 'system',
+        background_theme: 'dark',
         language: 'zh-CN',
         background_blur: 18,
         background_opacity: 0.72,
@@ -142,13 +144,72 @@ describe('MuseApp 角色导入意图', () => {
     const { container } = render(<App />);
     await screen.findByRole('heading', { name: '暂无角色' });
 
-    await waitFor(() =>
-      expect(
-        container
-          .querySelector<HTMLElement>('main.runtime-shell')
-          ?.style.getPropertyValue('--app-background-opacity')
-      ).toBe('0.72')
-    );
+    await waitFor(() => {
+      const root = container.querySelector<HTMLElement>('main.runtime-shell');
+      expect(root?.style.getPropertyValue('--app-background-opacity')).toBe('0.72');
+      expect(root).toHaveClass('background-translucent');
+      expect(root).not.toHaveClass('background-solid');
+    });
+  });
+
+  it('实色背景使用独立材质状态且保持画布不透明', async () => {
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: '暂无角色' });
+
+    const root = container.querySelector<HTMLElement>('main.runtime-shell');
+    expect(root?.style.getPropertyValue('--app-background-opacity')).toBe('1');
+    expect(root).toHaveClass('background-solid');
+    expect(root).not.toHaveClass('background-translucent');
+  });
+
+  it('已保存的浅色主题覆盖角色展示包的默认明暗结果', async () => {
+    api.fetchAppearancePreferences.mockResolvedValue({
+      schema_version: 1,
+      appearance: {
+        theme: 'light',
+        background_theme: 'dark',
+        language: 'zh-CN',
+        background_blur: 18,
+        background_opacity: 1,
+        motion_level: 'full'
+      },
+      diagnostics: []
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: '暂无角色' });
+
+    await waitFor(() => {
+      const root = container.querySelector<HTMLElement>('main.runtime-shell');
+      expect(root).toHaveClass('theme-light');
+      expect(root).not.toHaveClass('theme-dark');
+      expect(root).toHaveClass('background-theme-dark');
+    });
+  });
+
+  it('浅色背景不改变已保存的深色界面主题', async () => {
+    api.fetchAppearancePreferences.mockResolvedValue({
+      schema_version: 1,
+      appearance: {
+        theme: 'dark',
+        background_theme: 'light',
+        language: 'zh-CN',
+        background_blur: 18,
+        background_opacity: 1,
+        motion_level: 'full'
+      },
+      diagnostics: []
+    });
+
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: '暂无角色' });
+
+    await waitFor(() => {
+      const root = container.querySelector<HTMLElement>('main.runtime-shell');
+      expect(root).toHaveClass('theme-dark');
+      expect(root).toHaveClass('background-theme-light');
+      expect(root).not.toHaveClass('theme-light');
+    });
   });
 
   it('从空态进入角色库后打开可审阅的导入流程，不直接弹出系统文件框', async () => {

@@ -9,7 +9,12 @@ import type {
   ModelsConfig,
   DiagnosticsConnectivityItem
 } from '@/types';
-import type { SecretUpdate, WebSearchProvider } from '@/types';
+import type {
+  AppearanceBackgroundTheme,
+  AppearanceTheme,
+  SecretUpdate,
+  WebSearchProvider
+} from '@/types';
 
 export type SettingsPanel =
   | 'chat'
@@ -26,12 +31,16 @@ export type MotionLevel = 'full' | 'reduced' | 'none';
 export type SettingsDirtyDomain = 'models' | 'workspace' | 'web_search' | 'appearance';
 
 export interface AppearanceSettings {
+  theme: AppearanceTheme;
+  backgroundTheme: AppearanceBackgroundTheme;
   backgroundBlur: number;
   backgroundOpacity: number;
   motionLevel: MotionLevel;
 }
 
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
+  theme: 'system',
+  backgroundTheme: 'dark',
   backgroundBlur: 18,
   backgroundOpacity: 1,
   motionLevel: 'full'

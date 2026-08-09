@@ -14,7 +14,7 @@
 - `speech_recognition`：OpenAI-compatible 语音识别配置，负责服务地址、密钥、模型、语言和返回格式。
 - `workspace`：工具工作区策略，负责权限模式、沙箱模式和风险提示。
 - `web_search`：Exa 联网搜索后端与密钥草稿。默认使用免费 MCP；切换 API 方案后，密钥按 `keep | replace | delete` 动作原子保存到受保护的用户级 `config.toml`。
-- `appearance`：客户端外观配置，负责动效强度和 Windows 实色/半透明背景。半透明选项复用 `background_opacity` 并即时预览；`background_blur` 继续由本地 API 兼容读取但暂不单独暴露。草稿随“保存全部更改”通过本地 API 原子写入用户级 `config.toml`，不进入模型配置或浏览器持久状态。
+- `appearance`：客户端外观配置，负责界面主题、背景主题、动效强度和 Windows 实色/半透明背景。界面选择复用既有 `appearance.theme`，背景明暗独立保存到 `appearance.background_theme`；角色展示包继续提供强调色和素材，不覆盖用户选择。半透明选项复用 `background_opacity`，透明度只作用于整扇窗口唯一的底层画布，标题栏、导航和内容浮岛保持不透出桌面的实体表面；`background_blur` 继续由本地 API 兼容读取但暂不单独暴露。草稿随“保存全部更改”通过本地 API 原子写入用户级 `config.toml`，不进入模型配置或浏览器持久状态。
 - `diagnostics`：系统诊断摘要，负责展示当前端点配置、运行状态和真实连通性检测结果。
 
 ## 目录结构

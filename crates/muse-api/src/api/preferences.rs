@@ -46,6 +46,12 @@ async fn handle_put_appearance_preferences(
     let (result, models) = {
         let mut store = state.user_config.lock().await;
         let mut appearance = store.snapshot().config.appearance;
+        if let Some(theme) = request.theme {
+            appearance.theme = theme;
+        }
+        if let Some(background_theme) = request.background_theme {
+            appearance.background_theme = background_theme;
+        }
         appearance.background_blur = request.background_blur;
         appearance.background_opacity = request.background_opacity;
         appearance.motion_level = request.motion_level;

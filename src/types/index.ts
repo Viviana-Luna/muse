@@ -9,3 +9,4 @@ export * from './secrets';
 export * from './skills';
 export * from './mcp';
 export * from './memories';
+export * from './appearance';
